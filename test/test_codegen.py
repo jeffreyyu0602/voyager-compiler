@@ -16,7 +16,7 @@ from transformers import (
 )
 from tqdm import tqdm
 
-from quantized_training import (
+from voyager_compiler import (
     TorchExportableModuleWithStaticCache,
     QuantizationConfig,
     QuantizationSpec,
@@ -34,12 +34,12 @@ from quantized_training import (
     swap_llama_attention,
     transform,
 )
-from quantized_training.codegen import (
+from voyager_compiler.codegen import (
     inline_autocast_modules,
     replace_rmsnorm_with_layer_norm,
     remove_softmax_dtype_cast,
 )
-from quantized_training.llm_utils import fuse_dequantize_quantize
+from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
 from utils.dataset import glue, imagenet
@@ -663,7 +663,7 @@ if __name__ == "__main__":
 
         gm = prepare_pt2e(model, quantizer, example_args)
 
-        from quantized_training.codegen.mapping import eliminate_dead_code
+        from voyager_compiler.codegen.mapping import eliminate_dead_code
         eliminate_dead_code(gm.graph)
 
         dataset = load_dataset("CUHK-CSE/wider_face")

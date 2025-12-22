@@ -22,7 +22,7 @@ from tqdm import tqdm
 from transformers import DeiTImageProcessor, ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
 from transformers.utils import logging
 
-from quantized_training import (
+from voyager_compiler import (
     DerivedQuantizationSpec,
     FusedAmaxObsFakeQuantize,
     QuantizationConfig,
@@ -37,7 +37,7 @@ from quantized_training import (
     extract_input_preprocessor,
     fuse,
 )
-from quantized_training.codegen import (
+from voyager_compiler.codegen import (
     get_conv_bn_layers,
     pad_vit_embeddings_output,
     remove_softmax_dtype_cast,

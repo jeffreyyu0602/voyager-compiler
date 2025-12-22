@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voyager-compiler"
+version = "0.1.dev0"
+description = "A Machine Learning Compiler with native quantization support"
+readme = "README.md"
+authors = [
+  { name = "Jeffrey Yu", email = "jeffreyy@stanford.edu" },
+]
+requires-python = ">=3.9"
+
+# STABILITY FIRST: Exact versions enforced here.
+dependencies = [
+    "matplotlib",
+    "scipy",
+    "transformers==4.57.1",
+    "datasets==3.5.0",
+    "accelerate==1.6.0",
+    "evaluate",
+    "scikit-learn",
+    "peft==0.6.2",
+    "sentencepiece",
+    "wandb",
+    "librosa",
+    "soundfile",
+    "jiwer",
+    "tabulate",
+    "protobuf",
+    "graphviz",
+    "timm"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"voyager_compiler" = ["*.txt", "*.json"]

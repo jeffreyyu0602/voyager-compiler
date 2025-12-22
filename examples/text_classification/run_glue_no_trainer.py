@@ -50,7 +50,7 @@ from transformers.utils.versions import require_version
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
-from quantized_training import add_qspec_args, quantize, setup_logging
+from voyager_compiler import add_qspec_args, quantize, setup_logging
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.

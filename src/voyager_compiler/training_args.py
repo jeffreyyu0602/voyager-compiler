@@ -1,7 +1,7 @@
 import argparse
 
-from quantized_training.quantizer.quantizer import QuantizationSpec
-from quantized_training.utils import SLURM_ARGS
+from voyager_compiler.quantizer.quantizer import QuantizationSpec
+from voyager_compiler.utils import SLURM_ARGS
 
 __all__ = [
     "add_qspec_args",

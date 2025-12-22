@@ -129,7 +129,12 @@ def setup_logging(func):
             func(args, *func_args, **func_kwargs)
 
         if args.sweep_id is not None:
-            wandb.agent(args.sweep_id, function=sweep_fn, count=args.max_trials, project=args.project)
+            wandb.agent(
+                args.sweep_id,
+                function=sweep_fn,
+                count=args.max_trials,
+                project=args.project,
+            )
         else:
             if args.project is not None:
                 wandb.init(

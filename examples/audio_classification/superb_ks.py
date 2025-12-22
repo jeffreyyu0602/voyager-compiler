@@ -7,7 +7,7 @@ from datasets import load_dataset
 from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
 from torchaudio.sox_effects import apply_effects_file
 
-from quantized_training import add_qspec_args, setup_logging
+from voyager_compiler import add_qspec_args, setup_logging
 
 logger = logging.getLogger(__name__)
 

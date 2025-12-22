@@ -1,0 +1,1 @@
+src/voyager_compiler/posit_gold/*.txt filter=lfs diff=lfs merge=lfs -text

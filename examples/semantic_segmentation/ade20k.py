@@ -14,7 +14,7 @@ from tqdm import tqdm
 from transformers import AutoModelForSemanticSegmentation
 
 from metrics import eval_metrics
-from quantized_training import (
+from voyager_compiler import (
     add_qspec_args,
     convert_pt2e,
     get_default_quantizer,

@@ -9,8 +9,8 @@ from transformers.activations import GELUActivation
 from transformers.models import bert, distilbert, gpt2, llama, mobilebert, roberta, whisper
 from transformers.pytorch_utils import Conv1D
 
-import quantized_training.modules.qat as nnqat
-from quantized_training.modules import quantizable
+import voyager_compiler.modules.qat as nnqat
+from voyager_compiler.modules import quantizable
 
 
 DEFAULT_QAT_MODULE_MAPPINGS: Dict[Callable, Any] = {

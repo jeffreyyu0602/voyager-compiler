@@ -13,15 +13,15 @@ from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.ao.quantization.quantizer import EdgeOrNode, QuantizationSpecBase
 from torch.fx import GraphModule, Graph, Node
 
-import quantized_training as qt
-from quantized_training.fake_quantize import (
+import voyager_compiler as qt
+from voyager_compiler.fake_quantize import (
     _DerivedObserverOrFakeQuantize,
     FusedAmaxObsFakeQuantize,
     get_quantization_map,
 )
-from quantized_training.quantizer.quantizer import QuantizationSpec, DerivedQuantizationSpec
-from quantized_training.quantizer.xnnpack_quantizer import XNNPACKQuantizer
-from quantized_training.quantizer.xnnpack_quantizer_utils import QuantizationConfig
+from voyager_compiler.quantizer.quantizer import QuantizationSpec, DerivedQuantizationSpec
+from voyager_compiler.quantizer.xnnpack_quantizer import XNNPACKQuantizer
+from voyager_compiler.quantizer.xnnpack_quantizer_utils import QuantizationConfig
 
 from .codegen.passes.utils import get_arg_or_kwarg
 from .codegen.mapping_utils import (

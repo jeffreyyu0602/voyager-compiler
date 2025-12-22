@@ -22,7 +22,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
 from tqdm import tqdm
-from quantized_training import (
+from voyager_compiler import (
     add_qspec_args,
     convert_pt2e,
     get_default_quantizer,
@@ -329,7 +329,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.convert_model:
             convert_pt2e(model, args.bias)
 
-        # from quantized_training.codegen.mapping import duplicate_shared_nodes
+        # from voyager_compiler.codegen.mapping import duplicate_shared_nodes
 
         # sym_size_int_node = next(
         #     (n for n in model.graph.nodes if n.target == torch.ops.aten.sym_size.int), None
@@ -339,14 +339,14 @@ def main_worker(gpu, ngpus_per_node, args):
         # for user in list(sym_size_int_node.users.keys()):
         #     duplicate_shared_nodes(model.graph, [sym_size_int_node, user])
 
-        # from quantized_training.codegen.utils import pad_vit_embeddings_output
+        # from voyager_compiler.codegen.utils import pad_vit_embeddings_output
 
         # pad_vit_embeddings_output(model, embeddings, (example_inputs,), dynamic_shapes=dynamic_shapes)
         # model.graph.print_tabular()
 
         # if args.compile:
         #     import copy
-        #     from quantized_training import transform
+        #     from voyager_compiler import transform
 
         #     # We perform transformation specifically for compilation
         #     model_to_compile = copy.deepcopy(model)

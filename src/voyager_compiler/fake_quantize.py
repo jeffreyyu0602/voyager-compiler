@@ -7,16 +7,16 @@ import torch
 from torch import Tensor
 from torch.ao.quantization import FakeQuantizeBase, ObserverOrFakeQuantize
 
-import quantized_training as qt
-from quantized_training.decomposed import expand, vmap, quantize_mx
-from quantized_training.fp8 import (
+import voyager_compiler as qt
+from voyager_compiler.decomposed import expand, vmap, quantize_mx
+from voyager_compiler.fp8 import (
     _quantize_elemwise_core,
     quantize_to_fp8_e4m3,
     quantize_to_fp8_e5m2,
 )
-from quantized_training.mx_utils import _reshape_to_blocks
-from quantized_training.normal_float import quantize_to_nf
-from quantized_training.posit import quantize_to_posit
+from voyager_compiler.mx_utils import _reshape_to_blocks
+from voyager_compiler.normal_float import quantize_to_nf
+from voyager_compiler.posit import quantize_to_posit
 
 
 __all__ = [

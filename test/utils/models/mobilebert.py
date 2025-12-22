@@ -4,7 +4,7 @@ from itertools import islice
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from quantized_training import (
+from voyager_compiler import (
     convert_pt2e,
     prepare_pt2e,
     transform,

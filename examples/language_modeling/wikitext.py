@@ -9,7 +9,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from prepare_model import QUANTIZATION_CONFIGS, set_qconfig
-from quantized_training import (
+from voyager_compiler import (
+    ShapeProp,
     add_qspec_args,
     get_default_quantizer,
     prepare_pt2e,
@@ -22,6 +23,7 @@ from quantized_training import (
     get_device_map,
     dispatch_model,
     insert_align_device_nodes,
+    sink_obs_or_fq,
 )
 
 
@@ -94,6 +96,7 @@ def main(args):
     # gradient on if capture_pre_autograd_graph is not called with torch.no_grad().
     with torch.no_grad():
         model = prepare_pt2e(model, quantizer, example_args, example_kwargs, dynamic_shapes)
+        sink_obs_or_fq(model)
 
     # torch.export does not capture the correct device for inputs, so we need to manually
     # set the device for operations like torch.full
@@ -108,7 +111,10 @@ def main(args):
             for k, v in get_max_memory().items() if isinstance(k, int) and v > reserved_memory
         }
 
-        device_map = get_device_map(model, max_memory)
+        device_map = get_device_map(model, max_memory, verbose=True)
+        print("Device map:")
+        for k, v in device_map.items():
+            print(f"layer {k} -> cuda:{v}")
         dispatch_model(model, device_map)
         insert_align_device_nodes(model, (input_ids, example_kwargs["labels"]))
 
@@ -132,8 +138,10 @@ def main(args):
             if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
                 module.disable_observer()
 
+    model.graph.print_tabular()
     if args.convert_model:
         model = convert_pt2e(model)
+    model.graph.print_tabular()
 
     test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
     encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")

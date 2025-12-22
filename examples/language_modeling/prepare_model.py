@@ -1,6 +1,6 @@
 import logging
 import torch
-from quantized_training import QuantizationSpec, QuantizationConfig
+from voyager_compiler import QuantizationSpec, QuantizationConfig
 
 
 logger = logging.getLogger(__name__)

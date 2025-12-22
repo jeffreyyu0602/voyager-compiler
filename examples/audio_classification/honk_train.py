@@ -19,7 +19,7 @@ from tqdm import tqdm
 from transformers import set_seed
 
 from honk_model import SpeechResModel, configs
-from quantized_training import (
+from voyager_compiler import (
     add_qspec_args,
     get_default_quantizer,
     prepare_pt2e,

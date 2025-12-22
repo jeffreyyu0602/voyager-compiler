@@ -10,13 +10,13 @@ from torch.nn.utils.parametrize import type_before_parametrizations
 from accelerate import dispatch_model
 from transformers import PretrainedConfig
 
-from quantized_training.modules import (
+from voyager_compiler.modules import (
     Softmax,
     modeling_bert,
     modeling_mobilebert,
 )
-from quantized_training.qconfig import get_qconfig
-from quantized_training.quantization_mappings import (
+from voyager_compiler.qconfig import get_qconfig
+from voyager_compiler.quantization_mappings import (
     DEFAULT_QAT_MODULE_MAPPINGS,
     QCONFIG_PROPAGATE_MODULE_CLASS_LIST,
     TRANSFORMER_MODULE_MAPPINGS,

@@ -574,7 +574,7 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
                         attention_mask=causal_mask.to(device),
                     )
                 except:
-                    from quantized_training import ShapeProp
+                    from voyager_compiler import ShapeProp
                     ShapeProp(model_decode).propagate(
                         current_token.to(device),
                         torch.tensor([len(response_tokens) - 1], dtype=torch.long, device=device),

@@ -59,7 +59,7 @@ from transformers.utils.versions import require_version
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
-from quantized_training import (
+from voyager_compiler import (
     add_qspec_args,
     get_default_quantizer,
     prepare_pt2e,

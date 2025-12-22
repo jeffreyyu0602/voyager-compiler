@@ -9,7 +9,7 @@ from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
 from torch.ao.quantization.quantizer.quantizer import QuantizationSpecBase
 from torch.fx import Node
 
-from quantized_training.fake_quantize import FusedAmaxObsFakeQuantize
+from voyager_compiler.fake_quantize import FusedAmaxObsFakeQuantize
 
 __all__ = [
     "QuantizationSpec",

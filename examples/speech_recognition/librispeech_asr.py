@@ -7,7 +7,7 @@ from datasets import load_dataset
 from evaluate import load
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-from quantized_training import (
+from voyager_compiler import (
     add_qspec_args,
     quantize,
     plot_histogram,
