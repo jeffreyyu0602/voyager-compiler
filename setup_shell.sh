@@ -5,7 +5,7 @@ _CONDA_ROOT="${SCRATCH}/anaconda3"
 \. "$_CONDA_ROOT/etc/profile.d/conda.sh" || return $?
 
 ENV_NAME=myenv
-REPO_PATH="${SCRATCH}/quantized-training/"
+REPO_PATH="${SCRATCH}/voyager-compiler/"
 WANDB_API_KEY="" # If you want to use wandb, set this to your API key.
 
 # Setup Conda
