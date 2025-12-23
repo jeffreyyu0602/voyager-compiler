@@ -148,6 +148,44 @@ class BankingStrategy:
 
         return current_offset, node_to_segment
 
+    def print_banking_info(self, key_to_node, node):
+        log_lines = []
+        handled_nodes = set()
+
+        for i, part in enumerate(self.partitions):
+            entries = []
+            for key in part.tensors:
+                if key in key_to_node:
+                    n = key_to_node[key]
+                    handled_nodes.add(n)
+                    entries.append(f"{n.name} ({key})")
+
+            if entries:
+                entry_str = ", ".join(entries)
+                log_lines.append(f"Partition {i}: {entry_str}")
+
+        if self.unspecified_policy == BankingPolicy.SEPARATE_UNALIGNED:
+            all_relevant = list(node.all_input_nodes) + [node]
+            unspecified_nodes = []
+
+            for n in all_relevant:
+                if n not in handled_nodes:
+                    role = "output" if n is node else "input"
+                    unspecified_nodes.append(f"{n.name} ({role})")
+
+            if unspecified_nodes:
+                entry_str = ", ".join(unspecified_nodes)
+                log_lines.append(f"Partition Unspecified: {entry_str}")
+
+        if log_lines:
+            logger.warning(
+                f"[BANK_CONFLICT]: {node.name}: Not all nodes are placed in "
+                f"separate banks; performance may be impacted."
+            )
+            logger.warning("\n".join(log_lines))
+        else:
+            logger.info(f"{node}: All nodes are placed in separate banks.")
+
 
 class BankingStrategyRegistry:
     """

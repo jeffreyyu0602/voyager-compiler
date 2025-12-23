@@ -1486,6 +1486,8 @@ def run_memory_mapping(
         if strides is not None:
             node.meta["tile_strides"] = normalize_shape(first_node, strides)
 
+        strategy.print_banking_info(key_to_node, node)
+
         if total_size > cache_size:
             logger.warning(
                 f"[MEM_ALLOC_FAIL] {node}: Could not allocate scratchpad "
