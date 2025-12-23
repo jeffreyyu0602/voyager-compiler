@@ -1,5 +1,6 @@
 import itertools
 import logging
+import math
 from typing import Callable, List
 
 import torch
@@ -643,13 +644,15 @@ def split_dense_spmm_node(model: GraphModule):
 
         tiled_shapes = node.meta.get("tiled_shapes")
         if tiled_shapes is not None:
+            output_shape = tiled_shapes["output"]
+            flattened_shape = (math.prod(output_shape[:-1]), output_shape[-1])
             spmm_node.meta["tiled_shapes"] = {
                 "data": tiled_shapes["A_data"],
                 "indices": tiled_shapes["A_indices"],
                 "indptr": tiled_shapes["A_indptr"],
                 "B": tiled_shapes["weight"],
                 "B_scale": tiled_shapes["weight_scale"],
-                "output": tiled_shapes["output"],
+                "output": flattened_shape,
             }
             spmm_node.meta["l2_tiling"] = node.meta.get("l2_tiling")
 
