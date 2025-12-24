@@ -1264,7 +1264,7 @@ def run_submod_l2_tiling(
             if math.prod(tiling) == 1:
                 new_shapes = None
             else:
-                first_node.meta["l2_tiling"] = tiling
+                node.meta["l2_tiling"] = tiling
             return total_size, scratchpad_map, new_shapes
 
     logger.warning(f"Failed to adjust tiling for {node}")
@@ -1333,7 +1333,7 @@ def run_memory_mapping(
 
     # Store all the weights in memory if persistent is enabled
     for node in model.graph.nodes:
-        if node.op == "get_attr" and not "qmap" in node.name:
+        if node.op == "get_attr" and require_allocation(node):
             node.meta["memory"] = allocator.allocate_memory(node)
 
     # Store inputs to the model in memory
