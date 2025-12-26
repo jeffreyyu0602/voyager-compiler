@@ -1427,7 +1427,7 @@ def run_vector_op_node_l2_tiling(
 
     output_shape = (
         node.value.shape if isinstance(node.value, torch.Tensor)
-        else node.value[1].shape
+        else node.value[-1].shape
     )
 
     logger.info(f"Running L2 tiling for vector op: {node}")

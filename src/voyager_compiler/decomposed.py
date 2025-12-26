@@ -592,7 +592,7 @@ def quantize_mx_outlier(
     )
     inliers = quantize(inliers, scale, None, axes, block_size, qmap)
 
-    return scale, inliers, data, indices, indptr
+    return data, indices, indptr, scale, inliers
 
 
 quantized_decomposed_lib.define(

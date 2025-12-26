@@ -1204,7 +1204,7 @@ def run_submod_l2_tiling(
 
     output_shape = tiled_shapes[node]
     if isinstance(node.value, (list, tuple)):
-        output_shape = output_shape[1]
+        output_shape = output_shape[-1]
 
     if is_gemm:
         args = map_arg(node.args, lambda n: get_tiled_tensor(n, tiled_shapes))

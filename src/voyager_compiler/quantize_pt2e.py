@@ -564,33 +564,31 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     activation_post_process.outlier_threshold,
                     max(activation_post_process.outlier_max_pct, 0.01),
                 ])
+                num_outputs = 5
+            else:
+                num_outputs = 2
 
             quantize_mx_node = model.graph.call_function(target, tuple(args))
-            scale_node = graph.call_function(operator.getitem, (quantize_mx_node, 0))
-            quantized_node = graph.call_function(operator.getitem, (quantize_mx_node, 1))
 
-            if activation_post_process.outlier_threshold is not None:
-                csr_data_node = graph.call_function(
-                    operator.getitem, (quantize_mx_node, 2)
-                )
-                indices_node = graph.call_function(
-                    operator.getitem, (quantize_mx_node, 3)
-                )
-                indptr_node = graph.call_function(
-                    operator.getitem, (quantize_mx_node, 4)
-                )
+            output_nodes = [
+                graph.call_function(operator.getitem, (quantize_mx_node, i))
+                for i in range(num_outputs)
+            ]
 
-        quantize_mx_node.meta["dtype"] = (
-            (
-                "fp8_e8m0"
-                if activation_post_process.force_scale_power_of_two
-                else activation_post_process.scale_dtype
-            ),
-            activation_post_process.dtype,
+        scale_dtype = (
+            "fp8_e8m0"
+            if activation_post_process.force_scale_power_of_two
+            else activation_post_process.scale_dtype
         )
 
-        if activation_post_process.outlier_threshold is not None:
-            quantize_mx_node.meta["dtype"] += (None, "int16", "int16")
+        if num_outputs == 5:
+            csr_data_node, indices_node, indptr_node, scale_node, quantized_node = output_nodes
+            dtype_tuple = (None, "int16", "int16", scale_dtype, activation_post_process.dtype)
+        else:
+            scale_node, quantized_node = output_nodes
+            dtype_tuple = (scale_dtype, activation_post_process.dtype)
+
+        quantize_mx_node.meta["dtype"] = dtype_tuple
 
         source_fn_st = quantize_mx_node.meta.setdefault("source_fn_stack", [])
         source_fn_st.append((quantize_mx_node.name, quantize_mx_node.target))
