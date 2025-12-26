@@ -551,6 +551,11 @@ def filter_outlier(input: torch.Tensor, threshold: float, max_pct: float = 0.05)
     is_outlier = torch.abs(input) > threshold
     inlier = torch.where(is_outlier, 0, input)
     outliers = torch.where(is_outlier, input, 0)
+
+    sparsity = (1 - torch.sum(is_outlier) / input.numel()) * 100
+    if sparsity > 99.99:
+        logger.warning(f"High sparsity level detected {sparsity:.2f}%. Check the threshold value.")
+
     csr = to_csr(outliers, max_nnz=int(input.numel() * max_pct))
     return inlier, *csr
 
