@@ -514,12 +514,12 @@ def to_csr(tensor: torch.Tensor, max_nnz: int):
         indptr.append(min(nnz, max_nnz))
 
     data = torch.tensor(data, dtype=tensor.dtype)
-    indices = torch.tensor(indices, dtype=torch.int16)
-    indptr = torch.tensor(indptr, dtype=torch.int16)
+    indices = torch.tensor(indices, dtype=torch.int32)
+    indptr = torch.tensor(indptr, dtype=torch.int32)
 
     actual_nnz = min(nnz, max_nnz)
     data_padded = torch.zeros((max_nnz,), dtype=tensor.dtype)
-    indices_padded = torch.full((max_nnz,), fill_value=-1, dtype=torch.int16)
+    indices_padded = torch.full((max_nnz,), fill_value=-1, dtype=torch.int32)
 
     if nnz > max_nnz:
         logger.warning(
@@ -555,6 +555,8 @@ def filter_outlier(input: torch.Tensor, threshold: float, max_pct: float = 0.05)
     sparsity = (1 - torch.sum(is_outlier) / input.numel()) * 100
     if sparsity > 99.99:
         logger.warning(f"High sparsity level detected {sparsity:.2f}%. Check the threshold value.")
+    else:
+        logger.info(f"Outlier sparsity level: {sparsity:.2f}%")
 
     csr = to_csr(outliers, max_nnz=int(input.numel() * max_pct))
     return inlier, *csr

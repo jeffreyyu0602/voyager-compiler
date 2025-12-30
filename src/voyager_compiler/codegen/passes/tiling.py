@@ -1383,10 +1383,14 @@ def _calculate_vector_op_shapes(node, tile_sizes, divisor):
             if isinstance(node.value, torch.Tensor):
                 shape[k] = tile_sizes
             elif isinstance(node.value, (tuple, list)):
-                shape[k] = tuple(
-                    get_tiled_shape(t.shape, divisor)
-                    for t in node.value
-                )
+                shape[k] = [
+                    get_tiled_shape(t.shape, divisor) for t in node.value
+                ]
+                # HACK indptr has a 1D shape corresponding to the X dimension
+                if len(node.value) > 2:
+                    indptr_shape = node.value[2].shape + (1,)
+                    shape[k][2] = get_tiled_shape(indptr_shape, divisor)[:-1]
+                shape[k] = tuple(shape[k])
         else:
             shape[k] = get_tiled_shape(tuple(n.shape), divisor)
     return shape

@@ -278,10 +278,12 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         amax_history_len: int = None,
         ch_axis: Optional[int] = None,
         block_size: Optional[int] = None,
-        record_histogram: bool = False,
         scale_dtype: Optional[str] = None,
         force_scale_power_of_two: bool = False,
+        record_histogram: bool = False,
         outlier_threshold: Optional[float] = None,
+        outlier_pct: Optional[float] = None,
+        device: Optional[torch.device] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -294,27 +296,42 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.block_size = block_size
         self.scale_dtype = scale_dtype
         self.force_scale_power_of_two = force_scale_power_of_two
+        self.record_histogram = record_histogram
         self.outlier_threshold = outlier_threshold
+        self.outlier_pct = outlier_pct
+        assert outlier_pct is None or outlier_threshold is None, (
+            "Only one of outlier_pct and outlier_threshold can be set."
+        )
         self.outlier_max_pct = 0.0
-        device = kwargs.get("device", None)
-        # Generate a quantization map from bfloat16 to quantized values of the given dtype
+
+        factory_kwargs = {'device': device, 'dtype': torch.float}
+
+        # Generate quantization map buffers
         quant_map = get_quantization_map(dtype, device)
         if isinstance(quant_map, tuple):
             indices, values = quant_map
             quant_map = values[indices]
         self.register_buffer("qmap", quant_map, persistent=False)
-        scale_map = get_quantization_map(self.scale_dtype, device) if self.scale_dtype is not None else None
+
+        scale_map = (
+            get_quantization_map(self.scale_dtype, device)
+            if self.scale_dtype is not None else None
+        )
         self.register_buffer("scale_qmap", scale_map, persistent=False)
+
         # Create amax history and scale buffers
-        factory_kwargs = {'device': device, 'dtype': torch.float}
         self.register_buffer("amax_history", torch.tensor([], **factory_kwargs))
         self.register_buffer('scale', torch.tensor([1.0], **factory_kwargs))
         self.register_buffer('zero_point', torch.tensor([1.0], **factory_kwargs))
+
+        # Create histogram buffer
+        if self.record_histogram:
+            self.register_buffer(
+                "histogram", torch.zeros(254, **factory_kwargs), persistent=False
+            )
+
         self.observer_enabled[0] = self.qscheme is not None
         self.is_per_channel = self.qscheme == qt.per_channel_symmetric
-        # Create histogram buffer
-        self.record_histogram = record_histogram
-        self.register_buffer("histogram", torch.zeros(254, **factory_kwargs), persistent=False)
 
     @torch.jit.export
     def calculate_qparams(self):
@@ -341,27 +358,27 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             )
         )
 
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        devices = {p.device for p in self.buffers()}
-        if len(devices) != 1 or next(iter(devices)) != X.device:
-            self.to(X.device)
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.record_histogram:
-            exp = torch.floor(torch.log2(torch.abs(X.detach().float())))
+            exp = torch.floor(torch.log2(torch.abs(x.detach().float())))
             self.histogram += torch.histc(exp, 254, min=-126, max=127)
+
+        if self.outlier_pct is not None:
+            q = 1 - self.outlier_pct
+            self.outlier_threshold = torch.quantile(x.abs().float(), q).item()
 
         # Remove outliers from the activation.
         if self.outlier_threshold is not None:
-            orig_X = X.clone()
-            mask = torch.abs(X) < self.outlier_threshold
-            X = torch.where(mask, X, torch.zeros_like(X))
+            orig_x = x.clone()
+            mask = torch.abs(x) < self.outlier_threshold
+            x = torch.where(mask, x, torch.zeros_like(x))
 
-            outlier_pct = mask.bitwise_not().sum().item() / X.numel()
+            outlier_pct = mask.bitwise_not().sum().item() / x.numel()
             self.outlier_max_pct = max(outlier_pct, self.outlier_max_pct)
 
         if self.qscheme == qt.microscaling:
-            X = MXFakeQuantFunction.apply(
-                X,
+            x = MXFakeQuantFunction.apply(
+                x,
                 self.fake_quant_enabled,
                 self.scale,
                 self.qmap,
@@ -372,8 +389,8 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 self.scale_qmap,
             )
         elif self.qscheme == qt.group_wise_affine:
-            X = GroupWiseAffineFakeQuantFunction.apply(
-                X,
+            x = GroupWiseAffineFakeQuantFunction.apply(
+                x,
                 self.fake_quant_enabled,
                 self.scale,
                 self.zero_point,
@@ -384,8 +401,8 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 self.scale_qmap,
             )
         else:
-            X = FusedAmaxObsFakeQuantFunction.apply(
-                X,
+            x = FusedAmaxObsFakeQuantFunction.apply(
+                x,
                 self.observer_enabled,
                 self.fake_quant_enabled,
                 self.qmap,
@@ -400,9 +417,9 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
 
         # Restore outliers
         if self.outlier_threshold is not None:
-            X = torch.where(mask, X, orig_X)
+            x = torch.where(mask, x, orig_x)
 
-        return X
+        return x
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
                               missing_keys, unexpected_keys, error_msgs):

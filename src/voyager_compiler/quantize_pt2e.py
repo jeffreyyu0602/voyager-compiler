@@ -583,7 +583,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
         if num_outputs == 5:
             csr_data_node, indices_node, indptr_node, scale_node, quantized_node = output_nodes
-            dtype_tuple = (None, "int16", "int16", scale_dtype, activation_post_process.dtype)
+            dtype_tuple = (None, None, None, scale_dtype, activation_post_process.dtype)
         else:
             scale_node, quantized_node = output_nodes
             dtype_tuple = (scale_dtype, activation_post_process.dtype)

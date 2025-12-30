@@ -29,7 +29,8 @@ ABBREV_MAP = {
     'ax': 'ch_axis',
     'bs': 'block_size',
     'scale': 'scale_dtype',
-    'outlier': 'outlier_threshold',
+    'othr': 'outlier_threshold',
+    'opct': 'outlier_pct',
 }
 
 def parse_int_or_list(value: str):
@@ -48,6 +49,7 @@ PARAMS_TYPE = {
     'block_size': parse_int_or_list,
     'scale_dtype': str,
     'outlier_threshold': float,
+    'outlier_pct': float,
 }
 
 def get_quant_min_max(dtype: str):
@@ -109,6 +111,7 @@ class QuantizationSpec(QuantizationSpecBase):
     block_size: Optional[Union[int, List[int]]] = None
     scale_dtype: Optional[str] = None
     outlier_threshold: Optional[float] = None
+    outlier_pct: Optional[float] = None
     is_dynamic: bool = False  # required by sharing nodes
 
     @staticmethod

@@ -83,8 +83,8 @@ vector_stages = [
 ]
 
 
-def get_llama_mp_qconfig(bs=64, threshold=None):
-    outlier = f",outlier={threshold}" if threshold is not None else ""
+def get_llama_mp_qconfig(bs=64, outlier_pct=None):
+    outlier = f",opct={outlier_pct}" if outlier_pct is not None else ""
     return {
         torch.nn.Linear: [
             f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3" + outlier,
@@ -154,7 +154,7 @@ if __name__ == "__main__":
         help="Quantization scheme to use for LLMs."
     )
     parser.add_argument(
-        "--outlier_threshold",
+        "--outlier_pct",
         type=float,
         default=None,
         help="Whether to filter outliers when quantizing activations."
@@ -456,7 +456,7 @@ if __name__ == "__main__":
         replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
 
         if args.mixed_precision:
-            qconfig = get_llama_mp_qconfig(args.hardware_unrolling[0], args.outlier_threshold)
+            qconfig = get_llama_mp_qconfig(args.hardware_unrolling[0], args.outlier_pct)
             set_qconfig(quantizer, qconfig)
 
             fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
