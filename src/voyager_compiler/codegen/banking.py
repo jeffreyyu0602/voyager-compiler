@@ -169,7 +169,7 @@ class BankingStrategy:
             unspecified_nodes = []
 
             for n in all_relevant:
-                if n not in handled_nodes:
+                if n not in handled_nodes and require_allocation(n):
                     role = "output" if n is node else "input"
                     unspecified_nodes.append(f"{n.name} ({role})")
 
@@ -198,8 +198,11 @@ class BankingStrategyRegistry:
     def register(self, op_kind: Any, strategies: Sequence[BankingStrategy]) -> None:
         self._strategies[op_kind] = list(strategies)
 
-    def get(self, op_kind: str) -> List[BankingStrategy]:
-        return self._strategies.get(op_kind, DEFAULT_FALLBACK_STRATEGIES)
+    def get(self, op_kind: Any) -> List[BankingStrategy]:
+        if op_kind in self._strategies:
+            return self._strategies[op_kind]
+
+        return get_default_strategies(op_kind)
 
 
 BANKING_STRATEGY_REGISTRY = BankingStrategyRegistry()
@@ -231,22 +234,28 @@ def register_banking_strategies(targets: Any) -> Callable:
     return decorator
 
 
-DEFAULT_FALLBACK_STRATEGIES: List[BankingStrategy] = [
-    BankingStrategy(
-        partitions=(), unspecified_policy=BankingPolicy.SEPARATE_ALIGNED,
-    ),
-    BankingStrategy(
-        partitions=(), unspecified_policy=BankingPolicy.SEPARATE_UNALIGNED,
-    ),
-]
-
-
 def _get_scope(target) -> str:
     if hasattr(target, "_schema"):
         scope = target._schema.name.split('::')[1]
     else:
         scope = str(target)
     return scope
+
+
+def get_default_strategies(target) -> List[BankingStrategy]:
+    scope = _get_scope(target)
+    return [
+        BankingStrategy(
+            partitions=(), unspecified_policy=BankingPolicy.SEPARATE_ALIGNED,
+        ),
+        BankingStrategy(
+            partitions=(BankPartition((f"{scope}::output",)),),
+            unspecified_policy=BankingPolicy.SEPARATE_UNALIGNED,
+        ),
+        BankingStrategy(
+            partitions=(), unspecified_policy=BankingPolicy.SEPARATE_UNALIGNED,
+        ),
+    ]
 
 
 @register_banking_strategies([
