@@ -7,6 +7,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from .utils import get_arg_or_kwarg, _pair
+from ..banking import require_allocation
 from ..mapping import duplicate_shared_nodes
 from ..mapping_utils import (
     is_conv2d,
@@ -70,48 +71,62 @@ def conv2d_transposed(
     return output.permute(0, 2, 3, 1)
 
 
-def extract_conv2d_graph(model: GraphModule, start: Node, visited: Set[Node]) -> Set[Node]:
-    """DFS downstream traversal to find conv2d nodes connected through elementwise ops."""
+def extract_conv2d_graph(
+    model: GraphModule, start: Node, visited: Set[Node]
+) -> List[Node]:
+    """
+    Depth-first worklist traversal over both consumers (users) and
+    producers (input nodes), restricted to reshape/elementwise/transpose
+    /indexing/quantization ops that are considered fusable.
+    """
+    quantized_lib = torch.ops.quantized_ops
+
+    ALLOW_LIST_OPS = {
+        torch.ops.aten.pad.default,
+        quantized_lib.calculate_mx_qparam.default,
+        quantized_lib.quantize_mx.default,
+    }
+
+    def should_traverse(node: Node) -> bool:
+        # Cannot fuse stack because it creates a new dimension
+        if node.target == torch.ops.aten.stack.default:
+            return False
+
+        # Only include reshape if the input is a 4D tensor
+        if is_reshape_op(node):
+            return len(node.shape) == 4
+
+        if node.target == operator.getitem:
+            src = node.args[0]
+            return src.target == quantized_lib.quantize_mx.default
+
+        return (
+            node.target in TRANSPOSED_OPERATORS
+            or node.target in ALLOW_LIST_OPS
+            or is_elementwise_op(node)
+            or is_indexing_or_concatenation_op(node)
+        )
+
     stack = [start]
     nodes_in_graph = set()
 
     while stack:
         node = stack.pop()
+
         if node in visited:
             continue
 
         visited.add(node)
         nodes_in_graph.add(node)
 
-        for user in list(node.users.keys()) + node.all_input_nodes:
-            # Stack op cannot be fused because it creates a new dimension
-            if user.target == torch.ops.aten.stack.default:
-                continue
+        adjacent_nodes = list(node.users) + list(node.all_input_nodes)
 
-            # Only include reshape if it is a 4D tensor
-            if is_reshape_op(user) and len(user.shape) == 4:
-                stack.append(user)
+        for n in adjacent_nodes:
+            if n not in visited and should_traverse(n):
+                stack.append(n)
 
-            if (
-                user.target == operator.getitem
-                and user.args[0].target == torch.ops.quantized_ops.quantize_mx.default
-            ):
-                stack.append(user)
-
-            if (
-                user.target in TRANSPOSED_OPERATORS
-                or is_elementwise_op(user)
-                or is_indexing_or_concatenation_op(user)
-                or user.target in [
-                    torch.ops.aten.pad.default,
-                    torch.ops.quantized_ops.calculate_mx_qparam.default,
-                    torch.ops.quantized_ops.quantize_mx.default,
-                ]
-            ):
-                stack.append(user)
-
-    node_position = {n: i for i, n in enumerate(model.graph.nodes)}
-    return sorted(nodes_in_graph, key=lambda n: node_position[n])
+    node_to_idx = {n: i for i, n in enumerate(model.graph.nodes)}
+    return sorted(nodes_in_graph, key=lambda n: node_to_idx[n])
 
 
 def remap_pad_after_permute(
@@ -436,49 +451,39 @@ def is_transpose_2d(node: torch.fx.Node) -> bool:
 
 
 def find_upstream_transpose_or_param(
-    tnode: torch.fx.Node,
+    node: torch.fx.Node,
     *,
-    max_hops: int = 64,
-) -> Tuple[Optional[torch.fx.Node], List[torch.fx.Node]]:
+    max_depth: int = 16,
+) -> Optional[List[torch.fx.Node]]:
     """
-    Starting from a transpose node, walks upstream through a specific allowlist
-    of operations to find another matching transpose(-2, -1) node (canceling effect)
+    Starting from a transpose node, walks upstream through a list
+    of allowed operations until reaching another transpose node
     or a constant param node.
-
-    Args:
-        tnode: The starting 'aten.transpose.int' node.
-        max_hops: Depth limit for the upstream search.
-
-    Returns:
-        A tuple (source_node, path_list).
-        - source_node: The Node found (transpose or get_attr), or None if not found.
-        - path_list: List of nodes from tnode UP TO source_node (inclusive). 
-                     Returns empty list if no source found.
     """
-    if not is_transpose_2d(tnode):
+    if not is_transpose_2d(node):
         return None
 
-    stack = [(tnode.args[0], [tnode])] 
-    visited = set()
+    def dfs(curr: Node, depth: int) -> Optional[List[Node]]:
+        if is_transpose_2d(curr):
+            return [curr]
 
-    while stack:
-        curr, path = stack.pop()
+        if curr.op == "get_attr" and require_allocation(curr):
+            return [curr]
 
-        if curr in visited:
-            continue
-        visited.add(curr)
+        if depth > max_depth:
+            return None
 
-        if is_transpose_2d(curr) or curr.op == "get_attr":
-            return [curr] + path
-
-        if len(path) >= max_hops:
-            continue
-        
+        path = []
         if curr.target in ALLOWED_UPSTREAM_OPS or is_nop(curr):
-            for n in reversed(curr.all_input_nodes):
-                stack.append((n, [curr] + path))
+            for inp in curr.all_input_nodes:
+                path.extend(dfs(inp, depth + 1) or [])
 
-    return None
+        return [curr] + path if path else None
+
+    if (found_path := dfs(node.args[0], 0)) is None:
+        return None
+
+    return list(set([node] + found_path))
 
 
 def _insert_transposed_input(arg: Node, model: GraphModule):
@@ -586,7 +591,7 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
     return model
 
 
-def process_double_transpose_chain(
+def eliminate_canceling_transposes(
     model: GraphModule, chain: List[Node], transposed_nodes: Dict[Node, Node] = None
 ) -> bool:
     """
@@ -795,7 +800,7 @@ def _insert_transpose_op(
     node_order = {n: i for i, n in enumerate(model.graph.nodes)}
     sorted_path = sorted(path, key=lambda n: node_order[n])
 
-    success = process_double_transpose_chain(
+    success = eliminate_canceling_transposes(
         model, sorted_path, transposed_nodes
     )
     return None if success else sorted_path
