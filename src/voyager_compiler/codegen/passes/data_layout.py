@@ -328,13 +328,28 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
         input_node = node.all_input_nodes[0]
 
         group = []
-        while len(curr_node.users) == 1 and (is_reshape_op(curr_node) or is_nop(curr_node)):
+        while (
+            len(curr_node.users) == 1
+            and (is_reshape_op(curr_node) or is_nop(curr_node))
+        ):
             group.append(curr_node)
             curr_node = next(iter(curr_node.users))
 
-        input_tensor = input_node.value.flatten()
-        while group and torch.any(group[-1].value.flatten() != input_tensor):
-            group.pop()
+        val = input_node.value
+        orig_x = torch.arange(val.numel(), dtype=torch.int32)
+
+        x = orig_x.reshape(val.shape)
+
+        last_valid_idx = -1
+
+        for i, node in enumerate(group):
+            args = torch.fx.graph.map_arg(node.args, lambda n: x)
+            x = node.target(*args)
+
+            if torch.equal(x.reshape(-1), orig_x):
+                last_valid_idx = i
+
+        del group[last_valid_idx + 1:]
 
         if len(group) <= 1:
             continue

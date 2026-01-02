@@ -1119,8 +1119,8 @@ def get_reference_node(nodes):
     return first_node
 
 
-def _calculate_gemm_new_shapes(node, output_shape):
-    from .passes.tiling import _conv2d_layout, _calculate_gemm_shapes
+def _build_shape_map(node, output_shape):
+    from .passes.tiling import _conv2d_layout, _build_gemm_shape_map
 
     input_node = node.args[0]
     transposed = node.meta.get("transposed", False)
@@ -1152,7 +1152,7 @@ def _calculate_gemm_new_shapes(node, output_shape):
         k_tiled = output_shape[-1]
         c_tiled = input_node.shape[-1]
 
-        new_shapes = _calculate_gemm_shapes(node, (x_tiled, c_tiled, k_tiled))
+        new_shapes = _build_gemm_shape_map(node, (x_tiled, c_tiled, k_tiled))
 
     return normalize_shape(node, new_shapes)
 
@@ -1168,15 +1168,17 @@ def run_submod_l2_tiling(
     bank_width,
     bank_size,
 ):
-    from .passes.tiling import get_valid_tiling, get_tiled_shape
-
-    if isinstance(unroll_dims, int):
-        unroll_dims = (unroll_dims, unroll_dims)
+    from .passes.tiling import (
+        get_valid_tiling,
+        compute_tiled_shape,
+        compute_output_tiled_shapes,
+        _merge_tiling
+    )
 
     first_node = get_reference_node(module.graph.nodes)
 
     total_size, scratchpad_map = strategy.evaluate(
-        key_to_node, node, tiled_shapes, bank_width, bank_size
+        key_to_node, node, tiled_shapes, bank_width, bank_size, unroll_dims[1]
     )
 
     # Unsupported operations for L2 tiling adjustment
@@ -1223,48 +1225,39 @@ def run_submod_l2_tiling(
         new_shapes = {}
 
         if is_gemm:
-            new_shapes = _calculate_gemm_new_shapes(first_node, tile_sizes)
+            new_shapes = _build_shape_map(first_node, tile_sizes)
             propagate_tiled_shapes_upstream(first_node, new_shapes)
 
         for n in node.all_input_nodes:
             if n not in new_shapes and require_allocation(n):
-                new_shapes[n] = get_tiled_shape(tiled_shapes[n], tiling)
+                new_shapes[n] = compute_tiled_shape(tiled_shapes[n], tiling)
 
-        if isinstance(node.value, torch.Tensor):
-            new_shapes[node] = tile_sizes
-        else:
-            new_shapes[node] = tuple(
-                get_tiled_shape(s, tiling) for s in tiled_shapes[node]
-            )
+        new_shapes[node] = compute_output_tiled_shapes(
+            node, tiling, tiled_shapes[node]
+        )
 
         logger.debug("Proposed new shapes:")
         for n, s in new_shapes.items():
             logger.debug(f"  {n}: {s}")
-        logger.debug(f"  Total size: {total_size}, Available: {cache_size}")
 
         total_size, scratchpad_map = strategy.evaluate(
-            key_to_node, node, new_shapes, bank_width, bank_size
+            key_to_node, node, new_shapes, bank_width, bank_size, unroll_dims[1]
         )
+        logger.debug(f"  Total size: {total_size}, Available: {cache_size}")
 
         if total_size <= cache_size:
-            # Tiling tuple adjustment for linear and matmul layers
+            # Tiling adjustment for linear and matmul layers
             if is_gemm and not is_conv2d(first_node):
                 tiling = (math.prod(tiling[:-1]), tiling[-1])
 
-            if (orig_tiling := first_node.meta.get("l2_tiling")) is not None:
-                diff = len(orig_tiling) - len(tiling)
-
-                tiling = tuple(
-                    a * b for a, b in zip(
-                        (1,) * -diff + orig_tiling,
-                        (1,) * diff + tiling
-                    )
-                )
+            tiling = _merge_tiling(tiling, first_node.meta.get("l2_tiling"))
 
             if math.prod(tiling) == 1:
                 new_shapes = None
+                first_node.meta.pop("l2_tiling", None)
             else:
-                node.meta["l2_tiling"] = tiling
+                first_node.meta["l2_tiling"] = tiling
+
             return total_size, scratchpad_map, new_shapes
 
     logger.warning(f"Failed to adjust tiling for {node}")
@@ -1281,7 +1274,7 @@ def propagate_tiled_shapes_upstream(start_node, tiled_shapes):
                     already have defined tiled shapes.
         tiled_shapes: Dictionary mapping nodes to their tiled shapes.
     """
-    from .passes.tiling import get_tiled_shape
+    from .passes.tiling import compute_tiled_shape
 
     queue = list(start_node.all_input_nodes)
     visited = set(queue)
@@ -1289,32 +1282,26 @@ def propagate_tiled_shapes_upstream(start_node, tiled_shapes):
     while queue:
         node = queue.pop(0)
 
-        if node not in tiled_shapes:
+        if (tiled_shape := tiled_shapes.get(node)) is None:
             continue
 
         orig_shape = node.shape
-        tiled_shape = tiled_shapes[node]
 
         assert len(tiled_shape) == len(orig_shape), (
             f"Rank mismatch: {len(tiled_shape)} vs {len(orig_shape)}"
         )
-        divisors = tuple(o // s for o, s in zip(orig_shape, tiled_shape))
+        factors = tuple(o // s for o, s in zip(orig_shape, tiled_shape))
 
-        for input_node in node.all_input_nodes:
-            if input_node in tiled_shapes or not require_allocation(input_node):
+        for n in node.all_input_nodes:
+            if n in tiled_shapes or not require_allocation(n):
                 continue
 
-            new_shape = get_tiled_shape(input_node.shape, divisors)
+            node_key = n.meta.get("source_node", n)
+            tiled_shapes[node_key] = compute_tiled_shape(n.shape, factors)
 
-            node_key = input_node
-            if input_node.op == "placeholder":
-                node_key = input_node.meta.get("source_node", input_node)
-
-            tiled_shapes[node_key] = new_shape
-
-            if input_node not in visited and input_node.all_input_nodes:
-                visited.add(input_node)
-                queue.append(input_node)
+            if n not in visited and n.all_input_nodes:
+                visited.add(n)
+                queue.append(n)
 
 
 def run_memory_mapping(
@@ -1327,6 +1314,9 @@ def run_memory_mapping(
 ):
     graph = model.graph
     named_modules = dict(model.named_modules(remove_duplicate=False))
+
+    if isinstance(unroll_dims, int):
+        unroll_dims = (unroll_dims, unroll_dims)
 
     if allocator is None:
         allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE)
@@ -1393,7 +1383,7 @@ def run_memory_mapping(
         return None
 
     def allocate_scratchpad(node: Node):
-        from .passes.tiling import get_tiled_shape
+        from .passes.tiling import compute_tiled_shape, compute_output_tiled_shapes
 
         if cache_size is None:
             return
@@ -1430,20 +1420,13 @@ def run_memory_mapping(
             # Calculate tiled shape for other input/output nodes
             for n in node.all_input_nodes:
                 if n not in tiled_shapes:
-                    tiled_shapes[n] = get_tiled_shape(n.shape, l2_tiling)
+                    tiled_shapes[n] = compute_tiled_shape(n.shape, l2_tiling)
 
-            if isinstance(node.value, torch.Tensor):
-                tiled_shapes[node] = get_tiled_shape(node.shape, l2_tiling)
-            else:
-                tiled_shapes[node] = tuple(
-                    get_tiled_shape(t.shape, l2_tiling) for t in node.value
-                )
-
-        input_nodes = set(node.all_input_nodes)
+            tiled_shapes[node] = compute_output_tiled_shapes(node, l2_tiling)
 
         tiled_shapes = {
             n: s for n, s in tiled_shapes.items()
-            if n in input_nodes and require_allocation(n) or n is node
+            if n in node.all_input_nodes and require_allocation(n) or n is node
         }
 
         op_scope = _get_scope(first_node.target)
@@ -1469,7 +1452,12 @@ def run_memory_mapping(
                 )
             else:
                 total_size, scratchpad_map = strategy.evaluate(
-                    key_to_node, node, tiled_shapes, bank_width, bank_size
+                    key_to_node,
+                    node,
+                    tiled_shapes,
+                    bank_width,
+                    bank_size,
+                    unroll_dims[1]
                 )
                 new_shapes = tiled_shapes if l2_tiling else None
 

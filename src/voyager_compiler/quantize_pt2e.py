@@ -471,6 +471,11 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     if isinstance(activation_post_process.ch_axis, int):
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
+    if activation_post_process.outlier_max_pct is not None:
+        activation_post_process.outlier_max_pct = (
+            int(activation_post_process.outlier_max_pct * 100 + 1) / 100.0
+        )
+
     # Can only fuse scale calculation with quantization if along the last dim
     fuse_with_quantize = False
     if len(activation_post_process.ch_axis) == 1:
@@ -562,7 +567,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
                 args.extend([
                     activation_post_process.outlier_threshold,
-                    max(activation_post_process.outlier_max_pct, 0.01),
+                    activation_post_process.outlier_max_pct,
                 ])
                 num_outputs = 5
             else:
@@ -600,21 +605,14 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     (
                         input_node,
                         activation_post_process.outlier_threshold,
-                        max(activation_post_process.outlier_max_pct, 0.01),
+                        activation_post_process.outlier_max_pct,
                     ),
                 )
-                input_node = graph.call_function(
-                    operator.getitem, (filter_outlier_node, 0)
-                )
-                csr_data_node = graph.call_function(
-                    operator.getitem, (filter_outlier_node, 1)
-                )
-                indices_node = graph.call_function(
-                    operator.getitem, (filter_outlier_node, 2)
-                )
-                indptr_node = graph.call_function(
-                    operator.getitem, (filter_outlier_node, 3)
-                )
+                output_nodes = [
+                    graph.call_function(operator.getitem, (filter_outlier_node, i))
+                    for i in range(4)
+                ]
+                csr_data_node, indices_node, indptr_node, input_node = output_nodes
 
             calculate_qparam_op_inputs = [
                 input_node,

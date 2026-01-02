@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Callable
 
 import torch
 
-from .memory import Segment, MemorySpace, _align_size, _get_tensor_size
+from .memory import Segment, MemorySpace, _align_size, compute_tensor_size
 
 
 logger = logging.getLogger(__name__)
@@ -63,17 +63,24 @@ class BankingStrategy:
     partitions: Tuple[BankPartition, ...]
     unspecified_policy: BankingPolicy = BankingPolicy.SEPARATE_ALIGNED
 
-    def evaluate(self, key_to_node, node, tile_shapes, bank_width, bank_size):
+    def evaluate(
+        self,
+        key_to_node,
+        node,
+        tile_shapes,
+        bank_width,
+        bank_size,
+        unroll_dim=None,
+    ):
         specified_nodes = set()
 
         node_to_segment: Dict[Any, Segment] = {}
         current_offset = 0
 
         # Only keep tiled shapes for input and output nodes
-        input_nodes = set(node.all_input_nodes)
         tile_shapes = {
             n: s for n, s in tile_shapes.items()
-            if n in input_nodes and require_allocation(n) or n is node
+            if n in node.all_input_nodes and require_allocation(n) or n is node
         }
 
         logger.debug(f"Evaluating banking strategy:")
@@ -99,8 +106,8 @@ class BankingStrategy:
                 if n not in tile_shapes:
                     continue
 
-                t_size = _get_tensor_size(
-                    n, tile_shapes[n], (n is node), bank_width
+                t_size = compute_tensor_size(
+                    n, tile_shapes[n], (n is node), bank_width, unroll_dim
                 )
 
                 node_to_segment[n] = Segment(
@@ -123,8 +130,8 @@ class BankingStrategy:
             current_offset = _align_size(current_offset, bank_size)
 
         for n in unspecified_nodes:
-            t_size = _get_tensor_size(
-                n, tile_shapes[n], (n is node), bank_width
+            t_size = compute_tensor_size(
+                n, tile_shapes[n], (n is node), bank_width, unroll_dim
             )
 
             node_to_segment[n] = Segment(

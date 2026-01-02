@@ -1,9 +1,10 @@
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch.fx.graph import map_arg
 from torch.fx.node import Node
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 logger = logging.getLogger(__name__)
 
@@ -19,12 +20,20 @@ class ShapeProp:
     `Node`.
     """
 
-    def __init__(self, mod):
+    def __init__(self, mod, mode: Optional[FakeTensorMode] = None):
         self.mod = mod
         self.graph = mod.graph
         self.modules = dict(self.mod.named_modules())
+        self._mode = mode
 
     def propagate(self, *args):
+        if self._mode is not None:
+            with self._mode:
+                return self._propagate(*args)
+        else:
+            return self._propagate(*args)
+
+    def _propagate(self, *args):
         args_iter = iter(args)
         env : Dict[str, Node] = {}
 
@@ -86,9 +95,6 @@ class ShapeProp:
                 print(f"Error in node {node}")
                 raise
 
-            # This is the only code specific to shape propagation.
-            # you can delete this `if` branch and this becomes
-            # a generic GraphModule interpreter.
             if isinstance(result, torch.Tensor):
                 node.shape = result.shape
                 node.value = result.cpu().clone()

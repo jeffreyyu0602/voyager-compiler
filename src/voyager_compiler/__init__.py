@@ -18,6 +18,7 @@ import operator
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils._pytree import tree_flatten
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 __all__ = [
@@ -93,12 +94,19 @@ OPERATOR_MAPPINGS = {
     "dequantize": [quantized_ops.dequantize.default],
 }
 
-def fuse(model, patterns, example_args, example_kwargs=None, fuse_reshape=True):
+def fuse(
+    model,
+    patterns,
+    example_args,
+    example_kwargs=None,
+    fuse_reshape=True,
+    fake_mode=None
+):
     if example_kwargs is None:
         example_kwargs = {}
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*flatten_args)
+    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
     vector_stages = []
     for pattern in patterns:
@@ -130,8 +138,10 @@ def transform(
     if example_kwargs is None:
         example_kwargs = {}
 
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*flatten_args)
+    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
     # -------------------------------------------------------------------------
     # 1. Lowering & Decomposition
@@ -181,7 +191,7 @@ def transform(
 
     transpose_linear_weights(model, transpose_weight, transpose_fc)
 
-    ShapeProp(model).propagate(*flatten_args)
+    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
     # Remove redundant reshapes that have no effect on tensor semantics
     eliminate_reshape_with_no_effect(model)
@@ -206,7 +216,13 @@ def transform(
     # Conv+ReLU) into single kernels to reduce memory access overhead.
 
     if fuse_operator:
-        fuse(model, patterns, flatten_args, fuse_reshape=fuse_reshape)
+        fuse(
+            model,
+            patterns,
+            flatten_args,
+            fuse_reshape=fuse_reshape,
+            fake_mode=fake_mode,
+        )
 
     rename_nodes_with_param_names(model)
 
@@ -232,7 +248,7 @@ def compile(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*flatten_args)
 
-    allocator = MemoryAllocator(total_memory)
+    allocator = MemoryAllocator(total_memory, bank_width=bank_width)
     run_memory_mapping(
         model, allocator, cache_size, num_banks, bank_width, unroll_dims
     )

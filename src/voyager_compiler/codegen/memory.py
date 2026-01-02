@@ -83,7 +83,13 @@ def _align_size(size, width):
     return (size + width - 1) // width * width
 
 
-def _get_tensor_size(node, shape, is_output=False, bank_width=None):
+def compute_tensor_size(
+    node,
+    shape=None,
+    is_scratchpad_output=False,
+    bank_width=None,
+    unroll_dim=None,
+):
     val = node.value
     if isinstance(val, torch.Tensor):
         dtype = node.meta.get('dtype') or val.dtype
@@ -99,41 +105,47 @@ def _get_tensor_size(node, shape, is_output=False, bank_width=None):
         if conv_user is not None:
             dim = 1 if conv_user.target == torch.ops.aten.conv2d.default else -1
             if val.shape[dim] == 3:
-                logger.info(f"Increase memory for conv2d input {node} by 3x")
+                logger.debug(f"Increase memory for conv2d input {node} by 3x")
                 tensor_size *= 3
 
         # If this is an output during scratchpad allocation, we don't care
         # downstream layers
-        if is_output:
+        if is_scratchpad_output:
             return tensor_size
 
-        # TODO: handle the case where one node has multiple users
+        # TODO: Should only do this when allocating scratchpad memory for the
+        # specific operation. E.g. if a node is consumed by both a softmax and
+        # an add node, we shouldn't increase the size for the add path.
         if _find_user_with_target(node, torch.ops.aten.softmax.int):
-            logger.info(f"Increase memory for softmax input {node} by 2x")
+            logger.debug(f"Increase memory for softmax input {node} by 2x")
             return tensor_size * 2
 
         if _find_user_with_target(node, torch.ops.aten.layer_norm.default):
-            logger.info(f"Increase memory for layer_norm input {node} by 2x")
+            logger.debug(f"Increase memory for layer_norm input {node} by 2x")
             return (tensor_size + numel) * 2
 
         return tensor_size
 
     if isinstance(val, (tuple, list)):
-        if shape is not None and isinstance(shape, (tuple, list)):
+        if shape is not None:
             key = "tiled_output_sizes"
-            numel_iter = (math.prod(s) for s in shape)
+            numel = [math.prod(s) for s in shape]
         else:
             key = "output_sizes"
-            numel_iter = (t.numel() for t in val)
+            numel = [t.numel() for t in val]
 
-        dtype_iter = node.meta.get('dtype') or (None for _ in val)
+        # Sparse outputs need to be aligned with hardware unroll dimension
+        if unroll_dim is not None:
+            numel = [_align_size(s, unroll_dim) for s in numel]
+
+        dtypes = node.meta.get('dtype') or [None for _ in val]
 
         sizes = [
             _align_size(n * dtype_byte_size(dt or t.dtype), bank_width)
-            for t, n, dt in zip(val, numel_iter, dtype_iter)
+            for t, n, dt in zip(val, numel, dtypes)
         ]
 
-        node.meta[key] = sizes
+        node.meta[key] = tuple(sizes)
         return _align_size(sum(sizes), bank_width)
 
     logger.warning(f"Node {node} has a non-tensor output")
@@ -151,42 +163,16 @@ class MemoryAllocator:
 
     """
 
-    def __init__(self, total_memory=None, bank_width=None, bank_size=None, memory_space=None):
+    def __init__(self, total_memory=None, bank_width=None, memory_space=None):
         self.total_memory = total_memory or (1 << 63) - 1
         self.bank_width = bank_width
-        self.bank_size = bank_size
         self.memory_space = memory_space or MemorySpace.DRAM  # default to DRAM
 
-        self.segments = [Segment(start=0, end=self.total_memory, memory_space=self.memory_space)]
+        self.segments = [Segment(0, self.total_memory, self.memory_space)]
         self.memory_map = {}
         self.snapshots = []
 
-    def align_size(self, size, align_bank=False):
-        if self.bank_size is not None and align_bank:
-            alignment = self.bank_size
-        elif self.bank_width is not None:
-            alignment = self.bank_width
-        else:
-            return size
-        return _align_size(size, alignment)
-
-    def get_tensor_size(self, node, shape, align_bank=False, is_output=False):
-        size = _get_tensor_size(node, shape, is_output, self.bank_width)
-
-        if size is None:
-            return self.align_size(size, align_bank)
-
-        return size
-
-    def allocate_memory(
-        self,
-        node,
-        size=None,
-        shape=None,
-        align_bank=False,
-        expand_on_failure=False,
-        is_output=False,
-    ):
+    def allocate_memory(self, node):
         if not hasattr(node, 'value'):
             logger.warning(f"Node {node} does not have a value attribute")
             return None
@@ -200,13 +186,12 @@ class MemoryAllocator:
             logger.info(f"Skipping allocation for scalar scale tensor: {node.name}")
             return None
 
-        tensor_size = (
-            size if size is not None else
-            self.get_tensor_size(node, shape, align_bank, is_output)
-        )
+        tensor_size = compute_tensor_size(node, bank_width=self.bank_width)
 
         if tensor_size is None:
             return None
+
+        tensor_size = _align_size(tensor_size, self.bank_width)
 
         for index, segment in enumerate(self.segments):
             if segment.node is None and (segment.end - segment.start) >= tensor_size:
@@ -218,38 +203,11 @@ class MemoryAllocator:
                     )
                     segment.end = segment.start + tensor_size
                     self.segments.insert(index + 1, new_segment)
+
                 self.memory_map[node] = segment
                 segment.node = node
-                return Segment(start=segment.start, end=segment.end, memory_space=self.memory_space)
 
-        if expand_on_failure:
-            last_segment = self.segments[-1]
-            start = last_segment.start if last_segment.node is None else last_segment.end
-            end = start + tensor_size
-
-            new_segment = Segment(
-                start=start,
-                end=end,
-                memory_space=self.memory_space,
-                node=node,
-            )
-            self.memory_map[node] = new_segment
-
-            if last_segment.node is None:
-                self.segments.insert(-1, new_segment)
-                last_segment.start = end
-                last_segment.end = self.total_memory * 2
-            else:
-                self.segments.append(new_segment)
-                self.segments.append(Segment(
-                    start=end, end=self.total_memory * 2, memory_space=self.memory_space
-                ))
-
-            self.total_memory *= 2
-
-            return Segment(
-                start=new_segment.start, end=new_segment.end, memory_space=self.memory_space
-            )
+                return Segment(segment.start, segment.end, self.memory_space)
 
         raise RuntimeError(f"Memory allocation failed for tensor {node.name}")
 

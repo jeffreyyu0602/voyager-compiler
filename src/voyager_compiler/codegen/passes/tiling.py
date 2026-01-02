@@ -737,7 +737,7 @@ def _make_linear_tiled_module(C, tile_c):
                 return None, None, None
 
             return torch.ops.quantized_ops.slice_csr_tensor(
-                A_data, A_indices, A_indptr, 1, c0, c1,
+                A_data, A_indices, A_indptr, 1, c0, c1, tile_c / C
             )
 
         def run_linear(
@@ -1113,7 +1113,7 @@ def _conv2d_layout(shape, is_weight=False, do_transpose=False):
         return (shape[0], shape[2], shape[3], shape[1])
 
 
-def _calculate_conv2d_shapes(node, tile_sizes, divisor=None):
+def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
     bs = node.kwargs.get("block_size", 1)
     transposed = node.meta.get("transposed", False)
 
@@ -1149,7 +1149,7 @@ def _calculate_conv2d_shapes(node, tile_sizes, divisor=None):
     }
 
 
-def _calculate_gemm_shapes(node, tile_sizes, divisor=None):
+def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     bs = node.kwargs.get("block_size", 1)
 
     x_tiled, c_tiled, k_tiled = tile_sizes
@@ -1173,7 +1173,8 @@ def _calculate_gemm_shapes(node, tile_sizes, divisor=None):
         weight_scale_shape = (k_tiled, c_scaled)
 
     A_data = node.kwargs.get("A_data")
-    A_indices = node.kwargs.get("A_indices")
+    if A_data is not None:
+        nnz = A_data.shape[0] // divisor[1]
 
     return {
         "input": batch_dims + (c_tiled,),
@@ -1181,8 +1182,8 @@ def _calculate_gemm_shapes(node, tile_sizes, divisor=None):
         "bias": (k_tiled,),
         "input_scale": batch_dims + (c_scaled,),
         "weight_scale": weight_scale_shape,
-        "A_data": tuple(A_data.shape) if A_data else None,
-        "A_indices": tuple(A_indices.shape) if A_indices else None,
+        "A_data": (nnz,) if A_data else None,
+        "A_indices": (nnz,) if A_data else None,
         "A_indptr": (x_tiled + 1,),
         "output": batch_dims + (k_tiled,),
     }
@@ -1206,6 +1207,17 @@ def _log_tiling_details(node, tiled_shapes, strategy):
     logger.info(f"  Out[{node}]: {orig_shape} -> {tile_shape}")
 
 
+def _merge_tiling(a, b):
+    if b is None:
+        return a
+
+    n = max(len(a), len(b))
+    a = (1,) * (n - len(a)) + a
+    b = (1,) * (n - len(b)) + b
+
+    return tuple(ai * bi for ai, bi in zip(a, b))
+
+
 def _search_tiling(
     node,
     full_shape,
@@ -1216,6 +1228,7 @@ def _search_tiling(
     bank_size,
     order=None,
     last_dim=None,
+    base_tiling=None,
 ):
     """
     Generic driver that iterates over banking strategies and valid tilings.
@@ -1230,9 +1243,11 @@ def _search_tiling(
         for tile_sizes, tiling in get_valid_tiling(
             full_shape, min_sizes=min_sizes, order=order, last_dim=last_dim
         ):
-            logger.info(f"Trying tiling {tiling} with tile sizes {tile_sizes}")
+            global_tiling = _merge_tiling(tiling, base_tiling)
 
-            tiled_shapes = shape_func(node, tile_sizes, tiling)
+            logger.debug(f"Trying tiling {global_tiling} with tile sizes {tile_sizes}")
+
+            tiled_shapes = shape_func(node, tile_sizes, global_tiling)
             node_to_shape = normalize_shape(node, tiled_shapes)
 
             total_size, _ = strategy.evaluate(
@@ -1247,7 +1262,7 @@ def _search_tiling(
     return None, None
 
 
-def select_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
+def search_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     if isinstance(unroll_dims, int):
         unroll_dims = (unroll_dims, unroll_dims)
 
@@ -1273,14 +1288,14 @@ def select_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         full_shape=full_shape,
         min_sizes=min_sizes,
         order=order,
-        shape_func=_calculate_conv2d_shapes,
+        shape_func=_build_conv2d_shape_map,
         cache_size=cache_size,
         bank_width=bank_width,
         bank_size=bank_size
     )
 
 
-def select_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
+def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     if isinstance(unroll_dims, int):
         unroll_dims = (unroll_dims, unroll_dims)
 
@@ -1314,10 +1329,11 @@ def select_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         full_shape=full_shape,
         min_sizes=min_sizes,
         order=order,
-        shape_func=_calculate_gemm_shapes,
+        shape_func=_build_gemm_shape_map,
         cache_size=cache_size,
         bank_width=bank_width,
-        bank_size=bank_size
+        bank_size=bank_size,
+        base_tiling=(1, num_c_tile, 1),
     )
 
 
@@ -1343,18 +1359,22 @@ def run_matrix_op_l2_tiling(
 
     for node in list(graph.nodes):
         if is_conv2d(node):
-            tile_sizes, tiled_shape = select_conv2d_tiling(
+            tile_sizes, tiled_shape = search_conv2d_tiling(
                 node, unroll, cache_size, None, bank_size
             )
 
-            split_conv2d_node(model, node, tile_sizes)
+            if tile_sizes is not None:
+                split_conv2d_node(model, node, tile_sizes)
 
         elif is_linear(node) or is_matmul(node):
-            tile_sizes, tiled_shape = select_gemm_tiling(
+            tile_sizes, tiled_shape = search_gemm_tiling(
                 node, unroll, cache_size, None, bank_size
             )
 
-            split_gemm_node(model, node, tile_sizes, tiled_shape)
+            if tile_sizes is not None:
+                split_gemm_node(model, node, tile_sizes, tiled_shape)
+            else:
+                raise RuntimeError(f"Failed to tile GEMM node: {node}")
 
     graph.lint()
     graph.eliminate_dead_code()
@@ -1362,38 +1382,63 @@ def run_matrix_op_l2_tiling(
     return model
 
 
-def get_tiled_shape(shape, divisor):
+def compute_tiled_shape(shape, divisor):
     ndim = len(shape)
     m = len(divisor)
-    if ndim > m:
+
+    # Align divisor to shape dimensions
+    if m < ndim:
         divisor = (1,) * (ndim - m) + divisor
-    elif ndim < m:
-        shape = (1,) * (m - ndim) + shape
-    tiled_shape = []
-    for i in range(len(shape)):
-        tiled_shape.append(shape[i] // divisor[i] if shape[i] > 1 else shape[i])
-    return tuple(tiled_shape[-ndim:])
+    elif m > ndim:
+        divisor = divisor[-ndim:]
+
+    return tuple(
+        s // d if s > 1 else s
+        for s, d in zip(shape, divisor)
+    )
 
 
-def _calculate_vector_op_shapes(node, tile_sizes, divisor):
+def compute_output_tiled_shapes(node, tiling, override_shapes=None):
+    """
+    Computes tiled shape for an output node
+    
+    Args:
+        node: The output node containing value and shape.
+        tiling: The tiling divisor/size configuration.
+        override_shapes: Optional shapes to use instead of node's value shapes.
+    """
+    if isinstance(node.value, torch.Tensor):
+        return compute_tiled_shape(override_shapes or node.shape, tiling)
+    elif isinstance(node.value, (tuple, list)):
+        shapes = []
+        has_sparse_outputs = len(node.value) > 2
+
+        for i, tensor in enumerate(node.value):
+            old_shape = override_shapes[i] if override_shapes else tensor.shape
+            if has_sparse_outputs and i < 3:
+                if i == 2:
+                    old_shape = (old_shape[0] - 1,)
+                output_shape = old_shape + (1,)
+                s = compute_tiled_shape(output_shape, tiling)[0]
+                if i == 2:
+                    s = s + 1
+                shapes.append((s,))
+            else:
+                shapes.append(compute_tiled_shape(old_shape, tiling))
+        return tuple(shapes)
+
+    return None
+
+
+def _build_vector_op_shape_map(node, tile_sizes, divisor):
     node_to_key = get_node_to_key_map(node)
-    shape = {}
+    shapes_map = {}
     for n, k in node_to_key.items():
         if k == "output":
-            if isinstance(node.value, torch.Tensor):
-                shape[k] = tile_sizes
-            elif isinstance(node.value, (tuple, list)):
-                shape[k] = [
-                    get_tiled_shape(t.shape, divisor) for t in node.value
-                ]
-                # HACK indptr has a 1D shape corresponding to the X dimension
-                if len(node.value) > 2:
-                    indptr_shape = node.value[2].shape + (1,)
-                    shape[k][2] = get_tiled_shape(indptr_shape, divisor)[:-1]
-                shape[k] = tuple(shape[k])
-        else:
-            shape[k] = get_tiled_shape(tuple(n.shape), divisor)
-    return shape
+            shapes_map[k] = compute_output_tiled_shapes(node, divisor)
+        elif require_allocation(n):
+            shapes_map[k] = compute_tiled_shape(tuple(n.shape), divisor)
+    return shapes_map
 
 
 def run_vector_op_node_l2_tiling(
@@ -1441,7 +1486,7 @@ def run_vector_op_node_l2_tiling(
         full_shape=output_shape,
         min_sizes=(unroll,),
         last_dim=last_dim,
-        shape_func=_calculate_vector_op_shapes,
+        shape_func=_build_vector_op_shape_map,
         cache_size=cache_size,
         bank_width=bank_width,
         bank_size=None if num_banks is None else cache_size // num_banks,
