@@ -314,11 +314,22 @@ def is_linear(node: Node) -> bool:
     ]
 
 
-def is_fc(node: Node) -> bool:
-    return (
-        (is_linear(node) or is_matmul(node))
-        and math.prod(node.args[0].shape[:-1]) == 1
-    )
+def is_fully_connected(node: Node) -> bool:
+    if is_linear(node):
+        input_shape = node.args[0].shape
+        return all(s == 1 for s in input_shape[:-1])
+
+    if is_matmul(node):
+        input_shape = node.args[0].shape
+        other_shape = node.args[1].shape
+
+        is_bmm = len(input_shape) > 2 or len(other_shape) > 2
+        if is_bmm:
+            return input_shape[-2] == 1
+        else:
+            return all(s == 1 for s in input_shape[:-1])
+
+    return False
 
 
 def is_matmul(node: Node) -> bool:

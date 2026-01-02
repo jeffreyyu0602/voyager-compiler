@@ -23,7 +23,7 @@ from .banking import (
 from .mapping_utils import (
     is_conv2d,
     is_elementwise_op,
-    is_fc,
+    is_fully_connected,
     is_gemm_op,
     is_indexing_or_concatenation_op,
     is_matmul,
@@ -748,7 +748,7 @@ def _fuse_reshape_with_input_impl(
     fused_nodes.append(current_node)
 
     # Check if fusion is valid
-    if is_gemm_op(current_node) and not is_fc(current_node):
+    if is_gemm_op(current_node) and not is_fully_connected(current_node):
         input_node = fused_nodes[-2]
         if is_mha_qkv_permute(reshape_node):
             can_fuse = input_node == current_node.args[0]
@@ -1642,8 +1642,7 @@ def gen_code(model, args, output_dir=None):
     model_params = Model()
 
     for node in model.graph.nodes:
-        node_value = getattr(node, 'value', None)
-        if not isinstance(node_value, (torch.Tensor, tuple, list)):
+        if not isinstance(node.value, (torch.Tensor, tuple, list)):
             continue
 
         op = Operation()
