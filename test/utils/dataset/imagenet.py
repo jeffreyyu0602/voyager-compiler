@@ -1,10 +1,11 @@
 import os
 
-from torchvision import datasets, transforms
+from datasets import load_dataset, DownloadConfig
+from torchvision import transforms
 from tqdm import tqdm
 
-from datasets import load_dataset
 from .utils import write_tensor_to_file
+
 
 def get_transforms(model_type):
     if model_type == "resnet":
@@ -43,9 +44,16 @@ def retrieve_dataset(num_samples, model_type):
     transform = get_transforms(model_type)
 
     # Load the ImageNet dataset from Hugging Face
-    dataset = load_dataset("timm/imagenet-1k-wds", split="validation", streaming=True)
+    config = DownloadConfig(max_retries=10)
+
+    dataset = load_dataset(
+        "timm/imagenet-1k-wds",
+        split="validation",
+        streaming=True,
+        download_config=config
+    )
     dataset = dataset.take(num_samples)
-    
+
     processed_dataset = []
 
     # Iterate over the selected indices and retrieve samples
