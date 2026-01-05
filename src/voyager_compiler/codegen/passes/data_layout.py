@@ -357,9 +357,9 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
 
         last_valid_idx = -1
 
-        for i, node in enumerate(group):
-            args = torch.fx.graph.map_arg(node.args, lambda n: x)
-            x = node.target(*args)
+        for i, gn in enumerate(group):
+            args = torch.fx.graph.map_arg(gn.args, lambda n: x)
+            x = gn.target(*args)
 
             if torch.equal(x.reshape(-1), orig_x):
                 last_valid_idx = i
