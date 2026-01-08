@@ -392,6 +392,7 @@ def get_new_node_name_with_prefix(prefix: str):
 
     def get_new_node_name(module: torch.nn.Module):
         existing_names = {n.name for n in module.graph.nodes}
+        existing_names.update(dict(module.named_modules()).keys())
 
         if prefix not in existing_names:
             return prefix
@@ -475,8 +476,12 @@ def rename_nodes_with_param_names(model: GraphModule):
 def _create_and_insert_subgraph(
     nodes: List[Node],
     model: torch.nn.Module,
-    named_modules: Dict[str, torch.nn.Module]
+    named_modules: Dict[str, torch.nn.Module],
+    node_order: Dict[Node, int] = None,
 ) -> Node:
+    if node_order is None:
+        node_order = {n: i for i, n in enumerate(model.graph.nodes)}
+    nodes.sort(key=lambda n: node_order[n])
     submodule, new_args = _create_subgraph(nodes)
     node_name = get_submodule_name(model, nodes)
     setattr(model, node_name, submodule)
@@ -486,7 +491,8 @@ def _create_and_insert_subgraph(
             'call_module', node_name, new_args, {})
     nodes[-1].replace_all_uses_with(new_node)
     for node in reversed(nodes):
-        model.graph.erase_node(node)
+        if not node.users:
+            model.graph.erase_node(node)
     new_node.meta['submodule'] = submodule
     if (dtype := nodes[-1].meta.get('dtype', None)) is not None:
         new_node.meta['dtype'] = dtype
@@ -1217,7 +1223,8 @@ def run_submod_l2_tiling(
             dim = 3 if transposed else 1
             min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1:]
         else:
-            min_sizes = (unroll_dims[0],)
+            min_x_size = min(sum(unroll_dims), math.prod(output_shape[:-1]))
+            min_sizes = (min_x_size, unroll_dims[0])
 
     for tile_sizes, tiling in get_valid_tiling(
         output_shape, min_sizes=min_sizes, reverse=is_gemm

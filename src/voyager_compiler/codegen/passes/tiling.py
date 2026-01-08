@@ -1,6 +1,7 @@
 import copy
 import logging
 import math
+import operator
 import re
 from typing import List, Tuple, Generator, Optional, Union
 
@@ -17,6 +18,7 @@ from ..mapping import (
     normalize_shape,
     replace_node_with_graph_module,
     _nodes_sequential,
+    _create_and_insert_subgraph,
 )
 from ..mapping_utils import (
     is_conv2d,
@@ -711,59 +713,48 @@ def _slice_tensor(node, dim, start, end, model):
     return tiled_node
 
 
-def _make_linear_tiled_module(C, tile_c):
+def _make_tiled_gemm_module(C, tile_c, target, is_mat):
     """
-    Factory function to create a LinearTiled module class with captured parameters.
+    Factory function to create a TiledGemm module class with
+    captured parameters.
     """
-    class LinearTiled(torch.nn.Module):
+    if is_mat:
+        slice_fn = lambda weight, c0, c1: weight[c0:c1]
+    else:
+        slice_fn = lambda weight, c0, c1: weight[:, c0:c1]
+
+    class TiledGemm(torch.nn.Module):
         def __init__(self, block_size=16):
             super().__init__()
             self.block_size = block_size
 
-        def get_scale_tile(self, input_scale, weight_scale, tidx):
+        def get_scale_tiles(self, input_scale, weight_scale, c0, c1):
             if input_scale is None or weight_scale is None:
-                return None, None
+                return None
 
-            c0, c1 = tidx * tile_c, min((tidx + 1) * tile_c, C)
             bs = self.block_size
 
             in_s = input_scale[..., c0 // bs:c1 // bs]
-            wt_s = weight_scale[..., c0 // bs:c1 // bs]
+            wt_s = slice_fn(weight_scale, c0 // bs, c1 // bs)
 
             return in_s, wt_s
 
-        def get_csr_tile(self, A_data, A_indices, A_indptr, c0, c1):
-            if A_data is None:
-                return None, None, None
+        def run_op(self, input, weight, bias, scales, codes):
+            if is_mat:
+                args = (input, weight)
+            else:
+                args = (input, weight, bias)
 
-            return torch.ops.quantized_ops.slice_csr_tensor(
-                A_data, A_indices, A_indptr, 1, c0, c1, tile_c / C
-            )
+            if scales is None:
+                return target(*args)
 
-        def run_linear(
-            self,
-            input_tile,
-            weight_tile,
-            bias,
-            scales,
-            codes,
-            A_csr,
-        ):
-            args = (input_tile, weight_tile, bias)
-
-            if scales[0] is None or scales[1] is None:
-                return torch.ops.aten.linear.default(*args)
-
-            return torch.ops.quantized_ops.linear_mx(
+            return target(
                 *args,
                 input_scale=scales[0],
                 weight_scale=scales[1],
                 block_size=self.block_size,
                 input_code=codes[0],
                 weight_code=codes[1],
-                A_data=A_csr[0],
-                A_indices=A_csr[1],
-                A_indptr=A_csr[2],
             )
 
         def forward(
@@ -775,92 +766,55 @@ def _make_linear_tiled_module(C, tile_c):
             weight_scale: Optional[torch.Tensor] = None,
             input_code: Optional[torch.Tensor] = None,
             weight_code: Optional[torch.Tensor] = None,
-            A_data: Optional[torch.Tensor] = None,
-            A_indices: Optional[torch.Tensor] = None,
-            A_indptr: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             psums = None
 
             for c in range(0, C, tile_c):
                 c0, c1 = c, min(c + tile_c, C)
 
-                tiled_input = input[..., c0:c1]
-                tiled_weight = weight[..., c0:c1]
-
-                scale_tiles = self.get_scale_tile(
-                    input_scale, weight_scale, c // tile_c
+                input_tile = input[..., c0:c1]
+                weight_tile = slice_fn(weight, c0, c1)
+                scale_tiles = self.get_scale_tiles(
+                    input_scale, weight_scale, c0, c1
                 )
 
-                csr_tiles = self.get_csr_tile(
-                    A_data, A_indices, A_indptr, c0, c1
-                )
-
-                tiled_gemm = self.run_linear(
-                    tiled_input,
-                    tiled_weight,
+                tiled_gemm = self.run_op(
+                    input_tile,
+                    weight_tile,
                     bias if c1 == C else None,
                     scale_tiles,
                     (input_code, weight_code),
-                    csr_tiles,
                 )
 
-                if psums is not None:
-                    psums = psums + tiled_gemm
-                else:
-                    psums = tiled_gemm
+                psums = tiled_gemm if psums is None else psums + tiled_gemm
 
             return psums
 
-    return LinearTiled
+    return TiledGemm
 
 
-def _make_matmul_tiled_module(C, tile_c):
+def _make_tiled_linear_with_outlier_filter_module(
+    C, tile_c, quantize_mx_kwargs,
+):
     """
-    Factory function to create a MatmulTiled module class with captured parameters.
+    Factory function to create a TiledLinear module class with
+    captured parameters.
     """
-    class MatmulTiled(torch.nn.Module):
+    quantized_ops = torch.ops.quantized_ops
+
+    class TiledLinear(torch.nn.Module):
         def __init__(self, block_size=16):
             super().__init__()
             self.block_size = block_size
 
-        def get_scale_tile(self, input_scale, weight_scale, tidx):
-            if input_scale is None or weight_scale is None:
-                return None, None
-
-            c0, c1 = tidx * tile_c, min((tidx + 1) * tile_c, C)
-            bs = self.block_size
-
-            in_s = input_scale[..., c0 // bs:c1 // bs]
-            wt_s = weight_scale[c0 // bs:c1 // bs]
-
-            return in_s, wt_s
-
-        def run_matmul(
-            self,
-            input_tile,
-            weight_tile,
-            scales,
-            codes,
-        ):
-            args = (input_tile, weight_tile)
-
-            if scales[0] is None or scales[1] is None:
-                return torch.ops.aten.matmul.default(*args)
-
-            return torch.ops.quantized_ops.matmul_mx(
-                *args,
-                input_scale=scales[0],
-                weight_scale=scales[1],
-                block_size=self.block_size,
-                input_code=codes[0],
-                weight_code=codes[1],
-            )
-
         def forward(
             self,
             input: torch.Tensor,
-            other: torch.Tensor,
-            input_scale: Optional[torch.Tensor] = None,
+            input_qmap: Optional[torch.Tensor],
+            scale_qmap: Optional[torch.Tensor],
+            output_code: Optional[torch.Tensor],
+            weight: torch.Tensor,
+            bias: Optional[torch.Tensor] = None,
             weight_scale: Optional[torch.Tensor] = None,
             input_code: Optional[torch.Tensor] = None,
             weight_code: Optional[torch.Tensor] = None,
@@ -870,28 +824,35 @@ def _make_matmul_tiled_module(C, tile_c):
             for c in range(0, C, tile_c):
                 c0, c1 = c, min(c + tile_c, C)
 
-                tiled_input = input[..., c0:c1]
-                tiled_weight = other[c0:c1]
+                bs = self.block_size
 
-                scale_tiles = self.get_scale_tile(
-                    input_scale, weight_scale, c // tile_c
+                data, indices, indptr, input_scale, inliers = quantized_ops.quantize_mx_outlier(
+                    input[..., c0:c1],
+                    qmap=input_qmap,
+                    scale_qmap=scale_qmap,
+                    output_code=output_code,
+                    **quantize_mx_kwargs,
                 )
 
-                tiled_gemm = self.run_matmul(
-                    tiled_input,
-                    tiled_weight,
-                    scale_tiles,
-                    (input_code, weight_code),
+                tiled_gemm = quantized_ops.linear_mx(
+                    inliers,
+                    weight[..., c0:c1],
+                    bias if c1 == C else None,
+                    input_scale=input_scale,
+                    weight_scale=weight_scale[..., c0 // bs:c1 // bs],
+                    block_size=self.block_size,
+                    input_code=input_code,
+                    weight_code=weight_code,
+                    A_data=data,
+                    A_indices=indices,
+                    A_indptr=indptr,
                 )
 
-                if psums is not None:
-                    psums = psums + tiled_gemm
-                else:
-                    psums = tiled_gemm
+                psums = tiled_gemm if psums is None else psums + tiled_gemm
 
             return psums
 
-    return MatmulTiled
+    return TiledLinear
 
 
 def split_gemm_node(model, node, tile_sizes, tiled_shapes):
@@ -926,28 +887,74 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
         node.meta["l2_tiling"] = tiling
         return
 
-    # Create the tiled module using factory function
-    if is_matmul(node):
-        GemmTiled = _make_matmul_tiled_module(C, c_tiled)
-    else:
-        GemmTiled = _make_linear_tiled_module(C, c_tiled)
-
     def load_arg(a):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
 
-    mod = GemmTiled(block_size=node.kwargs.get("block_size", 1))
-    kwargs = {k: v for k, v in node.kwargs.items() if v is not None}
-    kwargs.pop("block_size", None)
-    gm = export_model(mod, load_arg(node.args[:3]), load_arg(kwargs))
+    A_data = node.kwargs.get("A_data")
+    if A_data is not None:
+        quantize_mx_node = A_data.args[0]
+
+        args = (
+            quantize_mx_node.args[0],
+            get_arg_or_kwarg(quantize_mx_node, 1, "qmap"),
+            get_arg_or_kwarg(quantize_mx_node, 6, "scale_qmap"),
+            get_arg_or_kwarg(quantize_mx_node, 7, "output_code"),
+            node.args[1],
+            node.args[2] if len(node.args) > 2 else None,
+            node.kwargs.get("weight_scale"),
+            node.kwargs.get("input_code"),
+            node.kwargs.get("weight_code"),
+        )
+
+        args_and_kwargs = normalize_function(
+            quantize_mx_node.target,
+            quantize_mx_node.args,
+            quantize_mx_node.kwargs,
+            normalize_to_only_use_kwargs=True
+        )
+
+        kwargs = {
+            k: v for k, v in args_and_kwargs.kwargs.items()
+            if v is not None and not isinstance(v, Node)
+        }
+
+        # We first create a subgraph for the quantize_mx + gemm then replace
+        # the whole subgraph with a tiled version of linear_mx with outlier filter
+        named_modules = dict(model.named_modules())
+        fused_nodes = [quantize_mx_node, node] + list(quantize_mx_node.users)
+        node_to_replace = _create_and_insert_subgraph(
+            fused_nodes, model, named_modules
+        )
+
+        cls = _make_tiled_linear_with_outlier_filter_module(
+            C, c_tiled, kwargs
+        )
+
+        mod = cls(block_size=kwargs.get("block_size", 1))
+        gm = export_model(mod, load_arg(args))
+    else:
+        node_to_replace = node
+
+        args = node.args[:2] + (None,) if is_mat else node.args[:3]
+        kwargs = {k: v for k, v in node.kwargs.items() if v is not None}
+
+        cls = _make_tiled_gemm_module(C, c_tiled, node.target, is_mat)
+
+        mod = cls(block_size=kwargs.pop("block_size", 1))
+        gm = export_model(mod, load_arg(args), load_arg(kwargs))
 
     for n in list(gm.graph.nodes):
+        if n.op == "placeholder" and not n.users:
+            gm.graph.erase_node(n)
+
         if is_prunable_op(n):
             n.replace_all_uses_with(n.all_input_nodes[0])
             gm.graph.erase_node(n)
+
     gm.graph.lint()
 
     value_remap = {}
-    replace_node_with_graph_module(model, gm, node, value_remap)
+    replace_node_with_graph_module(model, gm, node_to_replace, value_remap)
 
     # Update metadata on new nodes in the graph
     if (source_fn_st := node.meta.get("source_fn_stack")) is not None:
@@ -964,10 +971,16 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
             model.graph.erase_node(n)
             continue
 
-        if n.target in [
-            torch.ops.aten.slice.Tensor, torch.ops.aten.pad.default,
-        ]:
+        if n.target == torch.ops.aten.slice.Tensor:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
+
+        if n.target == operator.getitem:
+            if (dtypes := n.args[0].meta.get("dtype")) is not None:
+                idx = n.args[1]
+                n.meta["dtype"] = dtypes[idx]
+
+        if n.target == torch.ops.quantized_ops.quantize_mx_outlier.default:
+            n.meta["dtype"] = quantize_mx_node.meta.get("dtype")
 
         if n.target == node.target:
             n.meta.update({
@@ -1173,8 +1186,9 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         weight_scale_shape = (k_tiled, c_scaled)
 
     A_data = node.kwargs.get("A_data")
+    num_c_tile = divisor[1] if divisor is not None else 1
     if A_data is not None:
-        nnz = A_data.shape[0] // divisor[1]
+        nnz = A_data.shape[0] // num_c_tile
 
     return {
         "input": batch_dims + (c_tiled,),
