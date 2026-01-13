@@ -8,7 +8,7 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from prepare_model import QUANTIZATION_CONFIGS, set_qconfig
+from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
 from voyager_compiler import (
     ShapeProp,
     add_qspec_args,
@@ -32,28 +32,44 @@ logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process model parameters.")
-    parser.add_argument('--model_id', required=True, help='Pretrained model identifier')
-    parser.add_argument('--max_length', type=int, default=1024, help='Maximum sequence length')
-    parser.add_argument('--stride', type=int, default=512, help='Stride for processing the data')
-    parser.add_argument('--output_dir', default=None, help='Output directory for histograms')
+    parser.add_argument(
+        '--model_id', required=True, help='Pretrained model identifier'
+    )
+    parser.add_argument(
+        '--max_length', type=int, default=1024, help='Maximum sequence length'
+    )
+    parser.add_argument(
+        '--stride', type=int, default=512, help='Stride for processing the data'
+    )
+    parser.add_argument(
+        '--output_dir', default=None, help='Output directory for histograms'
+    )
     parser.add_argument(
         '--torch_dtype',
         default="bfloat16",
         choices=["auto", "bfloat16", "float16", "float32"],
         help=(
-            "Override the default `torch.dtype` and load the model under this dtype. If `auto` is passed, the "
-            "dtype will be automatically derived from the model's weights."
+            "Override the default `torch.dtype` and load the model under this "
+            "dtype. If `auto` is passed, the dtype will be automatically "
+            "derived from the model's weights."
         )
     )
-    parser.add_argument('--qconfig', default=None, help='Quantization scheme for the model')
-    parser.add_argument('--reserved_memory', type=int, default=8, help='GPU memory reserved for storing activations')
+    parser.add_argument(
+        '--qconfig', default=None, help='Quantization scheme for the model'
+    )
+    parser.add_argument(
+        '--reserved_memory',
+        type=int,
+        default=8,
+        help='GPU memory reserved for storing activations'
+    )
     add_qspec_args(parser)
     return parser.parse_args()
 
 
 @setup_logging
 def main(args):
-    device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None else "cuda")
+    device = torch.device(f"cuda:{args.gpu}") if args.gpu is not None else None
     torch_dtype = (
         args.torch_dtype
         if args.torch_dtype in ["auto", None]
@@ -75,47 +91,49 @@ def main(args):
         force_scale_power_of_two=args.force_scale_power_of_two,
     )
 
-    quantizer.set_module_name_object_type_order(
-        r"model\.rotary_emb", torch.ops.aten.matmul.default, 0, None
-    )
-
     if (qconfig := QUANTIZATION_CONFIGS.get(args.qconfig)) is not None:
         set_qconfig(quantizer, qconfig)
 
-    input_ids = torch.randint(0, model.config.vocab_size, (1, args.max_length))
+    input_ids = torch.randint(
+        0, model.config.vocab_size, (1, args.max_length), device=device
+    )
     example_args = (input_ids,)
-    example_kwargs = {"labels": input_ids.clone(), 'use_cache': False}
+    example_kwargs = {"labels": input_ids.clone(), "use_cache": False}
+
     seq_len = torch.export.Dim("seq_length", min=3, max=args.max_length)
-    dynamic_shapes = {"input_ids": {1: seq_len}, "labels": {1: seq_len}, "use_cache": None}
+    dynamic_shapes = {
+        "input_ids": {1: seq_len},
+        "labels": {1: seq_len},
+        "use_cache": None,
+    }
 
     # gm = get_aten_graph_module(model, example_args, example_kwargs, dynamic_shapes)
     # gm.graph.print_tabular()
     # print_node_scope_tabular(gm)
 
-    # New LLaMA implementation includes @torch.no_grad() statement, which will turn
+    # LLaMA implementation includes @torch.no_grad() statement, which will turn
     # gradient on if capture_pre_autograd_graph is not called with torch.no_grad().
     with torch.no_grad():
-        model = prepare_pt2e(model, quantizer, example_args, example_kwargs, dynamic_shapes)
-        sink_obs_or_fq(model)
+        model = prepare_pt2e(
+            model, quantizer, example_args, example_kwargs, dynamic_shapes
+        )
 
-    # torch.export does not capture the correct device for inputs, so we need to manually
-    # set the device for operations like torch.full
-    for node in list(model.graph.nodes):
-        if 'device' in node.kwargs:
-            node.kwargs = dict(node.kwargs, device=device)
+    sink_obs_or_fq(model)
 
     if args.gpu is None:
         reserved_memory = args.reserved_memory * 1024 ** 3
         max_memory = {
-            k: v - reserved_memory
-            for k, v in get_max_memory().items() if isinstance(k, int) and v > reserved_memory
+            k: v - reserved_memory for k, v in get_max_memory().items()
+            if isinstance(k, int) and v > reserved_memory
         }
 
         device_map = get_device_map(model, max_memory, verbose=True)
-        print("Device map:")
-        for k, v in device_map.items():
-            print(f"layer {k} -> cuda:{v}")
         dispatch_model(model, device_map)
+
+        for node in list(model.graph.nodes):
+            if node.op not in ["placeholder", "output"] and not node.users:
+                model.graph.erase_node(node)
+
         insert_align_device_nodes(model, (input_ids, example_kwargs["labels"]))
 
     def calibrate(model):
@@ -127,7 +145,7 @@ def main(args):
             input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
             target_ids = input_ids.clone()
             with torch.no_grad():
-                model(input_ids, labels=target_ids)
+                model(input_ids, labels=target_ids, use_cache=False)
 
             if i == args.calibration_steps - 1:
                 break
@@ -138,9 +156,9 @@ def main(args):
             if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
                 module.disable_observer()
 
-    model.graph.print_tabular()
     if args.convert_model:
         model = convert_pt2e(model)
+
     model.graph.print_tabular()
 
     test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
@@ -161,9 +179,9 @@ def main(args):
         with torch.no_grad():
             outputs = model(input_ids, labels=target_ids, use_cache=False)
 
-            # loss is calculated using CrossEntropyLoss which averages over valid labels
-            # N.B. the model only calculates loss over trg_len - 1 labels, because it internally shifts the labels
-            # to the left by 1.
+            # loss is calculated using CrossEntropyLoss which averages over valid
+            # labels N.B. the model only calculates loss over trg_len - 1 labels,
+            # because it internally shifts the labels to the left by 1.
             neg_log_likelihood = outputs.loss
 
         nlls.append(neg_log_likelihood)
@@ -178,16 +196,6 @@ def main(args):
     print(f"max length: {args.max_length}")
     print(f"stride:     {args.stride}")
     print(f"perplexity: {ppl.item()}")
-
-    outlier_pct = []
-
-    for name, module in model.named_modules():
-        if hasattr(module, "max_outlier_pct") and module.max_outlier_pct > 0:
-            print(f"{name}: {module.max_outlier_pct:.2%} outliers")
-            outlier_pct.append(module.max_outlier_pct)
-
-    if outlier_pct:
-        print(f"Average outlier percentage: {sum(outlier_pct) / len(outlier_pct):.2%}")
 
     if args.record_histogram and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)

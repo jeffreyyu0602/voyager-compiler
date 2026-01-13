@@ -176,19 +176,28 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
     class BMM(torch.nn.Module):
         def forward(
                 self, input: torch.Tensor, other: torch.Tensor, input_scale=None,
-                weight_scale=None, input_code=None, weight_code=None):
+                weight_scale=None, input_code=None, weight_code=None, A_data=None,
+                A_indices=None, A_indptr=None, weight_transposed=False):
             # Loop through each element in the batch dimensions
             batch_shape = input.shape[:-2]
             result = []
             for idx in itertools.product(*[range(dim) for dim in batch_shape]):
+                kwargs = {
+                    "input_scale": input_scale[idx],
+                    "weight_scale": weight_scale[idx],
+                    "block_size": block_size,
+                    "input_code": input_code,
+                    "weight_code": weight_code,
+                }
+                if A_data is not None:
+                    kwargs.update({
+                        "A_data": A_data[idx],
+                        "A_indices": A_indices[idx],
+                        "A_indptr": A_indptr[idx],
+                        "weight_transposed": weight_transposed,
+                    })
                 result.append(torch.ops.quantized_ops.matmul_mx(
-                    input[idx],
-                    other[idx],
-                    input_scale=input_scale[idx],
-                    weight_scale=weight_scale[idx],
-                    block_size=block_size,
-                    input_code=input_code,
-                    weight_code=weight_code,
+                    input[idx], other[idx], **kwargs,
                 ))
             result = torch.stack(result)
             result = result.view(*batch_shape, *result.shape[-2:])
@@ -196,12 +205,19 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
 
     input_code = node.kwargs.get('input_code', None)
     weight_code = node.kwargs.get('weight_code', None)
+    A_data = node.kwargs.get('A_data', None)
+    A_indices = node.kwargs.get('A_indices', None)
+    A_indptr = node.kwargs.get('A_indptr', None)
 
     kwargs = {
         'input_scale': node.kwargs['input_scale'].value,
         'weight_scale': node.kwargs['weight_scale'].value,
         'input_code': input_code.value if input_code is not None else None,
         'weight_code': weight_code.value if weight_code is not None else None,
+        'A_data': A_data.value if A_data is not None else None,
+        'A_indices': A_indices.value if A_indices is not None else None,
+        'A_indptr': A_indptr.value if A_indptr is not None else None,
+        'weight_transposed': node.kwargs.get('weight_transposed', True),
     }
 
     gm = export_model(BMM(), (input1, input2), kwargs)
@@ -320,11 +336,14 @@ def split_multi_head_attention(model: GraphModule):
 
                 propagate_shape(value_remap[node])
 
+            has_spmm_arg = "A_data" in av_matmul.kwargs
+            arg_idx = 1 if has_spmm_arg else 0
             av_matmul.replace_input_with(
-                av_matmul.args[0], value_remap[nodes_between[-1]]
+                av_matmul.args[arg_idx], value_remap[nodes_between[-1]]
             )
 
-            if (scale_node := av_matmul.kwargs.get('input_scale')) is not None:
+            arg_key = 'weight_scale' if has_spmm_arg else 'input_scale'
+            if (scale_node := av_matmul.kwargs.get(arg_key)) is not None:
                 av_matmul.replace_input_with(
                     scale_node, value_remap[nodes_between[-2]]
                 )
@@ -717,7 +736,7 @@ def move_transpose_after_select(graph: torch.fx.Graph, nodes: List[Node]):
 
     if len(select_nodes) == 0:
         return nodes
-    
+
     user_node = next(iter(select_nodes[-1].users))
     ndim = transpose_node.value.ndim
     dims = [
@@ -852,7 +871,7 @@ def fuse_reshape_with_output(
         fused_nodes.insert(0, curr_node)
         curr_node = curr_node.all_input_nodes[0]
 
-    def _is_tiled(n): 
+    def _is_tiled(n):
         return "tiled_shapes" in getattr(n, "meta", {})
 
     if len(curr_node.users) > 1 or _is_tiled(curr_node):

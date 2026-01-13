@@ -254,7 +254,7 @@ class FusedAmaxObsFakeQuantFunction(torch.autograd.Function):
 
 class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
     r"""Simulate the quantize and dequantize operations in training time.
-    
+
     Observer module for computing the quantization parameters based on the
     historical amax values.
 
@@ -333,6 +333,15 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.observer_enabled[0] = self.qscheme is not None
         self.is_per_channel = self.qscheme == qt.per_channel_symmetric
 
+        if outlier_pct is not None:
+            self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.99)
+            self.register_buffer(
+                "outlier_threshold_history", torch.tensor(0.0, **factory_kwargs)
+            )
+            self.register_buffer(
+                "outlier_initialized", torch.tensor(False, device=device),
+            )
+
     @torch.jit.export
     def calculate_qparams(self):
         if self.qscheme == qt.group_wise_affine:
@@ -364,8 +373,18 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             self.histogram += torch.histc(exp, 254, min=-126, max=127)
 
         if self.outlier_pct is not None:
-            q = 1 - self.outlier_pct
-            self.outlier_threshold = torch.quantile(x.abs().float(), q).item()
+            q = 1.0 - self.outlier_pct
+            value = torch.quantile(x.abs().float(), q)
+
+            if not self.outlier_initialized:
+                self.outlier_threshold_history.copy_(value)
+                self.outlier_initialized.fill_(True)
+            else:
+                self.outlier_threshold_history.mul_(self.outlier_ema_decay).add_(
+                    value * (1.0 - self.outlier_ema_decay)
+                )
+
+            self.outlier_threshold = self.outlier_threshold_history.item()
 
         # Remove outliers from the activation.
         if self.outlier_threshold is not None:

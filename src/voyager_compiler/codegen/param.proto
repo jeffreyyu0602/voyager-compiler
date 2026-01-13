@@ -22,23 +22,11 @@ message Tensor {
   bool is_none = 10;
 }
 
-// Wrapper for repeated tensors (since `oneof` doesn't allow repeated fields)
-message TensorList {
-  repeated Tensor tensors = 1;
-}
-
-// Wrapper for repeated integers (to avoid `repeated int32` inside `oneof`)
-message IntList {
-  repeated int64 values = 1;
-}
-
-message BoolList {
-  repeated bool values = 1;
-}
-
-message ScalarList {
-  repeated double values = 1;
-}
+// Wrapper for repeated type (since `oneof` doesn't allow repeated fields)
+message TensorList { repeated Tensor tensors = 1; }
+message IntList { repeated int64 values = 1; }
+message BoolList { repeated bool values = 1; }
+message ScalarList { repeated double values = 1; }
 
 // Represents arguments for operations
 message Argument {
@@ -72,12 +60,13 @@ message OpOverloadList {
 
 message Operation {
   oneof op_type {
-    OpOverload op = 2;
-    OpOverloadList fused_op = 3;
+    OpOverload op = 1;
+    OpOverloadList fused_op = 2;
   }
+
   oneof return_type {
-    Tensor output = 4;
-    TensorList outputs = 5;
+    Tensor output = 3;
+    TensorList outputs = 4;
   }
 }
 

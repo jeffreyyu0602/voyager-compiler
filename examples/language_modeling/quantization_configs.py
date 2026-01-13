@@ -7,19 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 QUANTIZATION_CONFIGS = {
-    "linear4": {
-        torch.nn.Linear: [
-            "nf4,qs=microscaling,bs=64,ax=-1",
-            "nf4,qs=microscaling,bs=64,ax=-1",
-        ],
-    },
-    "matmul4": {
-        torch.ops.aten.matmul.default: [
-            "nf4,qs=microscaling,bs=64,ax=-1",
-            "nf4,qs=microscaling,bs=64,ax=-2",
-        ],
-    },
-    "linear4_matmul6": {
+    "a4w4_attn6": {
         torch.nn.Linear: [
             "nf4,qs=microscaling,bs=64,ax=-1",
             "nf4,qs=microscaling,bs=64,ax=-1",
@@ -29,7 +17,7 @@ QUANTIZATION_CONFIGS = {
             "int6,qs=microscaling,bs=64,ax=-2",
         ],
     },
-    "linear4_matmul6_fp8": {
+    "a4w4_attn6_s8": {
         torch.nn.Linear: [
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
@@ -39,7 +27,7 @@ QUANTIZATION_CONFIGS = {
             "int6,qs=microscaling,bs=64,ax=-2,scale=fp8_e5m3",
         ],
     },
-    "linear4_matmul6_fp8_mixhead": {
+    "a4w4_attn6_heada6_s8": {
         torch.nn.Linear: [
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
@@ -53,21 +41,18 @@ QUANTIZATION_CONFIGS = {
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
         ],
     },
-    "linear4_matmul6_fp8_outlier": {
+    "a4w4_li_opct_attn_othr6_s8": {
         torch.nn.Linear: [
-            "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3,outlier=4.0",
+            "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3,opct=0.01",
             "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
         ],
         torch.ops.aten.matmul.default: [
             "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
-            "int6,qs=microscaling,bs=64,ax=-2,scale=fp8_e5m3",
-        ],
-        (r"lm_head", torch.ops.aten.linear.default, 0): [
-            "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
-            "nf4_6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3",
+            "nf4_6,qs=microscaling,bs=64,ax=-2,scale=fp8_e5m3,othr=6.0",
         ],
     },
 }
+
 
 def set_qconfig(quantizer, qconfigs):
     for key, qspec in qconfigs.items():

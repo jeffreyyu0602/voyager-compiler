@@ -1188,7 +1188,7 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     A_data = node.kwargs.get("A_data")
     num_c_tile = divisor[1] if divisor is not None else 1
     if A_data is not None:
-        nnz = A_data.shape[0] // num_c_tile
+        nnz = A_data.shape[-1] // num_c_tile
 
     return {
         "input": batch_dims + (c_tiled,),
@@ -1359,7 +1359,7 @@ def run_matrix_op_l2_tiling(
 
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
-        unroll (int): Systolic array input and output channel unrolling dimension. 
+        unroll (int): Systolic array input and output channel unrolling dimension.
         cache_size (int): Total cache size in bytes.
         num_banks (int, optional): Number of cache banks for bank-aligned tiling.
         bank_width (int, optional): Width of memory for bank-aligned tiling.
@@ -1415,7 +1415,7 @@ def compute_tiled_shape(shape, divisor):
 def compute_output_tiled_shapes(node, tiling, override_shapes=None):
     """
     Computes tiled shape for an output node
-    
+
     Args:
         node: The output node containing value and shape.
         tiling: The tiling divisor/size configuration.
@@ -1431,7 +1431,7 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
             old_shape = override_shapes[i] if override_shapes else tensor.shape
             if has_sparse_outputs and i < 3:
                 if i == 2:
-                    old_shape = (old_shape[0] - 1,)
+                    old_shape = (old_shape[-1] - 1,)
                 output_shape = old_shape + (1,)
                 s = compute_tiled_shape(output_shape, tiling)[0]
                 if i == 2:

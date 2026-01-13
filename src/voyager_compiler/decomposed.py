@@ -408,8 +408,10 @@ def _(
 
 
 quantized_decomposed_lib.define(
-    "matmul_mx(Tensor self, Tensor other, *, Tensor? input_scale=None, Tensor? weight_scale=None, "
-    "int? block_size=None, Tensor? input_code=None, Tensor? weight_code=None) -> Tensor"
+    "matmul_mx(Tensor self, Tensor other, *, Tensor? input_scale=None, Tensor? "
+    "weight_scale=None, int? block_size=None, Tensor? input_code=None, Tensor? "
+    "weight_code=None, Tensor? A_data=None, Tensor? A_indices=None, Tensor? A_indptr=None, "
+    "bool weight_transposed=True) -> Tensor"
 )
 
 
@@ -423,18 +425,38 @@ def matmul_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
+    A_data: Optional[torch.Tensor] = None,
+    A_indices: Optional[torch.Tensor] = None,
+    A_indptr: Optional[torch.Tensor] = None,
+    weight_transposed=True
 ) -> torch.Tensor:
     if input_code is not None:
         self = input_code[self.to(torch.long)].to(self.dtype)
-    if weight_code is not None:
-        other = weight_code[other.to(torch.long)].to(other.dtype)
-
     if input_scale is not None:
         self = self * expand(input_scale, self.shape, block_size)
-    if weight_scale is not None:
-        other = other * expand(weight_scale, other.shape, block_size)
 
-    return torch.matmul(self, other)
+    decoded_other = other
+    if weight_code is not None:
+        decoded_other = weight_code[other.to(torch.long)].to(other.dtype)
+    if weight_scale is not None:
+        decoded_other = decoded_other * expand(weight_scale, other.shape, block_size)
+
+    dense_out = torch.matmul(self, decoded_other)
+
+    if A_data is not None:
+        spmm_out = torch.ops.quantized_ops.spmm_csr(
+            A_data,
+            A_indices,
+            A_indptr,
+            other,
+            weight_scale,
+            weight_code,
+            block_size,
+            weight_transposed,
+        )
+        return dense_out + spmm_out
+
+    return dense_out
 
 
 @torch.library.register_fake("quantized_ops::matmul_mx")
@@ -613,14 +635,34 @@ def filter_outlier(input: torch.Tensor, threshold: float, max_pct: float = 0.01)
     sparsity = (1 - torch.sum(is_outlier) / input.numel()) * 100
     logger.info(f"Outlier sparsity level: {sparsity:.2f}%")
 
-    csr = outliers.to_sparse_csr()
+    batch_shape = input.shape[:-2]
+    mat_shape = input.shape[-2:]
+    max_nnz = int(math.prod(mat_shape) * max_pct)
 
-    crow_indices = csr.crow_indices()[0].to(torch.int32)
-    col_indices = csr.col_indices()[0].to(torch.int32)
-    values = csr.values()[0]
+    num_batches = int(math.prod(batch_shape))
 
-    max_nnz = int(input.numel() * max_pct)
-    data, indices = _pad_csr(values, col_indices, crow_indices, max_nnz)
+    outliers_flat = outliers.reshape(num_batches, *mat_shape)
+
+    all_crow_indices = []
+    all_col_indices = []
+    all_values = []
+
+    for i in range(num_batches):
+        csr = outliers_flat[i].to_sparse_csr()
+
+        crow_indices = csr.crow_indices().to(torch.int32)
+        col_indices = csr.col_indices().to(torch.int32)
+        values = csr.values()
+
+        data, indices = _pad_csr(values, col_indices, crow_indices, max_nnz)
+
+        all_crow_indices.append(crow_indices)
+        all_col_indices.append(indices)
+        all_values.append(data)
+
+    crow_indices = torch.stack(all_crow_indices, dim=0).reshape(*batch_shape, -1)
+    indices = torch.stack(all_col_indices, dim=0).reshape(*batch_shape, -1)
+    data = torch.stack(all_values, dim=0).reshape(*batch_shape, -1)
 
     return data, indices, crow_indices, inlier
 
@@ -631,11 +673,14 @@ def _(
     threshold: float,
     max_pct: float = 0.01,
 ):
-    max_nnz = int(input.numel() * max_pct)
-    nrows = input.numel() // input.shape[-1]
-    data = input.new_empty((max_nnz,))
-    indices = input.new_empty((max_nnz,), dtype=torch.int32)
-    indptr = input.new_empty((nrows + 1,), dtype=torch.int32)
+    batch_shape = input.shape[:-2]
+    mat_shape = input.shape[-2:]
+    max_nnz = int(math.prod(mat_shape) * max_pct)
+
+    indptr = input.new_empty((*batch_shape, mat_shape[0] + 1), dtype=torch.int32)
+    indices = input.new_empty((*batch_shape, max_nnz), dtype=torch.int32)
+    data = input.new_empty((*batch_shape, max_nnz))
+
     inliers = torch.empty_like(input)
     return data, indices, indptr, inliers
 
@@ -689,11 +734,13 @@ def _(
     threshold: Optional[float] = None,
     max_pct: float = 0.01
 ):
-    max_nnz = int(input.numel() * max_pct)
-    nrows = input.numel() // input.shape[-1]
-    data = input.new_empty((max_nnz,))
-    indices = input.new_empty((max_nnz,), dtype=torch.int32)
-    indptr = input.new_empty((nrows + 1,), dtype=torch.int32)
+    batch_shape = input.shape[:-2]
+    mat_shape = input.shape[-2:]
+    max_nnz = int(math.prod(mat_shape) * max_pct)
+
+    indptr = input.new_empty((*batch_shape, mat_shape[0] + 1), dtype=torch.int32)
+    indices = input.new_empty((*batch_shape, max_nnz), dtype=torch.int32)
+    data = input.new_empty((*batch_shape, max_nnz))
 
     scale_shape = list(input.shape)
     for axis in axes:
@@ -790,34 +837,46 @@ def spmm_csr(
     block_size: Optional[int] = None,
     weight_transposed=False
 ) -> torch.Tensor:
-    """
-    Performs SpMM: Y = A @ B where A is in CSR format.
-
-    Args:
-        data    : 1D tensor of non-zero values in A (shape [nnz])
-        indices : 1D tensor of column indices for each non-zero value (shape [nnz])
-        indptr  : 1D tensor of row pointers (shape [num_rows + 1])
-        B       : Dense matrix of shape [K, N]
-
-    Returns:
-        Y       : Dense matrix of shape [M, K]
-    """
     if B_code is not None:
         B = B_code[B.to(torch.long)]
     if B_scale is not None:
         B = B * expand(B_scale, B.shape, block_size)
 
     if not weight_transposed:
-        B = B.T
+        B = B.mT
 
-    input_size = (indptr.numel() - 1, B.shape[0])
+    batch_shape = indptr.shape[:-1]
+    num_batches = int(math.prod(batch_shape))
 
-    csr = torch.sparse_csr_tensor(
-        indptr, indices, data, dtype=torch.float32, size=input_size
-    )
+    indptr = indptr.reshape(-1, indptr.shape[-1])
+    indices = indices.reshape(-1, indices.shape[-1])
+    data = data.reshape(-1, data.shape[-1])
 
-    # Sparse mm only supports float32 for now
-    output = torch.sparse.mm(csr, B.to(torch.float32)).to(B.dtype)
+    if B.ndim > 2:
+        B = B.reshape(num_batches, B.shape[-2], B.shape[-1])
+
+    outputs = []
+
+    for i in range(num_batches):
+        B_batch = B[i] if B.ndim == 3 else B
+
+        input_size = (indptr[i].numel() - 1, B_batch.shape[0])
+        end_index = indptr[i][-1].item()
+
+        csr = torch.sparse_csr_tensor(
+            indptr[i],
+            indices[i,:end_index],
+            data[i,:end_index],
+            dtype=torch.float32,
+            size=input_size,
+        )
+
+        # Sparse mm only supports float32 for now
+        output = torch.sparse.mm(csr, B_batch.to(torch.float32)).to(B.dtype)
+        outputs.append(output)
+
+    output = torch.stack(outputs, dim=0)
+    output = output.reshape(*batch_shape, -1, B.shape[-1])
 
     return output
 
@@ -833,6 +892,7 @@ def _(
     block_size: Optional[int] = None,
     weight_transposed=False
 ):
-    X = indptr.numel() - 1
-    K = B.shape[1] if weight_transposed else B.shape[0]
-    return data.new_empty((X, K))
+    batch_shape = indptr.shape[:-1]
+    X = indptr.shape[-1] - 1
+    K = B.shape[-1] if weight_transposed else B.shape[-2]
+    return data.new_empty((*batch_shape, X, K))

@@ -1,5 +1,6 @@
 import copy
 import logging
+import math
 import operator
 import re
 from collections import OrderedDict
@@ -30,6 +31,7 @@ from .codegen.mapping_utils import (
     is_nop,
     is_reshape_op,
     is_conv2d,
+    is_matmul,
 )
 from .decomposed import quantized_decomposed_lib
 
@@ -471,9 +473,13 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     if isinstance(activation_post_process.ch_axis, int):
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
-    if activation_post_process.outlier_max_pct is not None:
-        activation_post_process.outlier_max_pct = (
-            int(activation_post_process.outlier_max_pct * 100 + 1) / 100.0
+    if activation_post_process.outlier_threshold is not None:
+        outlier_max_pct = (
+            math.ceil(activation_post_process.outlier_max_pct * 100) / 100.0
+        )
+        activation_post_process.outlier_max_pct = max(outlier_max_pct, 0.05)
+        logger.info(
+            f"{node.target} has maximum outlier percentage {outlier_max_pct:.2%}"
         )
 
     # Can only fuse scale calculation with quantization if along the last dim
@@ -587,7 +593,11 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         )
 
         if num_outputs == 5:
-            csr_data_node, indices_node, indptr_node, scale_node, quantized_node = output_nodes
+            csr_data_node = output_nodes[0]
+            csr_indices_node = output_nodes[1]
+            csr_indptr_node = output_nodes[2]
+            scale_node = output_nodes[3]
+            quantized_node = output_nodes[4]
             dtype_tuple = (None, None, None, scale_dtype, activation_post_process.dtype)
         else:
             scale_node, quantized_node = output_nodes
@@ -612,7 +622,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     graph.call_function(operator.getitem, (filter_outlier_node, i))
                     for i in range(4)
                 ]
-                csr_data_node, indices_node, indptr_node, input_node = output_nodes
+                csr_data_node, csr_indices_node, csr_indptr_node, input_node = output_nodes
 
             calculate_qparam_op_inputs = [
                 input_node,
@@ -700,7 +710,16 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             kwargs.setdefault("input_scale", kwarg2)
 
         # Sort kwargs so that they can be accessed sequentially during MHA splitting
-        order = ["input_scale", "weight_scale", "block_size", "input_code", "weight_code"]
+        order = [
+            "input_scale",
+            "weight_scale",
+            "block_size",
+            "input_code",
+            "weight_code",
+            "A_data",
+            "A_indices",
+            "A_indptr",
+        ]
         kwargs = OrderedDict((key, kwargs[key]) for key in order if key in kwargs)
 
         # Replace the node with its MX counterpart
@@ -741,25 +760,30 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             # For now only support linear layers
             assert mx_op_node.target in [
                 torch.ops.aten.linear.default,
+                torch.ops.aten.matmul.default,
                 torch.ops.quantized_ops.linear_mx.default,
+                torch.ops.quantized_ops.matmul_mx.default,
             ], (
-                f"Only torch.nn.Linear is supported for outlier suppresion, got {user.target}"
+                f"Only GEMM is supported for outlier suppresion, got {user.target}"
             )
 
             weight_node = mx_op_node.args[1]
 
-            if mx_op_node.target == torch.ops.quantized_ops.linear_mx.default:
+            if mx_op_node.target in [
+                torch.ops.quantized_ops.linear_mx.default,
+                torch.ops.quantized_ops.matmul_mx.default,
+            ]:
                 mx_op_node.kwargs = {
                     **mx_op_node.kwargs,
                     "A_data": csr_data_node,
-                    "A_indices": indices_node,
-                    "A_indptr": indptr_node,
+                    "A_indices": csr_indices_node,
+                    "A_indptr": csr_indptr_node,
                 }
             else:
                 with graph.inserting_before(mx_op_node):
                     spmm_node = graph.call_function(
                         torch.ops.quantized_ops.spmm_csr.default,
-                        (csr_data_node, indices_node, indptr_node, weight_node),
+                        (csr_data_node, csr_indices_node, csr_indptr_node, weight_node),
                         {
                             "B_scale": kwargs.get("weight_scale"),
                             "B_code": kwargs.get("weight_code"),
@@ -1001,8 +1025,74 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
     return model
 
 
+def swap_matmul_inputs(model: GraphModule):
+    graph = model.graph
+    modules = dict(model.named_modules(remove_duplicate=False))
+
+    def get_fake_quant_mod(node: Node):
+        if node.op != "call_module":
+            return False
+
+        mod = _get_module(node, modules)
+        if isinstance(mod, torch.ao.quantization.FakeQuantizeBase):
+            return mod
+
+        return None
+
+    target = torch.ops.aten.transpose.int
+
+    def transpose_input(node):
+        input_node = node.args[0]
+        if input_node.target != target:
+            with graph.inserting_before(node):
+                transposed_node = graph.call_function(
+                    target, (input_node, -1, -2),
+                )
+            node.replace_input_with(input_node, transposed_node)
+        else:
+            node.replace_input_with(input_node, input_node.args[0])
+
+    for node in list(graph.nodes):
+        if not is_matmul(node):
+            continue
+
+        input_node = node.args[0]
+        other_node = node.args[1]
+
+        input_fq = get_fake_quant_mod(input_node)
+        other_fq = get_fake_quant_mod(other_node)
+
+        if other_fq is None or other_fq.outlier_threshold is None:
+            continue
+
+        assert input_fq is None or input_fq.outlier_threshold is None, (
+            "Only one input of matmul can have outlier filter"
+        )
+
+        node.args = (other_node, input_node)
+
+        transpose_input(input_node)
+        transpose_input(other_node)
+
+        other_fq.ch_axis = -1
+        input_fq.ch_axis = -2
+
+        with graph.inserting_after(node):
+            transposed = graph.call_function(target, (node, -1, -2))
+
+        for user in list(node.users):
+            if id(user) != id(transposed):
+                user.replace_input_with(node, transposed)
+
+    model.graph.lint()
+    model.graph.eliminate_dead_code()
+    model.recompile()
+
+
 def convert_pt2e(model: GraphModule, output_dtype: str = None, eliminate_no_effect: bool = True):
     modules = dict(model.named_modules(remove_duplicate=False))
+
+    swap_matmul_inputs(model)
 
     for node in list(model.graph.nodes):
         if node.op == "call_module":

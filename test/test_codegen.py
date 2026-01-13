@@ -49,7 +49,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 target_path = os.path.join(script_dir, '../examples/language_modeling')
 sys.path.append(os.path.abspath(target_path))
 
-from prepare_model import set_qconfig
+from quantization_configs import set_qconfig
 
 logger = logging.getLogger()
 
@@ -83,22 +83,33 @@ vector_stages = [
 ]
 
 
-def get_llama_mp_qconfig(bs=64, outlier_pct=None):
-    outlier = f",opct={outlier_pct}" if outlier_pct is not None else ""
-    return {
-        torch.nn.Linear: [
-            f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3" + outlier,
-            f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-        ],
-        torch.ops.aten.matmul.default: [
-            f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-            f"int6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3",
-        ],
-        (r"lm_head", torch.ops.aten.linear.default, 0): [
-            f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-            f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-        ],
-    }
+def get_llama_qconfig(bs=64, outlier_pct=None):
+    if outlier_pct is None:
+        return {
+            torch.nn.Linear: [
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+            torch.ops.aten.matmul.default: [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"int6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3",
+            ],
+            (r"lm_head", torch.ops.aten.linear.default, 0): [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+        }
+    else:
+        return {
+            torch.nn.Linear: [
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3,opct={outlier_pct}",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+            ],
+            torch.ops.aten.matmul.default: [
+                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
+                f"nf4_6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3,othr=6.0",
+            ],
+        }
 
 
 if __name__ == "__main__":
@@ -277,7 +288,7 @@ if __name__ == "__main__":
 
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)
-        
+
         if args.dump_dataset or args.evaluate:
             imagenet_dataset = imagenet.retrieve_dataset(1000, "resnet")
             if args.evaluate:
@@ -297,14 +308,14 @@ if __name__ == "__main__":
             preprocessed_imagenet = imagenet.dump_imagenet(
                 args.dataset_output_dir, imagenet_dataset, "resnet", preprocess_fn, torch_dtype
             )
-        
+
         if args.evaluate:
             torchvision_models.evaluate(gm, preprocessed_imagenet)
     elif args.model == "mobilebert":
         model, tokenizer = mobilebert.load_model(args)
-        
+
         eval_dataset, train_dataset = glue.retrieve_dataset(model, tokenizer, args)
-        
+
         if args.evaluate:
             mobilebert.evaluate(model, eval_dataset)
 
@@ -456,7 +467,7 @@ if __name__ == "__main__":
         replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
 
         if args.mixed_precision:
-            qconfig = get_llama_mp_qconfig(args.hardware_unrolling[0], args.outlier_pct)
+            qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
             set_qconfig(quantizer, qconfig)
 
             fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
@@ -619,7 +630,7 @@ if __name__ == "__main__":
         new_output = gm(*example_args, **example_kwargs)
         gm.graph.print_tabular()
     elif args.model == "vit":
-        model = vit.load_model(args) 
+        model = vit.load_model(args)
 
         if args.dump_dataset or args.evaluate:
             imagenet_dataset = imagenet.retrieve_dataset(1000, "vit")
