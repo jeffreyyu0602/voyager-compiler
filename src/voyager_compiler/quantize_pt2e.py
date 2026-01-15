@@ -1030,12 +1030,10 @@ def swap_matmul_inputs(model: GraphModule):
     modules = dict(model.named_modules(remove_duplicate=False))
 
     def get_fake_quant_mod(node: Node):
-        if node.op != "call_module":
-            return False
-
-        mod = _get_module(node, modules)
-        if isinstance(mod, torch.ao.quantization.FakeQuantizeBase):
-            return mod
+        if node.op == "call_module":
+            mod = _get_module(node, modules)
+            if isinstance(mod, torch.ao.quantization.FakeQuantizeBase):
+                return mod
 
         return None
 
