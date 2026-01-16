@@ -643,7 +643,9 @@ def split_dense_spmm_node(model: GraphModule):
         propagate_shape(add_node)
 
         tiled_shapes = node.meta.get("tiled_shapes")
-        tiling = node.meta.get("l2_tiling")
+        tile_strides = node.meta.get("tile_strides")
+        tiling = node.meta.get("tiling")
+
         if tiled_shapes is not None:
             output_shape = tiled_shapes["output"]
             flattened_shape = (math.prod(output_shape[:-1]), output_shape[-1])
@@ -655,13 +657,12 @@ def split_dense_spmm_node(model: GraphModule):
                 "B_scale": tiled_shapes["weight_scale"],
                 "output": flattened_shape,
             }
-            indptr_shape = tiled_shapes["A_indptr"]
+
             spmm_node.meta["tile_strides"] = {
-                "indptr": (indptr_shape[0] - 1,),
+                "indptr": tile_strides["A_indptr"],
             }
-            spmm_node.meta["l2_tiling"] = (
-                math.prod(tiling[:-1]), tiling[-1]
-            )
+
+            spmm_node.meta["l2_tiling"] = tiling
 
     model.graph.lint()
     model.recompile()

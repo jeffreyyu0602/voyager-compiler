@@ -882,9 +882,15 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     if x_tiled == X and c_tiled == C and k_tiled == K:
         return
 
+    indptr_shape = tiled_shapes["A_indptr"]
+    tile_strides = {
+        "A_indptr": (*indptr_shape[:-1], indptr_shape[-1] - 1)
+    }
+
     if C == c_tiled:
         node.meta["tiled_shapes"] = tiled_shapes
         node.meta["l2_tiling"] = tiling
+        node.meta["tile_strides"] = tile_strides
         return
 
     def load_arg(a):
@@ -985,6 +991,7 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
         if n.target == node.target:
             n.meta.update({
                 "tiled_shapes": copy.deepcopy(tiled_shapes),
+                "tile_strides": copy.deepcopy(tile_strides),
                 "l2_tiling": tiling,
                 "dtype": node.meta.get("dtype"),
                 "source_fn_stack": [(n.name, source_fn)],
@@ -1196,9 +1203,9 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         "bias": (k_tiled,),
         "input_scale": batch_dims + (c_scaled,),
         "weight_scale": weight_scale_shape,
-        "A_data": (nnz,) if A_data else None,
-        "A_indices": (nnz,) if A_data else None,
-        "A_indptr": (x_tiled + 1,),
+        "A_data": batch_dims[:-1] + (nnz,) if A_data else None,
+        "A_indices": batch_dims[:-1] + (nnz,) if A_data else None,
+        "A_indptr": batch_dims[:-1] + (x_tiled + 1,),
         "output": batch_dims + (k_tiled,),
     }
 
