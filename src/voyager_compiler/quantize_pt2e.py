@@ -746,8 +746,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             )
             user.args = user.args[:-1] + (quantized_node,)
             user.kwargs = {
-                "B_scale": kwargs.get("weight_scale"),
-                "B_code": kwargs.get("weight_code"),
+                "weight_scale": kwargs.get("weight_scale"),
+                "weight_code": kwargs.get("weight_code"),
                 "block_size": activation_post_process.block_size,
             }
         else:
@@ -785,8 +785,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                         torch.ops.quantized_ops.spmm_csr.default,
                         (csr_data_node, csr_indices_node, csr_indptr_node, weight_node),
                         {
-                            "B_scale": kwargs.get("weight_scale"),
-                            "B_code": kwargs.get("weight_code"),
+                            "weight_scale": kwargs.get("weight_scale"),
+                            "weight_code": kwargs.get("weight_code"),
                             "block_size": activation_post_process.block_size,
                         },
                     )

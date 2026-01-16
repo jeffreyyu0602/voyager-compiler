@@ -821,78 +821,77 @@ def _(
 
 
 quantized_decomposed_lib.define(
-    "spmm_csr(Tensor data, Tensor indices, Tensor indptr, Tensor B, Tensor? B_scale=None, "
-    "Tensor? B_code=None, int? block_size=None, bool weight_transposed=False) -> Tensor"
+    "spmm_csr(Tensor A_data, Tensor A_indices, Tensor A_indptr, Tensor weight, Tensor? weight_scale=None, "
+    "Tensor? weight_code=None, int? block_size=None, bool weight_transposed=False) -> Tensor"
 )
 
 
 @impl(quantized_decomposed_lib, "spmm_csr", "CompositeExplicitAutograd")
 def spmm_csr(
-    data: torch.Tensor,
-    indices: torch.Tensor,
-    indptr: torch.Tensor,
-    B: torch.Tensor,
-    B_scale: Optional[torch.Tensor] = None,
-    B_code: Optional[torch.Tensor] = None,
+    A_data: torch.Tensor,
+    A_indices: torch.Tensor,
+    A_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    weight_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     weight_transposed=False
 ) -> torch.Tensor:
-    if B_code is not None:
-        B = B_code[B.to(torch.long)]
-    if B_scale is not None:
-        B = B * expand(B_scale, B.shape, block_size)
+    if weight_code is not None:
+        weight = weight_code[weight.to(torch.long)]
+    if weight_scale is not None:
+        weight = weight * expand(weight_scale, weight.shape, block_size)
 
     if not weight_transposed:
-        B = B.mT
+        weight = weight.mT
 
-    batch_shape = indptr.shape[:-1]
+    batch_shape = A_indptr.shape[:-1]
     num_batches = int(math.prod(batch_shape))
 
-    indptr = indptr.reshape(-1, indptr.shape[-1])
-    indices = indices.reshape(-1, indices.shape[-1])
-    data = data.reshape(-1, data.shape[-1])
+    A_indptr = A_indptr.reshape(-1, A_indptr.shape[-1])
+    A_indices = A_indices.reshape(-1, A_indices.shape[-1])
+    A_data = A_data.reshape(-1, A_data.shape[-1])
 
-    if B.ndim > 2:
-        B = B.reshape(num_batches, B.shape[-2], B.shape[-1])
+    if weight.ndim > 2:
+        weight = weight.reshape(num_batches, weight.shape[-2], weight.shape[-1])
 
     outputs = []
 
     for i in range(num_batches):
-        B_batch = B[i] if B.ndim == 3 else B
+        weight_batch = weight[i] if weight.ndim == 3 else weight
 
-        input_size = (indptr[i].numel() - 1, B_batch.shape[0])
-        end_index = indptr[i][-1].item()
+        input_size = (A_indptr[i].numel() - 1, weight_batch.shape[0])
+        end_index = A_indptr[i][-1].item()
 
         csr = torch.sparse_csr_tensor(
-            indptr[i],
-            indices[i,:end_index],
-            data[i,:end_index],
+            A_indptr[i],
+            A_indices[i,:end_index],
+            A_data[i,:end_index],
             dtype=torch.float32,
             size=input_size,
         )
 
         # Sparse mm only supports float32 for now
-        output = torch.sparse.mm(csr, B_batch.to(torch.float32)).to(B.dtype)
+        output = torch.sparse.mm(csr, weight_batch.to(torch.float32)).to(weight_batch.dtype)
         outputs.append(output)
 
     output = torch.stack(outputs, dim=0)
-    output = output.reshape(*batch_shape, -1, B.shape[-1])
-
+    output = output.reshape(*batch_shape, -1, weight.shape[-1])
     return output
 
 
 @torch.library.register_fake("quantized_ops::spmm_csr")
 def _(
-    data: torch.Tensor,
-    indices: torch.Tensor,
-    indptr: torch.Tensor,
-    B: torch.Tensor,
-    B_scale: Optional[torch.Tensor] = None,
-    B_code: Optional[torch.Tensor] = None,
+    A_data: torch.Tensor,
+    A_indices: torch.Tensor,
+    A_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: Optional[torch.Tensor] = None,
+    weight_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     weight_transposed=False
 ):
-    batch_shape = indptr.shape[:-1]
-    X = indptr.shape[-1] - 1
-    K = B.shape[-1] if weight_transposed else B.shape[-2]
-    return data.new_empty((*batch_shape, X, K))
+    batch_shape = A_indptr.shape[:-1]
+    X = A_indptr.shape[-1] - 1
+    K = weight.shape[-1] if weight_transposed else weight.shape[-2]
+    return A_data.new_empty((*batch_shape, X, K))
