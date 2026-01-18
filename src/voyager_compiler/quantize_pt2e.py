@@ -24,7 +24,7 @@ from voyager_compiler.quantizer.quantizer import QuantizationSpec, DerivedQuanti
 from voyager_compiler.quantizer.xnnpack_quantizer import XNNPACKQuantizer
 from voyager_compiler.quantizer.xnnpack_quantizer_utils import QuantizationConfig
 
-from .codegen.passes.utils import get_arg_or_kwarg
+from .codegen.passes.utils import get_arg_value
 from .codegen.mapping_utils import (
     is_gemm_op,
     is_indexing_or_concatenation_op,
@@ -891,7 +891,7 @@ def _eliminate_dequantize_with_no_effect(model: GraphModule):
 
         # During integer quantization, the dequantize node also perform a
         # quantization to the output dtype
-        output_qmap = get_arg_or_kwarg(node, 6, "output_qmap")
+        output_qmap = get_arg_value(node, 6, "output_qmap")
         if output_qmap is not None:
             continue
 
@@ -995,7 +995,7 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
             continue
 
         # Only handle per-tensor quantization for now
-        block_size = get_arg_or_kwarg(node, 4, "block_size")
+        block_size = get_arg_value(node, 4, "block_size")
         if block_size is not None and block_size > 1:
             continue
 

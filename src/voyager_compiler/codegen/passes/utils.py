@@ -1,19 +1,27 @@
 import collections.abc
 from itertools import repeat
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 
 __all__ = [
-    "get_arg_or_kwarg",
+    "get_arg_value",
     "get_conv_bn_layers",
 ]
 
 
-def get_arg_or_kwarg(node, idx, key, default=None):
-    if len(node.args) > idx:
-        return node.args[idx]
-    return node.kwargs.get(key, default)
+def get_arg_value(
+    node: torch.fx.Node,
+    arg_number: int,
+    kwarg_name: Optional[str] = None,
+    default=None,
+) -> Any:
+    return (
+        node.args[arg_number]
+        if len(node.args) > arg_number
+        else node.kwargs.get(kwarg_name, default)  # type: ignore[arg-type]
+    )
 
 
 def _ntuple(n, name="parse"):

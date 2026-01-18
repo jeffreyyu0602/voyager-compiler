@@ -9,7 +9,7 @@ from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 
-from .utils import _pair, get_arg_or_kwarg
+from .utils import _pair, get_arg_value
 from ..mapping import replace_node_with_graph_module
 from ..mapping_utils import is_nop
 from ...pt2e_utils import get_aten_graph_module, fetch_attr, propagate_shape
@@ -35,15 +35,16 @@ __all__ = [
 
 def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
     """
-    Transforms occurrences of `torch.cat` and `torch.stack` operations on non-zero dimensions
-    into a `torch.stack` on the 0th dimension, followed by a `permute` operation to restore
-    the original order.
+    Transforms occurrences of `torch.cat` and `torch.stack` operations on
+    non-zero dimensions into a `torch.stack` on the 0th dimension, followed by
+    a `permute` operation to restore the original order.
 
     Args:
         model (GraphModule): The PyTorch FX GraphModule to be modified.
 
     Returns:
-        GraphModule: The transformed GraphModule with `torch.cat` and `torch.stack` operations adjusted.
+        GraphModule: The transformed GraphModule with `torch.cat` and `torch.stack`
+        operations adjusted.
     """
     graph = model.graph
     for node in list(graph.nodes):
@@ -127,14 +128,15 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
 
 def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
     """
-    Convert `torch.cat` operations where input tensors have different shapes by replacing them
-    with a `torch.stack` operation along the concatenated dimensions.
+    Convert `torch.cat` operations where input tensors have different shapes by
+    replacing them with a `torch.stack` operation along the concatenated dimensions.
 
     Args:
         model (GraphModule): The PyTorch FX GraphModule to be modified.
 
     Returns:
-        GraphModule: The transformed GraphModule with `torch.cat` operations adjusted to `torch.stack`.
+        GraphModule: The transformed GraphModule with `torch.cat` operations
+        adjusted to `torch.stack`.
     """
     partitions = get_source_partitions(model.graph, [torch.cat])
     partitions = list(itertools.chain.from_iterable(partitions.values()))
@@ -174,16 +176,16 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
 
 def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
     """
-    Convert `torch.expand` operations into explicit memory copying by replicating input elements.
-    This replaces implicit broadcasting with actual memory duplication, ensuring that expanded
-    dimensions are materialized as stacked tensors.
+    Convert `torch.expand` operations into explicit memory copying by replicating
+    input elements. This replaces implicit broadcasting with actual memory
+    duplication, ensuring that expanded  dimensions are materialized as stacked tensors.
 
     Args:
         model (torch.fx.GraphModule): The PyTorch FX GraphModule to be modified.
 
     Returns:
-        torch.fx.GraphModule: The transformed GraphModule where `torch.expand` operations are
-        replaced with explicit memory copies.
+        torch.fx.GraphModule: The transformed GraphModule where `torch.expand`
+        operations are replaced with explicit memory copies.
     """
     for node in list(model.graph.nodes):
         if node.target != torch.ops.aten.expand.default:
@@ -339,9 +341,11 @@ def replace_target_with_vmap(
     return model
 
 
-def replace_conv2d_with_im2col(model: GraphModule, unroll=16):
+def replace_conv2d_with_im2col(model: GraphModule):
     """
-    Replace Conv2d operations with In2col operations in the given FX graph module.
+    Replace Conv2d operations that has input channel dimension equal to 3 with
+    In2col operations in the given FX graph module. Usually this is the first
+    Conv2D layer in torchvision models.
 
     Args:
         model (GraphModule): The FX graph module to transform.
@@ -349,70 +353,100 @@ def replace_conv2d_with_im2col(model: GraphModule, unroll=16):
     Returns:
         GraphModule: The transformed FX graph module.
     """
-    for node in model.graph.nodes:
+    graph = model.graph
+
+    def get_shape(n):
+        if n.meta and "val" in n.meta:
+            return n.meta["val"].shape
+        return getattr(n, "shape", None)
+
+    for node in list(graph.nodes):
         if node.target != torch.ops.aten.conv2d.default:
             continue
 
         input_node = node.args[0]
         weight_node = node.args[1]
-        bias_node = node.args[2]
+        bias_node = get_arg_value(node, 2, "bias")
+        stride = get_arg_value(node, 3, "stride", 1)
+        padding = get_arg_value(node, 4, "padding", 0)
+        dilation = get_arg_value(node, 5, "dilation", 1)
+        group = get_arg_value(node, 6, "groups", 1)
 
-        stride = _pair(get_arg_or_kwarg(node, 3, "stride"))
-        padding = _pair(get_arg_or_kwarg(node, 4, "padding"))
-        dilation = _pair(get_arg_or_kwarg(node, 5, "dilation"))
+        input_shape = get_shape(input_node)
+        output_shape = get_shape(node)
 
-        if input_node.value.shape[1] >= unroll:
+        if (
+            input_shape is None
+            or input_shape[1] != 3
+            or output_shape is None
+            or group != 1
+        ):
             continue
 
-        C_out, _, kH, kW = weight_node.value.shape
-        N, _, H_out, W_out = node.shape
+        orig_weight = fetch_attr(model, weight_node.target).detach()
+        C_out, _, kH, kW = orig_weight.shape
 
-        param = model.get_parameter(weight_node.target)
-        param.data = param.data.reshape(C_out, -1)
-        propagate_shape(weight_node, model)
-
-        if bias_node is not None:
-            param = model.get_parameter(bias_node.target)
-            param.data = param.data.reshape(C_out, 1)
-            propagate_shape(bias_node, model)
-
-        with model.graph.inserting_before(node):
-            in2col_node = model.graph.call_function(
+        with graph.inserting_before(node):
+            in2col_node = graph.call_function(
                 torch.ops.aten.im2col.default,
-                (input_node, (kH, kW), dilation, padding, stride),
+                (
+                    input_node,
+                    (kH, kW),
+                    _pair(dilation),
+                    _pair(padding),
+                    _pair(stride),
+                ),
             )
-            matmul_node = model.graph.call_function(
+
+            weight_flat_name = f"{weight_node.target}_im2col_flat"
+            flat_weight_node = create_getattr_from_value(
+                model, graph, weight_flat_name, orig_weight.reshape(C_out, -1)
+            )
+
+            propagate_shape(in2col_node)
+            propagate_shape(flat_weight_node, model)
+
+            matmul_node = graph.call_function(
                 torch.ops.aten.matmul.default,
-                (weight_node, in2col_node),
+                (flat_weight_node, in2col_node)
             )
-            add_node = model.graph.call_function(
-                torch.ops.aten.add.Tensor,
-                (matmul_node, bias_node),
-            )
-            reshape_node = model.graph.call_function(
+            propagate_shape(matmul_node)
+            matmul_node.meta["source_fn_stack"] = [
+                (matmul_node.name, torch.matmul)
+            ]
+
+            result_node = matmul_node
+
+            if bias_node is not None:
+                bias_flat_name = f"{bias_node.target}_im2col_flat"
+                orig_bias = fetch_attr(model, bias_node.target).detach()
+                new_bias = create_getattr_from_value(
+                    model, graph, bias_flat_name, orig_bias.reshape(C_out, 1)
+                )
+                propagate_shape(new_bias, model)
+
+                result_node = graph.call_function(
+                    torch.ops.aten.add.Tensor,
+                    (matmul_node, new_bias),
+                )
+                propagate_shape(result_node)
+                result_node.meta["source_fn_stack"] = [
+                    (result_node.name, "add")
+                ]
+
+            reshape_node = graph.call_function(
                 torch.ops.aten.reshape.default,
-                (add_node, (N, C_out, H_out, W_out)),
+                (result_node, (-1,) + output_shape[1:])
             )
+            propagate_shape(reshape_node)
 
-        in2col_node.meta = input_node.meta
-        matmul_node.meta = node.meta
+            node.replace_all_uses_with(reshape_node)
+            graph.erase_node(node)
 
-        propagate_shape(in2col_node)
-        propagate_shape(matmul_node)
-        propagate_shape(add_node)
-        propagate_shape(reshape_node)
-
-        in2col_node.meta["source_fn_stack"] = [(in2col_node.name, in2col_node.target)]
-        matmul_node.meta["source_fn_stack"] = [(matmul_node.name, torch.matmul)]
-        add_node.meta["source_fn_stack"] = [(add_node.name, "add")]
-        reshape_node.meta["source_fn_stack"] = [(reshape_node.name, "reshape")]
-
-        node.replace_all_uses_with(reshape_node)
-        model.graph.erase_node(node)
-
-    model.graph.lint()
+    graph.lint()
     model.recompile()
     return model
+
 
 def extract_input_preprocessor(model: GraphModule):
     """
@@ -647,8 +681,6 @@ def split_dense_spmm_node(model: GraphModule):
         tiling = node.meta.get("l2_tiling")
 
         if tiled_shapes is not None:
-            output_shape = tiled_shapes["output"]
-            flattened_shape = (math.prod(output_shape[:-1]), output_shape[-1])
             spmm_node.meta["tiled_shapes"] = {
                 "data": tiled_shapes["A_data"],
                 "indices": tiled_shapes["A_indices"],
@@ -657,11 +689,9 @@ def split_dense_spmm_node(model: GraphModule):
                 "B_scale": tiled_shapes["weight_scale"],
                 "output": tiled_shapes["output"],
             }
-
             spmm_node.meta["tile_strides"] = {
                 "indptr": tile_strides["A_indptr"],
             }
-
             spmm_node.meta["l2_tiling"] = tiling
 
     model.graph.lint()

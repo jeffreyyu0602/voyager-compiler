@@ -16,7 +16,7 @@ from .decomposed import expand
 from .pt2e_utils import fetch_attr
 from .quantize_pt2e import create_getattr_from_value
 from .codegen.mapping_utils import is_gemm_op, is_nop, is_reshape_op
-from .codegen.passes.utils import get_arg_or_kwarg
+from .codegen.passes.utils import get_arg_value
 
 
 __all__ = [
@@ -623,7 +623,7 @@ def convert_and_export_with_split_cache(
     """
     if not is_torch_greater_or_equal("2.6", accept_dev=True):
         raise ImportError("torch >= 2.6 is required.")
-    
+
     max_cache_len = max_len + max_new_tokens
 
     config_dict = model.generation_config.to_dict()
@@ -892,8 +892,8 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         if node.target == torch.ops.quantized_ops.quantize_mx.default:
             block_size = node.args[3]
         else:
-            block_size = get_arg_or_kwarg(node, 4, "block_size", 1)
-        dq_block_size = get_arg_or_kwarg(dq_node, 4, "block_size", 1)
+            block_size = get_arg_value(node, 4, "block_size", 1)
+        dq_block_size = get_arg_value(dq_node, 4, "block_size", 1)
         if block_size != dq_block_size:
             continue
 
@@ -907,7 +907,7 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         else:
             q_scale = fetch_attr(model, scale_node.target)
 
-        dq_axes = get_arg_or_kwarg(dq_node, 3, "axes")
+        dq_axes = get_arg_value(dq_node, 3, "axes")
         dq_scale = fetch_attr(model, dq_node.args[1].target)
         dq_scale, new_dq_axes = run_qparam_through_nodes(
             model, dq_scale, nodes_on_path[1:-1], dq_axes, block_size
@@ -923,7 +923,7 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         rank = output.ndim
         dq_axes = tuple((a + rank) % rank for a in new_dq_axes)
 
-        q_axes = get_arg_or_kwarg(node, 3, "axes")
+        q_axes = get_arg_value(node, 3, "axes")
         q_axes = tuple((a + rank) % rank for a in q_axes)
         new_axes = tuple(set(q_axes) & set(dq_axes))
 

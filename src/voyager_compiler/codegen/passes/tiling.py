@@ -11,7 +11,7 @@ from torch.fx import Node
 from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
 
-from .utils import get_arg_or_kwarg, _pair
+from .utils import get_arg_value, _pair
 from ..mapping import (
     get_node_bytes,
     get_node_to_key_map,
@@ -360,10 +360,10 @@ def _make_conv2d_tiled_module(
 
 
 def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
-    stride = get_arg_or_kwarg(node, 3, "stride", 1)
-    padding = get_arg_or_kwarg(node, 4, "padding", 0)
-    dilation = get_arg_or_kwarg(node, 5, "dilation", 1)
-    groups = get_arg_or_kwarg(node, 6, "groups", 1)
+    stride = get_arg_value(node, 3, "stride", 1)
+    padding = get_arg_value(node, 4, "padding", 0)
+    dilation = get_arg_value(node, 5, "dilation", 1)
+    groups = get_arg_value(node, 6, "groups", 1)
     bs = node.kwargs.get("block_size", 1)
 
     N, K, Y, X = node.shape
@@ -456,9 +456,9 @@ def split_conv2d_node(model, node, tile_sizes):
         node: node (must be aten.conv2d or quantized conv2d)
         tile_sizes: (Y, X, C, K)
     """
-    stride  = _pair(get_arg_or_kwarg(node, 3, "stride", 1))
-    padding = _pair(get_arg_or_kwarg(node, 4, "padding", 0))
-    dilation = _pair(get_arg_or_kwarg(node, 5, "dilation", 1))
+    stride  = _pair(get_arg_value(node, 3, "stride", 1))
+    padding = _pair(get_arg_value(node, 4, "padding", 0))
+    dilation = _pair(get_arg_value(node, 5, "dilation", 1))
     bs = node.kwargs.get("block_size", 1)
 
     is_conv1 = node.args[0].shape[1] == 3
@@ -902,9 +902,9 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
 
         args = (
             quantize_mx_node.args[0],
-            get_arg_or_kwarg(quantize_mx_node, 1, "qmap"),
-            get_arg_or_kwarg(quantize_mx_node, 6, "scale_qmap"),
-            get_arg_or_kwarg(quantize_mx_node, 7, "output_code"),
+            get_arg_value(quantize_mx_node, 1, "qmap"),
+            get_arg_value(quantize_mx_node, 6, "scale_qmap"),
+            get_arg_value(quantize_mx_node, 7, "output_code"),
             node.args[1],
             node.args[2] if len(node.args) > 2 else None,
             node.kwargs.get("weight_scale"),
@@ -1140,9 +1140,9 @@ def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
     y_tile, x_tile, c_tile, k_tile = tile_sizes
     c_scaled = c_tile // bs
 
-    stride = _pair(get_arg_or_kwarg(node, 3, "stride", 1))
-    padding = _pair(get_arg_or_kwarg(node, 4, "padding", 0))
-    dilation = _pair(get_arg_or_kwarg(node, 5, "dilation", 1))
+    stride = _pair(get_arg_value(node, 3, "stride", 1))
+    padding = _pair(get_arg_value(node, 4, "padding", 0))
+    dilation = _pair(get_arg_value(node, 5, "dilation", 1))
 
     weight_shape = node.args[1].shape
     kH, kW, _, _ = _conv2d_layout(weight_shape, True, not transposed)

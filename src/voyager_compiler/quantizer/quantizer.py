@@ -136,7 +136,9 @@ class QuantizationSpec(QuantizationSpecBase):
             qmin, qmax = get_quant_min_max(params['dtype'])
             params.setdefault('quant_min', float(qmin))
             params.setdefault('quant_max', float(qmax))
-            if qscheme in [QScheme.PER_TENSOR_SYMMETRIC, QScheme.PER_CHANNEL_SYMMETRIC]:
+            if qscheme in [
+                QScheme.PER_TENSOR_SYMMETRIC, QScheme.PER_CHANNEL_SYMMETRIC
+            ]:
                 params.setdefault('amax_history_len', 16)
 
         return QuantizationSpec(**params)
@@ -145,14 +147,18 @@ class QuantizationSpec(QuantizationSpecBase):
         if self.qscheme is not None and self.quant_max is None:
             raise ValueError("quant_max is required for quantization.")
 
-        if self.qscheme in [QScheme.MICROSCALING, QScheme.GROUP_WISE_AFFINE] and self.block_size is None:
+        if (
+            self.qscheme in [QScheme.MICROSCALING, QScheme.GROUP_WISE_AFFINE]
+            and self.block_size is None
+        ):
             raise ValueError("block_size is required for microscaling.")
 
 EdgeOrNode = Union[Tuple[Node, Node], Node]
 
 @dataclass(eq=True)
 class DerivedQuantizationSpec(QuantizationSpecBase):
-    """ quantization spec for the Tensors whose quantization parameters are derived from other Tensors
+    """ quantization spec for the Tensors whose quantization parameters are
+    derived from other Tensors
     """
     derived_from: List[EdgeOrNode]
     derive_qparams_fn: Callable[[List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]]

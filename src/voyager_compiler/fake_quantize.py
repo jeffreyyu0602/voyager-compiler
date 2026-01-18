@@ -334,7 +334,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.is_per_channel = self.qscheme == qt.per_channel_symmetric
 
         if outlier_pct is not None:
-            self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.99)
+            self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
             self.register_buffer(
                 "outlier_threshold_history", torch.tensor(0.0, **factory_kwargs)
             )

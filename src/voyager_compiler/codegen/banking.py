@@ -371,13 +371,19 @@ def _(target) -> List[BankingStrategy]:
             BankPartition(("matmul_mx::other", "matmul_mx::weight_scale")),
         )),
         BankingStrategy((
+            BankPartition(("matmul_mx::other", "matmul_mx::weight_scale")),
+            BankPartition(("matmul_mx::A_data", "matmul_mx::A_indices", "matmul_mx::A_indptr")),
+        )),
+        BankingStrategy((
             BankPartition(("matmul_mx::input", "matmul_mx::input_scale")),
             BankPartition(("matmul_mx::other", "matmul_mx::weight_scale")),
+            BankPartition(("matmul_mx::A_data", "matmul_mx::A_indices", "matmul_mx::A_indptr")),
         )),
         BankingStrategy((
             BankPartition((
                 "matmul_mx::input", "matmul_mx::input_scale", "matmul_mx::other",
-                "matmul_mx::weight_scale",
+                "matmul_mx::weight_scale", "matmul_mx::A_data", "matmul_mx::A_indices",
+                "matmul_mx::A_indptr",
             )),
         )),
         BankingStrategy(

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
-from .utils import get_arg_or_kwarg
+from .utils import get_arg_value
 from ..mapping_utils import (
     is_conv2d,
     is_depthwise_conv,
@@ -103,7 +103,7 @@ def slice_output(model, output_node, slice_args):
             torch.ops.quantized_ops.dequantize.default,
             torch.ops.quantized_ops.quantize.default,
         ]:
-            bs = get_arg_or_kwarg(user, 4, "block_size")
+            bs = get_arg_value(user, 4, "block_size")
             if bs is None:
                 slice_output(model, user, slice_args)
                 continue

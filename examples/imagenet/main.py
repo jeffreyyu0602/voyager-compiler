@@ -21,6 +21,7 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+import torchao
 from tqdm import tqdm
 from voyager_compiler import (
     add_qspec_args,
@@ -86,10 +87,14 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
-parser.add_argument('--num_eval_samples', default=None,
+parser.add_argument('--num_observer_update_epochs', default=4, type=int,
+                    help='Optionally disable observer stats after certain number of epochs')
+parser.add_argument('--num_batch_norm_update_epochs', default=3, type=int,
+                    help='Optionally disable batchnorm stats after certain number of epochs')
+parser.add_argument('--num_train_samples', default=None, type=int,
+                    help="Number of samples to train on")
+parser.add_argument('--num_eval_samples', default=None, type=int,
                     help="Number of samples to evaluate on.")
-parser.add_argument('--num_train_samples_per_epoch', default=50000, type=int,
-                    help="Number of samples to train on per epoch")
 parser.add_argument('--max_pool2x2', action="store_true",
                     help="Whether to replace 3x3 maxpool with 2x2.")
 parser.add_argument('--bn_folding', action="store_true",
@@ -99,6 +104,8 @@ parser.add_argument('--save_val_dataset', action="store_true",
                     help="Whether to save the validation dataset.")
 parser.add_argument('--output_dir', default=None,
                     help="Directory to save model checkpoints.")
+parser.add_argument('--eager_mode_qat', action="store_true",
+                    help="Use eager mode quantization for QAT.")
 add_qspec_args(parser)
 
 best_acc1 = 0
@@ -245,21 +252,21 @@ def main_worker(gpu, ngpus_per_node, args):
             for images, target in tqdm(calib_loader):
                 model(images.to(device, dtype=torch_dtype))
 
-    example_inputs = next(iter(calib_loader))[0].to(device, dtype=torch_dtype)
+    example_inputs = (next(iter(calib_loader))[0].to(device, dtype=torch_dtype),)
 
     from utils import get_conv_bn_layers
     conv_bn_pairs = get_conv_bn_layers(model)
 
     # Use eager mode quantization for QAT or when evaluating a QAT model.
     # Use PT2E for post-training quantization
-    if not args.evaluate or args.qat_model_id is not None:
+    if args.eager_mode_qat:
         if args.bn_folding and len(conv_bn_pairs) > 0:
             model = torch.ao.quantization.fuse_modules_qat(model, conv_bn_pairs)
 
         quantize(model, args)
 
         with torch.no_grad():
-            model(example_inputs)
+            model(*example_inputs)
 
         # Perform PTQ before QAT and fix the scales
         if args.calibration_steps > 0:
@@ -292,10 +299,9 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.convert_model:
             convert_model(model)
     else:
-        if args.bn_folding and len(conv_bn_pairs) > 0:
-            model = torch.ao.quantization.fuse_modules(model.eval(), conv_bn_pairs)
-
-        # embeddings = model.vit.embeddings
+        # We will turn conv1 into im2col + matmul
+        model = torch.ao.quantization.fuse_modules(model.eval(), [['conv1', 'bn1']])
+        model.train()
 
         if args.bf16:
             model.bfloat16()
@@ -308,10 +314,53 @@ def main_worker(gpu, ngpus_per_node, args):
             force_scale_power_of_two=args.force_scale_power_of_two,
         )
 
-        bs = torch.export.Dim("bs", min=1, max=args.batch_size)
-        arg_name = "x" if args.arch in model_names else "pixel_values"
-        dynamic_shapes = {arg_name: {0: bs}}
-        model = prepare_pt2e(model, quantizer, (example_inputs,), dynamic_shapes=dynamic_shapes)
+        quantizer.set_module_name("fc", None)
+
+        # if args.activation is not None and "microscaling" in args.activation:
+        #     import re
+        #     from voyager_compiler import (
+        #         QuantizationConfig,
+        #         QuantizationSpec,
+        #         DerivedQuantizationSpec,
+        #         derive_bias_qparams_fn,
+        #     )
+
+        #     dtype = args.activation.split(",")[0]
+        #     if (match := re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype)):
+        #         bits = int(match.group(1))
+        #         dtype = f"int{bits}"
+        #     qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
+
+        #     bias_qspec = DerivedQuantizationSpec(
+        #         derived_from=None,
+        #         derive_qparams_fn=derive_bias_qparams_fn,
+        #         dtype=None,
+        #     )
+
+        #     qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
+        #     quantizer.set_module_name("^conv1$", qconfig)
+
+        dynamic_shapes = tuple(
+            {0:  torch.export.Dim("bs", min=1, max=args.batch_size)} if i == 0 else None
+            for i in range(len(example_inputs))
+        )
+        exported_model = torch.export.export(model, example_inputs, dynamic_shapes=dynamic_shapes).module()
+
+        from voyager_compiler import replace_conv2d_with_im2col
+
+        replace_conv2d_with_im2col(exported_model)
+
+        from torchao.quantization.pt2e.quantize_pt2e import prepare_qat_pt2e
+        from torchao.quantization.pt2e.qat_utils import _fold_conv_bn_qat, _fuse_conv_bn_qat
+
+        if args.bn_folding and args.evaluate:
+            _fold_conv_bn_qat(exported_model)
+        else:
+            _fuse_conv_bn_qat(exported_model)
+
+        model = prepare_pt2e(exported_model, quantizer)
+
+        model.graph.print_tabular()
 
         import types
 
@@ -319,6 +368,7 @@ def main_worker(gpu, ngpus_per_node, args):
             pass
 
         model.eval = types.MethodType(_eval, model)
+        model.train = types.MethodType(_eval, model)
 
         if args.calibration_steps > 0:
             calibrate(model)
@@ -329,50 +379,16 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.convert_model:
             convert_pt2e(model, args.bias)
 
-        # from voyager_compiler.codegen.mapping import duplicate_shared_nodes
-
-        # sym_size_int_node = next(
-        #     (n for n in model.graph.nodes if n.target == torch.ops.aten.sym_size.int), None
-        # )
-        # print(f"sym_size_int_node: {sym_size_int_node}")
-
-        # for user in list(sym_size_int_node.users.keys()):
-        #     duplicate_shared_nodes(model.graph, [sym_size_int_node, user])
-
-        # from voyager_compiler.codegen.utils import pad_vit_embeddings_output
-
-        # pad_vit_embeddings_output(model, embeddings, (example_inputs,), dynamic_shapes=dynamic_shapes)
-        # model.graph.print_tabular()
-
-        # if args.compile:
-        #     import copy
-        #     from voyager_compiler import transform
-
-        #     # We perform transformation specifically for compilation
-        #     model_to_compile = copy.deepcopy(model)
-
-        #     # FIXME this is not a proper use of replace_all_uses_with
-        #     for n in list(model_to_compile.graph.nodes):
-        #         if n.target == torch.ops.aten.sym_size.int:
-        #             n.replace_all_uses_with(1)
-
-        #     transform(
-        #         model_to_compile,
-        #         example_args=(example_inputs[:1],),
-        #         output_file=args.arch,
-        #         output_dir=args.output_dir,
-        #     )
-
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    
+
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-    
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -426,31 +442,34 @@ def main_worker(gpu, ngpus_per_node, args):
                 normalize,
             ]))
 
-    # Randomly select a subset of samples for evaluation and optionally save data
-    if args.num_eval_samples is not None:
-        args.num_eval_samples = int(args.num_eval_samples)
+    # Select a subset of samples for training/evaluation
+    if args.num_train_samples is not None and args.num_train_samples < len(train_dataset):
+        indices = random.sample(range(len(train_dataset)), args.num_train_samples)
+        train_dataset = Subset(train_dataset, indices=indices)
+
     if args.num_eval_samples is not None and args.num_eval_samples < len(val_dataset):
         indices = random.sample(range(len(val_dataset)), args.num_eval_samples)
         val_dataset = Subset(val_dataset, indices=indices)
 
-        if args.save_val_dataset:
-            dest_dirs = {}
-            labels = []
-            for idx in indices:
-                sample_path, label = val_dataset.dataset.samples[idx]
-                labels.append(label)
-                dir_path = os.path.dirname(sample_path)
-                dir_name = os.path.basename(dir_path)
-                dest_dirs[idx] = os.path.join(args.output_dir, dir_name)
-                os.makedirs(dest_dirs[idx], exist_ok=True)
+    # Optionally save the validation dataset
+    if args.save_val_dataset:
+        dest_dirs = {}
+        labels = []
+        for idx in indices:
+            sample_path, label = val_dataset.dataset.samples[idx]
+            labels.append(label)
+            dir_path = os.path.dirname(sample_path)
+            dir_name = os.path.basename(dir_path)
+            dest_dirs[idx] = os.path.join(args.output_dir, dir_name)
+            os.makedirs(dest_dirs[idx], exist_ok=True)
 
-            for idx in indices:
-                sample_path, _ = val_dataset.dataset.samples[idx]
-                shutil.copy(sample_path, dest_dirs[idx])
+        for idx in indices:
+            sample_path, _ = val_dataset.dataset.samples[idx]
+            shutil.copy(sample_path, dest_dirs[idx])
 
-            with open('labels.txt', 'w') as file:
-                for label in labels:
-                    file.write(f"{label},\n")
+        with open('labels.txt', 'w') as file:
+            for label in labels:
+                file.write(f"{label},\n")
 
     if args.distributed:
         train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
@@ -475,21 +494,32 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        # Pick a random subset of the training data
-        indices = random.sample(range(len(train_dataset)), args.num_train_samples_per_epoch)
-        subset = Subset(train_dataset, indices=indices)
-        train_loader = torch.utils.data.DataLoader(
-            subset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-            num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, device, args)
+
+        if epoch >= args.num_observer_update_epochs and not args.eager_mode_qat:
+            print("Disabling observer for subseq epochs, epoch = ", epoch)
+            model.apply(torchao.quantization.pt2e.disable_observer)
+        if epoch >= args.num_batch_norm_update_epochs and not args.eager_mode_qat:
+            print("Freezing BN for subseq epochs, epoch = ", epoch)
+            for n in model.graph.nodes:
+                # Args: input, weight, bias, running_mean, running_var, training, momentum, eps
+                # We set the `training` flag to False here to freeze BN stats
+                if n.target in [
+                    torch.ops.aten.batch_norm.default,
+                    torch.ops.aten._native_batch_norm_legit.default,
+                    torch.ops.aten.cudnn_batch_norm.default,
+                ]:
+                    new_args = list(n.args)
+                    new_args[5] = False
+                    n.args = new_args
+            model.recompile()
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
 
         scheduler.step()
-        
+
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
@@ -569,7 +599,7 @@ def validate(val_loader, model, criterion, args):
                     target = target.to('mps')
                 if torch.cuda.is_available():
                     target = target.cuda(args.gpu, non_blocking=True)
-                
+
                 if args.bf16:
                     images = images.bfloat16()
 
@@ -675,7 +705,7 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
-    
+
     def summary(self):
         fmtstr = ''
         if self.summary_type is Summary.NONE:
@@ -688,7 +718,7 @@ class AverageMeter(object):
             fmtstr = '{name} {count:.3f}'
         else:
             raise ValueError('invalid summary type %r' % self.summary_type)
-        
+
         return fmtstr.format(**self.__dict__)
 
 
@@ -702,7 +732,7 @@ class ProgressMeter(object):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
-        
+
     def display_summary(self):
         entries = [" *"]
         entries += [meter.summary() for meter in self.meters]

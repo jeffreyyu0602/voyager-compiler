@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import torch
 from torch.fx import GraphModule, Node
 
-from .utils import get_arg_or_kwarg, _pair
+from .utils import get_arg_value, _pair
 from ..banking import require_allocation
 from ..mapping import duplicate_shared_nodes
 from ..mapping_utils import (
@@ -238,7 +238,7 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
         node.args = args[:1] + (pad,) + args[2:]
 
     if is_indexing_or_concatenation_op(node):
-        dim = get_arg_or_kwarg(node, 1, "dim", 0)
+        dim = get_arg_value(node, 1, "dim", 0)
         if dim < 0:
             dim = dim + len(input_dims)
         node.args = args[:1] + (input_dims.index(dim),) + args[2:]
@@ -509,7 +509,7 @@ def _fix_axes_after_transpose(node: Node) -> List[int]:
     if (index := AXES_ARG_INDEX_MAP.get(node.target)) is None:
         return
 
-    axes = get_arg_or_kwarg(node, index, "axes")
+    axes = get_arg_value(node, index, "axes")
     rank = _rank(node)
 
     # Build forward and inverse permutation for transpose(-2, -1)
@@ -535,7 +535,7 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
         if node.target != torch.ops.quantized_ops.calculate_mx_qparam.default:
             continue
 
-        axes = get_arg_or_kwarg(node, 1, "axes")
+        axes = get_arg_value(node, 1, "axes")
         rank = _rank(node)
         if axes != (rank - 1,) and axes != (-1,):
             continue
@@ -550,7 +550,7 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
         assert quantize_node.args[0] == node.args[0], "Unexpected quantize input"
 
         qmap = quantize_node.args[5]
-        output_code = get_arg_or_kwarg(quantize_node, 6, "output_code")
+        output_code = get_arg_value(quantize_node, 6, "output_code")
         new_code = None
 
         with graph.inserting_before(node):
