@@ -12,7 +12,7 @@ from voyager_compiler import (
     quantize,
     plot_histogram,
     plot_layer_range,
-    setup_logging,
+    with_execution_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ def parse_args():
     return parser.parse_args()
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{args.gpu}" if args.gpu is not None else "cuda")

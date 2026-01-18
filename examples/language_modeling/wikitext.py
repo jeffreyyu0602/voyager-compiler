@@ -17,7 +17,7 @@ from voyager_compiler import (
     convert_pt2e,
     plot_histogram,
     plot_layer_range,
-    setup_logging,
+    with_execution_context,
     print_node_scope_tabular,
     get_aten_graph_module,
     get_device_map,
@@ -67,7 +67,7 @@ def parse_args():
     return parser.parse_args()
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     device = torch.device(f"cuda:{args.gpu}") if args.gpu is not None else None
     torch_dtype = (

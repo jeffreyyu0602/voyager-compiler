@@ -24,7 +24,7 @@ from voyager_compiler import (
     get_default_quantizer,
     prepare_pt2e,
     quantize,
-    setup_logging,
+    with_execution_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -256,7 +256,7 @@ def parse_args():
     return parser.parse_args()
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     if args.seed is not None:
         set_seed(args.seed)

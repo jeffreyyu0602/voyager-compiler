@@ -64,7 +64,7 @@ from voyager_compiler import (
     get_default_quantizer,
     prepare_pt2e,
     quantize,
-    setup_logging,
+    with_execution_context,
 )
 
 
@@ -350,7 +350,7 @@ def parse_args():
     return args
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     # args = parse_args()
 

@@ -7,7 +7,7 @@ from datasets import load_dataset
 from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
 from torchaudio.sox_effects import apply_effects_file
 
-from voyager_compiler import add_qspec_args, setup_logging
+from voyager_compiler import add_qspec_args, with_execution_context
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def sample_noise(example):
 #     return example
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     dataset = load_dataset("superb", "ks", split="test")
     dataset = dataset.map(map_to_array)

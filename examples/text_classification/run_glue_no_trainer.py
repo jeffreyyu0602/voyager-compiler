@@ -50,7 +50,7 @@ from transformers.utils.versions import require_version
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
-from voyager_compiler import add_qspec_args, quantize, setup_logging
+from voyager_compiler import add_qspec_args, quantize, with_execution_context
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -224,7 +224,7 @@ def parse_args():
     return args
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     # args = parse_args()
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The

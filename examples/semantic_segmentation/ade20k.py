@@ -19,7 +19,7 @@ from voyager_compiler import (
     convert_pt2e,
     get_default_quantizer,
     prepare_pt2e,
-    setup_logging,
+    with_execution_context,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ def parse_args():
     return parser.parse_args()
 
 
-@setup_logging
+@with_execution_context
 def main(args):
     dataset = load_dataset("scene_parse_150", split="validation")
 
