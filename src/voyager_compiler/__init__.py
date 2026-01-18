@@ -56,9 +56,9 @@ __all__ = [
     "quantize_to_nf",
     "quantize_to_posit",
     "replace_softmax",
-    "setup_logging",
     "sink_obs_or_fq",
     "swap_llama_attention",
+    "with_execution_context",
 ]
 
 class qscheme: ...
