@@ -26,7 +26,7 @@ from .mapping_utils import (
     is_fully_connected,
     is_gemm_op,
     is_indexing_or_concatenation_op,
-    is_matmul,
+    is_prunable_op,
     is_nop,
     is_reshape_op,
     map_node,
@@ -35,6 +35,7 @@ from .mapping_utils import (
 )
 from .memory import MemoryAllocator, Segment
 from .param_pb2 import Model, Operation, Tensor
+from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
 from ..pt2e_utils import dtype_byte_size, fetch_attr, propagate_shape
 from ..quantize_pt2e import create_getattr_from_value, export_model
@@ -320,10 +321,21 @@ def split_multi_head_attention(model: GraphModule):
         qk_matmuls = qk_output.args[0].args[0]
         av_matmuls = av_output.args[0].args[0]
 
+        def select_tensor(n, target_dim):
+            dim = len(n.shape)
+            for _ in range(dim - target_dim):
+                n = graph.call_function(torch.ops.aten.select.int, (n, 0, 0))
+                propagate_shape(n)
+            return n
+
         for qk_matmul, av_matmul in zip(qk_matmuls, av_matmuls):
             value_remap = {qk_output: qk_matmul}
             for node in nodes_between:
                 with graph.inserting_before(av_matmul):
+                    for n in node.all_input_nodes:
+                        if n not in value_remap and len(n.shape) > 2:
+                            value_remap[n] = select_tensor(n, 2)
+
                     value_remap[node] = graph.node_copy(
                         node, lambda n: value_remap.get(n, n)
                     )
@@ -518,23 +530,18 @@ def _create_and_insert_subgraph(
     return new_node
 
 
-def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]):
-    prev_node = nodes[0]
-    for n in nodes[1:]:
+def _nodes_sequential(nodes: List[Node]):
+    prev_node = None
+    for n in nodes:
         # Check if the current node is a user of the previous node
-        if n not in prev_node.users:
+        if prev_node is not None and n not in prev_node.users:
             return False
-        # Check if all the arguments of the current node are visited before the
-        # previous node
-        for arg in n.all_input_nodes:
-            if id(arg) == id(prev_node):
-                continue
-
-            while is_nop(arg):
-                arg = arg.all_input_nodes[0]
-
-            if arg.op == "call_function" and order[arg] > order[prev_node]:
-                return False
+        # We only fuse dequantize after GEMM here
+        if (
+            n.target == torch.ops.quantized_ops.dequantize.default
+            and not is_gemm_op(n.args[0])
+        ):
+            return False
         prev_node = n
     return True
 
@@ -587,7 +594,7 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate, order):
+                if _nodes_sequential(candidate):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True
@@ -940,6 +947,12 @@ def _fuse_dequantize_recursive(
 def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     node_to_move = nodes[0]
 
+    for n in nodes[1:]:
+        if is_prunable_op(n):
+            n.replace_all_uses_with(n.args[0])
+            graph.erase_node(n)
+            nodes.remove(n)
+
     # Pick select nodes in the chain
     select_nodes = [n for n in nodes if n.target == torch.ops.aten.select.int]
     chain = [node_to_move] + select_nodes
@@ -952,15 +965,19 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
 
     user_node = next(iter(select_nodes[-1].users))
 
-    def map_arg(arg):
+    def insert_select_ops(arg):
         if arg == node_to_move.args[0]:
             return select_nodes[-1]
 
         if "qmap" in arg.name or "code" in arg.name:
             return arg
 
-        # TODO some dims are broadcasted, thus don't need to apply all selects
+        # Some dims are broadcasted, thus don't need to apply all selects
         for sel_node in select_nodes:
+            arg_ndim = arg.value.ndim
+            ndim = select_nodes[0].args[0].value.ndim
+            if sel_node.args[1] < ndim - arg_ndim:
+                continue
             with graph.inserting_before(user_node):
                 arg = graph.call_function(
                     torch.ops.aten.select.int, (arg,) + sel_node.args[1:],
@@ -970,11 +987,13 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
         return arg
 
     with graph.inserting_before(user_node):
-        new_node = graph.node_copy(node_to_move, map_arg)
+        new_node = graph.node_copy(node_to_move, insert_select_ops)
 
     # Update dequantize axes arguments
-    axes = tuple(a - len(select_nodes) if a >= 0 else a for a in new_node.args[3])
-    new_node.args = new_node.args[:3] + (axes,) + new_node.args[4:]
+    axes = get_arg_value(new_node, 3, "axes")
+    if axes is not None:
+        axes = tuple(a - len(select_nodes) if a >= 0 else a for a in axes)
+        new_node.args = new_node.args[:3] + (axes,) + new_node.args[4:]
 
     user_node.replace_input_with(select_nodes[-1], new_node)
     select_nodes[0].replace_input_with(node_to_move, node_to_move.args[0])

@@ -491,10 +491,6 @@ def is_prunable_op(node: Node) -> bool:
             return end > node.args[0].shape[dim]
         return end == 0x7fffffffffffffff
 
-    # A select operation that selects the entire tensor
-    if node.target == torch.ops.aten.select.int:
-        return node.args[0].shape[node.args[1]] == 1
-
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])
 
