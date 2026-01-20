@@ -954,7 +954,7 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
         # Some dims are broadcasted, thus don't need to apply all selects
         for sel_node in select_nodes:
             arg_ndim = arg.value.ndim
-            ndim = select_nodes[0].args[0].value.ndim
+            ndim = sel_node.args[0].value.ndim
             if sel_node.args[1] < ndim - arg_ndim:
                 continue
             with graph.inserting_before(user_node):
