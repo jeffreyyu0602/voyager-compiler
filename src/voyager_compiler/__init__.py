@@ -225,6 +225,7 @@ def transform(
         )
 
     rename_nodes_with_param_names(model)
+    deduplicate_nodes(model)
 
     return model
 

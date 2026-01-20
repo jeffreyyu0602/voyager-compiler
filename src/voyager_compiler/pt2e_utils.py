@@ -187,29 +187,29 @@ def dispatch_model(model, device_map=None, max_memory=None):
         buffer.data = buffer.data.to(device_map[name])
 
 
-def deduplicate_nodes(graph: torch.fx.Graph):
+def deduplicate_nodes(model: torch.fx.GraphModule):
     """
-    Deduplicate identical nodes in a torch.fx.Graph.
-    Nodes are considered identical if:
-      - They have the same op type
-      - They have the same target
-      - They have the same args and kwargs
+    Deduplicate identical nodes in a torch.fx.Graph. Nodes are considered
+    identical if hey have the same op type, target, args and kwargs
     """
     seen = {}
     mapping = {}
+    graph = model.graph
 
     for node in list(graph.nodes):
         if node.op in ("placeholder", "output"):
             continue
 
-        key = (node.op, node.target, tuple(node.args), frozenset(node.kwargs.items()))
+        key = (
+            node.op,
+            node.target,
+            tuple(node.args),
+            frozenset(node.kwargs.items())
+        )
 
         if key in seen:
-            # Redirect all users of the duplicate to the original
             orig = seen[key]
-            for user in list(node.users):
-                user.replace_input_with(node, orig)
-            # Remove duplicate from graph
+            node.replace_all_uses_with(orig)
             graph.erase_node(node)
             mapping[node] = orig
         else:
@@ -218,8 +218,38 @@ def deduplicate_nodes(graph: torch.fx.Graph):
     for old, new in mapping.items():
         logger.info(f"Deduplicated {old} to {new}")
 
+    named_modules = dict(model.named_modules())
+
+    nodes_to_update = set(mapping.values())
+    for node in nodes_to_update:
+        update_submod_user_meta(model, node, named_modules)
+
     graph.lint()
+    model.recompile()
     return mapping
+
+
+def update_submod_user_meta(model, node, named_modules=None):
+    """
+    Update the metadata of all user nodes that consume the given node.
+    """
+    if named_modules is None:
+        named_modules = dict(model.named_modules())
+
+    for user in list(node.users):
+        if user.op != "call_module":
+            continue
+
+        index = user.all_input_nodes.index(node)
+
+        submod = named_modules[user.target]
+        placeholders = [n for n in submod.graph.nodes if n.op == 'placeholder']
+
+        assert index < len(placeholders)
+
+        placeholder = placeholders[index]
+        placeholder.name = node.name
+        placeholder.meta['source_node'] = node
 
 
 def sink_obs_or_fq(model: GraphModule) -> GraphModule:
@@ -267,7 +297,7 @@ def insert_align_device_nodes(model, example_args):
     env : Dict[str, Node] = {}
     modules = dict(model.named_modules())
 
-    deduplicate_nodes(model.graph)
+    deduplicate_nodes(model)
 
     node_to_last_use : Dict[Node, Node] = {}
     user_to_last_uses : Dict[Node, List[Node]] = {}

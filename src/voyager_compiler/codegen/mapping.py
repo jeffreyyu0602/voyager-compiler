@@ -37,7 +37,12 @@ from .memory import MemoryAllocator, Segment
 from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
-from ..pt2e_utils import dtype_byte_size, fetch_attr, propagate_shape
+from ..pt2e_utils import (
+    dtype_byte_size,
+    fetch_attr,
+    propagate_shape,
+    update_submod_user_meta,
+)
 from ..quantize_pt2e import create_getattr_from_value, export_model
 
 logger = logging.getLogger(__name__)
@@ -463,32 +468,6 @@ def get_submodule_name(module, nodes: List[Node]):
 
     get_new_node_name = get_new_node_name_with_prefix(prefix)
     return get_new_node_name(module)
-
-
-def update_submod_user_meta(model, node, named_modules=None):
-    """
-    Update the metadata of all user nodes that consume the given node.
-    """
-    if named_modules is None:
-        named_modules = dict(model.named_modules())
-
-    for user in list(node.users):
-        if user.op != "call_module":
-            continue
-
-        try:
-            index = user.all_input_nodes.index(node)
-        except ValueError:
-            continue
-
-        submod = named_modules[user.target]
-        placeholders = [n for n in submod.graph.nodes if n.op == 'placeholder']
-        if index >= len(placeholders):
-            continue
-
-        placeholder = placeholders[index]
-        placeholder.name = node.name
-        placeholder.meta['source_node'] = node
 
 
 def rename_nodes_with_param_names(model: GraphModule):
