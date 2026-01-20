@@ -895,7 +895,7 @@ def transpose_linear_weights(
                 model, node, transpose_weight, transpose_fc, transposed_nodes
             )
 
-    deduplicate_nodes(model.graph)
+    deduplicate_nodes(model)
     _fuse_quantize_mx_last_axis(model)
 
     model.graph.lint()
