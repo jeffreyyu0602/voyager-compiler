@@ -17,9 +17,10 @@ from transformers import (
 from tqdm import tqdm
 
 from voyager_compiler import (
-    TorchExportableModuleWithStaticCache,
+    OpMatcher,
     QuantizationConfig,
     QuantizationSpec,
+    TorchExportableModuleWithStaticCache,
     add_qspec_args,
     compile,
     convert_and_export_with_split_cache,
@@ -44,41 +45,39 @@ from voyager_compiler.llm_utils import fuse_dequantize_quantize
 from utils.models import bert, mobilebert, torchvision_models, vit
 from utils.dataset import glue, imagenet
 
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-target_path = os.path.join(script_dir, '../examples/language_modeling')
-sys.path.append(os.path.abspath(target_path))
-
-from quantization_configs import set_qconfig
-
 logger = logging.getLogger()
 
 
-task_to_keys = {
-    "cola": ("sentence", None),
-    "mnli": ("premise", "hypothesis"),
-    "mrpc": ("sentence1", "sentence2"),
-    "qnli": ("question", "sentence"),
-    "qqp": ("question1", "question2"),
-    "rte": ("sentence1", "sentence2"),
-    "sst2": ("sentence", None),
-    "stsb": ("sentence1", "sentence2"),
-    "wnli": ("sentence1", "sentence2"),
-}
+def _is_gemm_sparse(node):
+    return node.kwargs.get("A_data") is not None
 
 
-vector_stages = [
+VECTOR_PIPELINE = [
     [
-        ["gemm"],
-        ["dequantize"],
-        ["add", "sub", "mul", "div"],
-        ["exp", "abs", "relu", "gelu", "tanh", "silu", "vmap", "hardtanh"],
-        ["add", "mul", "div"],
-        ["div", "quantize"],
+        OpMatcher("conv", "gemm", predicate=lambda n: not _is_gemm_sparse(n)),
+        OpMatcher("dequantize"),
+        OpMatcher("add", "sub", "mul"),
+        OpMatcher("exp", "abs", "relu"),
+        OpMatcher("add", "mul"),
+        OpMatcher("quantize"),
     ],
     [
-        ["layer_norm", "softmax"],
-        ["quantize"],
+        OpMatcher("conv", "gemm", predicate=lambda n: not _is_gemm_sparse(n)),
+        OpMatcher("dequantize"),
+        OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
+        OpMatcher("quantize"),
+    ],
+    # Fused SpMM operation will use the first stage in the pipeline
+    [
+        OpMatcher("conv", "gemm", predicate=lambda n: _is_gemm_sparse(n)),
+        OpMatcher("dequantize"),
+        OpMatcher("exp", "abs", "relu"),
+        OpMatcher("add", "mul"),
+        OpMatcher("quantize"),
+    ],
+    [
+        OpMatcher("layer_norm", "softmax"),
+        OpMatcher("quantize"),
     ]
 ]
 
@@ -240,6 +239,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to split linear_mx with outliers into dense and SpMM operations.",
     )
+    parser.add_argument(
+        "--attn_implementation",
+        default="eager",
+        choices=["eager", "sdpa", "flash_attention_3"],
+    )
     add_qspec_args(parser)
     args = parser.parse_args()
 
@@ -262,7 +266,7 @@ if __name__ == "__main__":
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
     transform_args = {
-        "patterns": vector_stages,
+        "patterns": VECTOR_PIPELINE,
         "transpose_weight": args.transpose_weight,
         "transpose_fc": args.transpose_fc,
         "cache_size": args.cache_size,
@@ -300,7 +304,7 @@ if __name__ == "__main__":
             model=model,
             quantizer=quantizer,
             calibration_data=imagenet_dataset,
-            vector_stages=vector_stages,
+            vector_stages=VECTOR_PIPELINE,
             args=args
         )
 
@@ -328,7 +332,7 @@ if __name__ == "__main__":
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=vector_stages,
+            vector_stages=VECTOR_PIPELINE,
             args=args
         )
 
@@ -352,7 +356,7 @@ if __name__ == "__main__":
             model=model,
             quantizer=quantizer,
             calibration_data=train_dataset,
-            vector_stages=vector_stages,
+            vector_stages=VECTOR_PIPELINE,
             args=args
         )
 
@@ -368,7 +372,7 @@ if __name__ == "__main__":
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-            attn_implementation="eager", # turn off flash attention
+            attn_implementation=args.attn_implementation,
         )
 
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -468,6 +472,12 @@ if __name__ == "__main__":
 
         if args.mixed_precision:
             qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
+
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            target_path = os.path.join(script_dir, '../examples/language_modeling')
+            sys.path.append(os.path.abspath(target_path))
+
+            from quantization_configs import set_qconfig
             set_qconfig(quantizer, qconfig)
 
             fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
@@ -492,6 +502,14 @@ if __name__ == "__main__":
         transform(gm, example_args, example_kwargs=example_kwargs, **transform_args)
         compile(gm, example_args, **compile_args)
 
+        # from voyager_compiler.codegen.lowering.ir import FXToIR
+        # from voyager_compiler.codegen.lowering.lowering import lower_operations
+
+        # ir = FXToIR.convert(gm, func_name="m")
+        # print(ir.format())
+        # ir = lower_operations(ir)
+        # print(ir.format())
+
         new_output = gm(*example_args, *list(example_kwargs.values()))
         gm.graph.print_tabular()
     elif args.model == "llm_kivi":
@@ -503,7 +521,7 @@ if __name__ == "__main__":
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-            attn_implementation="eager", # turn off flash attention
+            attn_implementation=args.attn_implementation,
         ).eval()
 
         if args.remove_duplicate:
@@ -548,34 +566,22 @@ if __name__ == "__main__":
             gm, model.model.layers[0].input_layernorm, (example_input,)
         )
 
-        quantizer.set_module_name_object_type_order(
-            "model.model.rotary_emb", torch.ops.aten.matmul.default, 0, None
-        )
+        quantizer.set_object_type(torch.ops.aten.matmul.default, None)
 
         act0 = QuantizationSpec.from_str("int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3")
         act1 = QuantizationSpec.from_str("int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3")
-        matmul_qconfig = QuantizationConfig(act0, None, act1, None)
+        qconfig = QuantizationConfig(act0, None, act1, None)
 
         for layer_idx in range(model.config.num_hidden_layers):
             module_name = (
                 f"model.model.layers.slice(None, {model.config.num_hidden_layers}, None)"
                 f"._modules.{layer_idx}.self_attn"
             )
-
-            # Perform full cache matmul in MXINT6
             quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 0, matmul_qconfig
+                module_name, torch.ops.aten.matmul.default, 0, qconfig
             )
             quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 2, matmul_qconfig
-            )
-
-            # Perform residual cache matmul in full precision
-            quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 1, None
-            )
-            quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 3, None
+                module_name, torch.ops.aten.matmul.default, 2, qconfig
             )
 
         fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
@@ -643,7 +649,7 @@ if __name__ == "__main__":
             model=model,
             quantizer=quantizer,
             calibration_data=imagenet_dataset,
-            vector_stages=vector_stages,
+            vector_stages=VECTOR_PIPELINE,
             args=args
         )
 
@@ -733,7 +739,7 @@ if __name__ == "__main__":
         gm, preprocess_fn = extract_input_preprocessor(gm)
         example_args = (preprocess_fn(example_args[0]),)
 
-        fuse(gm, vector_stages, example_args)
+        fuse(gm, VECTOR_PIPELINE, example_args)
 
         gm.graph.print_tabular()
 
@@ -762,7 +768,7 @@ if __name__ == "__main__":
 
         old_output = gm(input_ids, False, False)[0]
 
-        transform(gm, example_args, example_kwargs, patterns=vector_stages)
+        transform(gm, example_args, example_kwargs, patterns=VECTOR_PIPELINE)
         gm.graph.print_tabular()
 
         new_output = gm(input_ids, False, False)[0]

@@ -92,6 +92,7 @@ class ShapeProp:
                 elif node.op == 'output':
                     result = load_arg(node.args[0])
             except:
+                self.graph.print_tabular()
                 print(f"Error in node {node}")
                 raise
 

@@ -1,7 +1,17 @@
+import operator
+
+from google.protobuf import text_format
+
+import torch.nn as nn
+import torch.nn.functional as F
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.utils._pytree import tree_flatten
+
 from .codegen import *
 from .decomposed import *
 from .fake_quantize import *
 from .fp8 import *
+from .histogram import *
 from .llm_utils import *
 from .normal_float import *
 from .posit import *
@@ -12,13 +22,6 @@ from .quantize_pt2e import *
 from .quantizer import *
 from .training_args import *
 from .utils import *
-from .histogram import *
-from google.protobuf import text_format
-import operator
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils._pytree import tree_flatten
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 __all__ = [
@@ -69,23 +72,55 @@ per_channel_symmetric: qscheme = QScheme.PER_CHANNEL_SYMMETRIC
 microscaling: qscheme = QScheme.MICROSCALING
 group_wise_affine: qscheme = QScheme.GROUP_WISE_AFFINE
 
-aten = torch.ops.aten
-quantized_ops = torch.ops.quantized_ops
 
+class OpMatcher:
+    targets: Tuple[Callable, ...]
+    predicate: Optional[Callable[[Node], bool]] = None
+
+    def __init__(self, *ops, predicate=None):
+        self.predicate = predicate
+
+        # Resolve symbolic ops
+        targets = []
+        for op in ops:
+            targets.extend(OPERATOR_MAPPINGS.get(op, [op]))
+
+        # Freeze resolved targets
+        self.targets = tuple(targets)
+
+    def matches(self, node: Node) -> bool:
+        if (source_fn_st := node.meta.get("source_fn_stack", None)) is not None:
+            source_fn = source_fn_st[-1]
+            if source_fn[1] not in self.targets:
+                return False
+
+        return self.predicate(node) if self.predicate else True
+
+
+quantized_ops = torch.ops.quantized_ops
 OPERATOR_MAPPINGS = {
-    "gemm": [nn.Conv2d, nn.Linear, F.conv2d, F.linear, torch.matmul, operator.matmul],
-    "add": ["add", "add_", operator.add, torch.add, operator.iadd, aten.add.Tensor],
+    # Convolution and Linear
+    "conv": [nn.Conv2d, F.conv2d],
+    "gemm": [nn.Linear, F.linear, torch.matmul, operator.matmul],
+    # Pooling
+    "maxpool2d": [nn.MaxPool2d, F.max_pool2d],
+    "avgpool2d": [nn.AdaptiveAvgPool2d, F.adaptive_avg_pool2d],
+    # Arithmetic
+    "add": ["add", "add_", operator.add, torch.add, operator.iadd],
     "sub": ["sub", "sub_", operator.sub, torch.sub, operator.isub],
     "mul": ["mul", "mul_", operator.mul, torch.mul, operator.imul],
     "div": ["div", "div_", operator.truediv, torch.div, operator.itruediv],
+    # Non-Linear Activations
+    "hardtanh" : [nn.ReLU6, F.relu6],
     "relu": [nn.ReLU, F.relu, F.relu_],
     "gelu": [nn.GELU, F.gelu],
+    "sigmoid": [nn.Sigmoid, F.sigmoid],
     "silu": [nn.SiLU, F.silu],
-    "hardtanh" : [nn.ReLU6, F.relu6],
-    "maxpool2d": [nn.MaxPool2d, F.max_pool2d],
-    "avgpool2d": [nn.AdaptiveAvgPool2d, F.adaptive_avg_pool2d],
-    "layer_norm": ["layer_norm", nn.LayerNorm, F.layer_norm],
+    "tanh": [nn.Tanh, F.tanh],
     "softmax": ["softmax", nn.Softmax, F.softmax],
+    # Normalization
+    "layer_norm": ["layer_norm", nn.LayerNorm, F.layer_norm],
+    # Quantization
     "quantize": [
         quantized_ops.quantize.default,
         quantized_ops.quantize_mx.default,
@@ -94,9 +129,10 @@ OPERATOR_MAPPINGS = {
     "dequantize": [quantized_ops.dequantize.default],
 }
 
+
 def fuse(
     model,
-    patterns,
+    fusion_pattern,
     example_args,
     example_kwargs=None,
     fuse_reshape=True,
@@ -108,15 +144,7 @@ def fuse(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
-    vector_stages = []
-    for pattern in patterns:
-        # If there is no corresponding mapping, we directly append the op itself
-        vector_stages.append([
-            [item for op in ops for item in OPERATOR_MAPPINGS.get(op, [op])]
-            for ops in pattern
-        ])
-
-    fuse_operator(model, vector_stages, fuse_reshape)
+    fuse_operator(model, fusion_pattern, fuse_reshape)
     return model
 
 

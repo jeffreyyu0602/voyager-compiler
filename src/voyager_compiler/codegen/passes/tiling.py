@@ -22,6 +22,7 @@ from ..mapping import (
 )
 from ..mapping_utils import (
     is_conv2d,
+    is_bmm,
     is_depthwise_conv,
     is_elementwise_op,
     is_linear,
@@ -869,7 +870,7 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     x_tiled, c_tiled, k_tiled = tile_sizes
 
     input_shape = node.args[0].shape
-    X = math.prod(input_shape[:-1])
+    X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
     C = input_shape[-1]
 
     is_mat = is_matmul(node)
@@ -1261,11 +1262,16 @@ def _search_tiling(
 
     for strategy in strategies:
         for tile_sizes, tiling in get_valid_tiling(
-            full_shape, min_sizes=min_sizes, order=order, last_dim=last_dim
+            full_shape,
+            min_sizes=min_sizes,
+            order=order,
+            last_dim=last_dim
         ):
             global_tiling = _merge_tiling(tiling, base_tiling)
 
-            logger.debug(f"Trying tiling {global_tiling} with tile sizes {tile_sizes}")
+            logger.debug(
+                f"Trying tiling {global_tiling} with tile sizes {tile_sizes}"
+            )
 
             tiled_shapes = shape_func(node, tile_sizes, global_tiling)
             node_to_shape = normalize_shape(node, tiled_shapes)
@@ -1320,7 +1326,7 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         unroll_dims = (unroll_dims, unroll_dims)
 
     input_shape = node.args[0].shape
-    X = math.prod(input_shape[:-1])
+    X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
     C = input_shape[-1]
 
     is_mat = is_matmul(node)

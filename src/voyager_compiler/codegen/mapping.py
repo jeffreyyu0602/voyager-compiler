@@ -21,6 +21,7 @@ from .banking import (
     require_allocation,
 )
 from .mapping_utils import (
+    is_bmm,
     is_conv2d,
     is_elementwise_op,
     is_fully_connected,
@@ -530,8 +531,11 @@ def find_sequential_nodes_(
     order: Dict[Node, int],
     nodes_by_source: Dict[Callable, List[Node]],
 ):
-    def get_source_nodes(sources):
-        return [node for s in sources for node in nodes_by_source[s]]
+    def get_matched_nodes(matcher):
+        return [
+            n for tgt in matcher.targets for n in nodes_by_source[tgt]
+            if matcher.matches(n)
+        ]
 
     def collect_nop_chain(node):
         nops = []
@@ -543,11 +547,11 @@ def find_sequential_nodes_(
 
     fused_chain = []
     fused_nodes = set()
-    singleton_nodes = set(get_source_nodes(pattern[0]))
+    singleton_nodes = set(get_matched_nodes(pattern[0]))
 
     for stage_sources in pattern[1:]:
         stage_nodes = [
-            n for n in get_source_nodes(stage_sources) if n not in fused_nodes
+            n for n in get_matched_nodes(stage_sources) if n not in fused_nodes
         ]
         if not stage_nodes:
             continue
@@ -593,7 +597,7 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}
 
     all_sources = {
-        fn for pattern in patterns for group in pattern for fn in group
+        fn for pattern in patterns for group in pattern for fn in group.targets
     }
     partitions = get_source_partitions(graph, list(all_sources))
     nodes_by_source = {
@@ -601,22 +605,24 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
         for s in all_sources
     }
 
-    all_fused_groups = []
-    seen_nodes = set()
+    all_candidates = []
     for pattern in patterns:
-        fused_groups = find_sequential_nodes_(
+        candidates = find_sequential_nodes_(
             pattern, nodes_order, nodes_by_source
         )
-        for group in fused_groups:
-            if not any(n in seen_nodes for n in group):
-                all_fused_groups.append(group)
-                seen_nodes.update(group)
+        all_candidates.extend(candidates)
 
-    for nodes in all_fused_groups:
-        nodes.sort(key=lambda n: nodes_order[n])
-    all_fused_groups.sort(key=lambda g: nodes_order[g[0]])
+    all_candidates.sort(key=lambda group: len(group), reverse=True)
 
-    return all_fused_groups
+    final_groups = []
+    seen_nodes = set()
+
+    for group in all_candidates:
+        if all(node not in seen_nodes for node in group):
+            final_groups.append(group)
+            seen_nodes.update(group)
+
+    return final_groups
 
 
 def is_tranpose(node: Node):
@@ -1171,7 +1177,10 @@ def _build_shape_map(node, output_shape):
             for k, v in new_shapes.items()
         }
     else:
-        x_tiled = math.prod(output_shape[:-1])
+        if is_bmm(node):
+            x_tiled = output_shape[-2]
+        else:
+            x_tiled = math.prod(output_shape[:-1])
         k_tiled = output_shape[-1]
         c_tiled = input_node.shape[-1]
 

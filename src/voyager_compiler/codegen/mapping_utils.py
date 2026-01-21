@@ -314,6 +314,21 @@ def is_linear(node: Node) -> bool:
     ]
 
 
+def is_matmul(node: Node) -> bool:
+    return node.target in [
+        torch.ops.aten.matmul.default,
+        torch.ops.quantized_ops.matmul_mx.default,
+    ]
+
+
+def is_bmm(node: Node) -> bool:
+    if is_matmul(node):
+        input_shape = node.args[0].shape
+        other_shape = node.args[1].shape
+        return len(input_shape) > 2 or len(other_shape) > 2
+    return False
+
+
 def is_fully_connected(node: Node) -> bool:
     if is_linear(node):
         input_shape = node.args[0].shape
@@ -323,20 +338,12 @@ def is_fully_connected(node: Node) -> bool:
         input_shape = node.args[0].shape
         other_shape = node.args[1].shape
 
-        is_bmm = len(input_shape) > 2 or len(other_shape) > 2
-        if is_bmm:
+        if is_bmm(node):
             return input_shape[-2] == 1
         else:
             return all(s == 1 for s in input_shape[:-1])
 
     return False
-
-
-def is_matmul(node: Node) -> bool:
-    return node.target in [
-        torch.ops.aten.matmul.default,
-        torch.ops.quantized_ops.matmul_mx.default,
-    ]
 
 
 def is_pooling(node: Node) -> bool:
