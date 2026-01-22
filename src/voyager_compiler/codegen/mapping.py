@@ -1595,7 +1595,7 @@ def run_memory_mapping(
                         start_offset, start_offset + size, allocator.memory_space
                     )
                     allocate_scratchpad(copy_node)
-                node.update_arg(0, tensors)
+                stack_node.update_arg(0, tensors)
 
             for n in nodes[:-1]:
                 n.meta["memory"] = segment
