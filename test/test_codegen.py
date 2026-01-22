@@ -49,15 +49,25 @@ from utils.dataset import glue, imagenet
 logger = logging.getLogger()
 
 
-def _is_gemm_sparse(node):
+def _is_bf16_fc(node):
+    # BF16 FC are ran on vector unit and thus cannot be fused
     if hasattr(node, 'value') and is_fully_connected(node):
-        return False
+        input_node = node.args[0]
+        return input_node.meta.get("dtype") is None
+    return False
+
+
+def _is_spmm(node):
     return node.kwargs.get("A_data") is not None
+
+
+def _can_fuse(node):
+    return not _is_spmm(node) and not _is_bf16_fc(node)
 
 
 VECTOR_PIPELINE = [
     [
-        OpMatcher("conv", "gemm", predicate=lambda n: not _is_gemm_sparse(n)),
+        OpMatcher("conv", "gemm", predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("add", "sub", "mul"),
         OpMatcher("exp", "abs", "relu"),
@@ -65,14 +75,14 @@ VECTOR_PIPELINE = [
         OpMatcher("quantize"),
     ],
     [
-        OpMatcher("conv", "gemm", predicate=lambda n: not _is_gemm_sparse(n)),
+        OpMatcher("conv", "gemm", predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
         OpMatcher("quantize"),
     ],
     # Fused SpMM operation will use the first stage in the pipeline
     [
-        OpMatcher("conv", "gemm", predicate=lambda n: _is_gemm_sparse(n)),
+        OpMatcher("conv", "gemm", predicate=_is_spmm),
         OpMatcher("dequantize"),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul"),
