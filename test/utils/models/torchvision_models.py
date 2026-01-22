@@ -10,6 +10,8 @@ from voyager_compiler import (
     QuantizationConfig,
     QuantizationSpec,
     convert_pt2e,
+    export_model,
+    replace_conv2d_with_im2col,
     prepare_pt2e,
     transform,
     compile,
@@ -20,6 +22,7 @@ from voyager_compiler import (
 from voyager_compiler.codegen import get_conv_bn_layers
 
 from .utils import get_transform_args, get_compile_args
+
 
 def load_model(args):
     if args.model_name_or_path is None:
@@ -37,6 +40,7 @@ def load_model(args):
     if args.bf16:
         model.bfloat16()
     return model
+
 
 def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
@@ -107,12 +111,9 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
         quantizer.set_object_type(torch.ops.aten.add.Tensor, qconfig)
         quantizer.set_object_type(torch.ops.aten.add_.Tensor, qconfig)
 
-    # use per-tensor instead of microscaling for conv1 in resnet18 and resnet50
+    # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        if (match := re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype)):
-            bits = int(match.group(1))
-            dtype = f"int{bits}"
         qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
         qspec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize
 
@@ -126,7 +127,13 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
         quantizer.set_module_name("^conv1$", qconfig)
 
     example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
-    gm = prepare_pt2e(model, quantizer, example_args)
+    gm = export_model(model, example_args)
+
+    # im2col must be done before prepare_pt2e
+    if args.conv2d_im2col:
+        replace_conv2d_with_im2col(gm)
+
+    gm = prepare_pt2e(gm, quantizer)
 
     for i in tqdm(range(10), desc=f"Calibrating {model.__class__.__name__}"):
         inputs = calibration_data[i]["image"]
@@ -151,6 +158,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn
 
+
 def evaluate(model, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -160,11 +168,11 @@ def evaluate(model, dataset):
 
     with torch.no_grad():
         for image_label_pair in tqdm(dataset, desc=f"Evaluating {model.__class__.__name__}"):
-            # for running the original model without the preprocessing function 
+            # for running the original model without the preprocessing function
             # applied to the dataset
             image = image_label_pair["image"].to(device)
             label = image_label_pair["label"]
-    
+
             logits = model(image)
             prediction = torch.argmax(logits, dim=-1)
             if prediction.item() == label:

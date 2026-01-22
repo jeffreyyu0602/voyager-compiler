@@ -235,13 +235,13 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
 
     if node.target == torch.ops.aten.pad.default:
         pad = remap_pad_after_permute(args[1], input_dims, node.value.ndim)
-        node.args = args[:1] + (pad,) + args[2:]
+        node.update_arg(1, pad)
 
     if is_indexing_or_concatenation_op(node):
         dim = get_arg_value(node, 1, "dim", 0)
         if dim < 0:
             dim = dim + len(input_dims)
-        node.args = args[:1] + (input_dims.index(dim),) + args[2:]
+        node.update_arg(1, input_dims.index(dim))
 
     if is_reshape_op(node):
         if node.target == torch.ops.aten.transpose.int:
@@ -250,13 +250,13 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
             dims = args[1]
         dims = [d + max(input_dims) + 1 if d < 0 else d for d in dims]
         dims = tuple(input_dims.index(d) for d in dims)
-        node.args = args[:1] + (dims,) + args[2:]
+        node.update_arg(1, dims)
 
     idx = AXES_ARG_INDEX_MAP.get(node.target)
     if idx is not None and idx < len(args) and args[idx] is not None:
         axes = [a + len(input_dims) if a < 0 else a for a in args[idx]]
         axes = tuple(input_dims.index(a) for a in axes)
-        node.args = args[:idx] + (axes,) + args[idx + 1:]
+        node.update_arg(idx, axes)
 
     if node.target in TRANSPOSED_OPERATORS:
         node.target = TRANSPOSED_OPERATORS[node.target]

@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
 
-def eliminate_dead_code(self):
+def eliminate_dead_code(m):
     """
     Remove all dead code from the graph, based on each node's number of
     users, and whether the nodes have any side effects. The graph must be
@@ -62,58 +62,66 @@ def eliminate_dead_code(self):
     """
     # Lint the graph first to make sure its topologically sorted, otherwise
     # DCE below will not behave as expected.
-    self.lint()
+    m.lint()
 
     # Reverse iterate so that when we remove a node, any nodes used as an
     # input to that node have an updated user count that no longer reflects
     # the removed node.
     changed = False
-    for node in reversed(self.nodes):
+    for node in reversed(m.nodes):
         if node.op != 'output' and len(node.users) == 0:
-            self.erase_node(node)
+            m.erase_node(node)
             changed = True
 
     return changed
 
 
 def replace_node_with_graph_module(
-    self: GraphModule, module: GraphModule, source: Node, value_remap=None
+    gm: GraphModule,
+    source: Node,
+    replacement: GraphModule,
+    value_remap=None
 ) -> List[Node]:
     if value_remap is None:
         value_remap = {}
-    output = None
+
     args_iter = iter(source.all_input_nodes)
-    for node in list(module.graph.nodes):
+    output = None
+
+    for node in list(replacement.graph.nodes):
         if node.op == 'placeholder':
             value_remap[node] = next(args_iter, None)
-        elif node.op == 'output':
+            continue
+
+        if node.op == 'output':
             output = node.args[0]
             if len(output) == 1:
                 source.replace_all_uses_with(value_remap[output[0]])
             else:
                 for user in list(source.users):
                     assert user.target == operator.getitem
-                    select_idx = user.args[1]
-                    user.replace_all_uses_with(value_remap[output[select_idx]])
-        else:
-            with self.graph.inserting_before(source):
-                if node.op == 'get_attr':
-                    param = fetch_attr(module, node.target)
-                    value_remap[node] = create_getattr_from_value(
-                        self, self.graph, "_tensor_constant_", param
-                    )
-                else:
-                    value_remap[node] = self.graph.node_copy(
-                        node, lambda n: value_remap[n]
-                    )
+                    idx = user.args[1]
+                    user.replace_all_uses_with(value_remap[output[idx]])
+            continue
 
-            if (source_fn_st := node.meta.get('source_fn_stack', None)) is not None:
-                source_fn = source_fn_st[-1]
-                value_remap[node].meta['source_fn_stack'] = [
-                    (value_remap[node].name, source_fn[1])
-                ]
+        with gm.graph.inserting_before(source):
+            if node.op == 'get_attr':
+                param = fetch_attr(replacement, node.target)
+                value_remap[node] = create_getattr_from_value(
+                    gm, gm.graph, "_tensor_constant_", param
+                )
+            else:
+                value_remap[node] = gm.graph.node_copy(
+                    node, lambda n: value_remap[n]
+                )
 
-            propagate_shape(value_remap[node], self)
+        if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
+            source_fn = source_fn_st[-1]
+            value_remap[node].meta['source_fn_stack'] = [
+                (value_remap[node].name, source_fn[1])
+            ]
+
+        propagate_shape(value_remap[node], gm)
 
     return [value_remap[n] for n in output]
 
@@ -142,7 +150,7 @@ def _decompose_bmm(model: GraphModule, node: Node):
     gm = export_model(BMM(), (input1, input2))
 
     value_remap = {}
-    output_nodes = replace_node_with_graph_module(model, gm, node, value_remap)
+    output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
     model.graph.erase_node(node)
 
     source_fn = node.meta['source_fn_stack'][-1]
@@ -236,7 +244,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
     gm.graph.lint()
 
     value_remap = {}
-    output_nodes = replace_node_with_graph_module(model, gm, node, value_remap)
+    output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
     model.graph.erase_node(node)
 
     source_fn = node.meta['source_fn_stack'][-1]
@@ -978,7 +986,7 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     axes = get_arg_value(new_node, 3, "axes")
     if axes is not None:
         axes = tuple(a - len(select_nodes) if a >= 0 else a for a in axes)
-        new_node.args = new_node.args[:3] + (axes,) + new_node.args[4:]
+        new_node.update_arg(3, axes)
 
     user_node.replace_input_with(select_nodes[-1], new_node)
     select_nodes[0].replace_input_with(node_to_move, node_to_move.args[0])
@@ -1587,7 +1595,7 @@ def run_memory_mapping(
                         start_offset, start_offset + size, allocator.memory_space
                     )
                     allocate_scratchpad(copy_node)
-                stack_node.args = (tensors,) + stack_node.args[1:]
+                node.update_arg(0, tensors)
 
             for n in nodes[:-1]:
                 n.meta["memory"] = segment

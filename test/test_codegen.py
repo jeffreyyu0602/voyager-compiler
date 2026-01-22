@@ -40,6 +40,7 @@ from voyager_compiler.codegen import (
     replace_rmsnorm_with_layer_norm,
     remove_softmax_dtype_cast,
 )
+from voyager_compiler.codegen.mapping_utils import is_fully_connected
 from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
@@ -49,6 +50,8 @@ logger = logging.getLogger()
 
 
 def _is_gemm_sparse(node):
+    if hasattr(node, 'value') and is_fully_connected(node):
+        return False
     return node.kwargs.get("A_data") is not None
 
 
@@ -265,6 +268,14 @@ if __name__ == "__main__":
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
+    fuse_reshape = (
+        not args.dont_fuse_reshape
+        and (
+            args.hardware_unrolling is None
+            or max(args.hardware_unrolling) < 64
+        )
+    )
+
     transform_args = {
         "patterns": VECTOR_PIPELINE,
         "transpose_weight": args.transpose_weight,
@@ -272,11 +283,7 @@ if __name__ == "__main__":
         "cache_size": args.cache_size,
         "num_banks": args.num_banks,
         "unroll_dims": args.hardware_unrolling,
-        "conv2d_im2col": args.conv2d_im2col,
-        "fuse_reshape": (
-            not args.dont_fuse_reshape
-            and (args.hardware_unrolling is None or max(args.hardware_unrolling) < 64)
-        ),
+        "fuse_reshape": fuse_reshape,
         "split_spmm": args.split_spmm,
     }
 

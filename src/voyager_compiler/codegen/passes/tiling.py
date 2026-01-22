@@ -401,7 +401,7 @@ def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
     gm.graph.lint()
 
     value_remap = {}
-    output = replace_node_with_graph_module(model, gm, node, value_remap)
+    output = replace_node_with_graph_module(model, node, gm, value_remap)
 
     if (source_fn_st := node.meta.get("source_fn_stack")) is not None:
         source_fn = source_fn_st[-1][1]
@@ -485,7 +485,7 @@ def split_conv2d_node(model, node, tile_sizes):
             _pad_input(model, node, input_scale, pad_hw, 1.0)
 
         padding = _pair(0)
-        node.args = node.args[:4] + (padding,) + node.args[5:]
+        node.update_arg(4, padding)
         propagate_shape(node, model)
         _, _, IY, IX = node.args[0].shape
 
@@ -960,7 +960,7 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     gm.graph.lint()
 
     value_remap = {}
-    replace_node_with_graph_module(model, gm, node_to_replace, value_remap)
+    replace_node_with_graph_module(model, node_to_replace, gm, value_remap)
 
     # Update metadata on new nodes in the graph
     if (source_fn_st := node.meta.get("source_fn_stack")) is not None:

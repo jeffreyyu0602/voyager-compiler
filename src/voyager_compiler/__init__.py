@@ -154,7 +154,6 @@ def transform(
     example_kwargs=None,
     patterns=None,
     unroll_dims=None,
-    conv2d_im2col=False,
     transpose_weight=False,
     transpose_fc=False,
     cache_size=None,
@@ -187,9 +186,6 @@ def transform(
         convert_cat_with_mismatched_shapes_to_stack(model)
 
     fuse_quantize_dequantize_with_previous_op(model)
-
-    if conv2d_im2col:
-        replace_conv2d_with_im2col(model)
 
     # -------------------------------------------------------------------------
     # 2. Hardware Alignment (Padding)

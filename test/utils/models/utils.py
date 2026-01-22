@@ -1,4 +1,12 @@
 def get_transform_args(args, vector_stages):
+    fuse_reshape = (
+        not args.dont_fuse_reshape
+        and (
+            args.hardware_unrolling is None
+            or max(args.hardware_unrolling) < 64
+        )
+    )
+
     transform_args = {
         "patterns": vector_stages,
         "transpose_weight": args.transpose_weight,
@@ -6,13 +14,10 @@ def get_transform_args(args, vector_stages):
         "unroll_dims": args.hardware_unrolling,
         "cache_size": args.cache_size,
         "num_banks": args.num_banks,
-        "conv2d_im2col": args.conv2d_im2col,
-        "fuse_reshape": (
-            not args.dont_fuse_reshape
-            and (args.hardware_unrolling is None or max(args.hardware_unrolling) < 64)
-        ),
+        "fuse_reshape": fuse_reshape,
     }
     return transform_args
+
 
 def get_compile_args(args):
     compile_args = {

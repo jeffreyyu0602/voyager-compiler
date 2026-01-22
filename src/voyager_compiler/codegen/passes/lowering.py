@@ -1,17 +1,18 @@
 import itertools
 import logging
-import math
-from typing import Callable, List
+from typing import Tuple, Union, Callable, List
 
 import torch
+import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
-from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
+from torchao.quantization.pt2e.export_utils import WrapperModule
+from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
 from .utils import _pair, get_arg_value
-from ..mapping import replace_node_with_graph_module
-from ..mapping_utils import is_nop
+from ..mapping import replace_node_with_graph_module, _nodes_sequential
+from ..mapping_utils import is_elementwise_op, is_gemm_op, is_nop
 from ...pt2e_utils import get_aten_graph_module, fetch_attr, propagate_shape
 from ...quantize_pt2e import create_getattr_from_value, export_model
 from ...quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
@@ -24,7 +25,6 @@ __all__ = [
     "convert_expand_to_memory_copy",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
-    "replace_target_with_vmap",
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
     "rewrite_fx_graph",
@@ -138,10 +138,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
         GraphModule: The transformed GraphModule with `torch.cat` operations
         adjusted to `torch.stack`.
     """
-    partitions = get_source_partitions(model.graph, [torch.cat])
-    partitions = list(itertools.chain.from_iterable(partitions.values()))
-    for partition in partitions:
-        node = partition.output_nodes[0]
+    for node in model.graph.nodes:
         if node.target != torch.ops.aten.cat.default:
             continue
 
@@ -165,10 +162,9 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
                 return output.reshape(*shape, *output.shape[1:])
 
         gm = export_model(Concat(), (*args[0],))
-        replace_node_with_graph_module(model, gm, node)
+        replace_node_with_graph_module(model, node, gm)
 
     model.graph.lint()
-
     model.graph.eliminate_dead_code()
     model.recompile()
     return model
@@ -220,7 +216,7 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
                 return input
 
         gm = export_model(Expand(), (input_node.meta["val"],))
-        replace_node_with_graph_module(model, gm, node)
+        replace_node_with_graph_module(model, node, gm)
         model.graph.erase_node(node)
 
     model.graph.lint()
@@ -303,42 +299,25 @@ def replace_rmsnorm_with_layer_norm(
     model.recompile()
 
 
-def replace_target_with_vmap(
-    model: GraphModule,
-    target: Callable
-) -> GraphModule:
-    nodes_map = {}
-    for node in list(model.graph.nodes):
-        if node.target != target:
-            continue
+def _get_im2col_gemm_pattern(
+    output_shape: Tuple[int],
+    stride: Union[int, Tuple[int]] = 1,
+    padding: Union[int, Tuple[int]] = 0,
+    dilation: Union[int, Tuple[int]] = 1,
+):
 
-        if (get_attr_node := nodes_map.get(node.target, None)) is None:
-            values = torch.arange(2 ** 16, dtype=torch.int16).view(torch.bfloat16)
-            code = node.target(values, *node.args[1:])
+    def _im2col_gemm_pattern(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor]:
+        inp_unf = F.unfold(input, weight.shape[-2:], dilation, padding, stride)
+        wt = weight.view(weight.size(0), -1)
+        out_unf = F.linear(inp_unf.transpose(-1, -2), wt, bias)
+        out = out_unf.transpose(-1, -2).view(*output_shape)
+        return out
 
-            with model.graph.inserting_before(node):
-                get_attr_node = create_getattr_from_value(
-                    model, model.graph, '_tensor_constant_', code
-                )
-
-            nodes_map[node.target] = get_attr_node
-
-        with model.graph.inserting_before(node):
-            new_node = model.graph.call_function(
-                torch.ops.quantized_ops.vmap.default,
-                (node.args[0], get_attr_node)
-            )
-
-        new_node.meta = node.meta
-        new_node.meta["source_fn_stack"] = [(new_node.name, "vmap")]
-
-        node.replace_all_uses_with(new_node)
-        model.graph.erase_node(node)
-
-    model.graph.lint()
-    model.graph.eliminate_dead_code()
-    model.recompile()
-    return model
+    return WrapperModule(_im2col_gemm_pattern)
 
 
 def replace_conv2d_with_im2col(model: GraphModule):
@@ -373,6 +352,7 @@ def replace_conv2d_with_im2col(model: GraphModule):
         group = get_arg_value(node, 6, "groups", 1)
 
         input_shape = get_shape(input_node)
+        weight_shape = get_shape(weight_node)
         output_shape = get_shape(node)
 
         if (
@@ -383,66 +363,68 @@ def replace_conv2d_with_im2col(model: GraphModule):
         ):
             continue
 
-        orig_weight = fetch_attr(model, weight_node.target).detach()
-        C_out, _, kH, kW = orig_weight.shape
+        logger.info(f"Replacing Conv2d node {node} with Im2col + GEMM")
 
-        with graph.inserting_before(node):
-            in2col_node = graph.call_function(
-                torch.ops.aten.im2col.default,
-                (
-                    input_node,
-                    (kH, kW),
-                    _pair(dilation),
-                    _pair(padding),
-                    _pair(stride),
-                ),
+        _example_inputs = (
+            torch.randn(input_shape),
+            torch.randn(weight_shape),
+            torch.randn((weight_shape[0],)) if bias_node is not None else None,
+        )
+
+        match_pattern = _get_im2col_gemm_pattern(
+            output_shape, _pair(stride), _pair(padding), _pair(dilation)
+        )
+        match_pattern = _get_aten_graph_module_for_pattern(
+            match_pattern,
+            _example_inputs,
+        )
+
+        val_maps = {}
+        output = replace_node_with_graph_module(model, node, match_pattern, val_maps)[0]
+        graph.erase_node(node)
+
+        # Fold the view operation into the parameter
+        view_node = next(iter(weight_node.users))
+        assert view_node.target == torch.ops.aten.view.default
+
+        val = fetch_attr(model, weight_node.target).detach()
+        val = val.reshape(val.size(0), -1)
+
+        with graph.inserting_before(view_node):
+            new_weight = create_getattr_from_value(
+                model, graph, f"{weight_node.target}_im2col", val
             )
 
-            weight_flat_name = f"{weight_node.target}_im2col_flat"
-            flat_weight_node = create_getattr_from_value(
-                model, graph, weight_flat_name, orig_weight.reshape(C_out, -1)
-            )
+        propagate_shape(new_weight, model)
+        view_node.replace_all_uses_with(new_weight)
 
-            propagate_shape(in2col_node)
-            propagate_shape(flat_weight_node, model)
+        # Move elementwise operations after view to after the linear node
+        linear_node = next((n for n in val_maps.values() if is_gemm_op(n)))
 
-            matmul_node = graph.call_function(
-                torch.ops.aten.matmul.default,
-                (flat_weight_node, in2col_node)
-            )
-            propagate_shape(matmul_node)
-            matmul_node.meta["source_fn_stack"] = [
-                (matmul_node.name, torch.matmul)
-            ]
+        fusable_ops = []
+        next_node = next(iter(output.users))
+        while is_elementwise_op(next_node):
+            chain = fusable_ops + [next_node]
+            if _nodes_sequential(chain):
+                fusable_ops.append(next_node)
+            else:
+                break
+            # Stop fusing if last node is a quantize op
+            if (
+                len(next_node.users) != 1
+                or next_node.target == torch.ops.quantized_ops.quantize.default
+            ):
+                break
+            next_node = next(iter(next_node.users))
 
-            result_node = matmul_node
+        linear_node.replace_all_uses_with(fusable_ops[-1])
+        fusable_ops[0].replace_input_with(output, linear_node)
+        next_node.replace_input_with(fusable_ops[-1], output)
 
-            if bias_node is not None:
-                bias_flat_name = f"{bias_node.target}_im2col_flat"
-                orig_bias = fetch_attr(model, bias_node.target).detach()
-                new_bias = create_getattr_from_value(
-                    model, graph, bias_flat_name, orig_bias.reshape(C_out, 1)
-                )
-                propagate_shape(new_bias, model)
+        for n in reversed(fusable_ops):
+            linear_node.append(n)
 
-                result_node = graph.call_function(
-                    torch.ops.aten.add.Tensor,
-                    (matmul_node, new_bias),
-                )
-                propagate_shape(result_node)
-                result_node.meta["source_fn_stack"] = [
-                    (result_node.name, "add")
-                ]
-
-            reshape_node = graph.call_function(
-                torch.ops.aten.reshape.default,
-                (result_node, (-1,) + output_shape[1:])
-            )
-            propagate_shape(reshape_node)
-
-            node.replace_all_uses_with(reshape_node)
-            graph.erase_node(node)
-
+    graph.eliminate_dead_code()
     graph.lint()
     model.recompile()
     return model
@@ -468,6 +450,7 @@ def extract_input_preprocessor(model: GraphModule):
         torch.ops.aten.permute.default,
         torch.ops.aten.transpose.int,
         torch.ops.aten.im2col.default,
+        torch.ops.aten.pad.default,
         torch.ops.quantized_ops.quantize.default,
     ]:
         preprocess_nodes.extend(
@@ -578,7 +561,7 @@ def rewrite_fx_graph(model: torch.fx.GraphModule, fn: Callable):
             if n.target == torch.ops.aten.zeros.default:
                 n.kwargs = {}
 
-        replace_node_with_graph_module(model, gm, node)
+        replace_node_with_graph_module(model, node, gm)
 
         model.graph.erase_node(node)
 
@@ -611,7 +594,7 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
             node.replace_all_uses_with(new_node)
             graph.erase_node(node)
 
-            replace_node_with_graph_module(model, mod, new_node)
+            replace_node_with_graph_module(model, new_node, mod)
 
     graph.eliminate_dead_code()
     model.graph.lint()

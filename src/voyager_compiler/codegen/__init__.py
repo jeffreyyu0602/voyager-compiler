@@ -26,7 +26,6 @@ __all__ = [
     "inline_autocast_modules",
     "rename_nodes_with_param_names",
     "replace_conv2d_with_im2col",
-    "replace_target_with_vmap",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
     "rewrite_fx_graph",
