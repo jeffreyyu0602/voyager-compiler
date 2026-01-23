@@ -15,6 +15,7 @@ from transformers import default_data_collator
 
 from .utils import get_transform_args, get_compile_args
 
+
 def load_model(args):
     from transformers import AutoModelForSequenceClassification
     from transformers import AutoTokenizer
@@ -31,6 +32,7 @@ def load_model(args):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     return model, tokenizer
+
 
 def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
     calibration_dataloader = DataLoader(calibration_data, collate_fn=default_data_collator, batch_size=1)
@@ -74,7 +76,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
             first_token_tensor = hidden_states[:, 0]
             output = self.classifier(first_token_tensor)
             return output
-        
+
     quantizer.set_module_name("classifier", None)
 
     gm = prepare_pt2e(MobileBertWrapper(), quantizer, example_args)
@@ -85,7 +87,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
                 token_type_ids=batch["token_type_ids"]
             )
         gm(embedding_output, extended_attention_mask, head_mask)
-    
+
     convert_pt2e(gm, args.bias)
 
     old_output = gm(*example_args)
@@ -97,6 +99,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output
+
 
 def evaluate(model, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,8 +118,9 @@ def evaluate(model, dataset):
             prediction = torch.argmax(logits, dim=-1)
             correct_predictions += (prediction == inputs["labels"]).sum().item()
             total_samples += inputs["labels"].size(0)
-    
+
     print(f"MobileBERT Accuracy: {correct_predictions / total_samples:.4f}")
+
 
 def evaluate_gm(gm, dataset):
     correct_predictions = 0
@@ -130,13 +134,11 @@ def evaluate_gm(gm, dataset):
                 data_label_pair["attention_mask"],
                 data_label_pair["head_mask"],
             )
-            
+
             logits = outputs
             prediction = torch.argmax(logits, dim=-1)
             if prediction == label:
                 correct_predictions += 1
             total_samples += 1
-    
+
     print(f"Quantized MobileBERT Accuracy: {correct_predictions / total_samples:.4f}")
-    
-    

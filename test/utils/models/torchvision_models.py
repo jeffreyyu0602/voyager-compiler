@@ -114,6 +114,9 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
+        matches = re.findall(r'\d+', dtype)
+        if len(matches) > 1:
+            dtype = f"int{matches[1]}"
         qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
         qspec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize
 

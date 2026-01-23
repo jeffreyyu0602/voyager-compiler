@@ -19,7 +19,13 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from transformers import DeiTImageProcessor, ViTConfig, ViTForImageClassification, ViTImageProcessor, ViTModel
+from transformers import (
+    DeiTImageProcessor,
+    ViTConfig,
+    ViTForImageClassification,
+    ViTImageProcessor,
+    ViTModel,
+)
 from transformers.utils import logging
 
 from voyager_compiler import (
@@ -280,6 +286,7 @@ def load_model(args):
         model.load_state_dict(timm_model.state_dict(), strict=False)
     return model
 
+
 def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
     transform_args = get_transform_args(args, vector_stages)
@@ -344,6 +351,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn
 
+
 def evaluate(model, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -353,11 +361,11 @@ def evaluate(model, dataset):
 
     with torch.no_grad():
         for image_label_pair in tqdm(dataset, desc="Evaluating ViT"):
-            # for running the original model without the preprocessing function 
+            # for running the original model without the preprocessing function
             # applied to the dataset
             image = image_label_pair["image"].to(device)
             label = image_label_pair["label"]
-    
+
             outputs = model(image)
             logits = outputs.logits
             prediction = torch.argmax(logits, dim=-1)
@@ -367,7 +375,3 @@ def evaluate(model, dataset):
 
     accuracy = correct_predictions / total_samples if total_samples > 0 else 0.0
     print(f"Vit Accuracy: {accuracy:.4f}")
-
-    
-            
-
