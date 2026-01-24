@@ -31,7 +31,7 @@ dependencies = [
     "protobuf",
     "graphviz",
     "timm",
-    "torchao
+    "torchao"
 ]
 
 [tool.setuptools.packages.find]
