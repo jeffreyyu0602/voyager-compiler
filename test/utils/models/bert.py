@@ -71,7 +71,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
                 )
                 hidden_states = layer_outputs[0]
 
-                if args.remove_duplicate:
+                if args.compile_single_layer:
                     break
 
             hidden_states = self.bert.pooler(hidden_states)

@@ -149,16 +149,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dump_dataset",
         action="store_true",
-        help="Whether to dump the dataset to disk for later use."
-    )
-    parser.add_argument(
-        "--dump_tensors",
-        action="store_true",
-        help="Whether to save tensors for verification."
+        help="Whether to save the dataset for later use."
     )
     parser.add_argument(
         "--dataset_output_dir",
         help="Output directory for dataset files"
+    )
+    parser.add_argument(
+        "--dump_tensors",
+        action="store_true",
+        help="Whether to save intermediate outputs for verification."
     )
     parser.add_argument(
         "--context_length",
@@ -167,12 +167,12 @@ if __name__ == "__main__":
         help="Context length for the LLM decoding."
     )
     parser.add_argument(
-        "--remove_duplicate",
+        "--compile_single_layer",
         action="store_true",
-        help="Only compiler for a single encoder/decoder layer in Transformer models."
+        help="Only compile for a single encoder/decoder layer in Transformer models."
     )
     parser.add_argument(
-        "--use_mixed_precision",
+        "--enable_mixed_precision",
         action="store_true",
         help="Use mixed precision quantization scheme to quantize LLMs."
     )
@@ -195,7 +195,7 @@ if __name__ == "__main__":
         help="Number of banks in the accelerator."
     )
     parser.add_argument(
-        "--transpose_weight",
+        "--transform_layout",
         action="store_true",
         help=(
             "Whether to transpose Conv2d inputs and weights and Linear weights "
@@ -205,7 +205,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transpose_fc",
         action="store_true",
-        help="Whether to transpose weights of fully connected layers."
+        help="Whether to transpose the weights of fully connected layers."
     )
     parser.add_argument(
         "--use_maxpool_2x2",
@@ -287,7 +287,7 @@ if __name__ == "__main__":
 
     transform_args = {
         "patterns": VECTOR_PIPELINE,
-        "transpose_weight": args.transpose_weight,
+        "transform_layout": args.transform_layout,
         "transpose_fc": args.transpose_fc,
         "cache_size": args.cache_size,
         "num_banks": args.num_banks,
@@ -472,7 +472,7 @@ if __name__ == "__main__":
                     )
                     hidden_states = layer_outputs[0]
 
-                    if args.remove_duplicate:
+                    if args.compile_single_layer:
                         break
 
                 logits = self.lm_head(hidden_states)
@@ -486,7 +486,7 @@ if __name__ == "__main__":
         example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
         replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
 
-        if args.use_mixed_precision:
+        if args.enable_mixed_precision:
             qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
 
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -540,7 +540,7 @@ if __name__ == "__main__":
             attn_implementation=args.attn_implementation,
         ).eval()
 
-        if args.remove_duplicate:
+        if args.compile_single_layer:
             layers_to_keep = model.model.layers[:1]
             model.model.layers = nn.ModuleList(layers_to_keep)
 

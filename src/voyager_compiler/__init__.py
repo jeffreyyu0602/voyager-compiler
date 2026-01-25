@@ -154,7 +154,7 @@ def transform(
     example_kwargs=None,
     patterns=None,
     unroll_dims=None,
-    transpose_weight=False,
+    transform_layout=False,
     transpose_fc=False,
     cache_size=None,
     num_banks=None,
@@ -210,10 +210,10 @@ def transform(
     # Transform GEMM and convolution inputs/weights into layouts friendly
     # for systolic-array based hardware (e.g., transposing weights).
 
-    if transpose_weight:
+    if transform_layout:
         transpose_conv2d_inputs_and_weights(model)
 
-    transpose_linear_weights(model, transpose_weight, transpose_fc)
+    transpose_linear_weights(model, transform_layout, transpose_fc)
 
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
