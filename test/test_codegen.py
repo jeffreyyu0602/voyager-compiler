@@ -130,7 +130,7 @@ if __name__ == "__main__":
     torch.set_num_threads(32)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model", default="resnet50")
+    parser.add_argument("model")
     parser.add_argument(
         "--model_name_or_path",
         default=None,
@@ -172,15 +172,15 @@ if __name__ == "__main__":
         help="Only compiler for a single encoder/decoder layer in Transformer models."
     )
     parser.add_argument(
-        "--mixed_precision",
+        "--use_mixed_precision",
         action="store_true",
-        help="Quantization scheme to use for LLMs."
+        help="Use mixed precision quantization scheme to quantize LLMs."
     )
     parser.add_argument(
         "--outlier_pct",
         type=float,
         default=None,
-        help="Whether to filter outliers when quantizing activations."
+        help="Percentage of outliers to filter when quantizing activations."
     )
     parser.add_argument(
         "--cache_size",
@@ -197,12 +197,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--transpose_weight",
         action="store_true",
-        help="Whether to transpose weights for executing on the accelerator."
+        help=(
+            "Whether to transpose Conv2d inputs and weights and Linear weights "
+            "to a systolic-array friendly layout."
+        )
     )
     parser.add_argument(
         "--transpose_fc",
         action="store_true",
-        help="Whether to transpose the weight of the fully connected layer."
+        help="Whether to transpose weights of fully connected layers."
     )
     parser.add_argument(
         "--use_maxpool_2x2",
@@ -213,8 +216,8 @@ if __name__ == "__main__":
         "--conv2d_im2col",
         action="store_true",
         help=(
-            "Whether to use transform conv2d operation with input channel "
-            "dimension smaller than unroll to linear operation through im2col."
+            "Whether to transform Conv2d operations with small input channels "
+            "into linear operations using im2col."
         )
     )
     parser.add_argument(
@@ -224,9 +227,9 @@ if __name__ == "__main__":
         help="Hardware unroll dimensions for the accelerator."
     )
     parser.add_argument(
-        "--dont_fuse_reshape",
+        "--disable_reshape_fusion",
         action="store_true",
-        help="Whether to fuse reshape operations in the model."
+        help="Whether to not fuse reshape operation with following GEMM in Transformer."
     )
     parser.add_argument(
         "--evaluate",
@@ -234,18 +237,14 @@ if __name__ == "__main__":
         help="Whether to run the pytorch evaluation during compilation"
     )
     parser.add_argument(
-        "--binary_mask",
+        "--quantize_attention_mask",
         action="store_true",
-        help="Whether to use binary attention mask for LLMs."
+        help="Whether to quantize Transformer attention mask to binary values."
     )
     parser.add_argument(
         "--quantize_fc",
         action="store_true",
         help="Whether to quantize the fully connected layers."
-    )
-    parser.add_argument(
-        "--residual",
-        help="Quantization spec for residual inputs.",
     )
     parser.add_argument(
         "--split_spmm",
@@ -279,7 +278,7 @@ if __name__ == "__main__":
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
     fuse_reshape = (
-        not args.dont_fuse_reshape
+        not args.disable_reshape_fusion
         and (
             args.hardware_unrolling is None
             or max(args.hardware_unrolling) < 64
@@ -487,7 +486,7 @@ if __name__ == "__main__":
         example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
         replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
 
-        if args.mixed_precision:
+        if args.use_mixed_precision:
             qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
 
             script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -502,7 +501,7 @@ if __name__ == "__main__":
             quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
             quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
-        if args.binary_mask:
+        if args.quantize_attention_mask:
             qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
             attention_mask = next(iter(n for n in gm.graph.nodes if n.target == "attention_mask"))
             _annotate_output_qspec(attention_mask, qspec)

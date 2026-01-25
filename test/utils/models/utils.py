@@ -1,13 +1,13 @@
 def get_transform_args(args, vector_stages):
     fuse_reshape = (
-        not args.dont_fuse_reshape
+        not args.disable_reshape_fusion
         and (
             args.hardware_unrolling is None
             or max(args.hardware_unrolling) < 64
         )
     )
 
-    transform_args = {
+    return {
         "patterns": vector_stages,
         "transpose_weight": args.transpose_weight,
         "transpose_fc": args.transpose_fc,
@@ -16,11 +16,10 @@ def get_transform_args(args, vector_stages):
         "num_banks": args.num_banks,
         "fuse_reshape": fuse_reshape,
     }
-    return transform_args
 
 
 def get_compile_args(args):
-    compile_args = {
+    return {
         "cache_size": args.cache_size,
         "num_banks": args.num_banks,
         "bank_width": args.bank_width,
@@ -29,4 +28,3 @@ def get_compile_args(args):
         "output_file": args.model,
         "dump_tensors": args.dump_tensors,
     }
-    return compile_args

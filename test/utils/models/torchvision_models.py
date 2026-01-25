@@ -1,6 +1,5 @@
 import re
 import torch
-
 from torchvision import models
 from tqdm import tqdm
 
@@ -138,7 +137,8 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     gm = prepare_pt2e(gm, quantizer)
 
-    for i in tqdm(range(10), desc=f"Calibrating {model.__class__.__name__}"):
+    model_name = model.__class__.__name__
+    for i in tqdm(range(args.calibration_steps), desc=f"Calibrating {model_name}"):
         inputs = calibration_data[i]["image"]
         with torch.no_grad():
             gm(inputs.to(torch_dtype))

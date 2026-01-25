@@ -1,8 +1,7 @@
 import torch
-
-from itertools import islice
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import default_data_collator
 
 from voyager_compiler import (
     convert_pt2e,
@@ -10,8 +9,6 @@ from voyager_compiler import (
     transform,
     compile,
 )
-
-from transformers import default_data_collator
 
 from .utils import get_transform_args, get_compile_args
 
@@ -81,12 +78,15 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     gm = prepare_pt2e(MobileBertWrapper(), quantizer, example_args)
 
-    for batch in tqdm(islice(calibration_dataloader, 10), desc="Calibrating MobileBERT"):
-        embedding_output = model.mobilebert.embeddings(
+    if args.calibration_steps > 0:
+        for i, batch in enumerate(tqdm(calibration_dataloader, desc="Calibrating MobileBERT")):
+            embedding_output = model.mobilebert.embeddings(
                 input_ids=batch["input_ids"],
                 token_type_ids=batch["token_type_ids"]
             )
-        gm(embedding_output, extended_attention_mask, head_mask)
+            gm(embedding_output, extended_attention_mask, head_mask)
+            if i == args.calibration_steps - 1:
+                break
 
     convert_pt2e(gm, args.bias)
 

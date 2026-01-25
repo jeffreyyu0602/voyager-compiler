@@ -170,6 +170,11 @@ def add_qspec_args(parser=None):
         ),
     )
     parser.add_argument(
+        "--residual",
+        default=None,
+        help="Residual quantization specification. Format same as activation.",
+    )
+    parser.add_argument(
         "--error",
         default=None,
         type=QuantizationSpec.from_str,
