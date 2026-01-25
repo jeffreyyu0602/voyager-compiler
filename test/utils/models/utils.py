@@ -9,7 +9,7 @@ def get_transform_args(args, vector_stages):
 
     return {
         "patterns": vector_stages,
-        "transpose_weight": args.transpose_weight,
+        "transform_layout": args.transform_layout,
         "transpose_fc": args.transpose_fc,
         "unroll_dims": args.hardware_unrolling,
         "cache_size": args.cache_size,
