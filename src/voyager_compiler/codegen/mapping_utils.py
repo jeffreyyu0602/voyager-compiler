@@ -513,6 +513,10 @@ def is_nop(node: Node) -> bool:
     if is_prunable_op(node):
         return True
 
+    # A select operation that selects the entire tensor
+    if node.target == torch.ops.aten.select.int:
+        return node.args[0].shape[node.args[1]] == 1
+
     return node.target in [
         torch.ops.aten.clone.default,
         torch.ops.aten.contiguous.default,

@@ -1409,20 +1409,6 @@ def run_memory_mapping(
         nodes_to_delete = user_to_last_uses.get(user, [])
         return nodes_to_delete
 
-    def get_path_to_target(node: torch.fx.Node, targets):
-        if not isinstance(targets, (list, tuple)):
-            targets = [targets]
-
-        for user in node.users:
-            if user.target in targets:
-                return [node, user]
-
-            if is_nop(user):
-                path = get_path_to_target(user, targets)
-                if path is not None:
-                    return [node] + path
-        return None
-
     def allocate_scratchpad(node: Node):
         from .passes.tiling import compute_tiled_shape, compute_output_tiled_shapes
 
@@ -1524,6 +1510,20 @@ def run_memory_mapping(
             )
 
         node.meta["scratchpad_map"] = scratchpad_map
+
+    def get_path_to_target(node: torch.fx.Node, targets):
+        if not isinstance(targets, (list, tuple)):
+            targets = [targets]
+
+        for user in node.users:
+            if user.target in targets:
+                return [node, user]
+
+            if is_nop(user):
+                path = get_path_to_target(user, targets)
+                if path is not None:
+                    return [node] + path
+        return None
 
     def create_copy_node(node: Node, user: Node):
         from .passes.tiling import run_vector_op_node_l2_tiling
@@ -1671,6 +1671,9 @@ def run_memory_mapping(
 
         if node.meta.get("scratchpad_map") is None:
             allocate_scratchpad(node)
+
+    graph.lint()
+    model.recompile()
 
 
 def gen_code(model, args, output_dir=None):
