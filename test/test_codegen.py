@@ -65,27 +65,38 @@ def _can_fuse(node):
     return not _is_spmm(node) and not _is_bf16_fc(node)
 
 
+def _is_constant_div(node):
+    if node.target != torch.ops.aten.div.Tensor:
+        return True
+
+    divisor = node.args[1]
+    if isinstance(divisor, torch.fx.Node):
+        return divisor.value.numel() == 1
+
+    return True
+
+
 VECTOR_PIPELINE = [
     [
         OpMatcher("conv", "gemm", predicate=_can_fuse),
         OpMatcher("dequantize"),
-        OpMatcher("add", "sub", "mul"),
+        OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul"),
-        OpMatcher("quantize"),
+        OpMatcher("add", "mul", "div", predicate=_is_constant_div),
+        OpMatcher("mul", "div", "quantize"),
     ],
     [
         OpMatcher("conv", "gemm", predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher("quantize"),
+        OpMatcher("mul", "div", "quantize"),
     ],
     # Fused SpMM operation will use the first stage in the pipeline
     [
         OpMatcher("conv", "gemm", predicate=_is_spmm),
         OpMatcher("dequantize"),
         OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul"),
+        OpMatcher("add", "mul", "div"),
         OpMatcher("quantize"),
     ],
     [
