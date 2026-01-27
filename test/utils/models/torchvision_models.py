@@ -5,7 +5,6 @@ from tqdm import tqdm
 
 from voyager_compiler import (
     DerivedQuantizationSpec,
-    FusedAmaxObsFakeQuantize,
     QuantizationConfig,
     QuantizationSpec,
     convert_pt2e,
@@ -84,7 +83,6 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
             ]
 
             qspec = QuantizationSpec.from_str("int8,qs=per_tensor_symmetric")
-            qspec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize
 
             bias_qspec = DerivedQuantizationSpec(
                 derived_from=None,
@@ -113,11 +111,10 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        matches = re.findall(r'\d+', dtype)
-        if len(matches) > 1:
-            dtype = f"int{matches[1]}"
+        match = re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype, re.IGNORECASE)
+        if match is not None and match.group(2) is not None:
+            dtype = f"int{match.group(2)}"
         qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
-        qspec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize
 
         bias_qspec = DerivedQuantizationSpec(
             derived_from=None,

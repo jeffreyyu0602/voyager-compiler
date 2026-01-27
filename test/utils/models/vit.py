@@ -14,6 +14,7 @@
 # limitations under the License.
 """Convert ViT and non-distilled DeiT checkpoints from the timm library."""
 
+import re
 import requests
 import torch
 from PIL import Image
@@ -30,7 +31,6 @@ from transformers.utils import logging
 
 from voyager_compiler import (
     DerivedQuantizationSpec,
-    FusedAmaxObsFakeQuantize,
     QuantizationConfig,
     QuantizationSpec,
     add_qspec_args,
@@ -300,10 +300,10 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        if dtype == "nf4_6":
-            dtype = "int6"
+        match = re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype, re.IGNORECASE)
+        if match is not None and match.group(2) is not None:
+            dtype = f"int{match.group(2)}"
         qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
-        qspec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize
 
         bias_qspec = DerivedQuantizationSpec(
             derived_from=None,
@@ -329,7 +329,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     remove_softmax_dtype_cast(gm)
 
-    for i in tqdm(range(10), desc="Calibrating ViT"):
+    for i in tqdm(range(args.calibration_steps), desc="Calibrating ViT"):
         inputs = calibration_data[i]["image"]
         with torch.no_grad():
             gm(inputs.to(torch_dtype))
