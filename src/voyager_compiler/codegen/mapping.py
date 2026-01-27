@@ -69,7 +69,7 @@ def eliminate_dead_code(m):
     # the removed node.
     changed = False
     for node in reversed(m.nodes):
-        if node.op != 'output' and len(node.users) == 0:
+        if node.op not in ['placeholder', 'output'] and not node.users:
             m.erase_node(node)
             changed = True
 
