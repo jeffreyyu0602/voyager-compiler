@@ -781,7 +781,7 @@ def _make_tiled_gemm_module(C, tile_c, target, is_mat):
                 tiled_gemm = self.run_op(
                     input_tile,
                     weight_tile,
-                    bias if c1 == C else None,
+                    bias if c == 0 else None,
                     scale_tiles,
                     (input_code, weight_code),
                 )

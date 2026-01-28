@@ -518,9 +518,9 @@ def _create_and_insert_subgraph(
     return new_node
 
 
-def _nodes_sequential(nodes: List[Node]):
-    prev_node = None
-    for n in nodes:
+def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
+    prev_node = nodes[0]
+    for n in nodes[1:]:
         # Check if the current node is a user of the previous node
         if prev_node is not None and n not in prev_node.users:
             return False
@@ -530,6 +530,15 @@ def _nodes_sequential(nodes: List[Node]):
             and not is_gemm_op(n.args[0])
         ):
             return False
+        for arg in n.all_input_nodes:
+            if id(arg) == id(prev_node):
+                continue
+
+            while is_nop(arg):
+                arg = arg.all_input_nodes[0]
+
+            if arg.op == "call_function" and order[arg] > order[prev_node]:
+                return False
         prev_node = n
     return True
 
@@ -585,7 +594,7 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate):
+                if _nodes_sequential(candidate, order):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True
