@@ -177,11 +177,12 @@ def create_new_chain(model, node_to_fuse, cat_node, fusable):
 
 
 def move_fusable_ops_after_conv2d(model, node):
+    order = {n: i for i, n in enumerate(model.graph.nodes)}
     fusable_ops = []
     next_node = next(iter(node.users))
     while is_elementwise_op(next_node):
         chain = [node] + fusable_ops + [next_node]
-        if _nodes_sequential(chain):
+        if _nodes_sequential(chain, order):
             fusable_ops.append(next_node)
         else:
             break

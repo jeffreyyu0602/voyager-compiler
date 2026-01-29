@@ -401,11 +401,12 @@ def replace_conv2d_with_im2col(model: GraphModule):
         # Move elementwise operations after view to after the linear node
         linear_node = next((n for n in val_maps.values() if is_gemm_op(n)))
 
+        order = {n: i for i, n in enumerate(graph.nodes)}
         fusable_ops = []
         next_node = next(iter(output.users))
         while is_elementwise_op(next_node):
             chain = fusable_ops + [next_node]
-            if _nodes_sequential(chain):
+            if _nodes_sequential(chain, order):
                 fusable_ops.append(next_node)
             else:
                 break
