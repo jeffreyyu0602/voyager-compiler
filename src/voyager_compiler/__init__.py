@@ -161,11 +161,12 @@ def transform(
     fuse_operator=True,
     fuse_reshape=True,
     split_spmm=False,
+    use_fake_mode=True
 ):
     if example_kwargs is None:
         example_kwargs = {}
 
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+    fake_mode = FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)

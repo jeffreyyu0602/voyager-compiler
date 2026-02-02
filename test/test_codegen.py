@@ -526,7 +526,7 @@ if __name__ == "__main__":
 
         old_output = gm(*example_args, *list(example_kwargs.values()))
 
-        transform(gm, example_args, example_kwargs=example_kwargs, **transform_args)
+        transform(gm, example_args, example_kwargs=example_kwargs, use_fake_mode=False, **transform_args)
         compile(gm, example_args, **compile_args)
 
         # from voyager_compiler.codegen.lowering.ir import FXToIR
