@@ -100,8 +100,8 @@ class ShapeProp:
                 node.shape = result.shape
                 node.value = result.cpu().clone()
             elif isinstance(result, (tuple, list)):
-                node.shape = tuple(x.shape for x in result)
-                node.value = tuple(x.cpu().clone() for x in result)
+                node.shape = tuple(x.shape if x is not None else None for x in result)
+                node.value = tuple(x.cpu().clone() if x is not None else None for x in result)
             else:
                 node.value = result
                 logger.info(f"Node {node} produced non-tensor output {result}")

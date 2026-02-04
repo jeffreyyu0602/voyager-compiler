@@ -529,14 +529,6 @@ if __name__ == "__main__":
         transform(gm, example_args, example_kwargs=example_kwargs, **transform_args)
         compile(gm, example_args, **compile_args)
 
-        # from voyager_compiler.codegen.lowering.ir import FXToIR
-        # from voyager_compiler.codegen.lowering.lowering import lower_operations
-
-        # ir = FXToIR.convert(gm, func_name="m")
-        # print(ir.format())
-        # ir = lower_operations(ir)
-        # print(ir.format())
-
         new_output = gm(*example_args, *list(example_kwargs.values()))
         gm.graph.print_tabular()
     elif args.model == "llm_kivi":

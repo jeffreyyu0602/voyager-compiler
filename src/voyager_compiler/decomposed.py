@@ -896,3 +896,59 @@ def _(
     X = indptr.shape[-1] - 1
     K = B.shape[-1] if weight_transposed else B.shape[-2]
     return data.new_empty((*batch_shape, X, K))
+
+
+quantized_decomposed_lib.define(
+    "copy_tile(Tensor input, Tensor[] tile_indices, SymInt[] tile_sizes, "
+    "SymInt[] dims, SymInt[]? tile_strides=None) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "copy_tile", "CompositeExplicitAutograd")
+def copy_tile(
+    input: torch.Tensor,
+    tile_indices: List[torch.Tensor],
+    tile_sizes: List[int],
+    dims: List[int],
+    tile_strides: Optional[List[int]] = None,
+) -> torch.Tensor:
+    """
+    Semantic Python equivalent of DataLoader::copy_tile.
+
+    Returns the logical tile tensor corresponding to the C backend behavior.
+    """
+    if tile_strides is None:
+        tile_strides = tile_sizes
+
+    indices = []
+    i = 0
+    for d in range(input.dim()):
+        if d in dims:
+            indices.append(tile_indices[i])
+            i += 1
+        else:
+            indices.append(torch.tensor(0))
+
+    full_shape = input.shape
+    rank = len(full_shape)
+    assert rank == len(tile_sizes) == len(tile_strides) == len(indices)
+
+    # start[d] = tile_indices[d] * tile_strides[d]
+    start = [indices[d].item() * tile_strides[d] for d in range(rank)]
+
+    # Slice the logical tile
+    slices = tuple(
+        slice(start[d], start[d] + tile_sizes[d]) for d in range(rank)
+    )
+    return input[slices]
+
+
+@torch.library.register_fake("quantized_ops::copy_tile")
+def _(
+    input: torch.Tensor,
+    tile_indices: List[torch.Tensor],
+    tile_sizes: List[int],
+    dims: List[int],
+    tile_strides: Optional[List[int]] = None,
+):
+    return torch.empty(tile_sizes)
