@@ -525,8 +525,12 @@ if __name__ == "__main__":
         convert_pt2e(gm, args.bias)
 
         old_output = gm(*example_args, *list(example_kwargs.values()))
+        
+        has_outlier = args.enable_mixed_precision and args.outlier_pct is not None and args.outlier_pct > 0.0
 
-        transform(gm, example_args, example_kwargs=example_kwargs, **transform_args)
+        # if outlier quantization is enabled, we need to use actual data to determine the tile sizes of
+        # csr tensors
+        transform(gm, example_args, example_kwargs=example_kwargs, use_fake_mode=(not has_outlier), **transform_args)
         compile(gm, example_args, **compile_args)
 
         new_output = gm(*example_args, *list(example_kwargs.values()))
