@@ -1181,7 +1181,8 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         input_shape, x_tiled, list(range(len(input_shape) - 1))
     )
 
-    batch_dims = tiled_input_shape[:-1]
+    input_dims = tiled_input_shape[:-1]
+    batch_dims = tiled_input_shape[:-2]
 
     is_mat = is_matmul(node)
     weight_transposed = is_mat ^ node.meta.get("transposed", False)
@@ -1193,6 +1194,10 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         weight_shape = (k_tiled, c_tiled)
         weight_scale_shape = (k_tiled, c_scaled)
 
+    if is_bmm(node):
+        weight_shape = batch_dims + weight_shape
+        weight_scale_shape = batch_dims + weight_scale_shape
+
     A_indptr = node.kwargs.get("A_indptr")
     if A_indptr is not None:
         nnz = 0
@@ -1201,15 +1206,15 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
             nnz = max(nnz, A_indptr_value[i + x_tiled] - A_indptr_value[i])
 
     return {
-        "input": batch_dims + (c_tiled,),
+        "input": input_dims + (c_tiled,),
         "other" if is_mat else "weight": weight_shape,
         "bias": (k_tiled,),
-        "input_scale": batch_dims + (c_scaled,),
+        "input_scale": input_dims + (c_scaled,),
         "weight_scale": weight_scale_shape,
-        "A_data": batch_dims[:-1] + (nnz,) if A_indptr else None,
-        "A_indices": batch_dims[:-1] + (nnz,) if A_indptr else None,
-        "A_indptr": batch_dims[:-1] + (x_tiled + 1,),
-        "output": batch_dims + (k_tiled,),
+        "A_data": batch_dims + (nnz,) if A_indptr else None,
+        "A_indices": batch_dims + (nnz,) if A_indptr else None,
+        "A_indptr": batch_dims + (x_tiled + 1,),
+        "output": input_dims + (k_tiled,),
     }
 
 

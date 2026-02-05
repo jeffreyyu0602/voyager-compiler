@@ -519,26 +519,27 @@ def _create_and_insert_subgraph(
 
 
 def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
-    prev_node = nodes[0]
-    for n in nodes[1:]:
+    prev_node = None
+    for n in nodes:
         # Check if the current node is a user of the previous node
         if prev_node is not None and n not in prev_node.users:
             return False
-        # We only fuse dequantize after GEMM here
+        # We only handle dequantize after GEMM here
         if (
             n.target == torch.ops.quantized_ops.dequantize.default
             and not is_gemm_op(n.args[0])
         ):
             return False
-        for arg in n.all_input_nodes:
-            if id(arg) == id(prev_node):
-                continue
+        if prev_node is not None:
+            for arg in n.all_input_nodes:
+                if id(arg) == id(prev_node):
+                    continue
 
-            while is_nop(arg):
-                arg = arg.all_input_nodes[0]
+                while is_nop(arg):
+                    arg = arg.all_input_nodes[0]
 
-            if arg.op == "call_function" and order[arg] > order[prev_node]:
-                return False
+                if arg.op == "call_function" and order[arg] > order[prev_node]:
+                    return False
         prev_node = n
     return True
 
