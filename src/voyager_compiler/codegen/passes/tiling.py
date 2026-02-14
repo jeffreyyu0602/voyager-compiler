@@ -1198,10 +1198,12 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         weight_shape = batch_dims + weight_shape
         weight_scale_shape = batch_dims + weight_scale_shape
 
-    A_data = node.kwargs.get("A_data")
-    num_c_tile = divisor[1] if divisor is not None else 1
-    if A_data is not None:
-        nnz = A_data.shape[-1] // num_c_tile
+    A_indptr = node.kwargs.get("A_indptr")
+    if A_indptr is not None:
+        nnz = 0
+        A_indptr_value = A_indptr.value[-1] if len(A_indptr.shape) > 1 else A_indptr.value
+        for i in range(0, A_indptr.shape[-1] - 1, x_tiled):
+            nnz = max(nnz, A_indptr_value[i + x_tiled] - A_indptr_value[i])
 
     return {
         "input": input_dims + (c_tiled,),
@@ -1209,8 +1211,8 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
         "bias": (k_tiled,),
         "input_scale": input_dims + (c_scaled,),
         "weight_scale": weight_scale_shape,
-        "A_data": batch_dims + (nnz,) if A_data else None,
-        "A_indices": batch_dims + (nnz,) if A_data else None,
+        "A_data": batch_dims + (nnz,) if A_indptr else None,
+        "A_indices": batch_dims + (nnz,) if A_indptr else None,
         "A_indptr": batch_dims + (x_tiled + 1,),
         "output": input_dims + (k_tiled,),
     }
