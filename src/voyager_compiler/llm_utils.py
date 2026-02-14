@@ -47,6 +47,7 @@ def generate(
     min_length: int = 0,
     eos_token_id: Union[int, List[int]] = None,
     model_decode: torch.nn.Module = None,
+    **kwargs,
 ):
     device = model.device
     generation_config = model.generation_config
@@ -566,21 +567,12 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
                     dtype=next(model_decode.parameters()).dtype,
                 )
 
-                try:
-                    logits = model_decode(
-                        input_ids=current_token.to(device),
-                        cache_position=torch.tensor([len(response_tokens) - 1], dtype=torch.long, device=device),
-                        cache_position_residual=torch.tensor([step - 1], dtype=torch.long, device=device),
-                        attention_mask=causal_mask.to(device),
-                    )
-                except:
-                    from voyager_compiler import ShapeProp
-                    ShapeProp(model_decode).propagate(
-                        current_token.to(device),
-                        torch.tensor([len(response_tokens) - 1], dtype=torch.long, device=device),
-                        torch.tensor([step - 1], dtype=torch.long, device=device),
-                        causal_mask.to(device),
-                    )
+                logits = model_decode(
+                    input_ids=current_token.to(device),
+                    cache_position=torch.tensor([len(response_tokens) - 1], dtype=torch.long, device=device),
+                    cache_position_residual=torch.tensor([step - 1], dtype=torch.long, device=device),
+                    attention_mask=causal_mask.to(device),
+                )
 
                 # print(f"Step {step} logits:", logits)
 

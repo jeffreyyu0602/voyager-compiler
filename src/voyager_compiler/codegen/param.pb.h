@@ -64,6 +64,9 @@ extern BoolListDefaultTypeInternal _BoolList_default_instance_;
 class IntList;
 struct IntListDefaultTypeInternal;
 extern IntListDefaultTypeInternal _IntList_default_instance_;
+class Loop;
+struct LoopDefaultTypeInternal;
+extern LoopDefaultTypeInternal _Loop_default_instance_;
 class Memory;
 struct MemoryDefaultTypeInternal;
 extern MemoryDefaultTypeInternal _Memory_default_instance_;
@@ -2352,6 +2355,257 @@ class OpOverloadList final : public ::google::protobuf::Message
 };
 // -------------------------------------------------------------------
 
+class Loop final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.Loop) */ {
+ public:
+  inline Loop() : Loop(nullptr) {}
+  ~Loop() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(Loop* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(Loop));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR Loop(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline Loop(const Loop& from) : Loop(nullptr, from) {}
+  inline Loop(Loop&& from) noexcept
+      : Loop(nullptr, std::move(from)) {}
+  inline Loop& operator=(const Loop& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline Loop& operator=(Loop&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const Loop& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const Loop* internal_default_instance() {
+    return reinterpret_cast<const Loop*>(
+        &_Loop_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 10;
+  friend void swap(Loop& a, Loop& b) { a.Swap(&b); }
+  inline void Swap(Loop* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(Loop* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  Loop* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<Loop>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const Loop& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const Loop& from) { Loop::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(Loop* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.Loop"; }
+
+ protected:
+  explicit Loop(::google::protobuf::Arena* arena);
+  Loop(::google::protobuf::Arena* arena, const Loop& from);
+  Loop(::google::protobuf::Arena* arena, Loop&& from) noexcept
+      : Loop(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kBodyFieldNumber = 5,
+    kNodeFieldNumber = 1,
+    kStartFieldNumber = 2,
+    kEndFieldNumber = 3,
+    kStepFieldNumber = 4,
+  };
+  // repeated .codegen.Operation body = 5;
+  int body_size() const;
+  private:
+  int _internal_body_size() const;
+
+  public:
+  void clear_body() ;
+  ::codegen::Operation* mutable_body(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* mutable_body();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& _internal_body() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* _internal_mutable_body();
+  public:
+  const ::codegen::Operation& body(int index) const;
+  ::codegen::Operation* add_body();
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& body() const;
+  // string node = 1;
+  void clear_node() ;
+  const std::string& node() const;
+  template <typename Arg_ = const std::string&, typename... Args_>
+  void set_node(Arg_&& arg, Args_... args);
+  std::string* mutable_node();
+  PROTOBUF_NODISCARD std::string* release_node();
+  void set_allocated_node(std::string* value);
+
+  private:
+  const std::string& _internal_node() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_node(
+      const std::string& value);
+  std::string* _internal_mutable_node();
+
+  public:
+  // int32 start = 2;
+  void clear_start() ;
+  ::int32_t start() const;
+  void set_start(::int32_t value);
+
+  private:
+  ::int32_t _internal_start() const;
+  void _internal_set_start(::int32_t value);
+
+  public:
+  // int32 end = 3;
+  void clear_end() ;
+  ::int32_t end() const;
+  void set_end(::int32_t value);
+
+  private:
+  ::int32_t _internal_end() const;
+  void _internal_set_end(::int32_t value);
+
+  public:
+  // int32 step = 4;
+  void clear_step() ;
+  ::int32_t step() const;
+  void set_step(::int32_t value);
+
+  private:
+  ::int32_t _internal_step() const;
+  void _internal_set_step(::int32_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:codegen.Loop)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      3, 5, 1,
+      25, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const Loop& from_msg);
+    ::google::protobuf::RepeatedPtrField< ::codegen::Operation > body_;
+    ::google::protobuf::internal::ArenaStringPtr node_;
+    ::int32_t start_;
+    ::int32_t end_;
+    ::int32_t step_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
 class Operation final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:codegen.Operation) */ {
  public:
@@ -2410,18 +2664,19 @@ class Operation final : public ::google::protobuf::Message
   enum OpTypeCase {
     kOp = 1,
     kFusedOp = 2,
+    kLoop = 3,
     OP_TYPE_NOT_SET = 0,
   };
   enum ReturnTypeCase {
-    kOutput = 3,
-    kOutputs = 4,
+    kOutput = 4,
+    kOutputs = 5,
     RETURN_TYPE_NOT_SET = 0,
   };
   static inline const Operation* internal_default_instance() {
     return reinterpret_cast<const Operation*>(
         &_Operation_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 10;
+  static constexpr int kIndexInFileMessages = 11;
   friend void swap(Operation& a, Operation& b) { a.Swap(&b); }
   inline void Swap(Operation* other) {
     if (other == this) return;
@@ -2510,8 +2765,9 @@ class Operation final : public ::google::protobuf::Message
   enum : int {
     kOpFieldNumber = 1,
     kFusedOpFieldNumber = 2,
-    kOutputFieldNumber = 3,
-    kOutputsFieldNumber = 4,
+    kLoopFieldNumber = 3,
+    kOutputFieldNumber = 4,
+    kOutputsFieldNumber = 5,
   };
   // .codegen.OpOverload op = 1;
   bool has_op() const;
@@ -2551,7 +2807,26 @@ class Operation final : public ::google::protobuf::Message
   ::codegen::OpOverloadList* _internal_mutable_fused_op();
 
   public:
-  // .codegen.Tensor output = 3;
+  // .codegen.Loop loop = 3;
+  bool has_loop() const;
+  private:
+  bool _internal_has_loop() const;
+
+  public:
+  void clear_loop() ;
+  const ::codegen::Loop& loop() const;
+  PROTOBUF_NODISCARD ::codegen::Loop* release_loop();
+  ::codegen::Loop* mutable_loop();
+  void set_allocated_loop(::codegen::Loop* value);
+  void unsafe_arena_set_allocated_loop(::codegen::Loop* value);
+  ::codegen::Loop* unsafe_arena_release_loop();
+
+  private:
+  const ::codegen::Loop& _internal_loop() const;
+  ::codegen::Loop* _internal_mutable_loop();
+
+  public:
+  // .codegen.Tensor output = 4;
   bool has_output() const;
   private:
   bool _internal_has_output() const;
@@ -2570,7 +2845,7 @@ class Operation final : public ::google::protobuf::Message
   ::codegen::Tensor* _internal_mutable_output();
 
   public:
-  // .codegen.TensorList outputs = 4;
+  // .codegen.TensorList outputs = 5;
   bool has_outputs() const;
   private:
   bool _internal_has_outputs() const;
@@ -2598,6 +2873,7 @@ class Operation final : public ::google::protobuf::Message
   class _Internal;
   void set_has_op();
   void set_has_fused_op();
+  void set_has_loop();
   void set_has_output();
   void set_has_outputs();
   inline bool has_op_type() const;
@@ -2606,7 +2882,7 @@ class Operation final : public ::google::protobuf::Message
   inline void clear_has_return_type();
   friend class ::google::protobuf::internal::TcParser;
   static const ::google::protobuf::internal::TcParseTable<
-      0, 4, 4,
+      0, 5, 5,
       0, 2>
       _table_;
 
@@ -2629,6 +2905,7 @@ class Operation final : public ::google::protobuf::Message
       ::google::protobuf::internal::ConstantInitialized _constinit_;
       ::codegen::OpOverload* op_;
       ::codegen::OpOverloadList* fused_op_;
+      ::codegen::Loop* loop_;
     } op_type_;
     union ReturnTypeUnion {
       constexpr ReturnTypeUnion() : _constinit_{} {}
@@ -2704,7 +2981,7 @@ class Model final : public ::google::protobuf::Message
     return reinterpret_cast<const Model*>(
         &_Model_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 11;
+  static constexpr int kIndexInFileMessages = 12;
   friend void swap(Model& a, Model& b) { a.Swap(&b); }
   inline void Swap(Model* other) {
     if (other == this) return;
@@ -4702,6 +4979,173 @@ OpOverloadList::_internal_mutable_op_list() {
 
 // -------------------------------------------------------------------
 
+// Loop
+
+// string node = 1;
+inline void Loop::clear_node() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.node_.ClearToEmpty();
+}
+inline const std::string& Loop::node() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Loop.node)
+  return _internal_node();
+}
+template <typename Arg_, typename... Args_>
+inline PROTOBUF_ALWAYS_INLINE void Loop::set_node(Arg_&& arg,
+                                                     Args_... args) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.node_.Set(static_cast<Arg_&&>(arg), args..., GetArena());
+  // @@protoc_insertion_point(field_set:codegen.Loop.node)
+}
+inline std::string* Loop::mutable_node() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  std::string* _s = _internal_mutable_node();
+  // @@protoc_insertion_point(field_mutable:codegen.Loop.node)
+  return _s;
+}
+inline const std::string& Loop::_internal_node() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.node_.Get();
+}
+inline void Loop::_internal_set_node(const std::string& value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.node_.Set(value, GetArena());
+}
+inline std::string* Loop::_internal_mutable_node() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _impl_.node_.Mutable( GetArena());
+}
+inline std::string* Loop::release_node() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:codegen.Loop.node)
+  return _impl_.node_.Release();
+}
+inline void Loop::set_allocated_node(std::string* value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.node_.SetAllocated(value, GetArena());
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString() && _impl_.node_.IsDefault()) {
+    _impl_.node_.Set("", GetArena());
+  }
+  // @@protoc_insertion_point(field_set_allocated:codegen.Loop.node)
+}
+
+// int32 start = 2;
+inline void Loop::clear_start() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.start_ = 0;
+}
+inline ::int32_t Loop::start() const {
+  // @@protoc_insertion_point(field_get:codegen.Loop.start)
+  return _internal_start();
+}
+inline void Loop::set_start(::int32_t value) {
+  _internal_set_start(value);
+  // @@protoc_insertion_point(field_set:codegen.Loop.start)
+}
+inline ::int32_t Loop::_internal_start() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.start_;
+}
+inline void Loop::_internal_set_start(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.start_ = value;
+}
+
+// int32 end = 3;
+inline void Loop::clear_end() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.end_ = 0;
+}
+inline ::int32_t Loop::end() const {
+  // @@protoc_insertion_point(field_get:codegen.Loop.end)
+  return _internal_end();
+}
+inline void Loop::set_end(::int32_t value) {
+  _internal_set_end(value);
+  // @@protoc_insertion_point(field_set:codegen.Loop.end)
+}
+inline ::int32_t Loop::_internal_end() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.end_;
+}
+inline void Loop::_internal_set_end(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.end_ = value;
+}
+
+// int32 step = 4;
+inline void Loop::clear_step() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.step_ = 0;
+}
+inline ::int32_t Loop::step() const {
+  // @@protoc_insertion_point(field_get:codegen.Loop.step)
+  return _internal_step();
+}
+inline void Loop::set_step(::int32_t value) {
+  _internal_set_step(value);
+  // @@protoc_insertion_point(field_set:codegen.Loop.step)
+}
+inline ::int32_t Loop::_internal_step() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.step_;
+}
+inline void Loop::_internal_set_step(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.step_ = value;
+}
+
+// repeated .codegen.Operation body = 5;
+inline int Loop::_internal_body_size() const {
+  return _internal_body().size();
+}
+inline int Loop::body_size() const {
+  return _internal_body_size();
+}
+inline void Loop::clear_body() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.body_.Clear();
+}
+inline ::codegen::Operation* Loop::mutable_body(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.Loop.body)
+  return _internal_mutable_body()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>* Loop::mutable_body()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.Loop.body)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_body();
+}
+inline const ::codegen::Operation& Loop::body(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Loop.body)
+  return _internal_body().Get(index);
+}
+inline ::codegen::Operation* Loop::add_body() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::Operation* _add = _internal_mutable_body()->Add();
+  // @@protoc_insertion_point(field_add:codegen.Loop.body)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& Loop::body() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.Loop.body)
+  return _internal_body();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>&
+Loop::_internal_body() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.body_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>*
+Loop::_internal_mutable_body() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.body_;
+}
+
+// -------------------------------------------------------------------
+
 // Operation
 
 // .codegen.OpOverload op = 1;
@@ -4862,7 +5306,86 @@ inline ::codegen::OpOverloadList* Operation::mutable_fused_op() ABSL_ATTRIBUTE_L
   return _msg;
 }
 
-// .codegen.Tensor output = 3;
+// .codegen.Loop loop = 3;
+inline bool Operation::has_loop() const {
+  return op_type_case() == kLoop;
+}
+inline bool Operation::_internal_has_loop() const {
+  return op_type_case() == kLoop;
+}
+inline void Operation::set_has_loop() {
+  _impl_._oneof_case_[0] = kLoop;
+}
+inline void Operation::clear_loop() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (op_type_case() == kLoop) {
+    if (GetArena() == nullptr) {
+      delete _impl_.op_type_.loop_;
+    } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
+      ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.loop_);
+    }
+    clear_has_op_type();
+  }
+}
+inline ::codegen::Loop* Operation::release_loop() {
+  // @@protoc_insertion_point(field_release:codegen.Operation.loop)
+  if (op_type_case() == kLoop) {
+    clear_has_op_type();
+    auto* temp = _impl_.op_type_.loop_;
+    if (GetArena() != nullptr) {
+      temp = ::google::protobuf::internal::DuplicateIfNonNull(temp);
+    }
+    _impl_.op_type_.loop_ = nullptr;
+    return temp;
+  } else {
+    return nullptr;
+  }
+}
+inline const ::codegen::Loop& Operation::_internal_loop() const {
+  return op_type_case() == kLoop ? *_impl_.op_type_.loop_ : reinterpret_cast<::codegen::Loop&>(::codegen::_Loop_default_instance_);
+}
+inline const ::codegen::Loop& Operation::loop() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Operation.loop)
+  return _internal_loop();
+}
+inline ::codegen::Loop* Operation::unsafe_arena_release_loop() {
+  // @@protoc_insertion_point(field_unsafe_arena_release:codegen.Operation.loop)
+  if (op_type_case() == kLoop) {
+    clear_has_op_type();
+    auto* temp = _impl_.op_type_.loop_;
+    _impl_.op_type_.loop_ = nullptr;
+    return temp;
+  } else {
+    return nullptr;
+  }
+}
+inline void Operation::unsafe_arena_set_allocated_loop(::codegen::Loop* value) {
+  // We rely on the oneof clear method to free the earlier contents
+  // of this oneof. We can directly use the pointer we're given to
+  // set the new value.
+  clear_op_type();
+  if (value) {
+    set_has_loop();
+    _impl_.op_type_.loop_ = value;
+  }
+  // @@protoc_insertion_point(field_unsafe_arena_set_allocated:codegen.Operation.loop)
+}
+inline ::codegen::Loop* Operation::_internal_mutable_loop() {
+  if (op_type_case() != kLoop) {
+    clear_op_type();
+    set_has_loop();
+    _impl_.op_type_.loop_ =
+        ::google::protobuf::Message::DefaultConstruct<::codegen::Loop>(GetArena());
+  }
+  return _impl_.op_type_.loop_;
+}
+inline ::codegen::Loop* Operation::mutable_loop() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::codegen::Loop* _msg = _internal_mutable_loop();
+  // @@protoc_insertion_point(field_mutable:codegen.Operation.loop)
+  return _msg;
+}
+
+// .codegen.Tensor output = 4;
 inline bool Operation::has_output() const {
   return return_type_case() == kOutput;
 }
@@ -4941,7 +5464,7 @@ inline ::codegen::Tensor* Operation::mutable_output() ABSL_ATTRIBUTE_LIFETIME_BO
   return _msg;
 }
 
-// .codegen.TensorList outputs = 4;
+// .codegen.TensorList outputs = 5;
 inline bool Operation::has_outputs() const {
   return return_type_case() == kOutputs;
 }

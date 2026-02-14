@@ -211,19 +211,6 @@ def quantize(
     return vmap(input, qmap)
 
 
-@torch.library.register_fake("quantized_ops::quantize")
-def _(
-    input: torch.Tensor,
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor] = None,
-    axes: Optional[Tuple[int]] = None,
-    block_size: Optional[int] = None,
-    qmap: torch.Tensor = None,
-    output_code: Optional[torch.Tensor] = None,
-):
-    return torch.empty_like(input)
-
-
 quantized_decomposed_lib.define(
     "dequantize(Tensor input, Tensor scale, Tensor? zero_point=None, SymInt[]? axes=None, "
     "int? block_size=None, Tensor? input_qmap=None, Tensor? output_qmap=None) -> Tensor"
@@ -276,19 +263,6 @@ def dequantize(
     return dequantized
 
 
-@torch.library.register_fake("quantized_ops::dequantize")
-def _(
-    input: torch.Tensor,
-    scale: torch.Tensor,
-    zero_point: Optional[torch.Tensor] = None,
-    axes: Optional[Tuple[int]] = None,
-    block_size: Optional[int] = None,
-    input_qmap: Optional[torch.Tensor] = None,
-    output_qmap: Optional[torch.Tensor] = None,
-):
-    return torch.empty_like(input)
-
-
 quantized_decomposed_lib.define(
     "conv2d_mx(Tensor input, Tensor weight, Tensor? bias=None, SymInt[2] stride=1, "
     "SymInt[2] padding=0, SymInt[2] dilation=1, SymInt groups=1, *, Tensor? input_scale=None, "
@@ -325,20 +299,6 @@ def conv2d_mx(
     if weight_scale is not None:
         weight = weight * expand(weight_scale, weight.shape, block_size)
 
-    return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
-
-
-@torch.library.register_fake("quantized_ops::conv2d_mx")
-def _(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor = None,
-    stride: Union[int, Tuple[int]] = 1,
-    padding: Union[int, Tuple[int]] = 0,
-    dilation: Union[int, Tuple[int]] = 1,
-    groups: int = 1,
-    **kwargs,
-):
     return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
 
 
@@ -524,21 +484,6 @@ def calculate_mx_qparam(
     return scale
 
 
-@torch.library.register_fake("quantized_ops::calculate_mx_qparam")
-def _(
-    input: torch.Tensor,
-    axes: Union[int, List[int]],
-    block_size: int,
-    quant_max: float,
-    force_scale_power_of_two: bool = False,
-    scale_qmap: Optional[torch.Tensor] = None,
-):
-    scale_shape = list(input.shape)
-    for axis in axes:
-        scale_shape[axis] = math.ceil(scale_shape[axis] / block_size)
-    return input.new_empty(scale_shape)
-
-
 quantized_decomposed_lib.define(
     "quantize_mx(Tensor self, Tensor qmap, SymInt[] axes, int block_size, float quant_max, "
     "bool force_scale_power_of_two=False, Tensor scale_qmap=None, Tensor output_code=None) -> (Tensor, Tensor)"
@@ -566,28 +511,6 @@ def quantize_mx(
     )
     input = quantize(input, scale, None, axes, block_size, qmap)
     return scale, input
-
-
-@torch.library.register_fake("quantized_ops::quantize_mx")
-def _(
-    input: torch.Tensor,
-    qmap: torch.Tensor,
-    axes: Tuple[int],
-    block_size: int,
-    quant_max: float,
-    force_scale_power_of_two: bool = False,
-    scale_qmap: Optional[torch.Tensor] = None,
-    output_code: Optional[torch.Tensor] = None,
-):
-    scale = torch.ops.quantized_ops.calculate_mx_qparam(
-        input,
-        axes,
-        block_size,
-        quant_max,
-        force_scale_power_of_two,
-        scale_qmap,
-    )
-    return scale, torch.empty_like(input)
 
 
 quantized_decomposed_lib.define(
@@ -747,7 +670,7 @@ def _(
         scale_shape[axis] = math.ceil(scale_shape[axis] / block_size)
     scale = input.new_empty(scale_shape)
 
-    inliers = torch.empty_like(input)
+    inliers = torch.empty_like(input, memory_format=torch.contiguous_format)
     return data, indices, indptr, scale, inliers
 
 
@@ -899,13 +822,13 @@ def _(
 
 
 quantized_decomposed_lib.define(
-    "copy_tile(Tensor input, Tensor[] tile_indices, SymInt[] tile_sizes, "
+    "load_tile(Tensor input, Tensor[] tile_indices, SymInt[] tile_sizes, "
     "SymInt[] dims, SymInt[]? tile_strides=None) -> Tensor"
 )
 
 
-@impl(quantized_decomposed_lib, "copy_tile", "CompositeExplicitAutograd")
-def copy_tile(
+@impl(quantized_decomposed_lib, "load_tile", "CompositeExplicitAutograd")
+def load_tile(
     input: torch.Tensor,
     tile_indices: List[torch.Tensor],
     tile_sizes: List[int],
@@ -913,28 +836,29 @@ def copy_tile(
     tile_strides: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """
-    Semantic Python equivalent of DataLoader::copy_tile.
+    Semantic Python equivalent of DataLoader::load_tile.
 
     Returns the logical tile tensor corresponding to the C backend behavior.
     """
     if tile_strides is None:
         tile_strides = tile_sizes
 
+    assert len(tile_indices) == len(dims)
+
     indices = []
     i = 0
     for d in range(input.dim()):
         if d in dims:
-            indices.append(tile_indices[i])
+            indices.append(tile_indices[i].item())
             i += 1
         else:
-            indices.append(torch.tensor(0))
+            indices.append(0)
 
-    full_shape = input.shape
-    rank = len(full_shape)
+    rank = len(input.shape)
     assert rank == len(tile_sizes) == len(tile_strides) == len(indices)
 
     # start[d] = tile_indices[d] * tile_strides[d]
-    start = [indices[d].item() * tile_strides[d] for d in range(rank)]
+    start = [indices[d] * tile_strides[d] for d in range(rank)]
 
     # Slice the logical tile
     slices = tuple(
@@ -943,7 +867,7 @@ def copy_tile(
     return input[slices]
 
 
-@torch.library.register_fake("quantized_ops::copy_tile")
+@torch.library.register_fake("quantized_ops::load_tile")
 def _(
     input: torch.Tensor,
     tile_indices: List[torch.Tensor],
@@ -951,4 +875,80 @@ def _(
     dims: List[int],
     tile_strides: Optional[List[int]] = None,
 ):
-    return torch.empty(tile_sizes)
+    return input.new_empty(tile_sizes)
+
+
+quantized_decomposed_lib.define(
+    "store_tile(Tensor src, Tensor dest, Tensor[] tile_indices, SymInt[] tile_sizes, "
+    "SymInt[] dims) -> Tensor"
+)
+
+
+@impl(quantized_decomposed_lib, "store_tile", "CompositeExplicitAutograd")
+def store_tile(
+    src: torch.Tensor,
+    dest: torch.Tensor,
+    tile_indices: List[torch.Tensor],
+    tile_sizes: List[int],
+    dims: List[int],
+) -> torch.Tensor:
+    """
+    Semantic Python equivalent of DataLoader::load_tile.
+
+    Returns the logical tile tensor corresponding to the C backend behavior.
+    """
+    assert len(tile_indices) == len(dims)
+
+    indices = []
+    i = 0
+    for d in range(dest.dim()):
+        if d in dims:
+            indices.append(tile_indices[i].item())
+            i += 1
+        else:
+            indices.append(0)
+
+    rank = len(dest.shape)
+    assert rank == len(tile_sizes) == len(indices)
+
+    # start[d] = tile_indices[d] * tile_sizes[d]
+    start = [indices[d]* tile_sizes[d] for d in range(rank)]
+
+    # Slice the logical tile
+    slices = tuple(
+        slice(start[d], start[d] + tile_sizes[d]) for d in range(rank)
+    )
+    dest[slices] = src
+
+    return dest
+
+
+@torch.library.register_fake("quantized_ops::store_tile")
+def _(
+    src: torch.Tensor,
+    dest: torch.Tensor,
+    tile_indices: List[torch.Tensor],
+    tile_sizes: List[int],
+    dims: List[int],
+):
+    return torch.empty_like(dest)
+
+
+quantized_decomposed_lib.define(
+    "increment_indices(Tensor[] indices, int[] bounds) -> Tensor[]"
+)
+
+
+@impl(quantized_decomposed_lib, "increment_indices", "CompositeExplicitAutograd")
+def increment_indices(indices: List[torch.Tensor], bounds: List[int]):
+    for i in reversed(range(len(indices))):
+        indices[i] += 1
+        if indices[i] < bounds[i]:
+            break
+        indices[i].zero_()
+    return indices
+
+
+@torch.library.register_fake("quantized_ops::increment_indices")
+def _(indices: List[torch.Tensor], bounds: List[int]):
+    return [torch.zeros_like(i) for i in indices]

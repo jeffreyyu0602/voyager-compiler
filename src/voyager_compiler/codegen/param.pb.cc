@@ -301,6 +301,37 @@ struct OpOverloadListDefaultTypeInternal {
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 OpOverloadListDefaultTypeInternal _OpOverloadList_default_instance_;
 
+inline constexpr Loop::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : body_{},
+        node_(
+            &::google::protobuf::internal::fixed_address_empty_string,
+            ::_pbi::ConstantInitialized()),
+        start_{0},
+        end_{0},
+        step_{0},
+        _cached_size_{0} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR Loop::Loop(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct LoopDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR LoopDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~LoopDefaultTypeInternal() {}
+  union {
+    Loop _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 LoopDefaultTypeInternal _Loop_default_instance_;
+
 inline constexpr Operation::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
       : op_type_{},
@@ -490,6 +521,19 @@ const ::uint32_t
         PROTOBUF_FIELD_OFFSET(::codegen::OpOverloadList, _impl_.name_),
         PROTOBUF_FIELD_OFFSET(::codegen::OpOverloadList, _impl_.op_list_),
         ~0u,  // no _has_bits_
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.node_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.start_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.end_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.step_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.body_),
+        ~0u,  // no _has_bits_
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _internal_metadata_),
         ~0u,  // no _extensions_
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_._oneof_case_[0]),
@@ -497,6 +541,7 @@ const ::uint32_t
         ~0u,  // no _inlined_string_donated_
         ~0u,  // no _split_
         ~0u,  // no sizeof(Split)
+        ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
@@ -528,8 +573,9 @@ static const ::_pbi::MigrationSchema
         {92, 102, -1, sizeof(::codegen::OpOverload_KwargsEntry_DoNotUse)},
         {104, -1, -1, sizeof(::codegen::OpOverload)},
         {117, -1, -1, sizeof(::codegen::OpOverloadList)},
-        {127, -1, -1, sizeof(::codegen::Operation)},
-        {141, -1, -1, sizeof(::codegen::Model)},
+        {127, -1, -1, sizeof(::codegen::Loop)},
+        {140, -1, -1, sizeof(::codegen::Operation)},
+        {155, -1, -1, sizeof(::codegen::Model)},
 };
 static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_Memory_default_instance_._instance,
@@ -542,6 +588,7 @@ static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_OpOverload_KwargsEntry_DoNotUse_default_instance_._instance,
     &::codegen::_OpOverload_default_instance_._instance,
     &::codegen::_OpOverloadList_default_instance_._instance,
+    &::codegen::_Loop_default_instance_._instance,
     &::codegen::_Operation_default_instance_._instance,
     &::codegen::_Model_default_instance_._instance,
 };
@@ -575,26 +622,30 @@ const char descriptor_table_protodef_param_2eproto[] ABSL_ATTRIBUTE_SECTION_VARI
     "\013\n\003key\030\001 \001(\t\022 \n\005value\030\002 \001(\0132\021.codegen.Ar"
     "gument:\0028\001\"D\n\016OpOverloadList\022\014\n\004name\030\001 \001"
     "(\t\022$\n\007op_list\030\002 \003(\0132\023.codegen.OpOverload"
-    "\"\300\001\n\tOperation\022!\n\002op\030\001 \001(\0132\023.codegen.OpO"
-    "verloadH\000\022+\n\010fused_op\030\002 \001(\0132\027.codegen.Op"
-    "OverloadListH\000\022!\n\006output\030\003 \001(\0132\017.codegen"
-    ".TensorH\001\022&\n\007outputs\030\004 \001(\0132\023.codegen.Ten"
-    "sorListH\001B\t\n\007op_typeB\r\n\013return_type\"n\n\005M"
-    "odel\022\037\n\006inputs\030\001 \003(\0132\017.codegen.Tensor\022#\n"
-    "\nparameters\030\002 \003(\0132\017.codegen.Tensor\022\037\n\003op"
-    "s\030\003 \003(\0132\022.codegen.Operationb\006proto3"
+    "\"`\n\004Loop\022\014\n\004node\030\001 \001(\t\022\r\n\005start\030\002 \001(\005\022\013\n"
+    "\003end\030\003 \001(\005\022\014\n\004step\030\004 \001(\005\022 \n\004body\030\005 \003(\0132\022"
+    ".codegen.Operation\"\337\001\n\tOperation\022!\n\002op\030\001"
+    " \001(\0132\023.codegen.OpOverloadH\000\022+\n\010fused_op\030"
+    "\002 \001(\0132\027.codegen.OpOverloadListH\000\022\035\n\004loop"
+    "\030\003 \001(\0132\r.codegen.LoopH\000\022!\n\006output\030\004 \001(\0132"
+    "\017.codegen.TensorH\001\022&\n\007outputs\030\005 \001(\0132\023.co"
+    "degen.TensorListH\001B\t\n\007op_typeB\r\n\013return_"
+    "type\"n\n\005Model\022\037\n\006inputs\030\001 \003(\0132\017.codegen."
+    "Tensor\022#\n\nparameters\030\002 \003(\0132\017.codegen.Ten"
+    "sor\022\037\n\003ops\030\003 \003(\0132\022.codegen.Operationb\006pr"
+    "oto3"
 };
 static ::absl::once_flag descriptor_table_param_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_param_2eproto = {
     false,
     false,
-    1435,
+    1564,
     descriptor_table_protodef_param_2eproto,
     "param.proto",
     &descriptor_table_param_2eproto_once,
     nullptr,
     0,
-    12,
+    13,
     schemas,
     file_default_instances,
     TableStruct_param_2eproto::offsets,
@@ -3739,6 +3790,370 @@ void OpOverloadList::InternalSwap(OpOverloadList* PROTOBUF_RESTRICT other) {
 }
 // ===================================================================
 
+class Loop::_Internal {
+ public:
+};
+
+Loop::Loop(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.Loop)
+}
+inline PROTOBUF_NDEBUG_INLINE Loop::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility, ::google::protobuf::Arena* arena,
+    const Impl_& from, const ::codegen::Loop& from_msg)
+      : body_{visibility, arena, from.body_},
+        node_(arena, from.node_),
+        _cached_size_{0} {}
+
+Loop::Loop(
+    ::google::protobuf::Arena* arena,
+    const Loop& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  Loop* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  ::memcpy(reinterpret_cast<char *>(&_impl_) +
+               offsetof(Impl_, start_),
+           reinterpret_cast<const char *>(&from._impl_) +
+               offsetof(Impl_, start_),
+           offsetof(Impl_, step_) -
+               offsetof(Impl_, start_) +
+               sizeof(Impl_::step_));
+
+  // @@protoc_insertion_point(copy_constructor:codegen.Loop)
+}
+inline PROTOBUF_NDEBUG_INLINE Loop::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : body_{visibility, arena},
+        node_(arena),
+        _cached_size_{0} {}
+
+inline void Loop::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  ::memset(reinterpret_cast<char *>(&_impl_) +
+               offsetof(Impl_, start_),
+           0,
+           offsetof(Impl_, step_) -
+               offsetof(Impl_, start_) +
+               sizeof(Impl_::step_));
+}
+Loop::~Loop() {
+  // @@protoc_insertion_point(destructor:codegen.Loop)
+  SharedDtor(*this);
+}
+inline void Loop::SharedDtor(MessageLite& self) {
+  Loop& this_ = static_cast<Loop&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.node_.Destroy();
+  this_._impl_.~Impl_();
+}
+
+inline void* Loop::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) Loop(arena);
+}
+constexpr auto Loop::InternalNewImpl_() {
+  constexpr auto arena_bits = ::google::protobuf::internal::EncodePlacementArenaOffsets({
+      PROTOBUF_FIELD_OFFSET(Loop, _impl_.body_) +
+          decltype(Loop::_impl_.body_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+  });
+  if (arena_bits.has_value()) {
+    return ::google::protobuf::internal::MessageCreator::CopyInit(
+        sizeof(Loop), alignof(Loop), *arena_bits);
+  } else {
+    return ::google::protobuf::internal::MessageCreator(&Loop::PlacementNew_,
+                                 sizeof(Loop),
+                                 alignof(Loop));
+  }
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull Loop::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_Loop_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &Loop::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<Loop>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &Loop::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<Loop>(), &Loop::ByteSizeLong,
+            &Loop::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(Loop, _impl_._cached_size_),
+        false,
+    },
+    &Loop::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* Loop::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<3, 5, 1, 25, 2> Loop::_table_ = {
+  {
+    0,  // no _has_bits_
+    0, // no _extensions_
+    5, 56,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967264,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    5,  // num_field_entries
+    1,  // num_aux_entries
+    offsetof(decltype(_table_), aux_entries),
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::Loop>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    {::_pbi::TcParser::MiniParse, {}},
+    // string node = 1;
+    {::_pbi::TcParser::FastUS1,
+     {10, 63, 0, PROTOBUF_FIELD_OFFSET(Loop, _impl_.node_)}},
+    // int32 start = 2;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(Loop, _impl_.start_), 63>(),
+     {16, 63, 0, PROTOBUF_FIELD_OFFSET(Loop, _impl_.start_)}},
+    // int32 end = 3;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(Loop, _impl_.end_), 63>(),
+     {24, 63, 0, PROTOBUF_FIELD_OFFSET(Loop, _impl_.end_)}},
+    // int32 step = 4;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(Loop, _impl_.step_), 63>(),
+     {32, 63, 0, PROTOBUF_FIELD_OFFSET(Loop, _impl_.step_)}},
+    // repeated .codegen.Operation body = 5;
+    {::_pbi::TcParser::FastMtR1,
+     {42, 63, 0, PROTOBUF_FIELD_OFFSET(Loop, _impl_.body_)}},
+    {::_pbi::TcParser::MiniParse, {}},
+    {::_pbi::TcParser::MiniParse, {}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // string node = 1;
+    {PROTOBUF_FIELD_OFFSET(Loop, _impl_.node_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kUtf8String | ::_fl::kRepAString)},
+    // int32 start = 2;
+    {PROTOBUF_FIELD_OFFSET(Loop, _impl_.start_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kInt32)},
+    // int32 end = 3;
+    {PROTOBUF_FIELD_OFFSET(Loop, _impl_.end_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kInt32)},
+    // int32 step = 4;
+    {PROTOBUF_FIELD_OFFSET(Loop, _impl_.step_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kInt32)},
+    // repeated .codegen.Operation body = 5;
+    {PROTOBUF_FIELD_OFFSET(Loop, _impl_.body_), 0, 0,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+  }}, {{
+    {::_pbi::TcParser::GetTable<::codegen::Operation>()},
+  }}, {{
+    "\14\4\0\0\0\0\0\0"
+    "codegen.Loop"
+    "node"
+  }},
+};
+
+PROTOBUF_NOINLINE void Loop::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.Loop)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.body_.Clear();
+  _impl_.node_.ClearToEmpty();
+  ::memset(&_impl_.start_, 0, static_cast<::size_t>(
+      reinterpret_cast<char*>(&_impl_.step_) -
+      reinterpret_cast<char*>(&_impl_.start_)) + sizeof(_impl_.step_));
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* Loop::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const Loop& this_ = static_cast<const Loop&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* Loop::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const Loop& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.Loop)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          // string node = 1;
+          if (!this_._internal_node().empty()) {
+            const std::string& _s = this_._internal_node();
+            ::google::protobuf::internal::WireFormatLite::VerifyUtf8String(
+                _s.data(), static_cast<int>(_s.length()), ::google::protobuf::internal::WireFormatLite::SERIALIZE, "codegen.Loop.node");
+            target = stream->WriteStringMaybeAliased(1, _s, target);
+          }
+
+          // int32 start = 2;
+          if (this_._internal_start() != 0) {
+            target = ::google::protobuf::internal::WireFormatLite::
+                WriteInt32ToArrayWithField<2>(
+                    stream, this_._internal_start(), target);
+          }
+
+          // int32 end = 3;
+          if (this_._internal_end() != 0) {
+            target = ::google::protobuf::internal::WireFormatLite::
+                WriteInt32ToArrayWithField<3>(
+                    stream, this_._internal_end(), target);
+          }
+
+          // int32 step = 4;
+          if (this_._internal_step() != 0) {
+            target = ::google::protobuf::internal::WireFormatLite::
+                WriteInt32ToArrayWithField<4>(
+                    stream, this_._internal_step(), target);
+          }
+
+          // repeated .codegen.Operation body = 5;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_body_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_body().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    5, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.Loop)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t Loop::ByteSizeLong(const MessageLite& base) {
+          const Loop& this_ = static_cast<const Loop&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t Loop::ByteSizeLong() const {
+          const Loop& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.Loop)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // repeated .codegen.Operation body = 5;
+            {
+              total_size += 1UL * this_._internal_body_size();
+              for (const auto& msg : this_._internal_body()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+          }
+           {
+            // string node = 1;
+            if (!this_._internal_node().empty()) {
+              total_size += 1 + ::google::protobuf::internal::WireFormatLite::StringSize(
+                                              this_._internal_node());
+            }
+            // int32 start = 2;
+            if (this_._internal_start() != 0) {
+              total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+                  this_._internal_start());
+            }
+            // int32 end = 3;
+            if (this_._internal_end() != 0) {
+              total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+                  this_._internal_end());
+            }
+            // int32 step = 4;
+            if (this_._internal_step() != 0) {
+              total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+                  this_._internal_step());
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void Loop::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<Loop*>(&to_msg);
+  auto& from = static_cast<const Loop&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.Loop)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  _this->_internal_mutable_body()->MergeFrom(
+      from._internal_body());
+  if (!from._internal_node().empty()) {
+    _this->_internal_set_node(from._internal_node());
+  }
+  if (from._internal_start() != 0) {
+    _this->_impl_.start_ = from._impl_.start_;
+  }
+  if (from._internal_end() != 0) {
+    _this->_impl_.end_ = from._impl_.end_;
+  }
+  if (from._internal_step() != 0) {
+    _this->_impl_.step_ = from._impl_.step_;
+  }
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void Loop::CopyFrom(const Loop& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.Loop)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void Loop::InternalSwap(Loop* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  auto* arena = GetArena();
+  ABSL_DCHECK_EQ(arena, other->GetArena());
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  _impl_.body_.InternalSwap(&other->_impl_.body_);
+  ::_pbi::ArenaStringPtr::InternalSwap(&_impl_.node_, &other->_impl_.node_, arena);
+  ::google::protobuf::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(Loop, _impl_.step_)
+      + sizeof(Loop::_impl_.step_)
+      - PROTOBUF_FIELD_OFFSET(Loop, _impl_.start_)>(
+          reinterpret_cast<char*>(&_impl_.start_),
+          reinterpret_cast<char*>(&other->_impl_.start_));
+}
+
+::google::protobuf::Metadata Loop::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
 class Operation::_Internal {
  public:
   static constexpr ::int32_t kOneofCaseOffset =
@@ -3770,6 +4185,19 @@ void Operation::set_allocated_fused_op(::codegen::OpOverloadList* fused_op) {
     _impl_.op_type_.fused_op_ = fused_op;
   }
   // @@protoc_insertion_point(field_set_allocated:codegen.Operation.fused_op)
+}
+void Operation::set_allocated_loop(::codegen::Loop* loop) {
+  ::google::protobuf::Arena* message_arena = GetArena();
+  clear_op_type();
+  if (loop) {
+    ::google::protobuf::Arena* submessage_arena = loop->GetArena();
+    if (message_arena != submessage_arena) {
+      loop = ::google::protobuf::internal::GetOwnedMessage(message_arena, loop, submessage_arena);
+    }
+    set_has_loop();
+    _impl_.op_type_.loop_ = loop;
+  }
+  // @@protoc_insertion_point(field_set_allocated:codegen.Operation.loop)
 }
 void Operation::set_allocated_output(::codegen::Tensor* output) {
   ::google::protobuf::Arena* message_arena = GetArena();
@@ -3836,6 +4264,9 @@ Operation::Operation(
       case kFusedOp:
         _impl_.op_type_.fused_op_ = ::google::protobuf::Message::CopyConstruct<::codegen::OpOverloadList>(arena, *from._impl_.op_type_.fused_op_);
         break;
+      case kLoop:
+        _impl_.op_type_.loop_ = ::google::protobuf::Message::CopyConstruct<::codegen::Loop>(arena, *from._impl_.op_type_.loop_);
+        break;
   }
   switch (return_type_case()) {
     case RETURN_TYPE_NOT_SET:
@@ -3895,6 +4326,14 @@ void Operation::clear_op_type() {
         delete _impl_.op_type_.fused_op_;
       } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
         ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.fused_op_);
+      }
+      break;
+    }
+    case kLoop: {
+      if (GetArena() == nullptr) {
+        delete _impl_.op_type_.loop_;
+      } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
+        ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.loop_);
       }
       break;
     }
@@ -3969,16 +4408,16 @@ const ::google::protobuf::internal::ClassData* Operation::GetClassData() const {
   return _class_data_.base();
 }
 PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
-const ::_pbi::TcParseTable<0, 4, 4, 0, 2> Operation::_table_ = {
+const ::_pbi::TcParseTable<0, 5, 5, 0, 2> Operation::_table_ = {
   {
     0,  // no _has_bits_
     0, // no _extensions_
-    4, 0,  // max_field_number, fast_idx_mask
+    5, 0,  // max_field_number, fast_idx_mask
     offsetof(decltype(_table_), field_lookup_table),
-    4294967280,  // skipmap
+    4294967264,  // skipmap
     offsetof(decltype(_table_), field_entries),
-    4,  // num_field_entries
-    4,  // num_aux_entries
+    5,  // num_field_entries
+    5,  // num_aux_entries
     offsetof(decltype(_table_), aux_entries),
     _class_data_.base(),
     nullptr,  // post_loop_handler
@@ -3997,15 +4436,19 @@ const ::_pbi::TcParseTable<0, 4, 4, 0, 2> Operation::_table_ = {
     // .codegen.OpOverloadList fused_op = 2;
     {PROTOBUF_FIELD_OFFSET(Operation, _impl_.op_type_.fused_op_), _Internal::kOneofCaseOffset + 0, 1,
     (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
-    // .codegen.Tensor output = 3;
-    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.return_type_.output_), _Internal::kOneofCaseOffset + 4, 2,
+    // .codegen.Loop loop = 3;
+    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.op_type_.loop_), _Internal::kOneofCaseOffset + 0, 2,
     (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
-    // .codegen.TensorList outputs = 4;
-    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.return_type_.outputs_), _Internal::kOneofCaseOffset + 4, 3,
+    // .codegen.Tensor output = 4;
+    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.return_type_.output_), _Internal::kOneofCaseOffset + 4, 3,
+    (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
+    // .codegen.TensorList outputs = 5;
+    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.return_type_.outputs_), _Internal::kOneofCaseOffset + 4, 4,
     (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
   }}, {{
     {::_pbi::TcParser::GetTable<::codegen::OpOverload>()},
     {::_pbi::TcParser::GetTable<::codegen::OpOverloadList>()},
+    {::_pbi::TcParser::GetTable<::codegen::Loop>()},
     {::_pbi::TcParser::GetTable<::codegen::Tensor>()},
     {::_pbi::TcParser::GetTable<::codegen::TensorList>()},
   }}, {{
@@ -4052,19 +4495,25 @@ PROTOBUF_NOINLINE void Operation::Clear() {
                   stream);
               break;
             }
+            case kLoop: {
+              target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                  3, *this_._impl_.op_type_.loop_, this_._impl_.op_type_.loop_->GetCachedSize(), target,
+                  stream);
+              break;
+            }
             default:
               break;
           }
           switch (this_.return_type_case()) {
             case kOutput: {
               target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
-                  3, *this_._impl_.return_type_.output_, this_._impl_.return_type_.output_->GetCachedSize(), target,
+                  4, *this_._impl_.return_type_.output_, this_._impl_.return_type_.output_->GetCachedSize(), target,
                   stream);
               break;
             }
             case kOutputs: {
               target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
-                  4, *this_._impl_.return_type_.outputs_, this_._impl_.return_type_.outputs_->GetCachedSize(), target,
+                  5, *this_._impl_.return_type_.outputs_, this_._impl_.return_type_.outputs_->GetCachedSize(), target,
                   stream);
               break;
             }
@@ -4107,18 +4556,24 @@ PROTOBUF_NOINLINE void Operation::Clear() {
                             ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.op_type_.fused_op_);
               break;
             }
+            // .codegen.Loop loop = 3;
+            case kLoop: {
+              total_size += 1 +
+                            ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.op_type_.loop_);
+              break;
+            }
             case OP_TYPE_NOT_SET: {
               break;
             }
           }
           switch (this_.return_type_case()) {
-            // .codegen.Tensor output = 3;
+            // .codegen.Tensor output = 4;
             case kOutput: {
               total_size += 1 +
                             ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.return_type_.output_);
               break;
             }
-            // .codegen.TensorList outputs = 4;
+            // .codegen.TensorList outputs = 5;
             case kOutputs: {
               total_size += 1 +
                             ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.return_type_.outputs_);
@@ -4167,6 +4622,15 @@ void Operation::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::googl
               ::google::protobuf::Message::CopyConstruct<::codegen::OpOverloadList>(arena, *from._impl_.op_type_.fused_op_);
         } else {
           _this->_impl_.op_type_.fused_op_->MergeFrom(from._internal_fused_op());
+        }
+        break;
+      }
+      case kLoop: {
+        if (oneof_needs_init) {
+          _this->_impl_.op_type_.loop_ =
+              ::google::protobuf::Message::CopyConstruct<::codegen::Loop>(arena, *from._impl_.op_type_.loop_);
+        } else {
+          _this->_impl_.op_type_.loop_->MergeFrom(from._internal_loop());
         }
         break;
       }

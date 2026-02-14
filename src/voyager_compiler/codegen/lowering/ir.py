@@ -32,14 +32,13 @@ Loops are used to provide control flow for BMM and tiled computation.
 
 """
 
-@dataclass
+
+@dataclass(kw_only=True)
 class Value:
     """Base class for Compiler IR SSA values."""
     name: str
-    users: Dict["Stmt", None] = field(
-        default_factory=dict, init=False, repr=False
-    )
-    producer_op: "Stmt" = field(default=None, init=False, repr=False)
+    users: Dict["IRNode", None] = field(default_factory=dict, repr=False)
+    producer_op: "IRNode" = field(default=None, repr=False)
 
     def replace_all_uses_with(self, new: Value):
         for user in self.users:
@@ -59,6 +58,7 @@ class TensorBox(Value):
     shape: tuple[int, ...]
     dtype: torch.dtype
     space: str = "DRAM"
+    address: Optional[int] = None
 
     def short_type(self) -> str:
         shape = ",".join(str(d) for d in self.shape)
@@ -66,7 +66,9 @@ class TensorBox(Value):
         return f"tensor<{shape}x{dtype}>"
 
     def __str__(self) -> str:
-        return f"{self.name}:{self.short_type()}@{self.space}"
+        if self.address is None:
+            return f"{self.name}:{self.short_type()}@{self.space}"
+        return f"{self.name}:{self.short_type()}@{self.space}[0x{self.address:x}]"
 
     def __hash__(self):
         # Uses the unique memory address; safe and fast for IR nodes
@@ -91,6 +93,453 @@ class IndexValue(Value):
         return id(self)
 
 
+@dataclass(eq=False, kw_only=True)
+class IRNode:
+    origin_node: torch.fx.Node = None
+    annotations: dict[str, Any] = field(default_factory=dict)
+    block: Optional["Loops" | "Module"] = field(default=None, init=False, repr=False)
+
+    def get_parent(self) -> Optional["Loops"]:
+        """Climb one level to find the immediate parent loop."""
+        return self.block
+
+
+@dataclass(eq=False)
+class Operation(IRNode):
+    """
+    Generic operation node that can represent any torch.fx.Node.
+    - Keeps FX "op" (call_function/call_method/call_module/placeholder/get_attr/output)
+    - Keeps "target" as a stable string
+    - Carries arbitrary kwargs (escape hatch)
+    - Inputs/outputs are SSA Values (TensorBox / IndexValue)
+    """
+    op_kind: str
+    target: Union[torch._ops.OpOverload, str]
+    inputs: List[Value]
+    outputs: List[Value]
+    kwargs: Dict[str, Any]
+
+    def format(self, indent: int = 0) -> str:
+        pad = " " * indent
+        outs = ", ".join(v.name for v in self.outputs) if self.outputs else ""
+        ins = ", ".join(v.name for v in self.inputs) if self.inputs else ""
+        target = _stringify_target(self.target)
+
+        hdr = f"{pad}{outs} = {target}({ins})" if outs else f"{pad}{target}({ins})"
+
+        # Keep kwargs compact and readable
+        if self.kwargs:
+            kw_parts = []
+            for k, v in self.kwargs.items():
+                if v is not None:
+                    kw_parts.append(f"{k}={v}")
+            hdr += "  {" + ", ".join(kw_parts) + "}"
+
+        # Attach brief type info for outputs (useful for debugging)
+        if self.outputs:
+            type_ann = []
+            for o in self.outputs:
+                if isinstance(o, TensorBox):
+                    type_ann.append(f"{o.name}:{o.short_type()}@{o.space}")
+                else:
+                    type_ann.append(str(o))
+            hdr += "  :: " + ", ".join(type_ann)
+
+        return hdr
+
+    @staticmethod
+    def from_fx_node(
+        node: torch.fx.Node,
+        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
+        namer: NameGenerator,
+        mem_space: str = "DRAM",
+        is_fused: bool = False,
+        outputs: Optional[List[Value]] = None,
+    ) -> Operation:
+        """
+        Converts a single FX node into an Operation + freshly created SSA outputs.
+        Stores outputs into env[node].
+
+        Notes:
+        - Constants that appear inside args/kwargs are encoded into Operation.kwargs.
+        - Tensor outputs become TensorBox.
+        - Non-tensor outputs become IndexValue with expr='unknown' (minimal).
+        - Tuple outputs become a tuple of Values and are stored as such in env.
+        """
+        inputs: List[Value] = []
+
+        args, kwargs = _get_node_args_and_kwargs(node)
+        lift_arg(args, env, inputs)
+        kwargs = lift_arg(kwargs, env, inputs)
+
+        orig_val = node.value
+
+        if (tiled_shapes := node.meta.get('tiled_shapes')):
+            def load_arg(a):
+                return map_arg(a, lambda n: get_tiled_tensor(n, tiled_shapes))
+            node.value = node.target(*load_arg(node.args), **load_arg(node.kwargs))
+
+        if outputs is None:
+            outputs = _resolve_fx_graph_input(node, namer, mem_space)
+        env[node] = outputs
+
+        node.value = orig_val  # restore
+
+        op = Operation(
+            op_kind=node.op,
+            target=node.target,
+            inputs=inputs,
+            outputs=outputs if isinstance(outputs, (list, tuple)) else [outputs],
+            kwargs=kwargs,
+            origin_node=node,
+            annotations=dict(getattr(node, "meta", {}) or {}),
+        )
+
+        if not is_fused and node.op == "call_function":
+            op = _generate_tiling_wrapper(node, namer, env, op)
+
+        link_operation(op)
+
+        return op
+
+    def replace_input_with(self, old: Value, new: Value):
+        new_inputs = []
+        success = False
+        for input in self.inputs:
+            if input is old:
+                new_inputs.append(new)
+                old.users.pop(self, None)
+                new.users[self] = None
+                success = True
+            else:
+                new_inputs.append(input)
+
+        if not success:
+            raise ValueError(f"Input {old} not found in operation inputs.")
+
+        self.inputs = new_inputs
+
+        new_kwargs = {}
+        for k, v in self.kwargs.items():
+            if v is old:
+                new_kwargs[k] = new.name
+            else:
+                new_kwargs[k] = v
+        self.kwargs = new_kwargs
+
+
+@dataclass(eq=False)
+class FusedOp(IRNode):
+    inputs: List[Value]
+    outputs: List[Value]
+    ops: List[Operation]
+
+    def format(self, indent: int = 0) -> str:
+        pad = " " * indent
+        ins = ", ".join(f"{v.name}:{v.short_type()}" for v in self.inputs)
+        outs = ", ".join(f"{v.name}:{v.short_type()}" for v in self.outputs)
+        hdr = f"{pad}{outs} = fused({ins})" if outs else f"{pad}fused({ins})"
+
+        lines = [hdr + " {"]
+        for op in self.ops:
+            lines.append(op.format(indent + 2))
+        lines.append(pad + "}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def from_fx_node(
+        node: torch.fx.Node,
+        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
+        namer: NameGenerator,
+        mem_space: str = "DRAM",
+    ) -> FusedOp:
+        gm = node.meta["submodule"]
+        assert isinstance(gm, torch.fx.GraphModule)
+
+        # Apply tiled shapes if available
+        if (tiled_shapes := node.meta.get('tiled_shapes')):
+            args = map_arg(
+                node.args, lambda n: get_tiled_tensor(n, tiled_shapes)
+            )
+            ShapeProp(gm).propagate(*args)
+
+        ops: List[Operation] = []
+
+        for n in list(gm.graph.nodes):
+            if n.op == "call_function":
+                ops.append(Operation.from_fx_node(n, env, namer, is_fused=True))
+            if n.op == "output":
+                outputs = _resolve_fx_graph_outputs(n.args[0], env)
+                env[node] = outputs
+
+        inputs = [env[n] for n in node.all_input_nodes]
+
+        fused_op = FusedOp(
+            inputs=inputs,
+            outputs=outputs if isinstance(outputs, (list, tuple)) else [outputs],
+            ops=ops,
+            origin_node=node,
+            annotations=dict(getattr(node, "meta", {}) or {}),
+        )
+
+        fused_op = _generate_tiling_wrapper(node, namer, env, fused_op)
+
+        link_operation(fused_op)
+
+        return fused_op
+
+    def replace_input_with(self, old: Value, new: Value):
+        new_inputs = []
+        success = False
+        for input in self.inputs:
+            if input is old:
+                new_inputs.append(new)
+                old.users.pop(self, None)
+                new.users[self] = None
+                success = True
+            else:
+                new_inputs.append(input)
+
+        if not success:
+            raise ValueError(f"Input {old} not found in operation inputs.")
+
+        self.inputs = new_inputs
+
+        for op in self.ops:
+            if old in op.inputs:
+                op.replace_input_with(old, new)
+
+
+@dataclass
+class Loops(IRNode):
+    """
+    Minimal for-loop control structure.
+
+    scf::for-like shape:
+      for (index = start; index < end; index += step) {
+        body...
+      }
+
+    This does not enforce loop-carried SSA (iter_args/yield) to keep it minimal,
+    but you can add them later if needed.
+    """
+    index: IndexValue
+    start: Union[IndexValue, int]
+    end: Union[IndexValue, int]
+    step: Union[IndexValue, int]
+    body: List[IRNode]
+
+    def format(self, indent: int = 0) -> str:
+        pad = " " * indent
+        hdr = f"{pad}for {self.index.name} in range({self.start}, {self.end}, {self.step}):"
+        lines = [hdr]
+        for s in self.body:
+            lines.append(s.format(indent=indent + 2))
+        return "\n".join(lines)
+
+    def __post_init__(self):
+        # When a Loop is created, it immediately claims
+        # ownership of everything in its body.
+        for stmt in self.body:
+            link_operation(stmt, parent=self)
+
+        # Also ensure the index knows this loop is its producer
+        self.index.producer_op = self
+
+    def __hash__(self):
+        return id(self)
+
+
+@dataclass
+class Module:
+    name: str
+    args: List[Value]
+    body: List[IRNode]
+    results: List[Value]
+
+    def format(self) -> str:
+        inputs = ", ".join(str(a) for a in self.args)
+        outputs = ", ".join(str(r) for r in self.results)
+        lines = [f"func @{self.name}({inputs}) -> ({outputs}) {{"]
+        for s in self.body:
+            lines.append(s.format(indent=2))
+        lines.append("}")
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.format()
+
+    def __post_init__(self):
+        # When a Module is created, it immediately claims
+        # ownership of everything in its body.
+        for stmt in self.body:
+            link_operation(stmt, parent=self)
+
+    @staticmethod
+    def convert(
+        gm: torch.fx.GraphModule,
+        name: str = "main",
+    ) -> Module:
+        namer = NameGenerator()
+        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]] = {}
+
+        body: List[IRNode] = []
+        args: List[Value] = []
+        results: List[Value] = []
+
+        for node in gm.graph.nodes:
+            if node.op == "call_module":
+                stmt = FusedOp.from_fx_node(node, env, namer)
+            else:
+                stmt = Operation.from_fx_node(node, env, namer)
+
+            if node.op == "placeholder":
+                v = _resolve_fx_graph_input(node, namer, ir_node=stmt)
+                v.producer_op = stmt
+                env[node] = v
+                args.append(v)
+                # Still emit an Operation for traceability
+                body.append(stmt)
+            elif node.op == "output":
+                results = _resolve_fx_graph_outputs(node.args[0], env)
+            else:
+                body.append(stmt)
+
+        return Module(name, args, body, results)
+
+
+class NameGenerator:
+    def __init__(self, prefix_tensor: str = "%t", prefix_index: str = "%i"):
+        self._t = 0
+        self._i = 0
+        self._pt = prefix_tensor
+        self._pi = prefix_index
+
+    def new_tensor(self) -> str:
+        self._t += 1
+        return f"{self._pt}{self._t}"
+
+    def new_index(self) -> str:
+        self._i += 1
+        return f"{self._pi}{self._i}"
+
+
+# =============================================================================
+# Helpers (type inference, formatting)
+# =============================================================================
+
+def _get_node_args_and_kwargs(node: torch.fx.Node):
+    if node.op in ["call_function", "call_method"]:
+        args_and_kwargs = normalize_function(
+            node.target,
+            node.args,
+            node.kwargs,
+            normalize_to_only_use_kwargs=True
+        )
+
+        if args_and_kwargs is not None:
+            return args_and_kwargs.args, args_and_kwargs.kwargs
+
+    return node.args, node.kwargs
+
+
+def _stringify_target(target: Any) -> str:
+    if isinstance(target, torch._ops.OpOverload):
+        return target._schema.name.split('::')[1]
+    else:
+        return str(target)
+
+
+def _pretty_atom(x: Any) -> str:
+    if isinstance(x, (int, float, bool)) or x is None:
+        return repr(x)
+    if isinstance(x, str):
+        if len(x) > 80:
+            return repr(x[:77] + "...")
+        return repr(x)
+    if isinstance(x, list):
+        if len(x) > 8:
+            return "[" + ", ".join(_pretty_atom(v) for v in x[:8]) + ", ...]"
+        return "[" + ", ".join(_pretty_atom(v) for v in x) + "]"
+    if isinstance(x, dict):
+        items = list(x.items())
+        if len(items) > 8:
+            items = items[:8] + [("...", "...")]
+        return "{" + ", ".join(f"{_pretty_atom(k)}: {_pretty_atom(v)}" for k, v in items) + "}"
+    return repr(x)
+
+
+def _dtype_name(dtype_obj: Any) -> str:
+    # torch dtype -> readable name
+    s = str(dtype_obj)
+    # e.g. "torch.float16" -> "float16"
+    if s.startswith("torch."):
+        return s.split(".", 1)[1]
+    return s
+
+
+def _resolve_fx_graph_input(
+    node: torch.fx.Node,
+    namer: NameGenerator,
+    mem_space: str = "DRAM",
+    ir_node: Optional[IRNode] = None
+) -> Union[Value, Tuple[Value, ...]]:
+    """
+    Attempts to infer whether node output is tensor / tuple[tensor] / scalar.
+    Uses node.meta['tensor_meta'] when available. Falls back to unknown.
+    """
+    val = getattr(node, "value", None)
+
+    if isinstance(val, torch.Tensor):
+        return TensorBox(
+            name=namer.new_tensor(),
+            shape=tuple(val.shape),
+            dtype=val.dtype,
+            space=mem_space,
+            producer_op=ir_node,
+        )
+
+    if isinstance(val, (list, tuple)):
+        outputs: List[Value] = [
+            TensorBox(
+                name=namer.new_tensor(),
+                shape=tuple(v.shape),
+                dtype=v.dtype,
+                space=mem_space,
+                producer_op=ir_node,
+            )
+            for v in val
+        ]
+        return tuple(outputs)
+
+    return IndexValue(name=namer.new_index(), expr="unknown")
+
+
+def _resolve_fx_graph_outputs(
+    node: Union[torch.fx.Node, List[torch.fx.Node]],
+    env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
+) -> List[Value]:
+    """
+    FX output arg can be:
+      - a Node
+      - a tuple/list/dict containing Nodes
+      - constants
+    We only collect Values corresponding to Nodes.
+    """
+    if isinstance(node, torch.fx.Node):
+        return env[node]
+
+    if isinstance(node, (list, tuple)):
+        outputs: List[Value] = []
+        for x in node:
+            v = _resolve_fx_graph_outputs(x, env)
+            outputs.extend(v if isinstance(v, list) else [v])
+        return outputs
+
+    return []  # constants or unsupported types
+
+
 def lift_arg(a: Any, env, inputs) -> Any:
     if isinstance(a, torch.fx.Node):
         sn = a.meta.get("source_node", a)
@@ -107,17 +556,28 @@ def lift_arg(a: Any, env, inputs) -> Any:
     return a
 
 
-def link_operation(op: Stmt):
-    if isinstance(op, Loops):
-        for body_op in op.body:
-            link_operation(body_op)
-    else:
-        for input_val in op.inputs:
-            if op not in input_val.users:
-                input_val.users[op] = None
+def link_operation(node: IRNode, parent: Union["Loops", "Module"] = None):
+    """
+    Sets the structural block link and updates SSA pointers.
+    """
+    node.block = parent
 
-        for output_val in op.outputs:
-            output_val.producer_op = op
+    # 1. Handle SSA value linking for Operations
+    if isinstance(node, (Operation, FusedOp)):
+        for input_val in node.inputs:
+            input_val.users[node] = None
+        for output_val in node.outputs:
+            output_val.producer_op = node
+
+        # If FusedOp has internal ops, they share the same block/parent
+        if isinstance(node, FusedOp):
+            for internal_op in node.ops:
+                link_operation(internal_op, parent=parent)
+
+    # 2. Handle Recursive Linking for Nested Loops
+    elif isinstance(node, Loops):
+        for body_stmt in node.body:
+            link_operation(body_stmt, parent=node)
 
 
 def _get_gemm_tiled_input_pattern(node: torch.fx.Node, gemm_node, tiling):
@@ -205,14 +665,14 @@ def _get_gemm_tiled_input_pattern(node: torch.fx.Node, gemm_node, tiling):
                         mapped_axes.append(axes[i])
                 logger.debug(f"  Mapped indices: {mapped_indices}, axes: {mapped_axes}")
 
-                arg = quantized_lib.copy_tile(
+                arg = quantized_lib.load_tile(
                     arg, mapped_indices, shape, mapped_axes, stride
                 )
             tiled_args.append(arg)
         return tuple(tiled_args)
 
     _example_inputs = (
-        tuple(torch.tensor([i], dtype=torch.int32) for i in range(active_idx_count)),
+        tuple(torch.tensor(i, dtype=torch.int32) for i in range(active_idx_count)),
         *map_arg(input_nodes, lambda n: n.value),
     )
 
@@ -248,12 +708,12 @@ def _get_vector_tiled_input_pattern(node, tiling):
         tiled_args = []
         for arg, shape, stride in zip(args, input_sizes, input_strides):
             if isinstance(arg, torch.Tensor) and shape is not None:
-                arg = quantized_lib.copy_tile(arg, indices, shape, dims, stride)
+                arg = quantized_lib.load_tile(arg, indices, shape, dims, stride)
             tiled_args.append(arg)
         return tuple(tiled_args)
 
     _example_inputs = (
-        tuple(torch.tensor([i], dtype=torch.int32) for i in range(num_indices)),
+        tuple(torch.tensor(i, dtype=torch.int32) for i in range(num_indices)),
         *map_arg(input_nodes, lambda n: n.value),
     )
 
@@ -339,7 +799,7 @@ def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
             else:
                 env_copy[n] = env[input_nodes[arg_idx - num_indices]]
             arg_idx += 1
-        elif n.op == "call_function" and n.target == quantized_lib.copy_tile.default:
+        elif n.op == "call_function" and n.target == quantized_lib.load_tile.default:
             ops.append(Operation.from_fx_node(
                 n, env_copy, namer, "Scratchpad", is_fused=True
             ))
@@ -362,7 +822,7 @@ def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
     def _tile_output_pattern(indices, outputs):
         if isinstance(outputs, torch.Tensor):
             if output_size is not None:
-                return quantized_lib.copy_tile(
+                return quantized_lib.load_tile(
                     outputs, indices, output_size, output_dims
                 )
             return outputs
@@ -370,14 +830,14 @@ def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
         new_outputs = []
         for output, tile_size in zip(outputs, output_size):
             if tile_size is not None:
-                output = quantized_lib.copy_tile(
+                output = quantized_lib.load_tile(
                     output, indices, tile_size, output_dims
                 )
             new_outputs.append(output)
         return tuple(new_outputs)
 
     _example_inputs = (
-        tuple(torch.tensor([i], dtype=torch.int32) for i in range(num_output_dims)),
+        tuple(torch.tensor(i, dtype=torch.int32) for i in range(num_output_dims)),
         node.value,
     )
 
@@ -403,7 +863,7 @@ def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
             else:
                 env_copy[n] = outputs[arg_idx - num_output_dims]
             arg_idx += 1
-        elif n.op == "call_function" and n.target == quantized_lib.copy_tile.default:
+        elif n.op == "call_function" and n.target == quantized_lib.load_tile.default:
             ops.append(Operation.from_fx_node(n, env_copy, namer, is_fused=True))
         elif n.op == "output":
             outputs = [env_copy[n] for n in n.args[0]]
@@ -441,448 +901,3 @@ def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
     print("Final tiled op:")
     print(loop_op.format())
     return loop_op
-
-
-@dataclass(eq=False)
-class Operation:
-    """
-    Generic operation node that can represent any torch.fx.Node.
-    - Keeps FX "op" (call_function/call_method/call_module/placeholder/get_attr/output)
-    - Keeps "target" as a stable string
-    - Carries arbitrary kwargs (escape hatch)
-    - Inputs/outputs are SSA Values (TensorBox / IndexValue)
-    """
-    op_kind: str
-    target: Union[torch._ops.OpOverload, str]
-    inputs: List[Value]
-    outputs: List[Value]
-    kwargs: Dict[str, Any]
-    origin_node: torch.fx.Node = None
-    annotations: dict[str, Any] = field(default_factory=dict)
-
-    def format(self, indent: int = 0) -> str:
-        pad = " " * indent
-        outs = ", ".join(v.name for v in self.outputs) if self.outputs else ""
-        ins = ", ".join(v.name for v in self.inputs) if self.inputs else ""
-        target = _stringify_target(self.target)
-        op = str(self.op_kind)
-
-        hdr = f"{pad}{outs} = {op} {target}({ins})" if outs else f"{pad}{op} {target}({ins})"
-
-        # Keep kwargs compact and readable
-        if self.kwargs:
-            kw_parts = []
-            for k, v in self.kwargs.items():
-                if v is not None:
-                    kw_parts.append(f"{k}={v}")
-            hdr += "  {" + ", ".join(kw_parts) + "}"
-
-        # Attach brief type info for outputs (useful for debugging)
-        if self.outputs:
-            type_ann = []
-            for o in self.outputs:
-                if isinstance(o, TensorBox):
-                    type_ann.append(f"{o.name}:{o.short_type()}@{o.space}")
-                else:
-                    type_ann.append(str(o))
-            hdr += "  :: " + ", ".join(type_ann)
-
-        return hdr
-
-    @staticmethod
-    def from_fx_node(
-        node: torch.fx.Node,
-        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
-        namer: NameGenerator,
-        mem_space: str = "DRAM",
-        is_fused: bool = False,
-    ) -> Operation:
-        """
-        Converts a single FX node into an Operation + freshly created SSA outputs.
-        Stores outputs into env[node].
-
-        Notes:
-        - Constants that appear inside args/kwargs are encoded into Operation.kwargs.
-        - Tensor outputs become TensorBox.
-        - Non-tensor outputs become IndexValue with expr='unknown' (minimal).
-        - Tuple outputs become a tuple of Values and are stored as such in env.
-        """
-        inputs: List[Value] = []
-
-        args, kwargs = _get_node_args_and_kwargs(node)
-        lift_arg(args, env, inputs)
-        kwargs = lift_arg(kwargs, env, inputs)
-
-        orig_val = node.value
-
-        if (tiled_shapes := node.meta.get('tiled_shapes')):
-            def load_arg(a):
-                return map_arg(a, lambda n: get_tiled_tensor(n, tiled_shapes))
-            node.value = node.target(*load_arg(node.args), **load_arg(node.kwargs))
-
-        outputs = _resolve_fx_graph_input(node, namer, mem_space)
-        env[node] = outputs
-
-        node.value = orig_val  # restore
-
-        op = Operation(
-            op_kind=node.op,
-            target=node.target,
-            inputs=inputs,
-            outputs=outputs if isinstance(outputs, (list, tuple)) else [outputs],
-            kwargs=kwargs,
-            origin_node=node,
-            annotations=dict(getattr(node, "meta", {}) or {}),
-        )
-
-        if not is_fused and node.op == "call_function":
-            op = _generate_tiling_wrapper(node, namer, env, op)
-
-        link_operation(op)
-
-        return op
-
-    def replace_input_with(self, old: Value, new: Value):
-        new_inputs = []
-        success = False
-        for input in self.inputs:
-            if input is old:
-                new_inputs.append(new)
-                old.users.pop(self, None)
-                new.users[self] = None
-                success = True
-            else:
-                new_inputs.append(input)
-
-        if not success:
-            raise ValueError(f"Input {old} not found in operation inputs.")
-
-        self.inputs = new_inputs
-
-        new_kwargs = {}
-        for k, v in self.kwargs.items():
-            if v is old:
-                new_kwargs[k] = new.name
-            else:
-                new_kwargs[k] = v
-        self.kwargs = new_kwargs
-
-
-@dataclass(eq=False)
-class FusedOp:
-    inputs: List[Value]
-    outputs: List[Value]
-    ops: List[Operation]
-    origin_node: torch.fx.Node
-    annotations: dict[str, Any]
-
-    def format(self, indent: int = 0) -> str:
-        pad = " " * indent
-        ins = ", ".join(f"{v.name}:{v.short_type()}" for v in self.inputs)
-        outs = ", ".join(f"{v.name}:{v.short_type()}" for v in self.outputs)
-        hdr = f"{pad}{outs} = fused({ins})" if outs else f"{pad}fused({ins})"
-
-        lines = [hdr + " {"]
-        for op in self.ops:
-            lines.append(op.format(indent + 2))
-        lines.append(pad + "}")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def from_fx_node(
-        node: torch.fx.Node,
-        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
-        namer: NameGenerator,
-        mem_space: str = "DRAM",
-    ) -> FusedOp:
-        gm = node.meta["submodule"]
-        assert isinstance(gm, torch.fx.GraphModule)
-
-        # Apply tiled shapes if available
-        if (tiled_shapes := node.meta.get('tiled_shapes')):
-            args = map_arg(
-                node.args, lambda n: get_tiled_tensor(n, tiled_shapes)
-            )
-            ShapeProp(gm).propagate(*args)
-
-        ops: List[Operation] = []
-
-        for n in list(gm.graph.nodes):
-            if n.op == "call_function":
-                ops.append(Operation.from_fx_node(n, env, namer, is_fused=True))
-            if n.op == "output":
-                outputs = _resolve_fx_graph_outputs(n.args[0], env)
-                env[node] = outputs
-
-        inputs = [env[n] for n in node.all_input_nodes]
-
-        fused_op = FusedOp(
-            inputs=inputs,
-            outputs=outputs if isinstance(outputs, (list, tuple)) else [outputs],
-            ops=ops,
-            origin_node=node,
-            annotations=dict(getattr(node, "meta", {}) or {}),
-        )
-
-        fused_op = _generate_tiling_wrapper(node, namer, env, fused_op)
-
-        link_operation(fused_op)
-
-        return fused_op
-
-    def replace_input_with(self, old: Value, new: Value):
-        new_inputs = []
-        success = False
-        for input in self.inputs:
-            if input is old:
-                new_inputs.append(new)
-                old.users.pop(self, None)
-                new.users[self] = None
-                success = True
-            else:
-                new_inputs.append(input)
-
-        if not success:
-            raise ValueError(f"Input {old} not found in operation inputs.")
-
-        self.inputs = new_inputs
-
-        for op in self.ops:
-            if old in op.inputs:
-                op.replace_input_with(old, new)
-
-
-@dataclass
-class Loops:
-    """
-    Minimal for-loop control structure.
-
-    scf::for-like shape:
-      for (index = start; index < end; index += step) {
-        body...
-      }
-
-    This does not enforce loop-carried SSA (iter_args/yield) to keep it minimal,
-    but you can add them later if needed.
-    """
-    index: IndexValue
-    start: Union[IndexValue, int]
-    end: Union[IndexValue, int]
-    step: Union[IndexValue, int]
-    body: List["Stmt"]
-    origin_node: Optional[torch.fx.Node] = None
-    annotations: dict[str, Any] = field(default_factory=dict)
-
-    def format(self, indent: int = 0) -> str:
-        pad = " " * indent
-        hdr = f"{pad}for {self.index.name} in range({self.start}, {self.end}, {self.step}):"
-        lines = [hdr]
-        for s in self.body:
-            lines.append(s.format(indent=indent + 2))
-        return "\n".join(lines)
-
-
-Stmt = Union[Operation, FusedOp, Loops]
-
-
-@dataclass
-class FunctionIR:
-    name: str
-    args: List[Value]
-    body: List[Stmt]
-    results: List[Value]
-
-    def format(self) -> str:
-        args_s = ", ".join(str(a) for a in self.args)
-        res_s = ", ".join(str(r) for r in self.results)
-        lines = [f"func @{self.name}({args_s}) -> ({res_s}) {{"]
-
-        for s in self.body:
-            lines.append(s.format(indent=2))
-
-        lines.append("}")
-        return "\n".join(lines)
-
-    def __str__(self) -> str:
-        return self.format()
-
-
-# =============================================================================
-# FX -> IR conversion
-# =============================================================================
-
-class NameGenerator:
-    def __init__(self, prefix_tensor: str = "%t", prefix_index: str = "%i"):
-        self._t = 0
-        self._i = 0
-        self._pt = prefix_tensor
-        self._pi = prefix_index
-
-    def new_tensor(self) -> str:
-        self._t += 1
-        return f"{self._pt}{self._t}"
-
-    def new_index(self) -> str:
-        self._i += 1
-        return f"{self._pi}{self._i}"
-
-
-class FXToIR:
-    """
-    Perform lowering from torch.fx.Graph (or GraphModule) to FunctionIR.
-
-    Key properties:
-    - Each FX node output becomes a fresh SSA TensorBox/IndexValue.
-    - Operation nodes retain FX args/kwargs in a debug-friendly form in Operation.kwargs.
-    - Real dependencies are expressed via Operation.inputs (SSA values).
-    """
-
-    @staticmethod
-    def convert(
-        gm: torch.fx.GraphModule,
-        *,
-        func_name: str = "main",
-    ) -> FunctionIR:
-        namer = NameGenerator()
-        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]] = {}
-
-        args: List[Value] = []
-        body: List[Stmt] = []
-        results: List[Value] = []
-
-        for node in gm.graph.nodes:
-            if node.op == "placeholder":
-                v = _resolve_fx_graph_input(node, namer)
-                env[node] = v
-                args.append(v)
-                # Still emit an Operation for traceability
-                body.append(Operation.from_fx_node(node, env, namer))
-            elif node.op == "output":
-                results = _resolve_fx_graph_outputs(node.args[0], env)
-                body.append(Operation.from_fx_node(node, env, namer))
-            elif node.op == "call_module":
-                body.append(FusedOp.from_fx_node(node, env, namer))
-            else:
-                body.append(Operation.from_fx_node(node, env, namer))
-
-        return FunctionIR(name=func_name, args=args, body=body, results=results)
-
-
-# =============================================================================
-# Helpers (type inference, formatting)
-# =============================================================================
-
-def _get_node_args_and_kwargs(node: torch.fx.Node):
-    if node.op in ["call_function", "call_method"]:
-        args_and_kwargs = normalize_function(
-            node.target,
-            node.args,
-            node.kwargs,
-            normalize_to_only_use_kwargs=True
-        )
-
-        if args_and_kwargs is not None:
-            return args_and_kwargs.args, args_and_kwargs.kwargs
-
-    return node.args, node.kwargs
-
-
-def _stringify_target(target: Any) -> str:
-    # Prefer stable string representations over Python object reprs
-    if isinstance(target, str):
-        return target
-    if target is None:
-        return "None"
-    # torch.ops.* often stringifies nicely
-    try:
-        return str(target)
-    except Exception:
-        return repr(target)
-
-
-def _pretty_atom(x: Any) -> str:
-    if isinstance(x, (int, float, bool)) or x is None:
-        return repr(x)
-    if isinstance(x, str):
-        if len(x) > 80:
-            return repr(x[:77] + "...")
-        return repr(x)
-    if isinstance(x, list):
-        if len(x) > 8:
-            return "[" + ", ".join(_pretty_atom(v) for v in x[:8]) + ", ...]"
-        return "[" + ", ".join(_pretty_atom(v) for v in x) + "]"
-    if isinstance(x, dict):
-        items = list(x.items())
-        if len(items) > 8:
-            items = items[:8] + [("...", "...")]
-        return "{" + ", ".join(f"{_pretty_atom(k)}: {_pretty_atom(v)}" for k, v in items) + "}"
-    return repr(x)
-
-
-def _dtype_name(dtype_obj: Any) -> str:
-    # torch dtype -> readable name
-    s = str(dtype_obj)
-    # e.g. "torch.float16" -> "float16"
-    if s.startswith("torch."):
-        return s.split(".", 1)[1]
-    return s
-
-
-def _resolve_fx_graph_input(
-    node: torch.fx.Node,
-    namer: NameGenerator,
-    mem_space: str = "DRAM",
-) -> Union[Value, Tuple[Value, ...]]:
-    """
-    Attempts to infer whether node output is tensor / tuple[tensor] / scalar.
-    Uses node.meta['tensor_meta'] when available. Falls back to unknown.
-    """
-    val = getattr(node, "value", None)
-
-    if isinstance(val, torch.Tensor):
-        return TensorBox(
-            name=namer.new_tensor(),
-            shape=tuple(val.shape),
-            dtype=val.dtype,
-            space=mem_space
-        )
-
-    if isinstance(val, (list, tuple)):
-        outputs: List[Value] = []
-        for v in val:
-            outputs.append(
-                TensorBox(
-                    name=namer.new_tensor(),
-                    shape=tuple(v.shape),
-                    dtype=v.dtype,
-                    space=mem_space
-                )
-            )
-        return tuple(outputs)
-
-    return IndexValue(name=namer.new_index(), expr="unknown")
-
-
-def _resolve_fx_graph_outputs(
-    node: Union[torch.fx.Node, List[torch.fx.Node]],
-    env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
-) -> List[Value]:
-    """
-    FX output arg can be:
-      - a Node
-      - a tuple/list/dict containing Nodes
-      - constants
-    We only collect Values corresponding to Nodes.
-    """
-    if isinstance(node, torch.fx.Node):
-        return env[node]
-
-    if isinstance(node, (list, tuple)):
-        outputs: List[Value] = []
-        for x in node:
-            v = _resolve_fx_graph_outputs(x, env)
-            outputs.extend(v if isinstance(v, list) else [v])
-        return outputs
-
-    return []  # constants or unsupported types

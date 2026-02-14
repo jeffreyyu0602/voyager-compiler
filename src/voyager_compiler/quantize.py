@@ -10,16 +10,11 @@ from torch.nn.utils.parametrize import type_before_parametrizations
 from accelerate import dispatch_model
 from transformers import PretrainedConfig
 
-from voyager_compiler.modules import (
-    Softmax,
-    modeling_bert,
-    modeling_mobilebert,
-)
+from voyager_compiler.modules import Softmax
 from voyager_compiler.qconfig import get_qconfig
 from voyager_compiler.quantization_mappings import (
     DEFAULT_QAT_MODULE_MAPPINGS,
     QCONFIG_PROPAGATE_MODULE_CLASS_LIST,
-    TRANSFORMER_MODULE_MAPPINGS,
 )
 
 __all__ = [
@@ -28,7 +23,6 @@ __all__ = [
     "prepare",
     "convert",
     "replace_softmax",
-    "get_quantized_model",
 ]
 
 logger = logging.getLogger(__name__)
@@ -63,7 +57,6 @@ def quantize(model, args, inplace=True):
         hasattr(model, 'config') and isinstance(model.config, PretrainedConfig)
     ):
         propagate_config(model, 'config', model.config)
-        convert(model, inplace=True, custom_module_class_mapping=TRANSFORMER_MODULE_MAPPINGS)
 
     if hasattr(model, 'hf_device_map'):
         dispatch_model(model, device_map=model.hf_device_map)
@@ -301,39 +294,3 @@ def replace_softmax(
             setattr(module, name, new_mod)
         else:
             replace_softmax(mod, posit_exp, posit_exp_shifted, posit_reciprocal, dtype, device)
-
-def get_quantized_model(model, qconfig, op_fusion=None, device=None):
-    logger.info(f"Fusing operations: {op_fusion}")
-
-    if device is None:
-        devices = _get_unique_devices_(model)
-        assert len(devices) <= 1, (
-            f"Quantized model only works with cpu or single-device CUDA modules, but got devices {devices}"
-        )
-        device = next(iter(devices)) if len(devices) > 0 else None
-
-    act_fake_quant = qconfig.activation(device=device)
-    class Quantizer(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, input, layer=None):
-            ctx.layer = layer
-            if op_fusion and any(x in layer for x in op_fusion):
-                return input
-            return act_fake_quant(input)
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            return grad_output, None
-
-    model_name = type(model).__name__
-    model_type = model_name.split("For", 1)[0]
-    assert model_type in {"MobileBert", "Bert"}, (
-        f"'{model_type}' models are not support for quantization."
-    )
-
-    module = modeling_bert if model_type == "Bert" else modeling_mobilebert
-    quantized_model = getattr(module, model_name)(model.config, Quantizer.apply)
-    quantized_model.load_state_dict(model.state_dict())
-    quantized_model.to(device)
-
-    return quantized_model

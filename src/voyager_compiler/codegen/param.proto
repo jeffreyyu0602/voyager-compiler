@@ -34,7 +34,7 @@ message Argument {
     Tensor tensor = 1;
     TensorList tensor_list = 2;
     IntList int_list = 3;
-    int64 int_value = 4;      
+    int64 int_value = 4;
     double float_value = 5;
     bool bool_value = 6;
     string str_value = 7;
@@ -58,15 +58,24 @@ message OpOverloadList {
   repeated OpOverload op_list = 2;
 }
 
+message Loop {
+  string node = 1;        // Name of the loop iterator
+  int32 start = 2;        // start value (only support int indices for now)
+  int32 end = 3;          // end value
+  int32 step = 4;         // step value
+  repeated Operation body = 5; // The recursive body
+}
+
 message Operation {
   oneof op_type {
     OpOverload op = 1;
     OpOverloadList fused_op = 2;
+    Loop loop = 3;
   }
 
   oneof return_type {
-    Tensor output = 3;
-    TensorList outputs = 4;
+    Tensor output = 4;
+    TensorList outputs = 5;
   }
 }
 

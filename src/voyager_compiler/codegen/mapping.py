@@ -1795,7 +1795,7 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
                     n.name for n in gm.graph.nodes if n.op == "call_function"
                 ])
         label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
-        label = label.replace("<", "\<").replace(">", "\>")
+        label = label.replace("<", r"\<").replace(">", r"\>")
 
         nodes[node.name] = {
             "label": label,
@@ -1809,7 +1809,7 @@ def gen_compute_graph(model, output_file="compute_graph", max_users=10):
             for i in range(num_splits):
                 sub_node = f"{node.name}_split_{i}"
                 sub_label = f"{{{sub_node}}}"
-                sub_label = sub_label.replace("<", "\<").replace(">", "\>")
+                sub_label = sub_label.replace("<", r"\<").replace(">", r"\>")
 
                 # Create a sub-node for this group of users
                 nodes[sub_node] = {

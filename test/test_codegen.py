@@ -265,7 +265,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--attn_implementation",
         default="eager",
-        choices=["eager", "sdpa", "flash_attention_3"],
+        choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
     )
     add_qspec_args(parser)
     args = parser.parse_args()

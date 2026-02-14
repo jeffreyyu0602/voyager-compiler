@@ -246,19 +246,21 @@ def export_model(
     dynamic_shapes: Optional[Dict[str, Any]] = None,
 ):
     from transformers.utils.import_utils import is_torch_greater_or_equal
-    if is_torch_greater_or_equal("2.5"):
-        from torch.export import export_for_training
 
-        model = export_for_training(model, args, kwargs, dynamic_shapes=dynamic_shapes).module()
+    if is_torch_greater_or_equal("2.10"):
+        return torch.export.export(
+            model, args, kwargs, dynamic_shapes=dynamic_shapes
+        ).module(check_guards=False)
+    elif is_torch_greater_or_equal("2.5"):
+        return torch.export.export_for_training(
+            model, args, kwargs, dynamic_shapes=dynamic_shapes
+        ).module()
     elif is_torch_greater_or_equal("2.0"):
-        from torch._export import capture_pre_autograd_graph
-
-        model = capture_pre_autograd_graph(
+        return torch._export.capture_pre_autograd_graph(
             model, args, kwargs, dynamic_shapes=dynamic_shapes
         )
     else:
-        raise RuntimeError("Torch version is not supported. Please use torch >= 2.0")
-    return model
+        raise RuntimeError(f"Require torch>=2.0, but found {torch.__version__}")
 
 
 def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):

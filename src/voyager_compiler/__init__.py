@@ -43,7 +43,6 @@ __all__ = [
     "get_device_map",
     "get_node_name_to_scope",
     "get_qconfig",
-    "get_quantized_model",
     "get_default_quantizer",
     "insert_align_device_nodes",
     "plot_histogram",
@@ -176,7 +175,7 @@ def transform(
     # Break down complex operators (like MultiHeadAttention) into simpler
     # primitives and handle memory copy/concat operations.
 
-    split_multi_head_attention(model)
+    # split_multi_head_attention(model)
 
     # TODO Disabled for large models. This will be removed in the future once
     # we can handle stack/cat using DMA properly.
@@ -277,6 +276,18 @@ def compile(
     run_memory_mapping(
         model, allocator, cache_size, num_banks, bank_width, unroll_dims
     )
+
+    # Experimental feature
+    from voyager_compiler.codegen.lowering.ir import Module
+    from voyager_compiler.codegen.lowering.codegen import generate_proto
+
+    top_module = Module.convert(model, name="m")
+    print(top_module.format())
+
+    params = generate_proto(top_module, model, flatten_args)
+
+    with open(os.path.join(output_dir, 'module.txt'), "w") as f:
+        f.write(text_format.MessageToString(params))
 
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))

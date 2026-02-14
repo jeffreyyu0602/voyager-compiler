@@ -25,7 +25,7 @@ class Segment:
     start: Union[float, int]
     end: Union[float, int]
     memory_space: Optional[int] = None
-    node: Optional["fx.Node"] = None
+    node: Optional[torch.fx.Node] = None
 
     def __post_init__(self) -> None:
         s_raw = self.start
@@ -154,13 +154,13 @@ def compute_tensor_size(
 
 class MemoryAllocator:
     """
-    This class implements a simple first-fit memory manager for allocating memory partitions to tensors.
+    This class implements a simple first-fit memory manager for allocating
+    memory partitions to tensors.
 
     Attributes:
         total_memory (int): The total amount of memory available for allocation.
-        segments (list of Segment): A list of memory partitions.
-        memory_map (dict): A dictionary mapping tensors to their allocated memory partitions.
-
+        bank_width (int): The alignment requirement for memory allocations.
+        memory_space (MemorySpace): The type of memory space to use for allocations.
     """
 
     def __init__(self, total_memory=None, bank_width=None, memory_space=None):
@@ -194,8 +194,9 @@ class MemoryAllocator:
         tensor_size = _align_size(tensor_size, self.bank_width)
 
         for index, segment in enumerate(self.segments):
-            if segment.node is None and (segment.end - segment.start) >= tensor_size:
-                if (segment.end - segment.start) > tensor_size:
+            segment_size = segment.end - segment.start
+            if segment.node is None and segment_size >= tensor_size:
+                if segment_size > tensor_size:
                     new_segment = Segment(
                         start=segment.start + tensor_size,
                         end=segment.end,
@@ -236,7 +237,11 @@ class MemoryAllocator:
 
     def snapshot(self):
         partitions = [
-            Segment(start=segment.start, end=segment.end, node=segment.node.name if segment.node else None)
+            Segment(
+                start=segment.start,
+                end=segment.end,
+                node=segment.node.name if segment.node else None,
+            )
             for segment in self.segments[:-1]
         ]
         self.snapshots.append(partitions)
