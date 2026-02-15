@@ -12,7 +12,7 @@ from torchao.quantization.pt2e.export_utils import WrapperModule
 from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
 from ..mapping import get_tiled_tensor, get_reference_node
-from ..mapping_utils import is_gemm_op, is_bmm
+from ..mapping_utils import is_gemm_op, is_bmm, is_elementwise_op
 from ..shape_prop import ShapeProp
 
 
@@ -481,6 +481,56 @@ def _dtype_name(dtype_obj: Any) -> str:
     return s
 
 
+def _get_output_dtype(ir_node: Operation, dtype=None):
+    node = ir_node.origin_node
+    input_dtypes = [getattr(i, 'dtype', None) for i in ir_node.inputs]
+    input_dtypes = [dt for dt in input_dtypes if dt is not None]
+
+    def get_list_item(array, index):
+        return array[index] if index < len(array) else None
+
+    if node.target == quantized_lib.quantize_mx.default:
+        out_dtype = get_list_item(input_dtypes, 1)
+        scale_dtype = get_list_item(input_dtypes, 6)
+        dtype = [out_dtype, scale_dtype]
+    elif node.target == quantized_lib.quantize.default:
+        dtype = get_list_item(input_dtypes, 5)
+    elif node.target == quantized_lib.calculate_mx_qparam.default:
+        dtype = get_list_item(input_dtypes, 5)
+    elif not is_gemm_op(node) and not is_elementwise_op(node) and len(input_dtypes) == 1:
+        dtype = input_dtypes[0]
+
+    return dtype if isinstance(dtype, list) else [dtype]
+
+
+def _propagate_dtype(module: Module, input_dtypes: List[Any]):
+    """
+    Propagates data types through the IR module.
+    """
+    if len(module.args) != len(input_dtypes):
+        raise ValueError(
+            f"Expected {len(module.args)} input dtypes, got {len(input_dtypes)}"
+        )
+
+    for arg, dtype in zip(module.args, input_dtypes):
+        if isinstance(arg, TensorBox) and dtype is not None:
+            arg.dtype = dtype
+
+    def visit_block(body: List[IRNode]):
+        for node in body:
+            if isinstance(node, Loops):
+                visit_block(node.body)
+            else:
+                if isinstance(node, FusedOp):
+                    visit_block(node.ops)
+                output_dtypes = _get_output_dtype(node)
+                for output, dtype in zip(node.outputs, output_dtypes):
+                    if isinstance(output, TensorBox) and dtype is not None:
+                        output.dtype = dtype
+
+    visit_block(module.body)
+
+
 def _resolve_fx_graph_input(
     node: torch.fx.Node,
     namer: NameGenerator,
@@ -492,12 +542,13 @@ def _resolve_fx_graph_input(
     Uses node.meta['tensor_meta'] when available. Falls back to unknown.
     """
     val = getattr(node, "value", None)
+    dtype = getattr(node, "dtype", None)
 
     if isinstance(val, torch.Tensor):
         return TensorBox(
             name=namer.new_tensor(),
             shape=tuple(val.shape),
-            dtype=val.dtype,
+            dtype=dtype or val.dtype,
             space=mem_space,
             producer_op=ir_node,
         )
@@ -507,11 +558,11 @@ def _resolve_fx_graph_input(
             TensorBox(
                 name=namer.new_tensor(),
                 shape=tuple(v.shape),
-                dtype=v.dtype,
+                dtype=dtype[i] if dtype is not None else v.dtype,
                 space=mem_space,
                 producer_op=ir_node,
             )
-            for v in val
+            for i, v in enumerate(val)
         ]
         return tuple(outputs)
 

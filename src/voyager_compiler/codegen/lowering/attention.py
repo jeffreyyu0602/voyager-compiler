@@ -20,6 +20,7 @@ from voyager_compiler.codegen.lowering.ir import (
     NameGenerator,
     Operation,
     IRNode,
+    _propagate_dtype,
 )
 from voyager_compiler.codegen.lowering.allocator import run_memory_pass
 from voyager_compiler.codegen.lowering.codegen import generate_proto
@@ -101,9 +102,6 @@ class FlashAttention(torch.nn.Module):
             query_scale is not None
             and key_scale is not None
             and value_scale is not None
-            and query_code is not None
-            and key_code is not None
-            and value_code is not None
         )
 
         if use_quant:
@@ -288,7 +286,7 @@ def _lower_nested_loops(
     loop_bounds,
     env,
     namer,
-    ssa_indices=None,
+    index_values=None,
     depth=0,
 ):
     named_modules = dict(model.named_modules())
@@ -331,7 +329,7 @@ def _lower_nested_loops(
                 loop_bounds,
                 env=env,
                 namer=namer,
-                ssa_indices=ssa_indices,
+                index_values=index_values,
                 depth=depth + 1
             )
 
@@ -340,7 +338,7 @@ def _lower_nested_loops(
 
             for i in reversed(range(len(bounds))):
                 stmts = Loops(
-                    index=ssa_indices[indices_count + i],
+                    index=index_values[indices_count + i],
                     start=0,
                     end=bounds[i],
                     step=1,
@@ -355,7 +353,7 @@ def _lower_nested_loops(
             if (
                 depth > 0
                 and index is not None
-                and index < len(ssa_indices)
+                and index < len(index_values)
                 or node.target == quantized_ops.increment_indices.default
             ):
                 continue
@@ -385,7 +383,7 @@ def _lower_nested_loops(
 
     outputs = []
     for i, n in enumerate(output_node.args[0]):
-        if depth > 0 and i < len(ssa_indices):
+        if depth > 0 and i < len(index_values):
             outputs.append(env[input_nodes[i]])
         else:
             outputs.append(env[n])
@@ -418,17 +416,24 @@ def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None
 
     namer = NameGenerator()
     env = {}
-    args = []
-    ssa_indices = []
+    placeholders = []
+    parameters = []
+    index_values = []
 
     for node in gm.graph.nodes:
-        if node.op == "get_attr" and node.target.startswith("lifted_tensor"):
-            ssa_index = IndexValue(name=namer.new_index(), expr=node.target)
-            env[node] = ssa_index
-            ssa_indices.append(ssa_index)
-        elif node.op == "placeholder" or node.op == "get_attr":
+        if node.op == "placeholder":
             ir_node = Operation.from_fx_node(node, env, namer)
-            args.extend(ir_node.outputs)
+            placeholders.extend(ir_node.outputs)
+        elif node.op == "get_attr":
+            if node.target.startswith("lifted_tensor"):
+                ssa_index = IndexValue(name=namer.new_index(), expr=node.target)
+                env[node] = ssa_index
+                index_values.append(ssa_index)
+            elif isinstance(getattr(gm, node.target), torch.Tensor):
+                ir_node = Operation.from_fx_node(node, env, namer)
+                parameters.extend(ir_node.outputs)
+
+    args = placeholders + parameters
 
     print("Initial environment mapping:")
     for k, v in env.items():
@@ -439,10 +444,8 @@ def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None
         loop_bounds,
         env=env,
         namer=namer,
-        ssa_indices=ssa_indices,
+        index_values=index_values,
     )
-
-    ShapeProp(gm).propagate(*flatten_args)
 
     module = Module("main", args=args, body=body, results=outputs)
     print("\nFinal IR:")
@@ -461,14 +464,14 @@ if __name__ == "__main__":
         "--output_dir",
         type=str,
         help="The directory where the output files will be saved",
-        default="./output"  # Optional: provides a fallback
+        default="test/compiler/networks/flash_attention"
     )
     args = parser.parse_args()
 
     torch.manual_seed(0)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
+    dtype = torch.bfloat16
 
     B, H, N, D = 1, 32, 1024, 64
     q = torch.randn(B, H, N, D, device=device, dtype=dtype)
@@ -492,8 +495,10 @@ if __name__ == "__main__":
     module, gm = lower_flash_attention(flash_attention_pattern, *example_inputs)
     run_memory_pass(module)
 
-    proto = generate_proto(module, gm, example_inputs, output_dir=args.output_dir)
-    with open(os.path.join(args.output_dir, 'module.txt'), "w") as f:
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    proto = generate_proto(module, gm, example_inputs)
+    with open(os.path.join(args.output_dir, 'fp16_model.txt'), "w") as f:
         f.write(text_format.MessageToString(proto))
 
 
@@ -532,6 +537,10 @@ if __name__ == "__main__":
         "key_code": nf4_code,
         "value_code": nf4_code,
     }
+    input_dtypes = [
+        "int4", "int4", "int4", "fp8_e5m3", "fp8_e5m3", "fp8_e5m3",
+        "int6", "int6", "int6", "int4", "fp8_e5m3", None, None
+    ]
 
     out_gold = flash_attention_quantized_pattern(
         *example_inputs, **example_kwargs
@@ -556,10 +565,12 @@ if __name__ == "__main__":
         *example_inputs,
         kwargs=example_kwargs,
     )
+    _propagate_dtype(module, input_dtypes=input_dtypes)
     run_memory_pass(module)
 
     flatten_args, spec = tree_flatten((example_inputs[:3], example_kwargs))
-    proto = generate_proto(module, gm, flatten_args, output_dir=args.output_dir)
+    output_dir = os.path.join(args.output_dir, "tensor_files")
+    proto = generate_proto(module, gm, flatten_args, output_dir=output_dir)
 
-    with open(os.path.join(args.output_dir, 'module_quantized.txt'), "w") as f:
+    with open(os.path.join(args.output_dir, 'model.txt'), "w") as f:
         f.write(text_format.MessageToString(proto))
