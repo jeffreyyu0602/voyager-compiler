@@ -1,13 +1,13 @@
 import math
 import operator
 import os
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
 from torch.fx.node import map_arg
+from torch.utils._pytree import tree_flatten
 from torch._higher_order_ops import while_loop
-from torchao.quantization.pt2e.export_utils import WrapperModule
 from google.protobuf import text_format
 
 import voyager_compiler.decomposed
@@ -20,12 +20,9 @@ from voyager_compiler.codegen.lowering.ir import (
     NameGenerator,
     Operation,
     IRNode,
-    _resolve_fx_graph_input,
-    _resolve_fx_graph_outputs,
 )
 from voyager_compiler.codegen.lowering.allocator import run_memory_pass
 from voyager_compiler.codegen.lowering.codegen import generate_proto
-
 
 
 aten = torch.ops.aten
@@ -41,101 +38,249 @@ def _create_causal_mask(i: int, j: int, Br: int, Bc: int, device=None):
     return (j <= i)  # [Br, Bc]
 
 
-def inner_loop_body(
-    indices: List[torch.Tensor],
-    O_i: torch.Tensor,
-    l_i: torch.Tensor,
-    m_i: torch.Tensor,
-    Qi: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    Br: int,
-    Bc: int,
-):
-    d = key.shape[-1]
-    b, h, i, j = indices
+class FlashAttention(torch.nn.Module):
+    """
+    torch.export friendly Flash Attention implementation for compiler lowering.
 
-    Kj = quantized_ops.load_tile(key, [b, h, j], [1, 1, Bc, d], [0, 1, 2])
-    Vj = quantized_ops.load_tile(value, [b, h, j], [1, 1, Bc, d], [0, 1, 2])
+    The auxiliary quantization tensors (qmap/codebooks/etc.) are passed in as
+    arguments and registered as buffers for quantizing attention probs on the fly.
+    QKV scales and codebooks are are passed as forward args during runtime.
+    """
 
-    scaling = 1.0 / math.sqrt(d)
+    def __init__(
+        self,
+        *,
+        qmap: Optional[torch.Tensor] = None,
+        axes: Optional[List[int]] = None,
+        block_size: int = None,
+        quant_max: Optional[float] = None,
+        force_scale_power_of_two: bool = False,
+        scale_qmap: Optional[torch.Tensor] = None,
+        output_code: Optional[torch.Tensor] = None,
+        input_code: Optional[torch.Tensor] = None,
+        accumulate_fp32: bool = False,
+    ):
+        super().__init__()
+        self.register_buffer("qmap", qmap)
+        self.register_buffer("input_code", input_code)
+        self.register_buffer("scale_qmap", scale_qmap)
+        self.register_buffer("output_code", output_code)
 
-    scores = torch.matmul(Qi, Kj.transpose(-1, -2)) * scaling
-    # mask = _create_causal_mask(i * Br, j * Bc, Br, Bc, device=key.device)
-    # scores = scores.masked_fill(~mask, -float("inf"))
+        self.axes = axes
+        self.block_size = block_size
+        self.quant_max = quant_max
+        self.force_scale_power_of_two = force_scale_power_of_two
+        self.accumulate_fp32 = accumulate_fp32
 
-    m_block = torch.maximum(m_i, scores.amax(dim=-1, keepdim=True))
+    def _inner_loop_body(
+        self,
+        indices,
+        O_i: torch.Tensor,
+        l_i: torch.Tensor,
+        m_i: torch.Tensor,
+        Qi: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        query_scale: Optional[torch.Tensor] = None,
+        key_scale: Optional[torch.Tensor] = None,
+        value_scale: Optional[torch.Tensor] = None,
+        query_code: Optional[torch.Tensor] = None,
+        key_code: Optional[torch.Tensor] = None,
+        value_code: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        d = key.shape[-1]
+        b, h, i, j = indices
 
-    alpha = torch.exp(m_i - m_block)
-    P = torch.exp(scores - m_block)
-    l_i = alpha * l_i + P.sum(dim=-1, keepdim=True)
-    O_i = alpha * O_i + torch.matmul(P, Vj)
+        Kj = quantized_ops.load_tile(key, [b, h, j], [1, 1, Bc, d], [0, 1, 2])
+        Vj = quantized_ops.load_tile(value, [b, h, j], [1, 1, Bc, d], [0, 1, 2])
 
-    # Perform a add nop to copy new maximum to the correct memory location
-    m_i = m_block.add(0)
-
-    return O_i, l_i, m_i
-
-
-def outer_loop_body(indices, query, key, value, Br, Bc):
-    B, H, N, d = query.shape
-    b, h, i, init_j = indices
-    Qi = quantized_ops.load_tile(query, [b, h, i], [1, 1, Br, d], [0, 1, 2])
-
-    kwargs = {"device": query.device, "dtype": query.dtype}
-
-    # Running max and sum for this block of queries
-    O_i = torch.zeros((1, 1, Br, d), **kwargs)
-    l_i = torch.zeros((1, 1, Br, 1), **kwargs)
-    m_i = torch.full((1, 1, Br, 1), -float("inf"), **kwargs)
-
-    def cond_fn(b, h, i, j, *args):
-        return j < N // Bc
-
-    def body_fn(b, h, i, j, *args):
-        next_state = inner_loop_body([b, h, i, j], *args, Qi, key, value, Br, Bc)
-        return (b.clone(), h.clone(), i.clone(), j + 1) + next_state
-
-    *_, O_i, l_i, m_i = while_loop(
-        cond_fn,
-        body_fn,
-        (b, h, i, init_j, O_i, l_i, m_i),
-    )
-
-    return O_i / l_i
-
-
-def flash_attention_pattern(query, key, value, Br=64, Bc=128):
-    B, H, N, d = query.shape
-    Tr = N // Br
-
-    # Output buffer
-    O = torch.zeros((B, H, N, d), device=query.device, dtype=query.dtype)
-
-    def cond_fn(b, h, i, j, O_buf):
-        return b < B
-
-    def body_fn(b, h, i, j, O_buf):
-        indices = [b, h, i, j]
-        O_tile = outer_loop_body(indices, query, key, value, Br, Bc)
-        O_buf = quantized_ops.store_tile(
-            O_tile, O_buf, [b, h, i], [1, 1, Br, d], [0, 1, 2]
+        use_quant = (
+            query_scale is not None
+            and key_scale is not None
+            and value_scale is not None
+            and query_code is not None
+            and key_code is not None
+            and value_code is not None
         )
-        new_indices = quantized_ops.increment_indices(indices, [B + 1, H, Tr, 1])
-        return (*new_indices, O_buf)
 
-    kwargs = {"device": query.device, "dtype": torch.int32}
-    initial_state = (
-        torch.tensor(0, **kwargs),  # b
-        torch.tensor(0, **kwargs),  # h
-        torch.tensor(0, **kwargs),  # i
-        torch.tensor(0, **kwargs),  # j
-        O,
-    )
+        if use_quant:
+            # Load per-block scales for K and V
+            Kj_scale = quantized_ops.load_tile(
+                key_scale,
+                [b, h, j],
+                [1, 1, Bc, d // self.block_size],
+                [0, 1, 2],
+            )
+            Vj_scale = quantized_ops.load_tile(
+                value_scale,
+                [b, h, j],
+                [1, 1, Bc // self.block_size, d],
+                [0, 1, 2],
+            )
 
-    *_, final_O = while_loop(cond_fn, body_fn, initial_state)
+            scores = quantized_ops.matmul_mx(
+                Qi,
+                Kj.transpose(-1, -2),
+                input_scale=query_scale,
+                weight_scale=Kj_scale.transpose(-1, -2),
+                block_size=self.block_size,
+                input_code=query_code,
+                weight_code=key_code,
+            )
+        else:
+            scores = torch.matmul(Qi, Kj.transpose(-1, -2))
 
-    return final_O
+        scores = scores * (1 / math.sqrt(d))
+        # mask = _create_causal_mask(i * Br, j * Bc, Br, Bc, device=key.device)
+        # scores = scores.masked_fill(~mask, -float("inf"))
+
+        # Numerically stable accumulation
+        if self.accumulate_fp32 and scores.dtype != torch.float32:
+            scores = scores.to(torch.float32)
+
+        m_block = torch.maximum(m_i, scores.amax(dim=-1, keepdim=True))
+
+        alpha = torch.exp(m_i - m_block)
+        P = torch.exp(scores - m_block)
+        l_i = alpha * l_i + P.sum(dim=-1, keepdim=True)
+
+        if use_quant:
+            P_scale, P_q = quantized_ops.quantize_mx(
+                P,
+                qmap=self.qmap,
+                axes=self.axes,
+                block_size=self.block_size,
+                quant_max=self.quant_max,
+                force_scale_power_of_two=self.force_scale_power_of_two,
+                scale_qmap=self.scale_qmap,
+                output_code=self.output_code,
+            )
+
+            attention_probs = quantized_ops.matmul_mx(
+                P_q,
+                Vj,
+                input_scale=P_scale,
+                weight_scale=Vj_scale,
+                block_size=self.block_size,
+                input_code=self.input_code,
+                weight_code=value_code,
+            )
+        else:
+            attention_probs = torch.matmul(P, Vj)
+
+        O_i = alpha * O_i + attention_probs
+
+        # Perform a nop to copy new maximum to the correct memory location
+        m_i = m_block.add(0)
+
+        return O_i, l_i, m_i
+
+    def _outer_loop_body(
+        self,
+        indices,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        **kwargs,
+    ):
+        B, H, N, d = query.shape
+        b, h, i, init_j = indices
+
+        Qi = quantized_ops.load_tile(query, [b, h, i], [1, 1, Br, d], [0, 1, 2])
+
+        Qi_scale = None
+        if (query_scale := kwargs.get("query_scale")) is not None:
+            Qi_scale = quantized_ops.load_tile(
+                query_scale,
+                [b, h, i],
+                [1, 1, Br, d // self.block_size],
+                [0, 1, 2],
+            )
+
+        # Accumulator dtype choice
+        acc_dtype = torch.float32 if self.accumulate_fp32 else query.dtype
+        O_i = torch.zeros((1, 1, Br, d), device=query.device, dtype=acc_dtype)
+        l_i = torch.zeros((1, 1, Br, 1), device=query.device, dtype=acc_dtype)
+        m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
+
+        def cond_fn(b, h, i, j, *args):
+            return j < N // Bc
+
+        def body_fn(b, h, i, j, *args):
+            additional_inputs = (Qi, key, value, Br, Bc)
+            additional_kwargs = {
+                **kwargs,
+                "query_scale": Qi_scale,
+            }
+            next_state = self._inner_loop_body(
+                [b, h, i, j], *args, *additional_inputs, **additional_kwargs
+            )
+            return (b, h, i, j + 1) + next_state
+
+        *_, O_i, l_i, m_i = while_loop(
+            cond_fn,
+            body_fn,
+            (b, h, i, init_j, O_i, l_i, m_i),
+        )
+
+        out = O_i / l_i
+        if self.accumulate_fp32 and out.dtype != query.dtype:
+            out = out.to(query.dtype)
+        return out
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int = 64,
+        Bc: int = 128,
+        **kwargs,
+    ):
+        B, H, N, d = query.shape
+        Tr = N // Br
+
+        # Allocate output buffer
+        O = torch.empty((B, H, N, d), device=query.device, dtype=query.dtype)
+
+        def cond_fn(b, h, i, j, O_buf):
+            return b < B
+
+        def body_fn(b, h, i, j, O_buf):
+            indices = [b, h, i, j]
+            O_tile = self._outer_loop_body(
+                indices,
+                query=query,
+                key=key,
+                value=value,
+                Br=Br,
+                Bc=Bc,
+                **kwargs,
+            )
+            O_buf = quantized_ops.store_tile(
+                O_tile, O_buf, [b, h, i], [1, 1, Br, d], [0, 1, 2]
+            )
+            new_indices = quantized_ops.increment_indices(
+                indices, [B + 1, H, Tr, 1]
+            )
+            return (*new_indices, O_buf)
+
+        factory_kwargs = {"device": query.device, "dtype": torch.int32}
+        initial_state = (
+            torch.tensor(0, **factory_kwargs),  # b
+            torch.tensor(0, **factory_kwargs),  # h
+            torch.tensor(0, **factory_kwargs),  # i
+            torch.tensor(0, **factory_kwargs),  # j
+            O,
+        )
+
+        *_, final_O = while_loop(cond_fn, body_fn, initial_state)
+        return final_O
 
 
 def _lower_nested_loops(
@@ -248,13 +393,14 @@ def _lower_nested_loops(
     return body, outputs
 
 
-def lower_flash_attention(query, key, value, Br=64, Bc=128):
+def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None):
     gm = export_model(
-        WrapperModule(flash_attention_pattern),
-        (query, key, value),
-        kwargs={"Br": Br, "Bc": Bc}
+        pattern,
+        (query, key, value, Br, Bc),
+        kwargs=kwargs,
     )
 
+    # Remove Br and Bc from the graph since they're compile-time constants
     for n in list(gm.graph.nodes):
         if n.op == "placeholder" and not n.users:
             gm.graph.erase_node(n)
@@ -262,7 +408,10 @@ def lower_flash_attention(query, key, value, Br=64, Bc=128):
     gm.graph.lint()
     gm.recompile()
 
-    ShapeProp(gm).propagate(query, key, value)
+    example_args = (query, key, value)
+    flatten_args, spec = tree_flatten((example_args, kwargs))
+
+    ShapeProp(gm).propagate(*flatten_args)
 
     B, H, N, d = query.shape
     loop_bounds = [[B, H, N // Br], [N // Bc]]
@@ -272,20 +421,16 @@ def lower_flash_attention(query, key, value, Br=64, Bc=128):
     args = []
     ssa_indices = []
 
-    i = 0
-
     for node in gm.graph.nodes:
-        if node.op == "placeholder":
-            v = _resolve_fx_graph_input(node, namer)
-            v.producer_op = Operation.from_fx_node(node, env, namer)
-            env[node] = v
-            args.append(v)
-        elif node.op == "get_attr" and node.target.startswith("lifted_tensor"):
-            ssa_index = IndexValue(name=namer.new_index(), expr=f"{node}_{i}")
+        if node.op == "get_attr" and node.target.startswith("lifted_tensor"):
+            ssa_index = IndexValue(name=namer.new_index(), expr=node.target)
             env[node] = ssa_index
             ssa_indices.append(ssa_index)
-            i += 1
+        elif node.op == "placeholder" or node.op == "get_attr":
+            ir_node = Operation.from_fx_node(node, env, namer)
+            args.extend(ir_node.outputs)
 
+    print("Initial environment mapping:")
     for k, v in env.items():
         print(f"{k} -> {v}")
 
@@ -296,6 +441,8 @@ def lower_flash_attention(query, key, value, Br=64, Bc=128):
         namer=namer,
         ssa_indices=ssa_indices,
     )
+
+    ShapeProp(gm).propagate(*flatten_args)
 
     module = Module("main", args=args, body=body, results=outputs)
     print("\nFinal IR:")
@@ -328,6 +475,8 @@ if __name__ == "__main__":
     k = torch.randn(B, H, N, D, device=device, dtype=dtype)
     v = torch.randn(B, H, N, D, device=device, dtype=dtype)
 
+    flash_attention_pattern = FlashAttention()
+
     out_ref = F.scaled_dot_product_attention(q, k, v)
     out_gold = flash_attention_pattern(q, k, v, Br=512, Bc=128)
 
@@ -340,9 +489,77 @@ if __name__ == "__main__":
     print(f"max_err={max_err:.6g}  rms_err={rms_err:.6g}\n\n")
 
     example_inputs = (q.cpu(), k.cpu(), v.cpu(), 512, 128)
-    module, gm = lower_flash_attention(*example_inputs)
+    module, gm = lower_flash_attention(flash_attention_pattern, *example_inputs)
     run_memory_pass(module)
 
     proto = generate_proto(module, gm, example_inputs, output_dir=args.output_dir)
     with open(os.path.join(args.output_dir, 'module.txt'), "w") as f:
+        f.write(text_format.MessageToString(proto))
+
+
+    from voyager_compiler.fake_quantize import get_quantization_map
+
+    nf4_qmap, nf4_code = get_quantization_map("nf4_6", device=device)
+    midpoints = (nf4_code[:-1] + nf4_code[1:]) / 2
+
+    scale_qmap = get_quantization_map("fp8_e5m3", device=device)
+
+    quant_kwargs = {
+        "qmap": nf4_qmap,
+        "axes": [-1],
+        "block_size": 64,
+        "quant_max": 31,
+        "force_scale_power_of_two": False,
+        "scale_qmap": scale_qmap,
+        "output_code": nf4_code,
+    }
+
+    qs, qq = quantized_ops.quantize_mx(q, **quant_kwargs)
+    ks, kq = quantized_ops.quantize_mx(k, **quant_kwargs)
+    vs, vq = quantized_ops.quantize_mx(v, **quant_kwargs)
+
+    flash_attention_quantized_pattern = FlashAttention(
+        **quant_kwargs,
+        input_code=nf4_code,
+    )
+
+    example_inputs = (qq, kq, vq, 512, 128)
+    example_kwargs = {
+        "query_scale": qs,
+        "key_scale": ks,
+        "value_scale": vs,
+        "query_code": nf4_code,
+        "key_code": nf4_code,
+        "value_code": nf4_code,
+    }
+
+    out_gold = flash_attention_quantized_pattern(
+        *example_inputs, **example_kwargs
+    )
+
+    print(out_ref)
+    print(out_gold)
+
+    # Compare in fp32 for a fair error metric
+    max_err = (out_gold.float() - out_ref.float()).abs().max().item()
+    rms_err = torch.mean((out_gold.float() - out_ref.float()) ** 2).sqrt().item()
+    print(f"max_err={max_err:.6g}  rms_err={rms_err:.6g}\n\n")
+
+    # Move inputs to CPU for export
+    example_inputs = tuple(
+        x.cpu() if isinstance(x, torch.Tensor) else x for x in example_inputs
+    )
+    example_kwargs = {k: v.cpu() for k, v in example_kwargs.items()}
+
+    module, gm = lower_flash_attention(
+        flash_attention_quantized_pattern.cpu(),
+        *example_inputs,
+        kwargs=example_kwargs,
+    )
+    run_memory_pass(module)
+
+    flatten_args, spec = tree_flatten((example_inputs[:3], example_kwargs))
+    proto = generate_proto(module, gm, flatten_args, output_dir=args.output_dir)
+
+    with open(os.path.join(args.output_dir, 'module_quantized.txt'), "w") as f:
         f.write(text_format.MessageToString(proto))

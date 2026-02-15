@@ -3,8 +3,6 @@ import os
 import logging
 import torch
 
-from torch.fx.operator_schemas import normalize_function
-
 import voyager_compiler.codegen.param_pb2 as pb
 
 from .ir import Module, Operation, FusedOp, Loops, Value, IRNode, IndexValue
@@ -21,12 +19,11 @@ MEM_SPACE_TO_INDEX = {
 }
 
 
-def set_tensor_field(field, value, output_dir=None):
+def set_tensor_field(field, value, output_dir=None, index=None):
     if isinstance(value, IndexValue):
         field.node = value.name
         field.shape.append(1)
         field.dtype = "int32"
-        print(f"IndexValue {value.name} mapped to tensor with shape {field.shape} and dtype {field.dtype}")
         return
 
     node = value.producer_op.origin_node
@@ -43,13 +40,14 @@ def set_tensor_field(field, value, output_dir=None):
     field.memory.address = int(value.address)
 
     if output_dir is not None:
-        save_tensor(node.value, os.path.join(output_dir, f"{field.node}.bin"))
+        tensor = node.value[index] if index is not None else node.value
+        save_tensor(tensor, os.path.join(output_dir, f"{field.node}.bin"))
 
 
 def set_tensor_list_field(field, values, output_dir):
-    for t in values:
+    for i, t in enumerate(values):
         tensor = pb.Tensor()
-        set_tensor_field(tensor, t, output_dir)
+        set_tensor_field(tensor, t, output_dir, index=i)
         field.tensors.append(tensor)
 
 
@@ -61,7 +59,6 @@ def convert_arg(value, output_dir=None) -> pb.Argument:
     arg = pb.Argument()
 
     if isinstance(value, Value):
-        print(value)
         set_tensor_field(arg.tensor, value, output_dir)
     elif isinstance(value, bool):
         arg.bool_value = value
@@ -114,25 +111,7 @@ def map_node(ir_node: IRNode, output_dir=None) -> pb.OpOverload:
     if node.target == torch.ops.aten.pad.default:
         op_overload.op = "cpu"
 
-    new_args_and_kwargs = normalize_function(
-        node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
-    )
-
-    if new_args_and_kwargs is not None:
-        args, kwargs = new_args_and_kwargs.args, new_args_and_kwargs.kwargs
-    else:
-        args, kwargs = node.args, node.kwargs
-
-    for k, v in kwargs.items():
-        print(f"FX Node kwarg: {k}={v}")
-
-    print("\n")
-    for k, v in ir_node.kwargs.items():
-        print(f"ir_node kwarg: {k}={v}")
-    print("\n")
-
     ssa_value_map = {inp.name: inp for inp in ir_node.inputs}
-    print(f"SSA value map: {ssa_value_map}")
 
     # Convert keyword arguments
     for key, value in ir_node.kwargs.items():
@@ -144,7 +123,6 @@ def map_node(ir_node: IRNode, output_dir=None) -> pb.OpOverload:
                     ssa_value_map.get(v, v) if isinstance(v, str) else v
                     for v in value
                 ]
-            print(f"Converting arg {key} with value {value} and type {type(value)}")
             op_overload.kwargs[key].CopyFrom(convert_arg(value, output_dir))
 
     return op_overload

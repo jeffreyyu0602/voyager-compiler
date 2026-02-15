@@ -395,11 +395,7 @@ class Module:
                 stmt = Operation.from_fx_node(node, env, namer)
 
             if node.op == "placeholder":
-                v = _resolve_fx_graph_input(node, namer, ir_node=stmt)
-                v.producer_op = stmt
-                env[node] = v
-                args.append(v)
-                # Still emit an Operation for traceability
+                args.append(env[node])
                 body.append(stmt)
             elif node.op == "output":
                 results = _resolve_fx_graph_outputs(node.args[0], env)
@@ -430,18 +426,24 @@ class NameGenerator:
 # =============================================================================
 
 def _get_node_args_and_kwargs(node: torch.fx.Node):
-    if node.op in ["call_function", "call_method"]:
+    args, kwargs = node.args, node.kwargs
+
+    if node.op in ("call_function", "call_method"):
         args_and_kwargs = normalize_function(
             node.target,
-            node.args,
-            node.kwargs,
+            args,
+            kwargs,
             normalize_to_only_use_kwargs=True
         )
 
         if args_and_kwargs is not None:
-            return args_and_kwargs.args, args_and_kwargs.kwargs
+            args, kwargs = args_and_kwargs.args, args_and_kwargs.kwargs
 
-    return node.args, node.kwargs
+    kwargs = {
+        k: v for k, v in kwargs.items() if v is not None and "qmap" not in k
+    }
+
+    return args, kwargs
 
 
 def _stringify_target(target: Any) -> str:
