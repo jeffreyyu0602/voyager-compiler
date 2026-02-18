@@ -120,7 +120,7 @@ class MemoryAllocatorPass:
             return  # Ignore spaces we aren't managing
 
         size = self.get_tensor_bytes(tensor)
-        if size == 0:
+        if size == 0 or not tensor.users:
             return
 
         offset = self.allocators[space].allocate(size)

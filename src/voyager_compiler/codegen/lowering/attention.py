@@ -281,6 +281,121 @@ class FlashAttention(torch.nn.Module):
         return final_O
 
 
+class FlashAttentionFlat(FlashAttention):
+    """
+    Flattened version of FlashAttention where both the outer and inner loops are
+    unrolled for testing purpose.
+    """
+
+    def _outer_loop_body(
+        self,
+        indices,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        **kwargs,
+    ):
+        B, H, N, d = query.shape
+        b, h, i = indices
+
+        Qi = quantized_ops.load_tile(query, [b, h, i], [1, 1, Br, d], [0, 1, 2])
+
+        Qi_scale = None
+        if (query_scale := kwargs.get("query_scale")) is not None:
+            Qi_scale = quantized_ops.load_tile(
+                query_scale,
+                [b, h, i],
+                [1, 1, Br, d // self.block_size],
+                [0, 1, 2],
+            )
+
+        # Accumulator dtype choice
+        acc_dtype = torch.float32 if self.accumulate_fp32 else query.dtype
+        O_i = torch.zeros((1, 1, Br, d), device=query.device, dtype=acc_dtype)
+        l_i = torch.zeros((1, 1, Br, 1), device=query.device, dtype=acc_dtype)
+        m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
+
+        for j in range(N // Bc):
+            j = torch.tensor(j, dtype=torch.int32, device=key.device)
+            additional_inputs = (Qi, key, value, Br, Bc)
+            additional_kwargs = {
+                **kwargs,
+                "query_scale": Qi_scale,
+            }
+            O_i, l_i, m_i = self._inner_loop_body(
+                [b, h, i, j], O_i, l_i, m_i, *additional_inputs, **additional_kwargs
+            )
+
+        out = O_i / l_i
+        if self.accumulate_fp32 and out.dtype != query.dtype:
+            out = out.to(query.dtype)
+        return out
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int = 64,
+        Bc: int = 128,
+        **kwargs,
+    ):
+        B, H, N, d = query.shape
+        Tr = N // Br
+
+        # Allocate output buffer
+        O = torch.empty((B, H, N, d), device=query.device, dtype=query.dtype)
+
+        import itertools
+        for b, h, i in itertools.product(range(B), range(H), range(Tr)):
+            b = torch.tensor(b, dtype=torch.int32, device=key.device)
+            h = torch.tensor(h, dtype=torch.int32, device=key.device)
+            i = torch.tensor(i, dtype=torch.int32, device=key.device)
+            O_tile = self._outer_loop_body(
+                [b, h, i],
+                query=query,
+                key=key,
+                value=value,
+                Br=Br,
+                Bc=Bc,
+                **kwargs,
+            )
+            quantized_ops.store_tile(
+                O_tile, O, [b, h, i], [1, 1, Br, d], [0, 1, 2]
+            )
+
+        return O
+
+
+def _is_reading_from_dram(node, named_modules):
+    if node.target == quantized_ops.store_tile.default:
+        return True
+
+    for user in node.users:
+        if user.target == quantized_ops.load_tile.default:
+            return True
+        elif user.target == quantized_ops.store_tile.default:
+            if user.args[1] == node:
+                return True
+        elif user.target == torch.ops.higher_order.while_loop:
+            loop_body = named_modules[user.args[1].target]
+            loop_inputs = user.args[2] + user.args[3]
+
+            placeholders = [
+                n for n in loop_body.graph.nodes if n.op == "placeholder"
+            ]
+            assert len(placeholders) == len(loop_inputs)
+
+            index = loop_inputs.index(node)
+
+            if _is_reading_from_dram(placeholders[index], named_modules):
+                return True
+
+    return False
+
+
 def _lower_nested_loops(
     model: torch.fx.GraphModule,
     loop_bounds,
@@ -364,16 +479,14 @@ def _lower_nested_loops(
                 idx = node.args[1]
                 env[node] = env[node.all_input_nodes[0]][idx]
             else:
-                mem_loc = "Scratchpad"
-                if (
-                    node.target == quantized_ops.store_tile.default
-                    or depth == 0
-                    and node.target == aten.zeros.default
-                ):
-                    mem_loc = "DRAM"
+                is_dma_op = _is_reading_from_dram(node, named_modules)
+                mem_loc = "DRAM" if is_dma_op else "Scratchpad"
 
-                # If the node is an output of the loop, accumulate into the input buffer
-                output_ir = env[input_nodes[index]] if index is not None else None
+                # If the node is a loop state, accumulate into the buffer
+                output_ir = (
+                    env[input_nodes[index]]
+                    if depth > 0 and index is not None else None
+                )
 
                 op = Operation.from_fx_node(
                     node, env, namer, mem_space=mem_loc, outputs=output_ir
@@ -455,6 +568,11 @@ def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None
 
 
 if __name__ == "__main__":
+    """
+    Usage:
+    python voyager-compiler/src/voyager_compiler/codegen/lowering/attention.py \
+        --output_dir test/compiler/networks/flash_attention/MXNF4
+    """
     import argparse
 
     parser = argparse.ArgumentParser(
@@ -516,16 +634,16 @@ if __name__ == "__main__":
         "quant_max": 31,
         "force_scale_power_of_two": False,
         "scale_qmap": scale_qmap,
-        "output_code": nf4_code,
+        "output_code": midpoints,
     }
 
     qs, qq = quantized_ops.quantize_mx(q, **quant_kwargs)
     ks, kq = quantized_ops.quantize_mx(k, **quant_kwargs)
     vs, vq = quantized_ops.quantize_mx(v, **quant_kwargs)
 
-    flash_attention_quantized_pattern = FlashAttention(
+    flash_attention_quantized_pattern = FlashAttentionFlat(
         **quant_kwargs,
-        input_code=nf4_code,
+        input_code=nf4_code.clone(),
     )
 
     example_inputs = (qq, kq, vq, 512, 128)
@@ -533,9 +651,9 @@ if __name__ == "__main__":
         "query_scale": qs,
         "key_scale": ks,
         "value_scale": vs,
-        "query_code": nf4_code,
-        "key_code": nf4_code,
-        "value_code": nf4_code,
+        "query_code": nf4_code.clone(),
+        "key_code": nf4_code.clone(),
+        "value_code": nf4_code.clone(),
     }
     input_dtypes = [
         "int4", "int4", "int4", "fp8_e5m3", "fp8_e5m3", "fp8_e5m3",

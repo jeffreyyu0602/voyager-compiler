@@ -36,8 +36,10 @@ def set_tensor_field(field, value, output_dir=None, index=None):
     else:
         field.dtype = value.dtype
 
-    field.memory.partition = MEM_SPACE_TO_INDEX[value.space]
-    field.memory.address = int(value.address)
+    # Ops like store_tile rely on side effect and do not have outputs
+    if value.address is not None:
+        field.memory.partition = MEM_SPACE_TO_INDEX[value.space]
+        field.memory.address = int(value.address)
 
     if output_dir is not None:
         tensor = node.value[index] if index is not None else node.value
