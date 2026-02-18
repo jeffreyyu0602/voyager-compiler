@@ -287,6 +287,115 @@ class FlashAttentionFlat(FlashAttention):
     unrolled for testing purpose.
     """
 
+    def _inner_loop_body(
+        self,
+        indices,
+        O_i: torch.Tensor,
+        l_i: torch.Tensor,
+        m_i: torch.Tensor,
+        Qi: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        query_scale: Optional[torch.Tensor] = None,
+        key_scale: Optional[torch.Tensor] = None,
+        value_scale: Optional[torch.Tensor] = None,
+        query_code: Optional[torch.Tensor] = None,
+        key_code: Optional[torch.Tensor] = None,
+        value_code: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        d = key.shape[-1]
+        b, h, i, j = indices
+
+        Kj = quantized_ops.load_tile(
+            key, [], [1, 1, Bc, d], [], static_indices=[b, h, j, 0]
+        )
+        Vj = quantized_ops.load_tile(
+            value, [], [1, 1, Bc, d], [], static_indices=[b, h, j, 0]
+        )
+
+        use_quant = (
+            query_scale is not None
+            and key_scale is not None
+            and value_scale is not None
+        )
+
+        if use_quant:
+            # Load per-block scales for K and V
+            Kj_scale = quantized_ops.load_tile(
+                key_scale,
+                [],
+                [1, 1, Bc, d // self.block_size],
+                [],
+                static_indices=[b, h, j, 0],
+            )
+            Vj_scale = quantized_ops.load_tile(
+                value_scale,
+                [],
+                [1, 1, Bc // self.block_size, d],
+                [],
+                static_indices=[b, h, j, 0],
+            )
+
+            scores = quantized_ops.matmul_mx(
+                Qi,
+                Kj.transpose(-1, -2),
+                input_scale=query_scale,
+                weight_scale=Kj_scale.transpose(-1, -2),
+                block_size=self.block_size,
+                input_code=query_code,
+                weight_code=key_code,
+            )
+        else:
+            scores = torch.matmul(Qi, Kj.transpose(-1, -2))
+
+        scores = scores * (1 / math.sqrt(d))
+        # mask = _create_causal_mask(i * Br, j * Bc, Br, Bc, device=key.device)
+        # scores = scores.masked_fill(~mask, -float("inf"))
+
+        # Numerically stable accumulation
+        if self.accumulate_fp32 and scores.dtype != torch.float32:
+            scores = scores.to(torch.float32)
+
+        m_block = torch.maximum(m_i, scores.amax(dim=-1, keepdim=True))
+
+        alpha = torch.exp(m_i - m_block)
+        P = torch.exp(scores - m_block)
+        l_i = alpha * l_i + P.sum(dim=-1, keepdim=True)
+
+        if use_quant:
+            P_scale, P_q = quantized_ops.quantize_mx(
+                P,
+                qmap=self.qmap,
+                axes=self.axes,
+                block_size=self.block_size,
+                quant_max=self.quant_max,
+                force_scale_power_of_two=self.force_scale_power_of_two,
+                scale_qmap=self.scale_qmap,
+                output_code=self.output_code,
+            )
+
+            attention_probs = quantized_ops.matmul_mx(
+                P_q,
+                Vj,
+                input_scale=P_scale,
+                weight_scale=Vj_scale,
+                block_size=self.block_size,
+                input_code=self.input_code,
+                weight_code=value_code,
+            )
+        else:
+            attention_probs = torch.matmul(P, Vj)
+
+        O_i = alpha * O_i + attention_probs
+
+        # Perform a nop to copy new maximum to the correct memory location
+        m_i = m_block.add(0)
+
+        return O_i, l_i, m_i
+
     def _outer_loop_body(
         self,
         indices,
@@ -300,15 +409,18 @@ class FlashAttentionFlat(FlashAttention):
         B, H, N, d = query.shape
         b, h, i = indices
 
-        Qi = quantized_ops.load_tile(query, [b, h, i], [1, 1, Br, d], [0, 1, 2])
+        Qi = quantized_ops.load_tile(
+            query, [], [1, 1, Br, d], [], static_indices=[b, h, i, 0]
+        )
 
         Qi_scale = None
         if (query_scale := kwargs.get("query_scale")) is not None:
             Qi_scale = quantized_ops.load_tile(
                 query_scale,
-                [b, h, i],
+                [],
                 [1, 1, Br, d // self.block_size],
-                [0, 1, 2],
+                [],
+                static_indices=[b, h, i, 0],
             )
 
         # Accumulator dtype choice
@@ -318,7 +430,6 @@ class FlashAttentionFlat(FlashAttention):
         m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
 
         for j in range(N // Bc):
-            j = torch.tensor(j, dtype=torch.int32, device=key.device)
             additional_inputs = (Qi, key, value, Br, Bc)
             additional_kwargs = {
                 **kwargs,
@@ -350,9 +461,6 @@ class FlashAttentionFlat(FlashAttention):
 
         import itertools
         for b, h, i in itertools.product(range(B), range(H), range(Tr)):
-            b = torch.tensor(b, dtype=torch.int32, device=key.device)
-            h = torch.tensor(h, dtype=torch.int32, device=key.device)
-            i = torch.tensor(i, dtype=torch.int32, device=key.device)
             O_tile = self._outer_loop_body(
                 [b, h, i],
                 query=query,
@@ -363,7 +471,7 @@ class FlashAttentionFlat(FlashAttention):
                 **kwargs,
             )
             quantized_ops.store_tile(
-                O_tile, O, [b, h, i], [1, 1, Br, d], [0, 1, 2]
+                O_tile, O, [], [1, 1, Br, d], [], static_indices=[b, h, i, 0]
             )
 
         return O

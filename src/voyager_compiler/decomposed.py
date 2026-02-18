@@ -823,7 +823,7 @@ def _(
 
 quantized_decomposed_lib.define(
     "load_tile(Tensor input, Tensor[] tile_indices, SymInt[] tile_sizes, "
-    "SymInt[] dims, SymInt[]? tile_strides=None) -> Tensor"
+    "SymInt[] dims, SymInt[]? tile_strides=None, SymInt[]? static_indices=None) -> Tensor"
 )
 
 
@@ -834,16 +834,33 @@ def load_tile(
     tile_sizes: List[int],
     dims: List[int],
     tile_strides: Optional[List[int]] = None,
+    static_indices: Optional[List[int]] = None
 ) -> torch.Tensor:
     """
-    Semantic Python equivalent of DataLoader::load_tile.
+    Emulate DMA operation of loading a tile from the input tensor based on the
+    provided tile indices, sizes, and dimensions.
 
-    Returns the logical tile tensor corresponding to the C backend behavior.
+    Args:
+        input (torch.Tensor): The input tensor to load the tile from.
+        tile_indices (List[torch.Tensor]): A list of 1D tensors containing the
+            dynamic tile indices for each dimension specified in `dims`.
+        tile_sizes (List[int]): A list of integers specifying the size of the tile
+            to be loaded for each dimension in `dims`.
+        dims (List[int]): A list of integers specifying the dimensions along which
+            tiling is applied.
+        tile_strides (Optional[List[int]]): A list of integers specifying the stride
+            for each dimension in `dims`. If None, it defaults to `tile_sizes`.
+        static_indices (Optional[List[int]]): A list of integers specifying the static
+            indices for dimensions that are not tiled. If None, it defaults to 0 for all
+            non-tiled dimensions.
     """
     if tile_strides is None:
         tile_strides = tile_sizes
 
     assert len(tile_indices) == len(dims)
+
+    if static_indices is None:
+        static_indices = [0] * input.dim()
 
     indices = []
     i = 0
@@ -852,7 +869,7 @@ def load_tile(
             indices.append(tile_indices[i].item())
             i += 1
         else:
-            indices.append(0)
+            indices.append(static_indices[d])
 
     rank = len(input.shape)
     assert rank == len(tile_sizes) == len(tile_strides) == len(indices)
@@ -874,13 +891,14 @@ def _(
     tile_sizes: List[int],
     dims: List[int],
     tile_strides: Optional[List[int]] = None,
+    static_indices: Optional[List[int]] = None
 ):
     return input.new_empty(tile_sizes)
 
 
 quantized_decomposed_lib.define(
     "store_tile(Tensor src, Tensor dest, Tensor[] tile_indices, SymInt[] tile_sizes, "
-    "SymInt[] dims) -> Tensor"
+    "SymInt[] dims, SymInt[]? static_indices=None) -> Tensor"
 )
 
 
@@ -891,6 +909,7 @@ def store_tile(
     tile_indices: List[torch.Tensor],
     tile_sizes: List[int],
     dims: List[int],
+    static_indices: Optional[List[int]] = None
 ) -> torch.Tensor:
     """
     Semantic Python equivalent of DataLoader::load_tile.
@@ -899,6 +918,9 @@ def store_tile(
     """
     assert len(tile_indices) == len(dims)
 
+    if static_indices is None:
+        static_indices = [0] * dest.dim()
+
     indices = []
     i = 0
     for d in range(dest.dim()):
@@ -906,7 +928,7 @@ def store_tile(
             indices.append(tile_indices[i].item())
             i += 1
         else:
-            indices.append(0)
+            indices.append(static_indices[d])
 
     rank = len(dest.shape)
     assert rank == len(tile_sizes) == len(indices)
@@ -930,6 +952,7 @@ def _(
     tile_indices: List[torch.Tensor],
     tile_sizes: List[int],
     dims: List[int],
+    static_indices: Optional[List[int]] = None
 ):
     return torch.empty_like(dest)
 

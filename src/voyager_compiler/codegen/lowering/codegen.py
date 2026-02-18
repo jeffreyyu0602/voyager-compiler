@@ -130,11 +130,14 @@ def map_node(ir_node: IRNode, output_dir=None) -> pb.OpOverload:
     return op_overload
 
 
-def map_operation(ir_node: Loops, output_dir=None):
+def map_operation(ir_node: Operation, output_dir=None):
     body = []
     if isinstance(ir_node, Operation):
         op = pb.Operation(op=map_node(ir_node))
-        set_tensor_list_field(op.outputs, ir_node.outputs, output_dir)
+        if len(ir_node.outputs) == 1:
+            set_tensor_field(op.output, ir_node.outputs[0], output_dir)
+        else:
+            set_tensor_list_field(op.outputs, ir_node.outputs, output_dir)
         return op
     elif isinstance(ir_node, FusedOp):
         node = ir_node.origin_node
@@ -144,7 +147,10 @@ def map_operation(ir_node: Loops, output_dir=None):
         for fused_op in ir_node.ops:
             op.fused_op.op_list.append(map_node(fused_op))
 
-        set_tensor_list_field(op.outputs, ir_node.outputs, output_dir)
+        if len(ir_node.outputs) == 1:
+            set_tensor_field(op.output, ir_node.outputs[0], output_dir)
+        else:
+            set_tensor_list_field(op.outputs, ir_node.outputs, output_dir)
         return op
     elif isinstance(ir_node, Loops):
         for stmt in ir_node.body:
