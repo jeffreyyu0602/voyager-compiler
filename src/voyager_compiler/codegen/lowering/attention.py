@@ -600,7 +600,6 @@ def _lower_nested_loops(
                     node, env, namer, mem_space=mem_loc, outputs=output_ir
                 )
                 body.append(op)
-                print(op.format())
 
     outputs = []
     for i, n in enumerate(output_node.args[0]):
@@ -646,17 +645,16 @@ def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None
             ir_node = Operation.from_fx_node(node, env, namer)
             placeholders.extend(ir_node.outputs)
         elif node.op == "get_attr":
-            if node.target.startswith("lifted_tensor"):
-                ssa_index = IndexValue(name=namer.new_index(), expr=node.target)
+            target = node.target
+            if target.startswith("lifted_tensor"):
+                ssa_index = IndexValue(name=namer.new_index(), expr=target)
                 env[node] = ssa_index
                 index_values.append(ssa_index)
-            elif isinstance(getattr(gm, node.target), torch.Tensor):
+            elif isinstance(getattr(gm, target), torch.Tensor):
                 ir_node = Operation.from_fx_node(node, env, namer)
                 parameters.extend(ir_node.outputs)
 
-    args = placeholders + parameters
-
-    print("Initial environment mapping:")
+    print("Module inputs:")
     for k, v in env.items():
         print(f"{k} -> {v}")
 
@@ -668,7 +666,13 @@ def lower_flash_attention(pattern, query, key, value, Br=64, Bc=128, kwargs=None
         index_values=index_values,
     )
 
-    module = Module("main", args=args, body=body, results=outputs)
+    module = Module(
+        "main",
+        args=placeholders,
+        params=parameters,
+        body=body,
+        results=outputs
+    )
     print("\nFinal IR:")
     print(module.format())
 

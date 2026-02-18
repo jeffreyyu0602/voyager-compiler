@@ -145,7 +145,7 @@ class MemoryAllocatorPass:
         """Walks the IR, allocating node outputs and freeing inputs that have reached their last use."""
         # Allocate module inputs at the start of the module scope
         if isinstance(block, Module):
-            for arg in block.args:
+            for arg in block.args + block.params:
                 self._allocate_tensor(arg)
 
         for node in block.body:

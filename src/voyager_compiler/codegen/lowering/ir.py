@@ -355,11 +355,12 @@ class Loops(IRNode):
 class Module:
     name: str
     args: List[Value]
+    params: List[Value]
     body: List[IRNode]
     results: List[Value]
 
     def format(self) -> str:
-        inputs = ", ".join(str(a) for a in self.args)
+        inputs = ", ".join(str(a) for a in self.args + self.params)
         outputs = ", ".join(str(r) for r in self.results)
         lines = [f"func @{self.name}({inputs}) -> ({outputs}) {{"]
         for s in self.body:
@@ -386,6 +387,7 @@ class Module:
 
         body: List[IRNode] = []
         args: List[Value] = []
+        params: List[Value] = []
         results: List[Value] = []
 
         for node in gm.graph.nodes:
@@ -396,13 +398,14 @@ class Module:
 
             if node.op == "placeholder":
                 args.append(env[node])
-                body.append(stmt)
+            elif node.op == "get_attr":
+                params.append(env[node])
             elif node.op == "output":
                 results = _resolve_fx_graph_outputs(node.args[0], env)
             else:
                 body.append(stmt)
 
-        return Module(name, args, body, results)
+        return Module(name, args, params, body, results)
 
 
 class NameGenerator:
@@ -507,12 +510,13 @@ def _propagate_dtype(module: Module, input_dtypes: List[Any]):
     """
     Propagates data types through the IR module.
     """
-    if len(module.args) != len(input_dtypes):
+    all_input_nodes = module.args + module.params
+    if len(all_input_nodes) != len(input_dtypes):
         raise ValueError(
-            f"Expected {len(module.args)} input dtypes, got {len(input_dtypes)}"
+            f"Expected {len(all_input_nodes)} input dtypes, got {len(input_dtypes)}"
         )
 
-    for arg, dtype in zip(module.args, input_dtypes):
+    for arg, dtype in zip(all_input_nodes, input_dtypes):
         if isinstance(arg, TensorBox) and dtype is not None:
             arg.dtype = dtype
 

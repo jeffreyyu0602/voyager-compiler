@@ -176,19 +176,18 @@ def generate_proto(module: Module, model, args, output_dir=None):
     ShapeProp(model).propagate(*args)
     model_params = pb.Model()
 
+    for arg in module.args:
+        tensor = pb.Tensor()
+        set_tensor_field(tensor, arg, output_dir)
+        model_params.inputs.append(tensor)
+
+    for param in module.params:
+        tensor = pb.Tensor()
+        set_tensor_field(tensor, param, output_dir)
+        model_params.parameters.append(tensor)
+
     for stmt in module.body:
-        node = stmt.origin_node
-        if node and node.op == 'placeholder':
-            tensor = pb.Tensor()
-            set_tensor_field(tensor, node, output_dir)
-            model_params.inputs.append(tensor)
-        elif node and node.op == 'get_attr':
-            tensor = pb.Tensor()
-            set_tensor_field(tensor, node, output_dir)
-            if "memory" in node.meta:
-                model_params.parameters.append(tensor)
-        else:
-            op = map_operation(stmt, output_dir=output_dir)
-            model_params.ops.append(op)
+        op = map_operation(stmt, output_dir=output_dir)
+        model_params.ops.append(op)
 
     return model_params
