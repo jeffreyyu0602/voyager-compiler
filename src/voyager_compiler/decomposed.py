@@ -823,7 +823,8 @@ def _(
 
 quantized_decomposed_lib.define(
     "load_tile(Tensor input, Tensor[] tile_indices, SymInt[] tile_sizes, "
-    "SymInt[] dims, SymInt[]? tile_strides=None, SymInt[]? static_indices=None) -> Tensor"
+    "SymInt[] dims, SymInt[]? tile_strides=None, SymInt[]? static_indices=None, "
+    "bool transposed=False) -> Tensor"
 )
 
 
@@ -834,7 +835,8 @@ def load_tile(
     tile_sizes: List[int],
     dims: List[int],
     tile_strides: Optional[List[int]] = None,
-    static_indices: Optional[List[int]] = None
+    static_indices: Optional[List[int]] = None,
+    transposed: bool = False
 ) -> torch.Tensor:
     """
     Emulate DMA operation of loading a tile from the input tensor based on the
@@ -853,6 +855,7 @@ def load_tile(
         static_indices (Optional[List[int]]): A list of integers specifying the static
             indices for dimensions that are not tiled. If None, it defaults to 0 for all
             non-tiled dimensions.
+        transposed (bool): Whether to transpose the output during DMA load.
     """
     if tile_strides is None:
         tile_strides = tile_sizes
@@ -881,7 +884,7 @@ def load_tile(
     slices = tuple(
         slice(start[d], start[d] + tile_sizes[d]) for d in range(rank)
     )
-    return input[slices]
+    return input[slices].mT if transposed else input[slices]
 
 
 @torch.library.register_fake("quantized_ops::load_tile")
@@ -891,9 +894,11 @@ def _(
     tile_sizes: List[int],
     dims: List[int],
     tile_strides: Optional[List[int]] = None,
-    static_indices: Optional[List[int]] = None
+    static_indices: Optional[List[int]] = None,
+    transposed: bool = False
 ):
-    return input.new_empty(tile_sizes)
+    output = input.new_empty(tile_sizes)
+    return output.mT if transposed else output
 
 
 quantized_decomposed_lib.define(

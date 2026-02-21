@@ -163,6 +163,11 @@ def map_operation(ir_node: Operation, output_dir=None):
             body=body,
         )
         op = pb.Operation(loop=loop)
+        # TODO set output for Loops as well
+        # if len(ir_node.outputs) == 1:
+        #     set_tensor_field(op.output, ir_node.outputs[0], output_dir)
+        # else:
+        #     set_tensor_list_field(op.outputs, ir_node.outputs, output_dir)
         return op
     else:
         print(f"Skipping non-operation stmt in loops: {ir_node}")
@@ -182,9 +187,10 @@ def generate_proto(module: Module, model, args, output_dir=None):
         model_params.inputs.append(tensor)
 
     for param in module.params:
-        tensor = pb.Tensor()
-        set_tensor_field(tensor, param, output_dir)
-        model_params.parameters.append(tensor)
+        if param.address is not None:
+            tensor = pb.Tensor()
+            set_tensor_field(tensor, param, output_dir)
+            model_params.parameters.append(tensor)
 
     for stmt in module.body:
         op = map_operation(stmt, output_dir=output_dir)

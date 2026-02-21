@@ -330,12 +330,39 @@ class Loops(IRNode):
     step: Union[IndexValue, int]
     body: List[IRNode]
 
+    init_args: List[Value] = field(default_factory=list) # Values coming from outside
+    iter_vars: List[Value] = field(default_factory=list) # Block args inside the loop
+    yields: List[Value] = field(default_factory=list)    # Values yielded to next iter
+    outputs: List[Value] = field(default_factory=list)   # Final results of the loop
+
     def format(self, indent: int = 0) -> str:
         pad = " " * indent
-        hdr = f"{pad}for {self.index.name} in range({self.start}, {self.end}, {self.step}):"
+
+        # 1. Format the outputs of the loop
+        out_str = ", ".join(v.name for v in self.outputs)
+        out_prefix = f"{out_str} = " if out_str else ""
+
+        # 2. Format the iter_args (mapping block vars to incoming values)
+        iter_str = ""
+        if self.init_args:
+            args_map = ", ".join(
+                f"{v.name}={i.name}" for v, i in zip(self.iter_vars, self.init_args)
+            )
+            iter_str = f" iter_args({args_map})"
+
+        # 3. Build the loop header
+        hdr = f"{pad}{out_prefix}for {self.index.name} in range({self.start}, {self.end}, {self.step}){iter_str}:"
         lines = [hdr]
+
+        # 4. Format the body
         for s in self.body:
             lines.append(s.format(indent=indent + 2))
+
+        # 5. Format the yield statement (acts as the end of the block)
+        if self.yields:
+            yield_str = ", ".join(y.name for y in self.yields)
+            lines.append(f"{pad}  yield({yield_str})")
+
         return "\n".join(lines)
 
     def __post_init__(self):
@@ -346,6 +373,14 @@ class Loops(IRNode):
 
         # Also ensure the index knows this loop is its producer
         self.index.producer_op = self
+
+        # TODO: outputs need to point to correct producer op so that codegen
+        # can get the right FX node.
+        # # Iter_vars and Outputs are produced by this loop
+        # for ivar in self.iter_vars:
+        #     ivar.producer_op = self
+        # for out in self.outputs:
+        #     out.producer_op = self
 
     def __hash__(self):
         return id(self)

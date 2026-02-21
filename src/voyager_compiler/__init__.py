@@ -309,3 +309,5 @@ def compile(
 
     if len(model.graph.nodes) < 10000:
         gen_compute_graph(model, os.path.join(output_dir, output_file))
+
+    return params
