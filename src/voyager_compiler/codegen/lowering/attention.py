@@ -1226,6 +1226,13 @@ if __name__ == "__main__":
         default="test/compiler/networks/flash_attention"
     )
     parser.add_argument(
+        "--qkv_shape",
+        type=int,
+        nargs=4,
+        default=[1, 32, 1024, 64],
+        help="Input shape as B H N D (Batch, Heads, SeqLen, Dim)"
+    )
+    parser.add_argument(
         "--Br", type=int, default=512, help="Row tile size for Flash Attention"
     )
     parser.add_argument(
@@ -1248,7 +1255,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
 
-    B, H, N, D = 1, 32, 1024, 64
+    B, H, N, D = args.qkv_shape
     q = torch.randn(B, H, N, D, device=device, dtype=dtype)
     k = torch.randn(B, H, N, D, device=device, dtype=dtype)
     v = torch.randn(B, H, N, D, device=device, dtype=dtype)

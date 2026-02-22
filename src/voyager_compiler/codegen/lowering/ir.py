@@ -374,6 +374,9 @@ class Loops(IRNode):
         # Also ensure the index knows this loop is its producer
         self.index.producer_op = self
 
+        for arg in self.init_args:
+            arg.users[self] = None
+
         # TODO: outputs need to point to correct producer op so that codegen
         # can get the right FX node.
         # # Iter_vars and Outputs are produced by this loop
