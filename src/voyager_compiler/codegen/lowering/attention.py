@@ -283,201 +283,6 @@ class FlashAttention(torch.nn.Module):
         return final_O
 
 
-class FlashAttentionFlat(FlashAttention):
-    """
-    Flattened version of FlashAttention where both the outer and inner loops are
-    unrolled for testing purpose.
-    """
-
-    def _inner_loop_body(
-        self,
-        indices,
-        O_i: torch.Tensor,
-        l_i: torch.Tensor,
-        m_i: torch.Tensor,
-        Qi: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        Br: int,
-        Bc: int,
-        query_scale: Optional[torch.Tensor] = None,
-        key_scale: Optional[torch.Tensor] = None,
-        value_scale: Optional[torch.Tensor] = None,
-        query_code: Optional[torch.Tensor] = None,
-        key_code: Optional[torch.Tensor] = None,
-        value_code: Optional[torch.Tensor] = None,
-        **kwargs,
-    ):
-        d = key.shape[-1]
-        b, h, i, j = indices
-
-        Kj = quantized_ops.load_tile(
-            key, [], [1, 1, Bc, d], [], static_indices=[b, h, j, 0]
-        )
-        Vj = quantized_ops.load_tile(
-            value, [], [1, 1, Bc, d], [], static_indices=[b, h, j, 0]
-        )
-
-        use_quant = (
-            query_scale is not None
-            and key_scale is not None
-            and value_scale is not None
-        )
-
-        if use_quant:
-            # Load per-block scales for K and V
-            Kj_scale = quantized_ops.load_tile(
-                key_scale,
-                [],
-                [1, 1, Bc, d // self.block_size],
-                [],
-                static_indices=[b, h, j, 0],
-            )
-            Vj_scale = quantized_ops.load_tile(
-                value_scale,
-                [],
-                [1, 1, Bc // self.block_size, d],
-                [],
-                static_indices=[b, h, j, 0],
-            )
-
-            scores = quantized_ops.matmul_mx(
-                Qi,
-                Kj.transpose(-1, -2),
-                input_scale=query_scale,
-                weight_scale=Kj_scale.transpose(-1, -2),
-                block_size=self.block_size,
-                input_code=query_code,
-                weight_code=key_code,
-            )
-        else:
-            scores = torch.matmul(Qi, Kj.transpose(-1, -2))
-
-        scores = scores * (1 / math.sqrt(d))
-        # mask = _create_causal_mask(i * Br, j * Bc, Br, Bc, device=key.device)
-        # scores = scores.masked_fill(~mask, -float("inf"))
-
-        # Numerically stable accumulation
-        if self.accumulate_fp32 and scores.dtype != torch.float32:
-            scores = scores.to(torch.float32)
-
-        m_block = torch.maximum(m_i, scores.amax(dim=-1, keepdim=True))
-
-        alpha = torch.exp(m_i - m_block)
-        P = torch.exp(scores - m_block)
-        l_i = alpha * l_i + P.sum(dim=-1, keepdim=True)
-
-        if use_quant:
-            P_scale, P_q = quantized_ops.quantize_mx(
-                P,
-                qmap=self.qmap,
-                axes=self.axes,
-                block_size=self.block_size,
-                quant_max=self.quant_max,
-                force_scale_power_of_two=self.force_scale_power_of_two,
-                scale_qmap=self.scale_qmap,
-                output_code=self.output_code,
-            )
-
-            attention_probs = quantized_ops.matmul_mx(
-                P_q,
-                Vj,
-                input_scale=P_scale,
-                weight_scale=Vj_scale,
-                block_size=self.block_size,
-                input_code=self.input_code,
-                weight_code=value_code,
-            )
-        else:
-            attention_probs = torch.matmul(P, Vj)
-
-        O_i = alpha * O_i + attention_probs
-
-        # Perform a nop to copy new maximum to the correct memory location
-        m_i = m_block.add(0)
-
-        return O_i, l_i, m_i
-
-    def _outer_loop_body(
-        self,
-        indices,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        Br: int,
-        Bc: int,
-        **kwargs,
-    ):
-        B, H, N, d = query.shape
-        b, h, i = indices
-
-        Qi = quantized_ops.load_tile(
-            query, [], [1, 1, Br, d], [], static_indices=[b, h, i, 0]
-        )
-
-        Qi_scale = None
-        if (query_scale := kwargs.get("query_scale")) is not None:
-            Qi_scale = quantized_ops.load_tile(
-                query_scale,
-                [],
-                [1, 1, Br, d // self.block_size],
-                [],
-                static_indices=[b, h, i, 0],
-            )
-
-        # Accumulator dtype choice
-        acc_dtype = torch.float32 if self.accumulate_fp32 else query.dtype
-        O_i = torch.zeros((1, 1, Br, d), device=query.device, dtype=acc_dtype)
-        l_i = torch.zeros((1, 1, Br, 1), device=query.device, dtype=acc_dtype)
-        m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
-
-        for j in range(N // Bc):
-            additional_inputs = (Qi, key, value, Br, Bc)
-            additional_kwargs = {
-                **kwargs,
-                "query_scale": Qi_scale,
-            }
-            O_i, l_i, m_i = self._inner_loop_body(
-                [b, h, i, j], O_i, l_i, m_i, *additional_inputs, **additional_kwargs
-            )
-
-        out = O_i / l_i
-        if self.accumulate_fp32 and out.dtype != query.dtype:
-            out = out.to(query.dtype)
-        return out
-
-    def forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        Br: int = 64,
-        Bc: int = 128,
-        **kwargs,
-    ):
-        B, H, N, d = query.shape
-        Tr = N // Br
-
-        # Allocate output buffer
-        O = torch.empty((B, H, N, d), device=query.device, dtype=query.dtype)
-
-        for b, h, i in itertools.product(range(B), range(H), range(Tr)):
-            O_tile = self._outer_loop_body(
-                [b, h, i],
-                query=query,
-                key=key,
-                value=value,
-                Br=Br,
-                Bc=Bc,
-                **kwargs,
-            )
-            quantized_ops.store_tile(
-                O_tile, O, [], [1, 1, Br, d], [], static_indices=[b, h, i, 0]
-            )
-
-        return O
-
-
 class FlashAttentionPipelined(torch.nn.Module):
     """
     torch.export friendly Flash Attention V3 implementation for compiler lowering.
@@ -501,7 +306,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         output_code: Optional[torch.Tensor] = None,
         input_code: Optional[torch.Tensor] = None,
         accumulate_fp32: bool = False,
-        flatten_loops: bool = True,
+        flatten_loops: bool = False,
     ):
         super().__init__()
         self.register_buffer("qmap", qmap)
@@ -683,6 +488,124 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         return O_i + attention_probs
 
+    def _inner_loop_body_sequential(
+        self,
+        indices: List[int],
+        O_i: torch.Tensor,
+        l_i: torch.Tensor,
+        m_i: torch.Tensor,
+        Qi: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        scaling: float,
+        query_scale: Optional[torch.Tensor] = None,
+        key_scale: Optional[torch.Tensor] = None,
+        value_scale: Optional[torch.Tensor] = None,
+        query_code: Optional[torch.Tensor] = None,
+        key_code: Optional[torch.Tensor] = None,
+        value_code: Optional[torch.Tensor] = None,
+    ):
+        Kj, Vj, Kj_scale, Vj_scale = self._dma_load(
+            indices, key, value, Bc, key_scale, value_scale
+        )
+
+        scores = self._qk_matmul(
+            query=Qi,
+            key=Kj,
+            query_scale=query_scale,
+            key_scale=Kj_scale,
+            query_code=query_code,
+            key_code=key_code,
+        )
+
+        use_quant = query_scale is not None
+        scale, P, O_i, l_i, m_i = self._online_softmax(
+            O_i, l_i, m_i, scores, scaling, use_quant, Br, Bc
+        )
+
+        O_i = self._pv_matmul(
+            O_i,
+            attention_probs=P,
+            value=Vj,
+            input_scale=scale,
+            value_scale=Vj_scale,
+            value_code=value_code
+        )
+
+        return O_i, l_i, m_i
+
+    def _outer_loop_body(
+        self,
+        indices: List[int],
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        Br: int,
+        Bc: int,
+        **kwargs,
+    ):
+        B, H, N, d = query.shape
+        b, h, i, init_j = indices
+
+        # Load Query tile
+        Qi = self._load_tile(query, [b, h, i], [1, 1, Br, d])
+
+        Qi_scale = None
+        if (query_scale := kwargs.get("query_scale")) is not None:
+            Qi_scale = self._load_tile(
+                query_scale, [b, h, i], [1, 1, Br, d // self.block_size]
+            )
+
+        # Initialize Accumulators
+        acc_dtype = torch.float32 if self.accumulate_fp32 else query.dtype
+        O_i = torch.zeros((1, 1, Br, d), device=query.device, dtype=acc_dtype)
+        l_i = torch.zeros((1, 1, Br, 1), device=query.device, dtype=acc_dtype)
+        m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
+
+        additional_inputs = (Qi, key, value, Br, Bc)
+        additional_kwargs = {
+            **kwargs,
+            "scaling": 1 / math.sqrt(d),
+            "query_scale": Qi_scale,
+        }
+
+        Tc = N // Bc
+
+        if self.flatten_loops:
+            for j in range(Tc):
+                O_i, l_i, m_i = self._inner_loop_body_sequential(
+                    [b, h, i, j],
+                    O_i,
+                    l_i,
+                    m_i,
+                    *additional_inputs,
+                    **additional_kwargs,
+                )
+        else:
+            def cond_fn(b, h, i, j, *args):
+                return j < Tc
+
+            def body_fn(b, h, i, j, *args):
+                next_start = self._inner_loop_body_sequential(
+                    [b, h, i, j], *args, *additional_inputs, **additional_kwargs
+                )
+                return (b, h, i, j + 1) + next_start
+
+            *_, O_i, l_i, m_i = while_loop(
+                cond_fn,
+                body_fn,
+                (b, h, i, init_j, O_i, l_i, m_i),
+            )
+
+        # Normalize output
+        out = O_i / l_i
+        if self.accumulate_fp32 and out.dtype != query.dtype:
+            out = out.to(query.dtype)
+
+        return out
+
     def _prologue(
         self,
         O_i: torch.Tensor,
@@ -854,7 +777,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         # Epilogue Step 1: Drain state0, advance state1 & state2
         # ---------------------------------------------------------
 
-        # Tile j+1: PV matmul
+        # Tile j + 1: PV matmul
         O_i = self._pv_matmul(
             O_i,
             attention_probs0,
@@ -864,12 +787,12 @@ class FlashAttentionPipelined(torch.nn.Module):
             value_code=value_code,
         )
 
-        # Tile j+2: Softmax
+        # Tile j + 2: Softmax
         scale1, attention_probs1, O_i, l_i, m_i = self._online_softmax(
             O_i, l_i, m_i, scores1, scaling, use_quant=use_quant, Br=Br, Bc=Bc
         )
 
-        # Tile j+3: QK matmul
+        # Tile j + 3: QK matmul
         scores2 = self._qk_matmul(
             Qi,
             K2,
@@ -883,7 +806,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         # Epilogue Step 2: Drain the new state1, advance state2
         # ---------------------------------------------------------
 
-        # Tile j+2: PV matmul
+        # Tile j + 2: PV matmul
         O_i = self._pv_matmul(
             O_i,
             attention_probs1,
@@ -893,7 +816,7 @@ class FlashAttentionPipelined(torch.nn.Module):
             value_code=value_code,
         )
 
-        # Tile j+3: Softmax
+        # Tile j + 3: Softmax
         scale2, attention_probs2, O_i, l_i, m_i = self._online_softmax(
             O_i, l_i, m_i, scores2, scaling, use_quant=use_quant, Br=Br, Bc=Bc
         )
@@ -902,7 +825,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         # Epilogue Step 3: Drain the final state2
         # ---------------------------------------------------------
 
-        # Tile j+3: PV matmul
+        # Tile j + 3: PV matmul
         O_i = self._pv_matmul(
             O_i,
             attention_probs2,
@@ -915,7 +838,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         # The pipeline is now fully drained.
         return O_i, l_i, m_i
 
-    def _outer_loop_body(
+    def _outer_loop_body_pipelined(
         self,
         indices,
         query: torch.Tensor,
@@ -989,6 +912,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         out = O_i / l_i
         if self.accumulate_fp32 and out.dtype != query.dtype:
             out = out.to(query.dtype)
+
         return out
 
     def forward(
@@ -1002,13 +926,18 @@ class FlashAttentionPipelined(torch.nn.Module):
     ):
         B, H, N, d = query.shape
         Tr = N // Br
+        Tc = N // Bc
+
+        outer_body_fn = (
+            self._outer_loop_body_pipelined if Tc > 3 else self._outer_loop_body
+        )
 
         # Allocate output buffer
         O = torch.empty((B, H, N, d), device=query.device, dtype=query.dtype)
 
         if self.flatten_loops:
             for b, h, i in itertools.product(range(B), range(H), range(Tr)):
-                O_tile = self._outer_loop_body(
+                O_tile = outer_body_fn(
                     [b, h, i, 3],
                     query=query,
                     key=key,
@@ -1026,7 +955,7 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         def body_fn(b, h, i, j, O_buf):
             indices = [b, h, i, j]
-            O_tile = self._outer_loop_body(
+            O_tile = outer_body_fn(
                 indices,
                 query=query,
                 key=key,
@@ -1048,7 +977,7 @@ class FlashAttentionPipelined(torch.nn.Module):
             torch.tensor(0, **factory_kwargs),  # b
             torch.tensor(0, **factory_kwargs),  # h
             torch.tensor(0, **factory_kwargs),  # i
-            torch.tensor(3, **factory_kwargs),  # j
+            torch.tensor(3 if Tc > 3 else 0, **factory_kwargs),  # j
             O,
         )
 
@@ -1296,6 +1225,22 @@ if __name__ == "__main__":
         help="The directory where the output files will be saved",
         default="test/compiler/networks/flash_attention"
     )
+    parser.add_argument(
+        "--Br", type=int, default=512, help="Row tile size for Flash Attention"
+    )
+    parser.add_argument(
+        "--Bc", type=int, default=128, help="Column tile size for Flash Attention"
+    )
+    parser.add_argument(
+        "--accumulate_fp32",
+        action="store_true",
+        help="Whether to perform accumulation in fp32 for improved numerical stability"
+    )
+    parser.add_argument(
+        "--flatten_loops",
+        action="store_true",
+        help="Whether to flatten the outer loops into a single loop with dynamic bounds"
+    )
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -1311,7 +1256,7 @@ if __name__ == "__main__":
     flash_attention_pattern = FlashAttention()
 
     out_ref = F.scaled_dot_product_attention(q, k, v)
-    out_gold = flash_attention_pattern(q, k, v, Br=512, Bc=128)
+    out_gold = flash_attention_pattern(q, k, v, Br=args.Br, Bc=args.Bc)
 
     print(out_ref)
     print(out_gold)
@@ -1321,7 +1266,7 @@ if __name__ == "__main__":
     rms_err = torch.mean((out_gold.float() - out_ref.float()) ** 2).sqrt().item()
     print(f"max_err={max_err:.6g}  rms_err={rms_err:.6g}\n\n")
 
-    example_inputs = (q.cpu(), k.cpu(), v.cpu(), 512, 128)
+    example_inputs = (q.cpu(), k.cpu(), v.cpu(), args.Br, args.Bc)
     module, gm = lower_flash_attention(flash_attention_pattern, *example_inputs)
     run_memory_pass(module)
 
@@ -1356,9 +1301,11 @@ if __name__ == "__main__":
     flash_attention_quantized_pattern = FlashAttentionPipelined(
         **quant_kwargs,
         input_code=nf4_code.clone(),
+        accumulate_fp32=args.accumulate_fp32,
+        flatten_loops=args.flatten_loops,
     )
 
-    example_inputs = (qq, kq, vq, 512, 128)
+    example_inputs = (qq, kq, vq, args.Br, args.Bc)
     example_kwargs = {
         "query_scale": qs,
         "key_scale": ks,
@@ -1404,3 +1351,11 @@ if __name__ == "__main__":
 
     with open(os.path.join(args.output_dir, 'model.txt'), "w") as f:
         f.write(text_format.MessageToString(proto))
+
+    operations = [
+        op.op.name if op.WhichOneof('op_type') == 'op' else op.fused_op.name
+        for op in proto.ops if op.op.op != 'nop'
+    ]
+
+    with open(os.path.join(args.output_dir, 'layers.txt'), 'w') as f:
+        f.write('\n'.join(operations))
