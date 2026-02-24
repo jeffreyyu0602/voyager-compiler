@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = [
+    "WrapperModule",
     "deduplicate_nodes",
     "dispatch_model",
     "dtype_byte_size",
@@ -29,6 +30,20 @@ __all__ = [
     "propagate_shape",
     "sink_obs_or_fq",
 ]
+
+
+class WrapperModule(torch.nn.Module):
+    """Class to wrap a callable in an :class:`torch.nn.Module`. Use this if you
+    are trying to export a callable.
+    """
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, *args, **kwargs):
+        """Simple forward that just calls the ``fn`` provided to :meth:`WrapperModule.__init__`."""
+        return self.fn(*args, **kwargs)
 
 
 def dtype_byte_size(dtype: torch.dtype):

@@ -139,7 +139,8 @@ def set_output_field(param, node, output_dir):
         if (tiled_shape := node.meta.get("tiled_shapes")) is not None:
             shapes = tiled_shape[node]
 
-        dtypes = node.meta.get("dtype", [None] * len(node.value))
+        if (dtypes := node.meta.get("dtype")) is None:
+            dtypes = [None] * len(node.value)
 
         for i, t in enumerate(node.value):
             tensor = Tensor(

@@ -39,6 +39,7 @@ from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
 from ..pt2e_utils import (
+    WrapperModule,
     dtype_byte_size,
     fetch_attr,
     propagate_shape,
@@ -266,6 +267,130 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
     return output_nodes[0]
 
 
+def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
+    from .passes.tiling import _get_node_attribute
+
+    quantized_ops = torch.ops.quantized_ops
+
+    assert (
+        node.op == 'call_function' and
+        node.target == torch.ops.quantized_ops.matmul_mx.default
+    )
+
+    input1 = node.args[0].value
+    input2 = node.args[1].value
+
+    input1_dims = sum(1 for d in input1.shape if d > 1)
+    input2_dims = sum(1 for d in input2.shape if d > 1)
+    if input1_dims < 3 and input2_dims < 3:
+        return None
+
+    input_node = node.args[0]
+    quantize_node = input_node.all_input_nodes[0]
+
+    example_inputs = (
+        quantize_node.args[0],
+        get_arg_value(quantize_node, 1, 'qmap'),
+        get_arg_value(quantize_node, 6, 'scale_qmap'),
+        get_arg_value(quantize_node, 7, 'output_code'),
+        node.args[1],
+        node.kwargs.get('weight_scale'),
+        node.kwargs.get('input_code'),
+        node.kwargs.get('weight_code'),
+    )
+
+    quantize_mx_outlier_kwargs = _get_node_attribute(quantize_node)
+    gemm_kwargs = _get_node_attribute(node)
+
+    def forward(
+        input,
+        input_qmap=None,
+        scale_qmap=None,
+        output_code=None,
+        other=None,
+        weight_scale=None,
+        input_code=None,
+        weight_code=None,
+    ):
+        batch_shape = input.shape[:-2]
+        result = []
+        for idx in itertools.product(*[range(dim) for dim in batch_shape]):
+            (
+                data, indices, indptr, input_scale, inliers
+            ) = quantized_ops.quantize_mx_outlier(
+                input[idx],
+                qmap=input_qmap,
+                scale_qmap=scale_qmap,
+                output_code=output_code,
+                **quantize_mx_outlier_kwargs,
+            )
+            output = quantized_ops.matmul_mx(
+                inliers,
+                other[idx],
+                input_scale=input_scale,
+                weight_scale=weight_scale[idx],
+                input_code=input_code,
+                weight_code=weight_code,
+                A_data=data,
+                A_indices=indices,
+                A_indptr=indptr,
+                **gemm_kwargs,
+            )
+            result.append(output)
+        result = torch.stack(result)
+        result = result.view(*batch_shape, *result.shape[-2:])
+        return result
+
+    node_group = [quantize_node, node] + list(quantize_node.users)
+    named_modules = dict(model.named_modules())
+    submod_node = _create_and_insert_subgraph(node_group, model, named_modules)
+
+    example_inputs = map_arg(
+        example_inputs, lambda n: n.value if isinstance(n, Node) else n
+    )
+
+    gm = export_model(WrapperModule(forward), example_inputs)
+
+    # Remove unused placeholder nodes
+    for n in gm.graph.nodes:
+        if n.op == 'placeholder' and len(n.users) == 0:
+            gm.graph.erase_node(n)
+    gm.graph.lint()
+
+    value_remap = {}
+    output_nodes = replace_node_with_graph_module(
+        model, submod_node, gm, value_remap
+    )
+    model.graph.erase_node(submod_node)
+
+    source_fn = node.meta['source_fn_stack'][-1]
+    for n in list(value_remap.values()):
+        if n.target in [torch.ops.aten.select.int, operator.getitem]:
+            n.meta["dtype"] = n.args[0].meta.get("dtype")
+
+        if n.target in (node.target, quantize_node.target):
+            n.meta.update({
+                "dtype": node.meta.get("dtype"),
+                "source_fn_stack": [(n.name, source_fn[1])],
+            })
+
+        if n.target in [
+            torch.ops.aten.stack.default, torch.ops.aten.view.default
+        ]:
+            n.meta["dtype"] = node.meta.get("dtype")
+
+    return output_nodes[0]
+
+
+def _decompose_bmm_helper(model: GraphModule, node: Node):
+    if node.target == torch.ops.aten.matmul.default:
+        return _decompose_bmm(model, node)
+    elif node.kwargs.get('A_data', None) is None:
+        return _decompose_bmm_mx(model, node)
+    else:
+        return _decompose_bmm_mx_with_outlier_inputs(model, node)
+
+
 def split_multi_head_attention(model: GraphModule):
     graph = model.graph
 
@@ -290,13 +415,13 @@ def split_multi_head_attention(model: GraphModule):
                     _decompose_bmm_mx(model, node)
             continue
 
-        qk_matmul, av_matmul = nodes[0], nodes[1]
+        qk_matmul, pv_matmul = nodes[0], nodes[1]
 
         # Find the nodes between the qk and av matmuls
         def dfs(current_node, visited, max_depth=20):
             if len(visited) > max_depth:
                 return None
-            if current_node == av_matmul:
+            if current_node == pv_matmul:
                 return [visited]
             paths = []
             for user in current_node.users:
@@ -309,16 +434,12 @@ def split_multi_head_attention(model: GraphModule):
         paths = dfs(qk_matmul, [qk_matmul])
 
         # Decompose BMM into multiple matmuls
-        if qk_matmul.target == torch.ops.aten.matmul.default:
-            qk_output = _decompose_bmm(model, qk_matmul)
-            av_output = _decompose_bmm(model, av_matmul)
-        else:
-            qk_output = _decompose_bmm_mx(model, qk_matmul)
-            av_output = _decompose_bmm_mx(model, av_matmul)
+        qk_output = _decompose_bmm_helper(model, qk_matmul)
+        pv_output = _decompose_bmm_helper(model, pv_matmul)
 
         if paths is None:
             logger.warning(
-                f"Failed to find paths between {qk_matmul} and {av_matmul}. "
+                f"Failed to find paths between {qk_matmul} and {pv_matmul}. "
                 "Skipping fusion."
             )
             continue
@@ -327,13 +448,13 @@ def split_multi_head_attention(model: GraphModule):
         for path in paths:
             nodes_between.update(path[1:-1])
 
-        # Sort the nodes between the qk and av matmuls
+        # Sort the nodes between the qk and pv matmuls
         order = {node: idx for idx, node in enumerate(graph.nodes)}
         nodes_between = sorted(nodes_between, key=lambda n: order[n])
 
-        # Duplicate the nodes between the qk and av matmuls to perform fusion
+        # Duplicate the nodes between the qk and pv matmuls to perform fusion
         qk_matmuls = qk_output.args[0].args[0]
-        av_matmuls = av_output.args[0].args[0]
+        pv_matmuls = pv_output.args[0].args[0]
 
         def select_tensor(n, target_dim):
             dim = len(n.shape)
@@ -342,10 +463,10 @@ def split_multi_head_attention(model: GraphModule):
                 propagate_shape(n)
             return n
 
-        for qk_matmul, av_matmul in zip(qk_matmuls, av_matmuls):
+        for qk_matmul, pv_matmul in zip(qk_matmuls, pv_matmuls):
             value_remap = {qk_output: qk_matmul}
             for node in nodes_between:
-                with graph.inserting_before(av_matmul):
+                with graph.inserting_before(pv_matmul):
                     for n in node.all_input_nodes:
                         if n not in value_remap and len(n.shape) > 2:
                             value_remap[n] = select_tensor(n, 2)
@@ -362,15 +483,15 @@ def split_multi_head_attention(model: GraphModule):
 
                 propagate_shape(value_remap[node])
 
-            has_spmm_arg = "A_data" in av_matmul.kwargs
+            has_spmm_arg = "A_data" in pv_matmul.kwargs
             arg_idx = 1 if has_spmm_arg else 0
-            av_matmul.replace_input_with(
-                av_matmul.args[arg_idx], value_remap[nodes_between[-1]]
+            pv_matmul.replace_input_with(
+                pv_matmul.args[arg_idx], value_remap[nodes_between[-1]]
             )
 
             arg_key = 'weight_scale' if has_spmm_arg else 'input_scale'
-            if (scale_node := av_matmul.kwargs.get(arg_key)) is not None:
-                av_matmul.replace_input_with(
+            if (scale_node := pv_matmul.kwargs.get(arg_key)) is not None:
+                pv_matmul.replace_input_with(
                     scale_node, value_remap[nodes_between[-2]]
                 )
 
