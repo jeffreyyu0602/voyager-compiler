@@ -1,10 +1,8 @@
 import copy
-import itertools
 import logging
 import math
 import operator
 import os
-from collections import defaultdict
 from typing import List, Dict, Callable, Union, Any
 
 import graphviz
@@ -39,7 +37,6 @@ from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
 from ..pt2e_utils import (
-    WrapperModule,
     dtype_byte_size,
     fetch_attr,
     propagate_shape,
@@ -92,9 +89,7 @@ def replace_node_with_graph_module(
     for node in list(replacement.graph.nodes):
         if node.op == 'placeholder':
             value_remap[node] = next(args_iter, None)
-            continue
-
-        if node.op == 'output':
+        elif node.op == 'output':
             output = node.args[0]
             if len(output) == 1:
                 source.replace_all_uses_with(value_remap[output[0]])
@@ -103,403 +98,27 @@ def replace_node_with_graph_module(
                     assert user.target == operator.getitem
                     idx = user.args[1]
                     user.replace_all_uses_with(value_remap[output[idx]])
-            continue
-
-        with gm.graph.inserting_before(source):
-            if node.op == 'get_attr':
-                param = fetch_attr(replacement, node.target)
-                value_remap[node] = create_getattr_from_value(
-                    gm, gm.graph, "_tensor_constant_", param
-                )
-            else:
-                value_remap[node] = gm.graph.node_copy(
-                    node, lambda n: value_remap[n]
-                )
-
-        if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
-            source_fn = source_fn_st[-1]
-            value_remap[node].meta['source_fn_stack'] = [
-                (value_remap[node].name, source_fn[1])
-            ]
-
-        propagate_shape(value_remap[node], gm)
-
-    return [value_remap[n] for n in output]
-
-
-def _decompose_bmm(model: GraphModule, node: Node):
-    assert node.op == 'call_function' and node.target == torch.ops.aten.matmul.default
-    input1 = node.args[0].value
-    input2 = node.args[1].value
-
-    input1_dims = sum(1 for d in input1.shape if d > 1)
-    input2_dims = sum(1 for d in input2.shape if d > 1)
-    if input1_dims < 3 and input2_dims < 3:
-        return None
-
-    class BMM(torch.nn.Module):
-        def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            # Loop through each element in the batch dimensions
-            batch_shape = x.shape[:-2]
-            result = []
-            for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-                result.append(torch.matmul(x[idx], y[idx]))
-            result = torch.stack(result)
-            result = result.view(*batch_shape, *result.shape[-2:])
-            return result
-
-    gm = export_model(BMM(), (input1, input2))
-
-    value_remap = {}
-    output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
-    model.graph.erase_node(node)
-
-    source_fn = node.meta['source_fn_stack'][-1]
-    for n in list(value_remap.values()):
-        if n.target == torch.ops.aten.select.int:
-            n.meta["dtype"] = n.args[0].meta.get("dtype")
-
-        if n.target == node.target:
-            n.meta.update({
-                "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
-
-        if n.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.view.default
-        ]:
-            n.meta["dtype"] = node.meta.get("dtype")
-
-    return output_nodes[0]
-
-
-def _decompose_bmm_mx(model: GraphModule, node: Node):
-    assert (
-        node.op == 'call_function' and
-        node.target == torch.ops.quantized_ops.matmul_mx.default
-    )
-
-    input1 = node.args[0].value
-    input2 = node.args[1].value
-
-    input1_dims = sum(1 for d in input1.shape if d > 1)
-    input2_dims = sum(1 for d in input2.shape if d > 1)
-    if input1_dims < 3 and input2_dims < 3:
-        return None
-
-    block_size = node.kwargs['block_size']
-
-    class BMM(torch.nn.Module):
-        def forward(
-                self, input: torch.Tensor, other: torch.Tensor, input_scale=None,
-                weight_scale=None, input_code=None, weight_code=None, A_data=None,
-                A_indices=None, A_indptr=None, weight_transposed=False):
-            # Loop through each element in the batch dimensions
-            batch_shape = input.shape[:-2]
-            result = []
-            for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-                kwargs = {
-                    "input_scale": input_scale[idx],
-                    "weight_scale": weight_scale[idx],
-                    "block_size": block_size,
-                    "input_code": input_code,
-                    "weight_code": weight_code,
-                }
-                if A_data is not None:
-                    kwargs.update({
-                        "A_data": A_data[idx],
-                        "A_indices": A_indices[idx],
-                        "A_indptr": A_indptr[idx],
-                        "weight_transposed": weight_transposed,
-                    })
-                result.append(torch.ops.quantized_ops.matmul_mx(
-                    input[idx], other[idx], **kwargs,
-                ))
-            result = torch.stack(result)
-            result = result.view(*batch_shape, *result.shape[-2:])
-            return result
-
-    input_code = node.kwargs.get('input_code', None)
-    weight_code = node.kwargs.get('weight_code', None)
-    A_data = node.kwargs.get('A_data', None)
-    A_indices = node.kwargs.get('A_indices', None)
-    A_indptr = node.kwargs.get('A_indptr', None)
-
-    kwargs = {
-        'input_scale': node.kwargs['input_scale'].value,
-        'weight_scale': node.kwargs['weight_scale'].value,
-        'input_code': input_code.value if input_code is not None else None,
-        'weight_code': weight_code.value if weight_code is not None else None,
-        'A_data': A_data.value if A_data is not None else None,
-        'A_indices': A_indices.value if A_indices is not None else None,
-        'A_indptr': A_indptr.value if A_indptr is not None else None,
-        'weight_transposed': node.kwargs.get('weight_transposed', True),
-    }
-
-    gm = export_model(BMM(), (input1, input2), kwargs)
-
-    # Remove unused placeholder nodes
-    for n in gm.graph.nodes:
-        if n.op == 'placeholder' and len(n.users) == 0:
-            gm.graph.erase_node(n)
-    gm.graph.lint()
-
-    value_remap = {}
-    output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
-    model.graph.erase_node(node)
-
-    source_fn = node.meta['source_fn_stack'][-1]
-    for n in list(value_remap.values()):
-        if n.target == torch.ops.aten.select.int:
-            n.meta["dtype"] = n.args[0].meta.get("dtype")
-
-        if n.target == node.target:
-            n.meta.update({
-                "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
-
-        if n.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.view.default
-        ]:
-            n.meta["dtype"] = node.meta.get("dtype")
-
-    return output_nodes[0]
-
-
-def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
-    from .passes.tiling import _get_node_attribute
-
-    quantized_ops = torch.ops.quantized_ops
-
-    assert (
-        node.op == 'call_function' and
-        node.target == torch.ops.quantized_ops.matmul_mx.default
-    )
-
-    input1 = node.args[0].value
-    input2 = node.args[1].value
-
-    input1_dims = sum(1 for d in input1.shape if d > 1)
-    input2_dims = sum(1 for d in input2.shape if d > 1)
-    if input1_dims < 3 and input2_dims < 3:
-        return None
-
-    input_node = node.args[0]
-    quantize_node = input_node.all_input_nodes[0]
-
-    example_inputs = (
-        quantize_node.args[0],
-        get_arg_value(quantize_node, 1, 'qmap'),
-        get_arg_value(quantize_node, 6, 'scale_qmap'),
-        get_arg_value(quantize_node, 7, 'output_code'),
-        node.args[1],
-        node.kwargs.get('weight_scale'),
-        node.kwargs.get('input_code'),
-        node.kwargs.get('weight_code'),
-    )
-
-    quantize_mx_outlier_kwargs = _get_node_attribute(quantize_node)
-    gemm_kwargs = _get_node_attribute(node)
-
-    def forward(
-        input,
-        input_qmap=None,
-        scale_qmap=None,
-        output_code=None,
-        other=None,
-        weight_scale=None,
-        input_code=None,
-        weight_code=None,
-    ):
-        batch_shape = input.shape[:-2]
-        result = []
-        for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-            (
-                data, indices, indptr, input_scale, inliers
-            ) = quantized_ops.quantize_mx_outlier(
-                input[idx],
-                qmap=input_qmap,
-                scale_qmap=scale_qmap,
-                output_code=output_code,
-                **quantize_mx_outlier_kwargs,
-            )
-            output = quantized_ops.matmul_mx(
-                inliers,
-                other[idx],
-                input_scale=input_scale,
-                weight_scale=weight_scale[idx],
-                input_code=input_code,
-                weight_code=weight_code,
-                A_data=data,
-                A_indices=indices,
-                A_indptr=indptr,
-                **gemm_kwargs,
-            )
-            result.append(output)
-        result = torch.stack(result)
-        result = result.view(*batch_shape, *result.shape[-2:])
-        return result
-
-    node_group = [quantize_node, node] + list(quantize_node.users)
-    named_modules = dict(model.named_modules())
-    submod_node = _create_and_insert_subgraph(node_group, model, named_modules)
-
-    example_inputs = map_arg(
-        example_inputs, lambda n: n.value if isinstance(n, Node) else n
-    )
-
-    gm = export_model(WrapperModule(forward), example_inputs)
-
-    # Remove unused placeholder nodes
-    for n in gm.graph.nodes:
-        if n.op == 'placeholder' and len(n.users) == 0:
-            gm.graph.erase_node(n)
-    gm.graph.lint()
-
-    value_remap = {}
-    output_nodes = replace_node_with_graph_module(
-        model, submod_node, gm, value_remap
-    )
-    model.graph.erase_node(submod_node)
-
-    source_fn = node.meta['source_fn_stack'][-1]
-    for n in list(value_remap.values()):
-        if n.target in [torch.ops.aten.select.int, operator.getitem]:
-            n.meta["dtype"] = n.args[0].meta.get("dtype")
-
-        if n.target in (node.target, quantize_node.target):
-            n.meta.update({
-                "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
-
-        if n.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.view.default
-        ]:
-            n.meta["dtype"] = node.meta.get("dtype")
-
-    return output_nodes[0]
-
-
-def _decompose_bmm_helper(model: GraphModule, node: Node):
-    if node.target == torch.ops.aten.matmul.default:
-        return _decompose_bmm(model, node)
-    elif node.kwargs.get('A_data', None) is None:
-        return _decompose_bmm_mx(model, node)
-    else:
-        return _decompose_bmm_mx_with_outlier_inputs(model, node)
-
-
-def split_multi_head_attention(model: GraphModule):
-    graph = model.graph
-
-    grouped_nodes = defaultdict(list)
-    for node in list(graph.nodes):
-        if node.target not in [
-            torch.ops.aten.matmul.default,
-            torch.ops.quantized_ops.matmul_mx.default,
-        ]:
-            continue
-
-        if (nn_module_stack := node.meta.get('nn_module_stack', None)) is not None:
-            bt = list(nn_module_stack.values())[-1]
-            grouped_nodes[bt[0]].append(node)
-
-    for nodes in grouped_nodes.values():
-        if len(nodes) != 2:
-            for node in nodes:
-                if node.target == torch.ops.aten.matmul.default:
-                    _decompose_bmm(model, node)
+        else:
+            with gm.graph.inserting_before(source):
+                if node.op == 'get_attr':
+                    param = fetch_attr(replacement, node.target)
+                    value_remap[node] = create_getattr_from_value(
+                        gm, gm.graph, "_tensor_constant_", param
+                    )
                 else:
-                    _decompose_bmm_mx(model, node)
-            continue
-
-        qk_matmul, pv_matmul = nodes[0], nodes[1]
-
-        # Find the nodes between the qk and av matmuls
-        def dfs(current_node, visited, max_depth=20):
-            if len(visited) > max_depth:
-                return None
-            if current_node == pv_matmul:
-                return [visited]
-            paths = []
-            for user in current_node.users:
-                if user not in visited:
-                    if (result := dfs(user, visited + [user], max_depth)) is None:
-                        return None
-                    paths.extend(result)
-            return paths
-
-        paths = dfs(qk_matmul, [qk_matmul])
-
-        # Decompose BMM into multiple matmuls
-        qk_output = _decompose_bmm_helper(model, qk_matmul)
-        pv_output = _decompose_bmm_helper(model, pv_matmul)
-
-        if paths is None:
-            logger.warning(
-                f"Failed to find paths between {qk_matmul} and {pv_matmul}. "
-                "Skipping fusion."
-            )
-            continue
-
-        nodes_between = set()
-        for path in paths:
-            nodes_between.update(path[1:-1])
-
-        # Sort the nodes between the qk and pv matmuls
-        order = {node: idx for idx, node in enumerate(graph.nodes)}
-        nodes_between = sorted(nodes_between, key=lambda n: order[n])
-
-        # Duplicate the nodes between the qk and pv matmuls to perform fusion
-        qk_matmuls = qk_output.args[0].args[0]
-        pv_matmuls = pv_output.args[0].args[0]
-
-        def select_tensor(n, target_dim):
-            dim = len(n.shape)
-            for _ in range(dim - target_dim):
-                n = graph.call_function(torch.ops.aten.select.int, (n, 0, 0))
-                propagate_shape(n)
-            return n
-
-        for qk_matmul, pv_matmul in zip(qk_matmuls, pv_matmuls):
-            value_remap = {qk_output: qk_matmul}
-            for node in nodes_between:
-                with graph.inserting_before(pv_matmul):
-                    for n in node.all_input_nodes:
-                        if n not in value_remap and len(n.shape) > 2:
-                            value_remap[n] = select_tensor(n, 2)
-
-                    value_remap[node] = graph.node_copy(
-                        node, lambda n: value_remap.get(n, n)
+                    value_remap[node] = gm.graph.node_copy(
+                        node, lambda n: value_remap[n]
                     )
 
-                if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
-                    source_fn = source_fn_st[-1]
-                    value_remap[node].meta['source_fn_stack'] = [
-                        (value_remap[node].name, source_fn[1])
-                    ]
+            if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
+                source_fn = source_fn_st[-1]
+                value_remap[node].meta['source_fn_stack'] = [
+                    (value_remap[node].name, source_fn[1])
+                ]
 
-                propagate_shape(value_remap[node])
+            propagate_shape(value_remap[node], gm)
 
-            has_spmm_arg = "A_data" in pv_matmul.kwargs
-            arg_idx = 1 if has_spmm_arg else 0
-            pv_matmul.replace_input_with(
-                pv_matmul.args[arg_idx], value_remap[nodes_between[-1]]
-            )
-
-            arg_key = 'weight_scale' if has_spmm_arg else 'input_scale'
-            if (scale_node := pv_matmul.kwargs.get(arg_key)) is not None:
-                pv_matmul.replace_input_with(
-                    scale_node, value_remap[nodes_between[-2]]
-                )
-
-    graph.lint()
-    graph.eliminate_dead_code()
-    model.recompile()
-
-    return model
+    return [value_remap[n] for n in output]
 
 
 def _create_subgraph(nodes: List[Node]):
