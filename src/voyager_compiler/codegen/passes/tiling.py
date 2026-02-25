@@ -1437,7 +1437,7 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
             old_shape = override_shapes[i] if override_shapes else tensor.shape
             if has_sparse_outputs and i < 3:
                 if i == 2:
-                    old_shape = (old_shape[-1] - 1,)
+                    old_shape = old_shape[:-1] + (old_shape[-1] - 1,)
                 output_shape = old_shape + (1,)
                 s = compute_tiled_shape(output_shape, tiling)[-2]
                 if i == 2:
