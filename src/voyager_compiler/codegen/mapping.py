@@ -359,8 +359,8 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
     }
     partitions = get_source_partitions(graph, list(all_sources))
     nodes_by_source = {
-        s: [p.output_nodes[0] for p in partitions[s]] if s in partitions else []
-        for s in all_sources
+        s: [p.output_nodes[0] for p in partitions[s] if p.output_nodes]
+        if s in partitions else [] for s in all_sources
     }
 
     all_candidates = []

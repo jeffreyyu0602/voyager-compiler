@@ -1,7 +1,11 @@
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import default_data_collator
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    default_data_collator
+)
 
 from voyager_compiler import (
     convert_pt2e,
@@ -14,15 +18,14 @@ from .utils import get_transform_args, get_compile_args
 
 
 def load_model(args):
-    from transformers import AutoModelForSequenceClassification
-    from transformers import AutoTokenizer
     if args.model_name_or_path is None:
-            args.model_name_or_path = "google/mobilebert-uncased"
+        args.model_name_or_path = "google/mobilebert-uncased"
 
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         attn_implementation="eager",
-    ).eval()
+    )
+    model.eval()
 
     if args.bf16:
         model.bfloat16()
@@ -48,7 +51,9 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
         token_type_ids=batch["token_type_ids"]
     )
 
-    extended_attention_mask = model.mobilebert.get_extended_attention_mask(batch["attention_mask"], input_shape)
+    extended_attention_mask = model.mobilebert.get_extended_attention_mask(
+        batch["attention_mask"], input_shape
+    )
 
     example_args = (embedding_output, extended_attention_mask)
 
@@ -59,7 +64,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
             self.classifier = model.classifier
 
         def forward(self, hidden_states, attention_mask):
-            for i, layer_module in enumerate(self.mobilebert.encoder.layer):
+            for layer_module in self.mobilebert.encoder.layer:
                 hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -91,8 +96,8 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     old_output = gm(*example_args)
 
     transform(gm, example_args, **transform_args)
-
     gm.graph.print_tabular()
+
     new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)

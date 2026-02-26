@@ -1,7 +1,11 @@
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import default_data_collator
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    default_data_collator
+)
 
 from voyager_compiler import (
     convert_pt2e,
@@ -14,15 +18,14 @@ from .utils import get_transform_args, get_compile_args
 
 
 def load_model(args):
-    from transformers import AutoModelForSequenceClassification
-    from transformers import AutoTokenizer
     if args.model_name_or_path is None:
-            args.model_name_or_path = "bert-base-uncased"
+        args.model_name_or_path = "bert-base-uncased"
 
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         attn_implementation="eager",
-    ).eval()
+    )
+    model.eval()
 
     if args.bf16:
         model.bfloat16()
@@ -44,39 +47,34 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     input_shape = input_ids.size()
 
     embedding_output = model.bert.embeddings(
-            input_ids=input_ids,
+        input_ids=input_ids,
     )
 
     extended_attention_mask = model.bert.get_extended_attention_mask(
         batch["attention_mask"], input_shape
     )
 
-    head_mask = model.bert.get_head_mask(None, model.config.num_hidden_layers)
-
-    example_args = (embedding_output, extended_attention_mask, head_mask)
+    example_args = (embedding_output, extended_attention_mask)
 
     class BertWrapper(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.bert = model.bert
-            self.pooler = model.bert.pooler
             self.classifier = model.classifier
 
-        def forward(self, hidden_states, attention_mask, head_mask):
-            for i, layer_module in enumerate(self.bert.encoder.layer):
-                layer_outputs = layer_module(
+        def forward(self, hidden_states, attention_mask):
+            for layer_module in self.bert.encoder.layer:
+                hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
-                    head_mask=head_mask[i],
                 )
-                hidden_states = layer_outputs[0]
 
                 if args.compile_single_layer:
                     break
 
-            hidden_states = self.bert.pooler(hidden_states)
-            output = self.classifier(hidden_states)
-            return output
+            pooled_output = self.bert.pooler(hidden_states)
+            logits = self.classifier(pooled_output)
+            return logits
 
     quantizer.set_module_name("pooler", None)
     quantizer.set_module_name("classifier", None)
@@ -88,7 +86,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
             embedding_output = model.bert.embeddings(
                 input_ids=batch["input_ids"]
             )
-            gm(embedding_output, extended_attention_mask, head_mask)
+            gm(embedding_output, extended_attention_mask)
             if i == args.calibration_steps - 1:
                 break
 
@@ -97,8 +95,8 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     old_output = gm(*example_args)
 
     transform(gm, example_args, **transform_args)
-
     gm.graph.print_tabular()
+
     new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)

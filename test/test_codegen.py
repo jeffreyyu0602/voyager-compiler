@@ -478,7 +478,7 @@ if __name__ == "__main__":
                         hidden_states,
                         attention_mask=attention_mask,
                         position_embeddings=position_embeddings,
-                        past_key_value=self.static_cache,
+                        past_key_values=self.static_cache,
                         cache_position=cache_position,
                     )
                     hidden_states = layer_outputs[0]
@@ -606,10 +606,7 @@ if __name__ == "__main__":
         qconfig = QuantizationConfig(act0, None, act1, None)
 
         for layer_idx in range(model.config.num_hidden_layers):
-            module_name = (
-                f"model.model.layers.slice(None, {model.config.num_hidden_layers}, None)"
-                f"._modules.{layer_idx}.self_attn"
-            )
+            module_name = f"model.model.layers.slice(None, {model.config.num_hidden_layers}, None).{layer_idx}.self_attn"
             quantizer.set_module_name_object_type_order(
                 module_name, torch.ops.aten.matmul.default, 0, qconfig
             )
