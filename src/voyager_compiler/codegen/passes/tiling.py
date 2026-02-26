@@ -161,10 +161,6 @@ def create_new_chain(model, node_to_fuse, cat_node, fusable):
         propagate_shape(new_node, model)
         new_node.meta["dtype"] = n.meta.get("dtype")
 
-        if (source_fn_st := n.meta.get("source_fn_stack")) is not None:
-            new_node.meta["source_fn_stack"] = [
-                (new_node.name, source_fn_st[0][1])
-            ]
         value_remap[n] = new_node
 
     # Reconnect users of the original node to the end of the new chain
@@ -404,11 +400,6 @@ def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
     value_remap = {}
     output = replace_node_with_graph_module(model, node, gm, value_remap)
 
-    if (source_fn_st := node.meta.get("source_fn_stack")) is not None:
-        source_fn = source_fn_st[-1][1]
-    else:
-        source_fn = node.target
-
     # Update metadata on new nodes in the graph
     for n in list(value_remap.values()):
         if n.target == torch.ops.aten.slice.Tensor and n.args[0].op == "get_attr":
@@ -429,7 +420,6 @@ def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
                 "tiled_shapes": tiled_shapes.pop(0),
                 "l2_tiling": (1, K // tile_k, 1, 1),
                 "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn)],
             })
 
     if output[0].target == torch.ops.aten.cat.default:
@@ -942,23 +932,17 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     value_remap = {}
     replace_node_with_graph_module(model, node_to_replace, gm, value_remap)
 
-    # Update metadata on new nodes in the graph
-    if (source_fn_st := node.meta.get("source_fn_stack")) is not None:
-        source_fn = source_fn_st[-1][1]
-    else:
-        source_fn = node.target
-
     for n in list(value_remap.values()):
-        if n.target == torch.ops.aten.slice.Tensor and n.args[0].op == "get_attr":
-            c_start, c_end = n.args[2], n.args[3]
-            with model.graph.inserting_before(n):
-                sliced_param = _slice_tensor(n.args[0], 1, c_start, c_end, model)
-            n.replace_all_uses_with(sliced_param)
-            model.graph.erase_node(n)
-            continue
-
         if n.target == torch.ops.aten.slice.Tensor:
-            n.meta["dtype"] = n.args[0].meta.get("dtype")
+            if n.args[0].op == "get_attr":
+                c_start = get_arg_value(n, 2, "start", None)
+                c_end = get_arg_value(n, 3, "end", None)
+                with model.graph.inserting_before(n):
+                    sliced_param = _slice_tensor(n.args[0], 1, c_start, c_end, model)
+                n.replace_all_uses_with(sliced_param)
+                model.graph.erase_node(n)
+            else:
+                n.meta["dtype"] = n.args[0].meta.get("dtype")
 
         if n.target == operator.getitem:
             if (dtypes := n.args[0].meta.get("dtype")) is not None:
@@ -974,7 +958,6 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
                 "tile_strides": copy.deepcopy(tile_strides),
                 "l2_tiling": tiling,
                 "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn)],
             })
 
 

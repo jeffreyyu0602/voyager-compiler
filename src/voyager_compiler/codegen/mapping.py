@@ -4,13 +4,13 @@ import math
 import operator
 import os
 from typing import List, Dict, Callable, Union, Any
+from collections import defaultdict
 
 import graphviz
 import torch
 from torch.fx import Node, Graph, GraphModule
 from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
-from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 from transformers.utils.import_utils import is_torch_greater_or_equal
 
 from .banking import (
@@ -42,36 +42,11 @@ from ..pt2e_utils import (
     propagate_shape,
     update_submod_user_meta,
 )
-from ..quantize_pt2e import create_getattr_from_value, export_model
+from ..quantize_pt2e import create_getattr_from_value
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
-
-
-def eliminate_dead_code(m):
-    """
-    Remove all dead code from the graph, based on each node's number of
-    users, and whether the nodes have any side effects. The graph must be
-    topologically sorted before calling.
-
-    Returns:
-        bool: Whether the graph was changed as a result of the pass.
-    """
-    # Lint the graph first to make sure its topologically sorted, otherwise
-    # DCE below will not behave as expected.
-    m.lint()
-
-    # Reverse iterate so that when we remove a node, any nodes used as an
-    # input to that node have an updated user count that no longer reflects
-    # the removed node.
-    changed = False
-    for node in reversed(m.nodes):
-        if node.op not in ['placeholder', 'output'] and not node.users:
-            m.erase_node(node)
-            changed = True
-
-    return changed
 
 
 def replace_node_with_graph_module(
@@ -106,17 +81,8 @@ def replace_node_with_graph_module(
                         gm, gm.graph, "_tensor_constant_", param
                     )
                 else:
-                    value_remap[node] = gm.graph.node_copy(
-                        node, lambda n: value_remap[n]
-                    )
-
-            if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
-                source_fn = source_fn_st[-1]
-                value_remap[node].meta['source_fn_stack'] = [
-                    (value_remap[node].name, source_fn[1])
-                ]
-
-            propagate_shape(value_remap[node], gm)
+                    value_remap[node] = gm.graph.node_copy(node, lambda n: value_remap[n])
+                propagate_shape(value_remap[node], gm)
 
     return [value_remap[n] for n in output]
 
@@ -355,13 +321,13 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}
 
     all_sources = {
-        fn for pattern in patterns for group in pattern for fn in group.targets
+        op for pattern in patterns for stage in pattern for op in stage.targets
     }
-    partitions = get_source_partitions(graph, list(all_sources))
-    nodes_by_source = {
-        s: [p.output_nodes[0] for p in partitions[s] if p.output_nodes]
-        if s in partitions else [] for s in all_sources
-    }
+
+    nodes_by_source = defaultdict(list)
+    for node in list(graph.nodes):
+        if node.target in all_sources:
+            nodes_by_source[node.target].append(node)
 
     all_candidates = []
     for pattern in patterns:
@@ -466,11 +432,6 @@ def duplicate_shared_nodes(graph: torch.fx.Graph, nodes: List[Node]) -> List[Nod
 
         next_node.replace_input_with(node, new_node)
         nodes[i] = new_node
-
-       # Copy and update the metadata for tracking
-        source_fn_st = node.meta.get('source_fn_stack', [])
-        source_fn = source_fn_st[-1][1] if source_fn_st else new_node.target
-        new_node.meta['source_fn_stack'] = [(new_node.name, source_fn)]
 
     return nodes
 
@@ -1124,7 +1085,10 @@ def run_memory_mapping(
 
     allocator.snapshot()
 
-    eliminate_dead_code(model.graph)
+    def is_impure_node(n):
+        return n.op in ['placeholder', 'output']
+
+    model.graph.eliminate_dead_code(is_impure_node=is_impure_node)
 
     # Run through reverse nodes and record the first instance of a use
     # of a given node. This represents the *last* use of the node in the

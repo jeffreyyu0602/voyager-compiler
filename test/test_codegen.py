@@ -75,33 +75,35 @@ def _is_constant_div(node):
 
     return True
 
+MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
+QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
 
 VECTOR_PIPELINE = [
     [
-        OpMatcher("conv", "gemm", predicate=_can_fuse),
+        OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher("mul", "div", "quantize"),
+        OpMatcher(*QUANT_OPS, "mul", "div"),
     ],
     [
-        OpMatcher("conv", "gemm", predicate=_can_fuse),
+        OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher("mul", "div", "quantize"),
+        OpMatcher(*QUANT_OPS, "mul", "div"),
     ],
     # Fused SpMM operation will use the first stage in the pipeline
     [
-        OpMatcher("conv", "gemm", predicate=_is_spmm),
+        OpMatcher(*MXU_OPS, predicate=_is_spmm),
         OpMatcher("dequantize"),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div"),
-        OpMatcher("quantize"),
+        OpMatcher(*QUANT_OPS),
     ],
     [
         OpMatcher("layer_norm", "softmax"),
-        OpMatcher("quantize"),
+        OpMatcher(*QUANT_OPS),
     ]
 ]
 
@@ -576,9 +578,12 @@ if __name__ == "__main__":
 
         swap_llama_attention(model)
 
-        gm = convert_and_export_with_split_cache(
-            model, max_len=max_length, max_new_tokens=bs
-        ).module()
+        from torch._export.utils import _disable_aten_to_metadata_assertions
+
+        with _disable_aten_to_metadata_assertions():
+            gm = convert_and_export_with_split_cache(
+                model, max_len=max_length, max_new_tokens=bs
+            ).module()
 
         # Run decode once to fill in the KV caches
         output = TorchExportableModuleWithStaticCache.generate(

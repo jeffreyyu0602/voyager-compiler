@@ -244,17 +244,24 @@ def export_model(
     kwargs: Optional[Dict[str, Any]] = None,
     *,
     dynamic_shapes: Optional[Dict[str, Any]] = None,
+    strict: bool = False,
 ):
     from transformers.utils.import_utils import is_torch_greater_or_equal
 
+    export_args = (model, args, kwargs)
+    export_kwargs = {"dynamic_shapes": dynamic_shapes, "strict": strict}
+
     if is_torch_greater_or_equal("2.10"):
-        return torch.export.export(
-            model, args, kwargs, dynamic_shapes=dynamic_shapes
-        ).module(check_guards=False)
+        gm = torch.export.export(*export_args, **export_kwargs)
+        return gm.module(check_guards=False)
+    elif is_torch_greater_or_equal("2.8"):
+        from torch._export.utils import _disable_aten_to_metadata_assertions
+
+        with _disable_aten_to_metadata_assertions():
+            gm = torch.export.export_for_training(*export_args, **export_kwargs)
+        return gm.module()
     elif is_torch_greater_or_equal("2.5"):
-        return torch.export.export_for_training(
-            model, args, kwargs, dynamic_shapes=dynamic_shapes
-        ).module()
+        return torch.export.export_for_training(*export_args, **export_kwargs).module()
     elif is_torch_greater_or_equal("2.0"):
         return torch._export.capture_pre_autograd_graph(
             model, args, kwargs, dynamic_shapes=dynamic_shapes
@@ -371,10 +378,6 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                 (node.args[0], qparam_node, None, None, None, get_attr_node),
             )
 
-        # source_fn_stack is used by get_source_partitions to find nodes with a given op
-        source_fn_st = quantized_node.meta.setdefault("source_fn_stack", [])
-        source_fn_st.append((quantized_node.name, quantized_node.target))
-
         # Annotate input dtype
         quantized_node.meta["dtype"] = activation_post_process.dtype
 
@@ -416,11 +419,6 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                         {}
                     )
 
-                # source_fn_stack is used by get_source_partitions to find nodes
-                # associated with a given op
-                source_fn_st = dequantized_node.meta.setdefault("source_fn_stack", [])
-                source_fn_st.append((dequantized_node.name, dequantized_node.target))
-
                 # We need to save orig users before updating users because
                 # the list of users will change as we update users
                 orig_users = list(user_node.users.keys())
@@ -443,9 +441,6 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
                     (quantized_node, qparam_node),
                     {}
                 )
-
-            source_fn_st = dequantized_node.meta.setdefault("source_fn_stack", [])
-            source_fn_st.append((dequantized_node.name, dequantized_node.target))
 
             user_node.replace_input_with(quantized_node, dequantized_node)
 
@@ -606,9 +601,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             dtype_tuple = (scale_dtype, activation_post_process.dtype)
 
         quantize_mx_node.meta["dtype"] = dtype_tuple
-
-        source_fn_st = quantize_mx_node.meta.setdefault("source_fn_stack", [])
-        source_fn_st.append((quantize_mx_node.name, quantize_mx_node.target))
     else:
         with model.graph.inserting_before(node):
             if activation_post_process.outlier_threshold is not None:
@@ -666,9 +658,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
         if activation_post_process.outlier_threshold is not None:
             filter_outlier_node.meta["dtype"] = (None, None, "int16", "int16")
-
-        source_fn_st = quantized_node.meta.setdefault("source_fn_stack", [])
-        source_fn_st.append((quantized_node.name, quantized_node.target))
 
     quantized_node.meta["dtype"] = activation_post_process.dtype
 
@@ -735,10 +724,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             graph.erase_node(user)
 
             mx_op_node.meta = user.meta
-
-            source_fn_st = mx_op_node.meta.setdefault("source_fn_stack", [])
-            target = source_fn_st[-1][1] if len(source_fn_st) > 0 else mx_op_node.target
-            source_fn_st.append((mx_op_node.name, target))
         elif user.target in MX_OP_MAPPING.values():
             mx_op_node = user
             mx_op_node.kwargs = kwargs
@@ -799,8 +784,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                         (spmm_node, mx_op_node),
                         {},
                     )
-
-                add_node.meta["source_fn_stack"] = [(add_node.name, add_node.target)]
 
                 mx_op_node.replace_all_uses_with(add_node)
                 add_node.replace_input_with(add_node, mx_op_node)
@@ -870,9 +853,6 @@ def _replace_observer_with_group_wise_affine_quantize_dequantize_node_decomposed
                 activation_post_process.block_size,
             ),
         )
-
-    source_fn_st = dequantized_node.meta.setdefault("source_fn_stack", [])
-    source_fn_st.append((dequantized_node.name, dequantized_node.target))
 
     node.replace_all_uses_with(dequantized_node)
     graph.erase_node(node)
@@ -973,16 +953,11 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
         for n in list(value_remap.values()) + [new_node]:
             propagate_shape(n, model)
 
-        # Copy meta data from the original node, specifically dtype and source_fn_stack
+        # Copy meta data from the original node, e.g. dtype
         new_node.meta = {
             k: copy.deepcopy(v) if k != 'val' else v.clone()
             for k, v in node.meta.items()
         }
-
-        # Update source_fn_stack with new node name
-        source_fn_stack = new_node.meta.setdefault("source_fn_stack", [])
-        target = source_fn_stack[-1][1] if len(source_fn_stack) > 0 else new_node.target
-        source_fn_stack.append((new_node.name, target))
 
         return nodes_on_path
 

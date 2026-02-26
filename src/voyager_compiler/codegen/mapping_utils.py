@@ -493,11 +493,11 @@ def is_prunable_op(node: Node) -> bool:
     if node.target == torch.ops.aten.slice.Tensor:
         default_args = [0, None, None, 1]
         dim, start, end, step = list(node.args[1:]) + default_args[len(node.args) - 1:]
-        if start != 0 or step != 1:
+        if start is not None and start != 0 or step != 1:
             return False
-        if hasattr(node.args[0], "shape"):
+        if end is not None and hasattr(node.args[0], "shape"):
             return end > node.args[0].shape[dim]
-        return end == 0x7fffffffffffffff
+        return (start is None and end is None) or end == 0x7fffffffffffffff
 
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])

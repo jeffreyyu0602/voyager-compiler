@@ -65,19 +65,14 @@ def _decompose_bmm(model: GraphModule, node: Node):
     output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
     model.graph.erase_node(node)
 
-    source_fn = node.meta['source_fn_stack'][-1]
     for n in list(value_remap.values()):
         if n.target == torch.ops.aten.select.int:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
 
-        if n.target == node.target:
-            n.meta.update({
-                "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
-
         if n.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.view.default
+            node.target,
+            torch.ops.aten.stack.default,
+            torch.ops.aten.view.default
         ]:
             n.meta["dtype"] = node.meta.get("dtype")
 
@@ -154,19 +149,14 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
     output_nodes = replace_node_with_graph_module(model, node, gm, value_remap)
     model.graph.erase_node(node)
 
-    source_fn = node.meta['source_fn_stack'][-1]
     for n in list(value_remap.values()):
         if n.target == torch.ops.aten.select.int:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
 
-        if n.target == node.target:
-            n.meta.update({
-                "dtype": node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
-
         if n.target in [
-            torch.ops.aten.stack.default, torch.ops.aten.view.default
+            node.target,
+            torch.ops.aten.stack.default,
+            torch.ops.aten.view.default
         ]:
             n.meta["dtype"] = node.meta.get("dtype")
 
@@ -275,11 +265,7 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
 
         if n.target in (node.target, quantize_node.target):
             source_node = node if n.target == node.target else quantize_node
-            source_fn = source_node.meta['source_fn_stack'][-1]
-            n.meta.update({
-                "dtype": source_node.meta.get("dtype"),
-                "source_fn_stack": [(n.name, source_fn[1])],
-            })
+            n.meta["dtype"] = source_node.meta.get("dtype")
 
     return output_nodes[0]
 
@@ -373,13 +359,6 @@ def split_multi_head_attention(model: GraphModule):
                     value_remap[node] = graph.node_copy(
                         node, lambda n: value_remap.get(n, n)
                     )
-
-                if (source_fn_st := node.meta.get('source_fn_stack')) is not None:
-                    source_fn = source_fn_st[-1]
-                    value_remap[node].meta['source_fn_stack'] = [
-                        (value_remap[node].name, source_fn[1])
-                    ]
-
                 propagate_shape(value_remap[node])
 
             has_spmm_arg = "A_data" in pv_matmul.kwargs
@@ -394,8 +373,11 @@ def split_multi_head_attention(model: GraphModule):
                     scale_node, value_remap[nodes_between[-2]]
                 )
 
+    def is_impure_node(n):
+        return n.op in ['placeholder', 'output']
+
     graph.lint()
-    graph.eliminate_dead_code()
+    graph.eliminate_dead_code(is_impure_node=is_impure_node)
     model.recompile()
 
     return model
@@ -465,9 +447,6 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
                 torch.ops.aten.permute.default, (stack_node, dims),
             )
         propagate_shape(permute_node)
-        # get_source_partitions expects 'permute' as the source function. This is
-        # hacky but there is no other way to set this meta field properly.
-        permute_node.meta['source_fn_stack'] = [(permute_node.name, 'permute')]
         output_node = permute_node
 
         # Flatten the permuted tensor if it is a cat operation
@@ -660,7 +639,6 @@ def replace_rmsnorm_with_layer_norm(
         original_graph.erase_node(output_node)
 
         new_node.meta = output_node.meta
-        new_node.meta["source_fn_stack"] = [(new_node.name, "layer_norm")]
 
     original_graph.lint()
     original_graph.eliminate_dead_code()
@@ -1021,8 +999,6 @@ def split_dense_spmm_node(model: GraphModule):
         for user in list(node.users):
             if id(user) != id(add_node):
                 user.replace_input_with(node, add_node)
-
-        add_node.meta["source_fn_stack"] = [(add_node.name, add_node.target)]
 
         propagate_shape(spmm_node)
         propagate_shape(node)
