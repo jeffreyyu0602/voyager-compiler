@@ -32,7 +32,9 @@ def load_model(args):
 
 
 def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
-    calibration_dataloader = DataLoader(calibration_data, collate_fn=default_data_collator, batch_size=1)
+    calibration_dataloader = DataLoader(
+        calibration_data, collate_fn=default_data_collator, batch_size=1
+    )
 
     compile_args = get_compile_args(args)
     transform_args = get_transform_args(args, vector_stages)
@@ -48,9 +50,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     extended_attention_mask = model.mobilebert.get_extended_attention_mask(batch["attention_mask"], input_shape)
 
-    head_mask = model.mobilebert.get_head_mask(None, model.config.num_hidden_layers)
-
-    example_args = (embedding_output, extended_attention_mask, head_mask)
+    example_args = (embedding_output, extended_attention_mask)
 
     class MobileBertWrapper(torch.nn.Module):
         def __init__(self):
@@ -58,21 +58,19 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
             self.mobilebert = model.mobilebert
             self.classifier = model.classifier
 
-        def forward(self, hidden_states, attention_mask, head_mask):
+        def forward(self, hidden_states, attention_mask):
             for i, layer_module in enumerate(self.mobilebert.encoder.layer):
-                layer_outputs = layer_module(
+                hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
-                    head_mask=head_mask[i],
                 )
-                hidden_states = layer_outputs[0]
 
                 if args.compile_single_layer:
                     break
 
-            first_token_tensor = hidden_states[:, 0]
-            output = self.classifier(first_token_tensor)
-            return output
+            pooled_output = self.mobilebert.pooler(hidden_states)
+            logits = self.classifier(pooled_output)
+            return logits
 
     quantizer.set_module_name("classifier", None)
 
@@ -84,7 +82,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
                 input_ids=batch["input_ids"],
                 token_type_ids=batch["token_type_ids"]
             )
-            gm(embedding_output, extended_attention_mask, head_mask)
+            gm(embedding_output, extended_attention_mask)
             if i == args.calibration_steps - 1:
                 break
 
