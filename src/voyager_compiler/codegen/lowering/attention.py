@@ -208,19 +208,19 @@ class FlashAttention(torch.nn.Module):
         l_i = torch.zeros((1, 1, Br, 1), device=query.device, dtype=acc_dtype)
         m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
 
+        additional_inputs = (Qi, key, value, Br, Bc)
+        additional_kwargs = {**kwargs,  "query_scale": Qi_scale}
+
         def cond_fn(b, h, i, j, *args):
+            N = additional_inputs[1].shape[2]
+            Bc = additional_inputs[-1]
             return j < N // Bc
 
         def body_fn(b, h, i, j, *args):
-            additional_inputs = (Qi, key, value, Br, Bc)
-            additional_kwargs = {
-                **kwargs,
-                "query_scale": Qi_scale,
-            }
             next_state = self._inner_loop_body(
                 [b, h, i, j], *args, *additional_inputs, **additional_kwargs
             )
-            return (b, h, i, j + 1) + next_state
+            return (b.clone(), h.clone(), i.clone(), j + 1) + next_state
 
         *_, O_i, l_i, m_i = while_loop(
             cond_fn,
@@ -428,12 +428,12 @@ class FlashAttentionPipelined(torch.nn.Module):
         l_i: torch.Tensor,
         m_i: torch.Tensor,
         scores: torch.Tensor,
-        scaling: float,
         use_quant: bool = False,
         Br: int = None,
         Bc: int = None,
     ):
-        scores = scores * scaling
+        d = O_i.shape[-1]
+        scores = scores * (1 / math.sqrt(d))
         # mask = _create_causal_mask(i * Br, j * Bc, Br, Bc, device=key.device)
         # scores = scores.masked_fill(~mask, -float("inf"))
 
@@ -499,7 +499,6 @@ class FlashAttentionPipelined(torch.nn.Module):
         value: torch.Tensor,
         Br: int,
         Bc: int,
-        scaling: float,
         query_scale: Optional[torch.Tensor] = None,
         key_scale: Optional[torch.Tensor] = None,
         value_scale: Optional[torch.Tensor] = None,
@@ -522,7 +521,7 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         use_quant = query_scale is not None
         scale, P, O_i, l_i, m_i = self._online_softmax(
-            O_i, l_i, m_i, scores, scaling, use_quant, Br, Bc
+            O_i, l_i, m_i, scores, use_quant, Br, Bc
         )
 
         O_i = self._pv_matmul(
@@ -565,16 +564,10 @@ class FlashAttentionPipelined(torch.nn.Module):
         m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
 
         additional_inputs = (Qi, key, value, Br, Bc)
-        additional_kwargs = {
-            **kwargs,
-            "scaling": 1 / math.sqrt(d),
-            "query_scale": Qi_scale,
-        }
-
-        Tc = N // Bc
+        additional_kwargs = {**kwargs, "query_scale": Qi_scale}
 
         if self.flatten_loops:
-            for j in range(Tc):
+            for j in range(N // Bc):
                 O_i, l_i, m_i = self._inner_loop_body_sequential(
                     [b, h, i, j],
                     O_i,
@@ -585,13 +578,15 @@ class FlashAttentionPipelined(torch.nn.Module):
                 )
         else:
             def cond_fn(b, h, i, j, *args):
-                return j < Tc
+                N = additional_inputs[1].shape[2]
+                Bc = additional_inputs[-1]
+                return j < N // Bc
 
             def body_fn(b, h, i, j, *args):
                 next_start = self._inner_loop_body_sequential(
                     [b, h, i, j], *args, *additional_inputs, **additional_kwargs
                 )
-                return (b, h, i, j + 1) + next_start
+                return (b.clone(), h.clone(), i.clone(), j + 1) + next_start
 
             *_, O_i, l_i, m_i = while_loop(
                 cond_fn,
@@ -616,7 +611,6 @@ class FlashAttentionPipelined(torch.nn.Module):
         value: torch.Tensor,
         Br: int,
         Bc: int,
-        scaling: float,
         query_scale: Optional[torch.Tensor] = None,
         key_scale: Optional[torch.Tensor] = None,
         value_scale: Optional[torch.Tensor] = None,
@@ -660,7 +654,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         # Stage 3: Online Softmax for Tile 0
         use_quant = query_scale is not None
         scale0, attention_probs0, O_i, l_i, m_i = self._online_softmax(
-            O_i, l_i, m_i, scores0, scaling, use_quant=use_quant, Br=Br, Bc=Bc
+            O_i, l_i, m_i, scores0, use_quant=use_quant, Br=Br, Bc=Bc
         )
 
         # Tile 1 QK matmul
@@ -698,7 +692,6 @@ class FlashAttentionPipelined(torch.nn.Module):
         value: torch.Tensor,
         Br: int,
         Bc: int,
-        scaling: float,
         query_scale: Optional[torch.Tensor] = None,
         key_scale: Optional[torch.Tensor] = None,
         value_scale: Optional[torch.Tensor] = None,
@@ -725,7 +718,7 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         # Tile j + 1 Softmax
         scale1, attention_probs1, O_i, l_i, m_i = self._online_softmax(
-            O_i, l_i, m_i, scores1, scaling, use_quant=use_quant, Br=Br, Bc=Bc
+            O_i, l_i, m_i, scores1, use_quant=use_quant, Br=Br, Bc=Bc
         )
 
         # Tile j + 3 DMA load
@@ -745,8 +738,8 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         return (
             (O_i, l_i, m_i),
-            (scale1, attention_probs1, V1, V1_scale),
-            (scores2, V2, V2_scale),
+            (scale1, attention_probs1, V1.clone(), V1_scale.clone()),
+            (scores2, V2.clone(), V2_scale.clone()),
             (K3, V3, K3_scale, V3_scale),
         )
 
@@ -758,7 +751,6 @@ class FlashAttentionPipelined(torch.nn.Module):
         value: torch.Tensor,
         Br: int,
         Bc: int,
-        scaling: float,
         query_scale: Optional[torch.Tensor] = None,
         key_scale: Optional[torch.Tensor] = None,
         value_scale: Optional[torch.Tensor] = None,
@@ -789,7 +781,7 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         # Tile j + 2: Softmax
         scale1, attention_probs1, O_i, l_i, m_i = self._online_softmax(
-            O_i, l_i, m_i, scores1, scaling, use_quant=use_quant, Br=Br, Bc=Bc
+            O_i, l_i, m_i, scores1, use_quant=use_quant, Br=Br, Bc=Bc
         )
 
         # Tile j + 3: QK matmul
@@ -818,7 +810,7 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         # Tile j + 3: Softmax
         scale2, attention_probs2, O_i, l_i, m_i = self._online_softmax(
-            O_i, l_i, m_i, scores2, scaling, use_quant=use_quant, Br=Br, Bc=Bc
+            O_i, l_i, m_i, scores2, use_quant=use_quant, Br=Br, Bc=Bc
         )
 
         # ---------------------------------------------------------
@@ -866,11 +858,7 @@ class FlashAttentionPipelined(torch.nn.Module):
         m_i = torch.full((1, 1, Br, 1), -float("inf"), device=query.device, dtype=acc_dtype)
 
         additional_inputs = (Qi, key, value, Br, Bc)
-        additional_kwargs = {
-            **kwargs,
-            "scaling": 1 / math.sqrt(d),
-            "query_scale": Qi_scale,
-        }
+        additional_kwargs = {**kwargs, "query_scale": Qi_scale}
 
         state = self._prologue(
             O_i,
@@ -890,6 +878,8 @@ class FlashAttentionPipelined(torch.nn.Module):
                 )
         else:
             def cond_fn(b, h, i, j, loop_state):
+                N = additional_inputs[1].shape[2]
+                Bc = additional_inputs[-1]
                 return j < N // Bc
 
             def body_fn(b, h, i, j, loop_state):
@@ -899,7 +889,7 @@ class FlashAttentionPipelined(torch.nn.Module):
                     *additional_inputs,
                     **additional_kwargs,
                 )
-                return b, h, i, j + 1, next_state
+                return b.clone(), h.clone(), i.clone(), j + 1, next_state
 
             *_, state = while_loop(cond_fn, body_fn, (b, h, i, init_j, state))
 
