@@ -41,7 +41,7 @@ def retrieve_dataset(model, tokenizer, args):
         )
         result["labels"] = examples["label"]
         return result
-    
+
     processed_datasets = raw_datasets.map(
         preprocess_function,
         batched=True,
@@ -53,6 +53,7 @@ def retrieve_dataset(model, tokenizer, args):
     train_dataset = processed_datasets["train"]
     return eval_dataset, train_dataset
 
+
 def dump_dataset(output_dir, dataset, model):
     eval_dataloader = DataLoader(
         dataset, collate_fn=default_data_collator, batch_size=1
@@ -60,13 +61,11 @@ def dump_dataset(output_dir, dataset, model):
 
     if isinstance(model, MobileBertPreTrainedModel):
         embeddings = model.mobilebert.embeddings
-        head_mask = model.mobilebert.get_head_mask(None, model.config.num_hidden_layers)
     elif isinstance(model, BertPreTrainedModel):
         embeddings = model.bert.embeddings
-        head_mask = model.bert.get_head_mask(None, model.config.num_hidden_layers)
     else:
         raise ValueError("Model not supported")
-    
+
     preprocessed_dataset = []
 
     for step, batch in enumerate(tqdm(eval_dataloader, desc="Dumping dataset")):
@@ -82,12 +81,11 @@ def dump_dataset(output_dir, dataset, model):
         preprocessed_dataset.append({
             "embedding_output": embedding_output,
             "attention_mask": attention_mask,
-            "head_mask": head_mask,
             "labels": batch["labels"]
         })
         write_tensor_to_file(
             embedding_output, os.path.join(folder, "hidden_states.bin")
         )
         write_tensor_to_file(attention_mask, os.path.join(folder, "attention_mask.bin"))
+
     return preprocessed_dataset
-    

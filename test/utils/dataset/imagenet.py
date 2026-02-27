@@ -61,8 +61,9 @@ def retrieve_dataset(num_samples, model_type):
         image = transform(item["jpg"]).unsqueeze(0)
         label = item["cls"]
         processed_dataset.append({"image": image, "label": label})
-        
+
     return processed_dataset
+
 
 def dump_imagenet(output_dir, dataset, model_type, preprocess_fn, torch_dtype):
     preprocessed_dataset = []
