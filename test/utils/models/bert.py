@@ -25,10 +25,9 @@ def load_model(args):
         args.model_name_or_path,
         attn_implementation="eager",
     )
-    model.eval()
 
-    if args.bf16:
-        model.bfloat16()
+    model.eval()
+    model.to(torch.bfloat16 if args.bf16 else torch.float32)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     return model, tokenizer
@@ -134,7 +133,6 @@ def evaluate_gm(gm, dataset):
             outputs = gm(
                 data_label_pair["embedding_output"],
                 data_label_pair["attention_mask"],
-                data_label_pair["head_mask"],
             )
 
             logits = outputs
