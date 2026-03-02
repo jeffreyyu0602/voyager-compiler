@@ -496,7 +496,7 @@ def is_prunable_op(node: Node) -> bool:
         if start is not None and start != 0 or step != 1:
             return False
         if end is not None and hasattr(node.args[0], "shape"):
-            return end > node.args[0].shape[dim]
+            return end >= node.args[0].shape[dim]
         return (start is None and end is None) or end == 0x7fffffffffffffff
 
     if node.target == torch.ops.aten.expand.default:
