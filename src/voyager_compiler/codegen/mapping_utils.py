@@ -518,6 +518,14 @@ def is_nop(node: Node) -> bool:
     if node.target == torch.ops.aten.select.int:
         return node.args[0].shape[node.args[1]] == 1
 
+    # aten.to.dtype is a nop only when the dtype is unchanged (e.g. a device
+    # transfer with no type change).  A real dtype conversion must be emitted
+    # as a cast op, not silenced.
+    if node.target == torch.ops.aten.to.dtype:
+        src_dtype = getattr(node.args[0], "dtype", None)
+        dst_dtype = node.args[1] if len(node.args) > 1 else node.kwargs.get("dtype")
+        return src_dtype == dst_dtype
+
     return node.target in [
         torch.ops.aten.clone.default,
         torch.ops.aten.contiguous.default,
@@ -529,7 +537,6 @@ def is_nop(node: Node) -> bool:
         torch.ops.aten.reshape.default,
         torch.ops.aten.squeeze.dim,
         torch.ops.aten.squeeze.dims,
-        torch.ops.aten.to.dtype,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.view.default,
     ]

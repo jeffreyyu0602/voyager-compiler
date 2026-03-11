@@ -963,20 +963,24 @@ def _(
 
 
 quantized_decomposed_lib.define(
-    "increment_indices(Tensor[] indices, int[] bounds) -> Tensor[]"
+    "increment_indices(Tensor[] indices, int[] ends, int[]? starts=None) -> Tensor[]"
 )
 
 
 @impl(quantized_decomposed_lib, "increment_indices", "CompositeExplicitAutograd")
-def increment_indices(indices: List[torch.Tensor], bounds: List[int]):
+def increment_indices(indices: List[torch.Tensor], ends: List[int], starts: List[int] = None):
     for i in reversed(range(len(indices))):
         indices[i] += 1
-        if indices[i] < bounds[i]:
+        if indices[i] < ends[i]:
             break
-        indices[i].zero_()
+        indices[i] = torch.tensor(
+            0 if starts is None else starts[i],
+            dtype=indices[i].dtype,
+            device=indices[i].device
+        )
     return indices
 
 
 @torch.library.register_fake("quantized_ops::increment_indices")
-def _(indices: List[torch.Tensor], bounds: List[int]):
+def _(indices: List[torch.Tensor], ends: List[int], starts: List[int] = None):
     return [torch.zeros_like(i) for i in indices]

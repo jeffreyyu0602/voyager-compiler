@@ -11,7 +11,9 @@ logs
 models
 plots
 slurm_scripts
-test
+test/*
 !test/test_codgen.py
+!test/test_gemm_lowering.py
+!test/test_attention_lowering.py
 wandb
 .vscode

@@ -1,19 +1,13 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
-from torchao.quantization.pt2e.export_utils import WrapperModule
-from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
-from ..mapping import get_tiled_tensor, get_reference_node
-from ..mapping_utils import is_gemm_op, is_bmm, is_elementwise_op
-from ..shape_prop import ShapeProp
+from ..mapping_utils import is_gemm_op, is_elementwise_op
 
 
 logger = logging.getLogger(__name__)
@@ -23,12 +17,18 @@ quantized_lib = torch.ops.quantized_ops
 
 """ [Note: Voyager IR]
 
-Voyager IR is an overly-simplified ML compiler IR that is meant to have minimal
-level of abstraction to represent loops for BMM and tiling. Each torch.fx.Node
-have a one-to-one mapping to an Operation in Voyager IR, and each Operation have
-SSA inputs/outputs represented as TensorBox.
+Voyager IR is a minimal compiler IR for the Voyager accelerator. It models
+tiled computation with explicit loop nesting and buffer semantics.
 
-Loops are used to provide control flow for BMM and tiled computation.
+Core design decisions:
+- Each FX node maps 1:1 to an Operation, preserving FX OpOverload targets so
+  the backend can recognize them directly.
+- SSA values are TensorBox (tensors with shape/dtype/memory-space) or
+  IndexValue (loop indices / scalars).
+- Loops follow scf.for semantics: init_args flow in, iter_vars shadow them
+  inside the body, yields thread the carried state per iteration, and outputs
+  hold the final results after the loop exits.
+- Operations carry origin_node links for verification-data propagation.
 
 """
 
@@ -41,11 +41,9 @@ class Value:
     producer_op: "IRNode" = field(default=None, repr=False)
 
     def replace_all_uses_with(self, new: Value):
-        for user in self.users:
-            for i, inp in enumerate(user.inputs):
-                if inp == self:
-                    user.replace_input_with(self, new)
-                    new.users[user] = None
+        for user in list(self.users):  # copy: replace_input_with mutates self.users
+            user.replace_input_with(self, new)
+            new.users[user] = None
         self.users.clear()
 
 
@@ -153,7 +151,6 @@ class Operation(IRNode):
         env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]],
         namer: NameGenerator,
         mem_space: str = "DRAM",
-        is_fused: bool = False,
         outputs: Optional[List[Value]] = None,
     ) -> Operation:
         """
@@ -172,18 +169,9 @@ class Operation(IRNode):
         lift_arg(args, env, inputs)
         kwargs = lift_arg(kwargs, env, inputs)
 
-        orig_val = node.value
-
-        if (tiled_shapes := node.meta.get('tiled_shapes')):
-            def load_arg(a):
-                return map_arg(a, lambda n: get_tiled_tensor(n, tiled_shapes))
-            node.value = node.target(*load_arg(node.args), **load_arg(node.kwargs))
-
         if outputs is None:
             outputs = _resolve_fx_graph_input(node, namer, mem_space)
         env[node] = outputs
-
-        node.value = orig_val  # restore
 
         op = Operation(
             op_kind=node.op,
@@ -194,9 +182,6 @@ class Operation(IRNode):
             origin_node=node,
             annotations=dict(getattr(node, "meta", {}) or {}),
         )
-
-        if not is_fused and node.op == "call_function":
-            op = _generate_tiling_wrapper(node, namer, env, op)
 
         link_operation(op)
 
@@ -257,18 +242,11 @@ class FusedOp(IRNode):
         gm = node.meta["submodule"]
         assert isinstance(gm, torch.fx.GraphModule)
 
-        # Apply tiled shapes if available
-        if (tiled_shapes := node.meta.get('tiled_shapes')):
-            args = map_arg(
-                node.args, lambda n: get_tiled_tensor(n, tiled_shapes)
-            )
-            ShapeProp(gm).propagate(*args)
-
         ops: List[Operation] = []
 
         for n in list(gm.graph.nodes):
             if n.op == "call_function":
-                ops.append(Operation.from_fx_node(n, env, namer, is_fused=True))
+                ops.append(Operation.from_fx_node(n, env, namer))
             if n.op == "output":
                 outputs = _resolve_fx_graph_outputs(n.args[0], env)
                 env[node] = outputs
@@ -282,8 +260,6 @@ class FusedOp(IRNode):
             origin_node=node,
             annotations=dict(getattr(node, "meta", {}) or {}),
         )
-
-        fused_op = _generate_tiling_wrapper(node, namer, env, fused_op)
 
         link_operation(fused_op)
 
@@ -374,16 +350,28 @@ class Loops(IRNode):
         # Also ensure the index knows this loop is its producer
         self.index.producer_op = self
 
+        # Gap 2: iter_vars and outputs are produced by this loop —
+        # set producer_op so callers can walk up the def chain.
+        for ivar in self.iter_vars:
+            ivar.producer_op = self
+        for out in self.outputs:
+            out.producer_op = self
+
+        # init_args flow into the loop from outside — register as users
         for arg in self.init_args:
             arg.users[self] = None
 
-        # TODO: outputs need to point to correct producer op so that codegen
-        # can get the right FX node.
-        # # Iter_vars and Outputs are produced by this loop
-        # for ivar in self.iter_vars:
-        #     ivar.producer_op = self
-        # for out in self.outputs:
-        #     out.producer_op = self
+        # Gap 5: yields are the last-use of carried values each iteration —
+        # register this loop as a user so def-use traversal is complete.
+        for y in self.yields:
+            y.users[self] = None
+
+    def replace_input_with(self, old: Value, new: Value):
+        """Update init_args / yields when an upstream Value is replaced."""
+        self.init_args = [new if a is old else a for a in self.init_args]
+        self.yields    = [new if y is old else y for y in self.yields]
+        old.users.pop(self, None)
+        new.users[self] = None
 
     def __hash__(self):
         return id(self)
@@ -415,35 +403,6 @@ class Module:
         for stmt in self.body:
             link_operation(stmt, parent=self)
 
-    @staticmethod
-    def convert(
-        gm: torch.fx.GraphModule,
-        name: str = "main",
-    ) -> Module:
-        namer = NameGenerator()
-        env: Dict[torch.fx.Node, Union[Value, Tuple[Value, ...]]] = {}
-
-        body: List[IRNode] = []
-        args: List[Value] = []
-        params: List[Value] = []
-        results: List[Value] = []
-
-        for node in gm.graph.nodes:
-            if node.op == "call_module":
-                stmt = FusedOp.from_fx_node(node, env, namer)
-            else:
-                stmt = Operation.from_fx_node(node, env, namer)
-
-            if node.op == "placeholder":
-                args.append(env[node])
-            elif node.op == "get_attr":
-                params.append(env[node])
-            elif node.op == "output":
-                results = _resolve_fx_graph_outputs(node.args[0], env)
-            else:
-                body.append(stmt)
-
-        return Module(name, args, params, body, results)
 
 
 class NameGenerator:
@@ -636,6 +595,12 @@ def _resolve_fx_graph_outputs(
 
 
 def lift_arg(a: Any, env, inputs) -> Any:
+    # Gap 1: Value objects may appear directly (e.g. IndexValue loop indices
+    # threaded through lowering passes rather than via FX Node env lookup).
+    # Track them in `inputs` so they appear in the SSA def-use graph.
+    if isinstance(a, Value):
+        inputs.append(a)
+        return a.name
     if isinstance(a, torch.fx.Node):
         sn = a.meta.get("source_node", a)
         v = env[sn]
@@ -675,324 +640,99 @@ def link_operation(node: IRNode, parent: Union["Loops", "Module"] = None):
             link_operation(body_stmt, parent=node)
 
 
-def _get_gemm_tiled_input_pattern(node: torch.fx.Node, gemm_node, tiling):
+def canonicalize(module: Module) -> None:
     """
-    We support GEMM tiling on X, K, C dimensions. Input and input scale are
-    tiled on X and C dimensions, weight and weight scale are tiled on C and K
-    dimensions, bias is tiled on K dimension.
+    In-place canonicalization pass: eliminates degenerate loops with statically
+    known trip counts.
+
+    - Dead loops (0 trips):   replace outputs with init_args, drop the loop.
+    - Single-trip loops (1 trip): inline the body into the parent scope,
+      substitute iter_vars → init_args and outputs → yields.
+
+    The loop index of a single-trip loop is turned into a constant IndexValue
+    (expr = str(start)) so downstream ops that reference it remain valid.
+
+    Module.results is updated to reflect any substituted output values.
     """
-    logger.debug(f"Lowering GEMM for {node.op} node {node} with tiling: {tiling}")
+    # subst[old] = new — for values that are unreachable via users (e.g. the
+    # top-level module results list, which isn't registered as a user).
+    subst: Dict[Value, Value] = {}
 
-    kwargs = _get_node_args_and_kwargs(gemm_node)[1]
-    node_to_key = {
-        n.meta.get("source_node", n): k for k, n in kwargs.items()
-        if isinstance(n, torch.fx.Node)
-    }
-    input_nodes = node.all_input_nodes
+    def resolve(v: Value) -> Value:
+        while v in subst:
+            v = subst[v]
+        return v
 
-    assert len(tiling) == 3, "GEMM tiling should have 3 dimensions (X, K, C)"
+    def _replace(old: Value, new: Value) -> None:
+        subst[old] = new
+        old.replace_all_uses_with(new)
 
-    output_shape = gemm_node.value.shape
-    num_batch_dims = len(output_shape) - 2 if is_bmm(gemm_node) else 0
-    idx_X = num_batch_dims + 0
-    idx_K = num_batch_dims + 1
-    idx_C = num_batch_dims + 2
-
-    logical_to_active_map = {}
-    active_idx_count = 0
-
-    for b in range(num_batch_dims):
-        if output_shape[b] > 1:
-            logical_to_active_map[b] = active_idx_count
-            active_idx_count += 1
-
-    for num_tiles, idx in zip(tiling, [idx_X, idx_K, idx_C]):
-        if num_tiles > 1:
-            logical_to_active_map[idx] = active_idx_count
-            active_idx_count += 1
-
-    tiled_shapes = node.meta.get('tiled_shapes')
-    tile_strides = node.meta.get('tile_strides', {})
-    input_sizes = tuple(tiled_shapes.get(a) for a in input_nodes)
-    input_strides = tuple(tile_strides.get(a) for a in input_nodes)
-
-    SPATIAL_MAP = {
-        "input":        ([idx_X, idx_C], lambda ndim: [ndim - 2, ndim - 1]),
-        "input_scale":  ([idx_X, idx_C], lambda ndim: [ndim - 2, ndim - 1]),
-        "weight":       ([idx_C, idx_K], lambda ndim: [ndim - 2, ndim - 1]),
-        "weight_scale": ([idx_C, idx_K], lambda ndim: [ndim - 2, ndim - 1]),
-        "bias":         ([idx_K],        lambda _: [0]),
-        "output":       ([idx_X, idx_K], lambda ndim: [ndim - 2, ndim - 1]),
-    }
-
-    tile_index_maps = []
-    tile_dim_axes = []
-
-    for n in input_nodes:
-        key = node_to_key.get(n)
-        indices, axis_func = SPATIAL_MAP.get(key, SPATIAL_MAP["output"])
-
-        if n.value.ndim > 2 and num_batch_dims > 0:
-            idx_batch = list(range(num_batch_dims))
-            tile_index_maps.append(idx_batch + indices)
-            tile_dim_axes.append(idx_batch + axis_func(n.value.ndim))
-        else:
-            tile_index_maps.append(indices)
-            tile_dim_axes.append(axis_func(n.value.ndim))
-
-    def _tile_inputs_pattern(active_indices, *args):
-        tiled_args = []
-        for arg, idx_map, axes, shape, stride in zip(
-            args, tile_index_maps, tile_dim_axes, input_sizes, input_strides
-        ):
-            if isinstance(arg, torch.Tensor) and shape is not None:
-                # Map logical IDs to the actual tensor values we prepared above
-                mapped_indices = []
-                mapped_axes = []
-
-                logger.debug(
-                    f"Tiling arg with idx_map: {idx_map}, axes: {axes}, shape: "
-                    f"{shape}, stride: {stride}"
-                )
-                for i, idx in enumerate(idx_map):
-                    if (active_idx := logical_to_active_map.get(idx)) is not None:
-                        mapped_indices.append(active_indices[active_idx])
-                        mapped_axes.append(axes[i])
-                logger.debug(f"  Mapped indices: {mapped_indices}, axes: {mapped_axes}")
-
-                arg = quantized_lib.load_tile(
-                    arg, mapped_indices, shape, mapped_axes, stride
-                )
-            tiled_args.append(arg)
-        return tuple(tiled_args)
-
-    _example_inputs = (
-        tuple(torch.tensor(i, dtype=torch.int32) for i in range(active_idx_count)),
-        *map_arg(input_nodes, lambda n: n.value),
-    )
-
-    match_pattern = WrapperModule(_tile_inputs_pattern)
-    match_pattern = _get_aten_graph_module_for_pattern(
-        match_pattern,
-        _example_inputs,
-    )
-    match_pattern.graph.print_tabular()
-
-    flatten_args, _ = torch.utils._pytree.tree_flatten(_example_inputs)
-    ShapeProp(match_pattern).propagate(*flatten_args)
-
-    return match_pattern, logical_to_active_map
-
-
-def _get_vector_tiled_input_pattern(node, tiling):
-    logger.debug(f"Lowering vector for {node.op} node {node} with tiling: {tiling}")
-
-    dims = [i for i, t in enumerate(tiling) if t > 1]
-    num_indices = len(dims)
-
-    tiled_shapes = node.meta.get('tiled_shapes')
-    tile_strides = node.meta.get('tile_strides', {})
-
-    input_nodes = node.all_input_nodes
-    input_sizes = tuple(tiled_shapes.get(a) for a in input_nodes)
-    input_strides = tuple(tile_strides.get(a) for a in input_nodes)
-
-    # TODO: handle broadcasting
-
-    def _tile_inputs_pattern(indices, *args):
-        tiled_args = []
-        for arg, shape, stride in zip(args, input_sizes, input_strides):
-            if isinstance(arg, torch.Tensor) and shape is not None:
-                arg = quantized_lib.load_tile(arg, indices, shape, dims, stride)
-            tiled_args.append(arg)
-        return tuple(tiled_args)
-
-    _example_inputs = (
-        tuple(torch.tensor(i, dtype=torch.int32) for i in range(num_indices)),
-        *map_arg(input_nodes, lambda n: n.value),
-    )
-
-    match_pattern = WrapperModule(_tile_inputs_pattern)
-    match_pattern = _get_aten_graph_module_for_pattern(
-        match_pattern,
-        _example_inputs,
-    )
-
-    flatten_args, _ = torch.utils._pytree.tree_flatten(_example_inputs)
-    ShapeProp(match_pattern).propagate(*flatten_args)
-
-    # Remove unused placeholder nodes
-    for n in match_pattern.graph.nodes:
-        if n.op == 'placeholder' and len(n.users) == 0:
-            match_pattern.graph.erase_node(n)
-
-    match_pattern.graph.lint()
-    match_pattern.graph.print_tabular()
-    return match_pattern
-
-
-def _generate_tiling_wrapper(node: torch.fx.Node, namer, env, stmt):
-    tiling = node.meta.get('l2_tiling')
-
-    if node.op == "call_module":
-        mod = node.meta["submodule"]
-        ref_node = get_reference_node(mod.graph.nodes)
-        tiling = ref_node.meta.get('l2_tiling')
-    else:
-        ref_node = node
-
-    if tiling is None:
-        logger.info("No tiling found for node:", node)
-        return stmt
-
-    if is_gemm_op(ref_node):
-        # Expand 2D tiling to 3D (X, K, C)
-        if len(tiling) == 2:
-            tiling = tiling + (1,)
-        match_pattern, idx_map = _get_gemm_tiled_input_pattern(node, ref_node, tiling)
-
-        ndim = ref_node.value.ndim
-        num_batch_dims = ndim - 2 if is_bmm(ref_node) else 0
-        loop_bounds = ref_node.shape[:num_batch_dims] + tiling
-        output_dims = [*range(num_batch_dims), ndim - 2, ndim - 1]
-
-        num_indices = len(idx_map)
-        num_output_dims = num_indices - 1 if tiling[-1] > 1 else num_indices
-        output_dims = [d for i, d in enumerate(output_dims) if i in idx_map]
-        loop_bounds = [b for i, b in enumerate(loop_bounds) if i in idx_map]
-    else:
-        match_pattern = _get_vector_tiled_input_pattern(node, tiling)
-        output_dims = [i for i, t in enumerate(tiling) if t > 1]
-        num_indices = len(output_dims)
-        num_output_dims = num_indices
-        loop_bounds = tuple(tiling[d] for d in output_dims)
-
-    # ==========================================================================
-    # Input tiling pattern
-    # ==========================================================================
-
-    input_nodes = node.all_input_nodes
-    placeholders = [
-        n for n in match_pattern.graph.nodes if n.op == 'placeholder'
-    ]
-    assert len(placeholders) == len(input_nodes) + num_indices
-
-    # Create new Operation from tiled op pattern
-    ssa_indices = [
-        IndexValue(name=namer.new_index(), expr=f"{node.name}_tiling_{i}")
-        for i in range(num_indices)
-    ]
-
-    ops: List[Operation] = []
-    arg_idx = 0
-    env_copy = env.copy()
-
-    for n in list(match_pattern.graph.nodes):
-        if n.op == "placeholder":
-            if arg_idx < num_indices:
-                env_copy[n] = ssa_indices[arg_idx]
+    def _process_body(
+        body: List[IRNode], parent: Union[Loops, Module]
+    ) -> List[IRNode]:
+        new_body: List[IRNode] = []
+        for stmt in body:
+            if isinstance(stmt, Loops):
+                result = _process_loops(stmt, parent)
+                if result is None:
+                    pass  # dead loop removed
+                elif isinstance(result, list):
+                    new_body.extend(result)  # inlined single-trip body
+                else:
+                    new_body.append(result)
             else:
-                env_copy[n] = env[input_nodes[arg_idx - num_indices]]
-            arg_idx += 1
-        elif n.op == "call_function" and n.target == quantized_lib.load_tile.default:
-            ops.append(Operation.from_fx_node(
-                n, env_copy, namer, "Scratchpad", is_fused=True
-            ))
-        elif n.op == "output":
-            new_inputs = [env_copy[n] for n in n.args[0]]
+                new_body.append(stmt)
+        return new_body
 
-    # Update inputs to new tiled inputs
-    for old_input, new_input in zip(stmt.inputs, new_inputs):
-        stmt.replace_input_with(old_input, new_input)
+    def _process_loops(
+        loop: Loops, parent: Union[Loops, Module]
+    ) -> Optional[Union[Loops, List[IRNode]]]:
+        # Recurse first so inner degenerate loops are folded before outer ones.
+        loop.body = _process_body(loop.body, loop)
 
-    ops.append(stmt)
+        start, end, step = loop.start, loop.end, loop.step
+        if not (isinstance(start, int) and isinstance(end, int)
+                and isinstance(step, int) and step > 0):
+            return loop  # dynamic or zero-step bounds — cannot fold
 
-    # ==========================================================================
-    # Output tiling pattern
-    # ==========================================================================
+        trips = max((end - start + step - 1) // step, 0)
 
-    tiled_shapes = node.meta.get('tiled_shapes')
-    output_size = tiled_shapes.get(node)
+        if trips == 0:
+            # Body never executes: outputs equal the init_args unchanged.
+            for out, init in zip(loop.outputs, loop.init_args):
+                _replace(out, init)
+                init.users.pop(loop, None)
+            for y in loop.yields:
+                y.users.pop(loop, None)
+            return None
 
-    def _tile_output_pattern(indices, outputs):
-        if isinstance(outputs, torch.Tensor):
-            if output_size is not None:
-                return quantized_lib.load_tile(
-                    outputs, indices, output_size, output_dims
-                )
-            return outputs
+        if trips == 1:
+            # Body runs exactly once.
 
-        new_outputs = []
-        for output, tile_size in zip(outputs, output_size):
-            if tile_size is not None:
-                output = quantized_lib.load_tile(
-                    output, indices, tile_size, output_dims
-                )
-            new_outputs.append(output)
-        return tuple(new_outputs)
+            # 1. Substitute iter_vars → init_args (same value at iteration 0).
+            for iv, init in zip(loop.iter_vars, loop.init_args):
+                _replace(iv, init)
+                init.users.pop(loop, None)
 
-    _example_inputs = (
-        tuple(torch.tensor(i, dtype=torch.int32) for i in range(num_output_dims)),
-        node.value,
-    )
+            # 2. Replace the loop index with a constant IndexValue.
+            #    Keep the same SSA name so kwargs string references stay valid.
+            const_idx = IndexValue(name=loop.index.name, expr=str(start))
+            _replace(loop.index, const_idx)
 
-    match_pattern = WrapperModule(_tile_output_pattern)
-    match_pattern = _get_aten_graph_module_for_pattern(
-        match_pattern,
-        _example_inputs,
-    )
-    match_pattern.graph.print_tabular()
+            # 3. Re-parent body ops to the enclosing scope.
+            for s in loop.body:
+                s.block = parent
 
-    flatten_args, _ = torch.utils._pytree.tree_flatten(_example_inputs)
-    ShapeProp(match_pattern).propagate(*flatten_args)
+            # 4. Substitute outputs → yields.
+            for out, y in zip(loop.outputs, loop.yields):
+                _replace(out, y)
+                y.users.pop(loop, None)
 
-    outputs = env[node]
-    if not isinstance(outputs, (list, tuple)):
-        outputs = [outputs]
-    arg_idx = 0
+            return loop.body  # caller splices these into the parent body
 
-    for n in list(match_pattern.graph.nodes):
-        if n.op == "placeholder":
-            if arg_idx < num_output_dims:
-                env_copy[n] = ssa_indices[arg_idx]
-            else:
-                env_copy[n] = outputs[arg_idx - num_output_dims]
-            arg_idx += 1
-        elif n.op == "call_function" and n.target == quantized_lib.load_tile.default:
-            ops.append(Operation.from_fx_node(n, env_copy, namer, is_fused=True))
-        elif n.op == "output":
-            outputs = [env_copy[n] for n in n.args[0]]
+        return loop  # multi-trip: leave unchanged
 
-    # Update stmt users
-    env[node] = outputs[0] if len(outputs) == 1 else tuple(outputs)
+    module.body = _process_body(module.body, module)
 
-    value_to_depth = {}
-    ops_at_depth = defaultdict(list)
-
-    for d, idx_val in enumerate(ssa_indices):
-        value_to_depth[idx_val] = d
-
-    for op in ops:
-        depths = [value_to_depth.get(inp, -1) for inp in op.inputs]
-        op_depth = max(depths) if depths else -1
-        ops_at_depth[op_depth].append(op)
-        for output in op.outputs:
-            value_to_depth[output] = op_depth
-
-    loop_op = None
-    # Iterate from innermost loop to outermost
-    for d in reversed(range(len(ssa_indices))):
-        body = ops_at_depth[d]
-
-        loop_op = Loops(
-            index=ssa_indices[d],
-            start=0,
-            end=loop_bounds[d],
-            step=1,
-            # TODO where should loop_op be placed at?
-            body=body if loop_op is None else body + [loop_op],
-        )
-
-    print("Final tiled op:")
-    print(loop_op.format())
-    return loop_op
+    # Fix up module results that may have been substituted.
+    module.results = [resolve(r) for r in module.results]
