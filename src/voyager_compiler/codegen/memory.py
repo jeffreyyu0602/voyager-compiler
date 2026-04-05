@@ -108,23 +108,20 @@ def compute_tensor_size(
                 logger.debug(f"Increase memory for conv2d input {node} by 3x")
                 tensor_size *= 3
 
-        # If this is an output during scratchpad allocation, we don't care
-        # downstream layers
-        if is_scratchpad_output:
-            return tensor_size
-
+        # Allocate extra memory for intermediate results like mean and variance.
         # TODO: Should only do this when allocating scratchpad memory for the
         # specific operation. E.g. if a node is consumed by both a softmax and
         # an add node, we shouldn't increase the size for the add path.
-        if _find_user_with_target(node, torch.ops.aten.softmax.int):
-            logger.debug(f"Increase memory for softmax input {node} by 2x")
-            return tensor_size * 2
+        if not is_scratchpad_output:
+            if _find_user_with_target(node, torch.ops.aten.softmax.int):
+                logger.debug(f"Increase memory for softmax input {node} by 2x")
+                tensor_size = tensor_size * 2
 
-        if _find_user_with_target(node, torch.ops.aten.layer_norm.default):
-            logger.debug(f"Increase memory for layer_norm input {node} by 2x")
-            return (tensor_size + numel) * 2
+            if _find_user_with_target(node, torch.ops.aten.layer_norm.default):
+                logger.debug(f"Increase memory for layer_norm input {node} by 2x")
+                tensor_size = (tensor_size + numel) * 2
 
-        return tensor_size
+        return _align_size(tensor_size, bank_width)
 
     if isinstance(val, (tuple, list)):
         if shape is not None:
@@ -146,7 +143,7 @@ def compute_tensor_size(
         ]
 
         node.meta[key] = tuple(sizes)
-        return _align_size(sum(sizes), bank_width)
+        return sum(sizes)
 
     logger.warning(f"Node {node} has a non-tensor output")
     return None

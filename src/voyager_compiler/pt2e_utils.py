@@ -124,6 +124,8 @@ def get_device_map(model: GraphModule, max_memory=None, verbose=False):
     current_device = 0
     current_memory_used = 0
 
+    model.graph.eliminate_dead_code(lambda n: n.op in ['placeholder', 'output'])
+
     named_modules = dict(model.named_modules(remove_duplicate=True))
 
     first_use : Dict[Node, int] = {}

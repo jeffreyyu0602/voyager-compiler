@@ -1310,8 +1310,12 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     weight_shape = node.args[1].shape
     K = weight_shape[-1] if is_mat else weight_shape[0]
 
-    # Pick a reduction dim that fits in a bank
-    min_x_tile = min(sum(unroll_dims), X)
+    min_x_tile = sum(unroll_dims)
+    # Increase input tile size to account for longer weight loading
+    if node.kwargs.get("A_indptr") is not None:
+        min_x_tile *= 2
+    min_x_tile = min(min_x_tile, X)
+
     input_bytes = get_node_bytes(node.args[0])
     num_c_tile = 1
     if bank_size is not None:
@@ -1465,8 +1469,25 @@ def run_vector_op_node_l2_tiling(
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
-    if node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
-        last_dim = min(node.args[1])
+    min_sizes = (unroll,)
+    if node.target == torch.ops.aten.softmax.int:
+        last_dim = get_arg_value(node, 1, "dim", -1)
+    elif node.target == torch.ops.aten.layer_norm.default:
+        normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
+        last_dim = -len(normalized_shape) if normalized_shape is not None else -1
+    elif node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
+        axes = get_arg_value(node, 1, "axes", None)
+        block_size = get_arg_value(node, 2, "block_size", None)
+        ndim = len(node.args[0].shape)
+
+        last_dim = None
+        axes = set(axes or ())
+        min_sizes = tuple(
+            max(block_size, unroll) if i == ndim - 1
+            else block_size if i in axes
+            else 1
+            for i in range(ndim)
+        )
     elif node.target in [
         torch.ops.quantized_ops.quantize_mx.default,
         torch.ops.quantized_ops.quantize_mx_outlier.default,
@@ -1487,7 +1508,7 @@ def run_vector_op_node_l2_tiling(
     tile_sizes, tiled_shapes = _search_tiling(
         node=node,
         full_shape=output_shape,
-        min_sizes=(unroll,),
+        min_sizes=min_sizes,
         last_dim=last_dim,
         shape_func=_build_vector_op_shape_map,
         cache_size=cache_size,

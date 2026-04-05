@@ -968,7 +968,10 @@ def run_submod_l2_tiling(
             dim = 3 if transposed else 1
             min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1:]
         else:
-            min_x_size = min(sum(unroll_dims), math.prod(output_shape[:-1]))
+            min_x_size = sum(unroll_dims)
+            if first_node.kwargs.get("A_indptr") is not None:
+                min_x_size *= 2  # Double weight reuse
+            min_x_size = min(min_x_size, math.prod(output_shape[:-1]))
             min_sizes = (min_x_size, unroll_dims[0])
 
     for tile_sizes, tiling in get_valid_tiling(
@@ -1071,7 +1074,7 @@ def run_memory_mapping(
         unroll_dims = (unroll_dims, unroll_dims)
 
     if allocator is None:
-        allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE)
+        allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE, bank_width)
 
     # Store all the weights in memory if persistent is enabled
     for node in model.graph.nodes:

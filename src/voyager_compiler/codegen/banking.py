@@ -335,11 +335,8 @@ def _(target) -> List[BankingStrategy]:
 def _(target) -> List[BankingStrategy]:
     return [
         BankingStrategy((
+            BankPartition(("linear_mx::weight", "linear_mx::weight_scale")),
             BankPartition(("linear_mx::A_data", "linear_mx::A_indices", "linear_mx::A_indptr")),
-            BankPartition(("linear_mx::weight", "linear_mx::weight_scale", "linear_mx::bias")),
-        )),
-        BankingStrategy((
-            BankPartition(("linear_mx::weight", "linear_mx::weight_scale", "linear_mx::bias")),
         )),
         BankingStrategy((
             BankPartition(("linear_mx::weight", "linear_mx::weight_scale", "linear_mx::bias")),
@@ -362,15 +359,10 @@ def _(target) -> List[BankingStrategy]:
         ),
     ]
 
+
 @register_banking_strategies(torch.ops.quantized_ops.matmul_mx.default)
 def _(target) -> List[BankingStrategy]:
     return [
-        BankingStrategy(
-            partitions=(), unspecified_policy=BankingPolicy.SEPARATE_ALIGNED,
-        ),
-        BankingStrategy((
-            BankPartition(("matmul_mx::other", "matmul_mx::weight_scale")),
-        )),
         BankingStrategy((
             BankPartition(("matmul_mx::other", "matmul_mx::weight_scale")),
             BankPartition(("matmul_mx::A_data", "matmul_mx::A_indices", "matmul_mx::A_indptr")),
