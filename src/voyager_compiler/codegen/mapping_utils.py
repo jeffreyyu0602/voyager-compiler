@@ -522,8 +522,14 @@ def is_nop(node: Node) -> bool:
     # transfer with no type change).  A real dtype conversion must be emitted
     # as a cast op, not silenced.
     if node.target == torch.ops.aten.to.dtype:
-        src_dtype = getattr(node.args[0], "dtype", None)
+        input_node = node.args[0]
+        value = getattr(input_node, "value", None)
+        src_dtype = getattr(input_node, "dtype", None)
+        if src_dtype is None and isinstance(value, torch.Tensor):
+            src_dtype = str(value.dtype).split(".")[1]
         dst_dtype = node.args[1] if len(node.args) > 1 else node.kwargs.get("dtype")
+        if isinstance(dst_dtype, torch.dtype):
+            dst_dtype = str(dst_dtype).split(".")[1]
         return src_dtype == dst_dtype
 
     return node.target in [
