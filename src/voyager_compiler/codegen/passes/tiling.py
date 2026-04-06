@@ -964,6 +964,7 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
 def get_valid_tiling(
     input_shape: Tuple[int, ...],
     min_sizes: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    multiple_of: Optional[Union[List[int], Tuple[int, ...]]] = None,
     order: Optional[Union[List[int], Tuple[int, ...]]] = None,
     fixed_dims: Optional[Union[List[int], Tuple[int, ...]]] = None,
     last_dim: Optional[int] = None,
@@ -977,6 +978,10 @@ def get_valid_tiling(
         input_shape: The original shape (e.g., (1024, 1024)).
         min_sizes: Minimum size for each dimension. If the list is shorter than
                    input_shape, it is padded with 1s on the left.
+        multiple_of: Required multiple for each dimension's tile size. If the list
+                     is shorter than input_shape, it is padded with 1s on the left
+                     (1 means no constraint). E.g., multiple_of=(1, 16) requires the
+                     last dimension's tile to be a multiple of 16.
         order: Explicit order of dimension indices to reduce.
         fixed_dims: Indices of dims that should remain at full size.
         last_dim: Convenience arg to fix dimensions starting from this index.
@@ -1015,11 +1020,17 @@ def get_valid_tiling(
     if len(targets) < ndim:
         targets = [1] * (ndim - len(targets)) + targets
 
+    # Align multiple_of to input_shape length (pad left with 1s — 1 means no constraint)
+    multiples = list(multiple_of) if multiple_of else []
+    if len(multiples) < ndim:
+        multiples = [1] * (ndim - len(multiples)) + multiples
+
     # --- 2. Pre-calculate Valid Factors ---
 
     # We calculate all valid tiling sizes for every dimension upfront.
-    # A factor is valid if it divides the dimension and >= min_size.
-    # Example: input 128 -> [128, 64, 32, ..., min_size]
+    # A factor is valid if it divides the dimension, >= min_size, and is a
+    # multiple of the required multiple (if specified).
+    # Example: input 128, multiple_of=16 -> [128, 64, 32, 16]
     dim_factors = {}
     for i in range(ndim):
         limit = max(1, targets[i]) # Ensure min_size is at least 1
@@ -1029,8 +1040,15 @@ def get_valid_tiling(
         if i in fixed_indices:
             factors = [size]
         else:
-            # Generate factors in descending order
-            factors = [f for f in range(size, limit - 1, -1) if size % f == 0]
+            mult = multiples[i]
+            # Generate factors in descending order, respecting divisibility and multiple_of
+            factors = [f for f in range(size, limit - 1, -1) if size % f == 0 and f % mult == 0]
+            if not factors:
+                logger.warning(
+                    f"No valid tiling found for dim {i} (size={size}, min={limit}, "
+                    f"multiple_of={mult}); keeping full size."
+                )
+                factors = [size]
 
         dim_factors[i] = factors
 
@@ -1227,6 +1245,7 @@ def _search_tiling(
     order=None,
     last_dim=None,
     base_tiling=None,
+    multiple_of=None,
 ):
     """
     Generic driver that iterates over banking strategies and valid tilings.
@@ -1241,6 +1260,7 @@ def _search_tiling(
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
             min_sizes=min_sizes,
+            multiple_of=multiple_of,
             order=order,
             last_dim=last_dim
         ):
@@ -1335,6 +1355,7 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         node=node,
         full_shape=full_shape,
         min_sizes=min_sizes,
+        multiple_of=unroll_dims,
         order=order,
         shape_func=_build_gemm_shape_map,
         cache_size=cache_size,
