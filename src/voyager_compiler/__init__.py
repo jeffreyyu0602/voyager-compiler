@@ -204,6 +204,7 @@ def transform(
 
     # Apply L2 tiling logic for vector-based operations.
     if cache_size is not None:
+        run_pool_op_l2_tiling(model, unroll_dims[1], cache_size, num_banks)
         run_vector_op_l2_tiling(model, unroll_dims[1], cache_size, num_banks)
 
     # -------------------------------------------------------------------------
@@ -251,17 +252,6 @@ def compile(
         model, allocator, cache_size, num_banks, bank_width, unroll_dims
     )
 
-    # Experimental feature
-    # from voyager_compiler.codegen.lowering.ir import Module
-    # from voyager_compiler.codegen.lowering.codegen import generate_proto
-
-    # top_module = Module.convert(model, name="m")
-    # print(top_module.format())
-
-    # params = generate_proto(top_module, model, flatten_args)
-
-    # with open(os.path.join(output_dir, 'module.txt'), "w") as f:
-    #     f.write(text_format.MessageToString(params))
 
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))

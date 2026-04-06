@@ -32,6 +32,7 @@ __all__ = [
     "run_memory_mapping",
     "run_matrix_op_l2_tiling",
     "run_vector_op_l2_tiling",
+    "run_pool_op_l2_tiling",
     "split_multi_head_attention",
     "remove_softmax_dtype_cast",
     "transpose_conv2d_inputs_and_weights",

@@ -18,6 +18,7 @@ from ..mapping_utils import (
     is_linear,
     is_matmul,
     is_nop,
+    is_pooling,
     is_reshape_op,
 )
 from ...pt2e_utils import deduplicate_nodes, fetch_attr, propagate_shape
@@ -304,7 +305,18 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
                 return tuple(t[i] for i in dims)
 
             tiled_shapes = node_to_treat.meta.get("tiled_shapes")
-            if is_conv2d(node_to_treat) and tiled_shapes is not None:
+            if is_pooling(node_to_treat) and tiled_shapes is not None:
+                tiled_shapes["input"]  = permute(tiled_shapes["input"],  NCHW_TO_NHWC)
+                tiled_shapes["output"] = permute(tiled_shapes["output"], NCHW_TO_NHWC)
+
+                tiling = node_to_treat.meta["l2_tiling"]
+                node_to_treat.meta["l2_tiling"] = permute(tiling, NCHW_TO_NHWC)
+
+                if stride := node_to_treat.meta.get("tile_strides"):
+                    stride["input"] = permute(stride["input"], NCHW_TO_NHWC)
+                    node_to_treat.meta["tile_strides"] = stride
+
+            elif is_conv2d(node_to_treat) and tiled_shapes is not None:
                 for key, arg in [
                     ("input", node_to_treat.args[0]),
                     ("weight", node_to_treat.args[1])
