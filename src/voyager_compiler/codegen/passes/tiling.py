@@ -851,8 +851,8 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     Args:
         model: FX GraphModule
         node: GEMM node to tile
-        tile_sizes: tiling sizes on X, C, and K dimensions
-        tiled_shapes: shape of inputs and outputs after tiling
+        tile_sizes: tuple of (x_tiled, c_tiled, k_tiled)
+        tiled_shapes: dict of tiled shapes
     """
     x_tiled, c_tiled, k_tiled = tile_sizes
 
@@ -864,20 +864,18 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     weight_shape = node.args[1].shape
     K = weight_shape[-1] if is_mat else weight_shape[0]
 
-    tiling = (X // x_tiled, K // k_tiled)
-
     if x_tiled == X and c_tiled == C and k_tiled == K:
         return
 
-    indptr_shape = tiled_shapes["A_indptr"]
-    tile_strides = {
-        "A_indptr": (*indptr_shape[:-1], indptr_shape[-1] - 1)
+    tiling_meta = {
+        "dtype": node.meta.get("dtype"),
+        "l2_tiling": (X // x_tiled, K // k_tiled),
+        "tiled_shapes": tiled_shapes,
+        "tile_strides": {"A_indptr": tiled_shapes["input"][:-1]},
     }
 
     if C == c_tiled:
-        node.meta["tiled_shapes"] = tiled_shapes
-        node.meta["l2_tiling"] = tiling
-        node.meta["tile_strides"] = tile_strides
+        node.meta.update(tiling_meta)
         return
 
     def load_arg(a):
@@ -955,12 +953,7 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
             n.meta["dtype"] = quantize_mx_node.meta.get("dtype")
 
         if n.target == node.target:
-            n.meta.update({
-                "tiled_shapes": copy.deepcopy(tiled_shapes),
-                "tile_strides": copy.deepcopy(tile_strides),
-                "l2_tiling": tiling,
-                "dtype": node.meta.get("dtype"),
-            })
+            n.meta.update(copy.deepcopy(tiling_meta))
 
 
 def get_valid_tiling(
@@ -1246,8 +1239,10 @@ def _search_tiling(
     bank_size,
     order=None,
     last_dim=None,
+    fixed_dims=None,
     base_tiling=None,
     multiple_of=None,
+    extra_size_fn=None,
 ):
     """
     Generic driver that iterates over banking strategies and valid tilings.
@@ -1264,7 +1259,8 @@ def _search_tiling(
             min_sizes=min_sizes,
             multiple_of=multiple_of,
             order=order,
-            last_dim=last_dim
+            last_dim=last_dim,
+            fixed_dims=fixed_dims,
         ):
             global_tiling = _merge_tiling(tiling, base_tiling)
 
@@ -1278,6 +1274,9 @@ def _search_tiling(
             total_size, _ = strategy.evaluate(
                 key_to_node, node, node_to_shape, bank_width, bank_size
             )
+
+            if extra_size_fn is not None:
+                total_size += extra_size_fn(node, tile_sizes, tiled_shapes)
 
             if total_size <= cache_size:
                 _log_tiling_details(node, node_to_shape, strategy)
@@ -1332,28 +1331,27 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     weight_shape = node.args[1].shape
     K = weight_shape[-1] if is_mat else weight_shape[0]
 
-    min_x_tile = sum(unroll_dims)
-    # Increase input tile size to account for longer weight loading
-    if node.kwargs.get("A_indptr") is not None:
-        min_x_tile *= 2
-    min_x_tile = min(min_x_tile, X)
+    x_min_size = min(sum(unroll_dims), X)
 
-    input_bytes = get_node_bytes(node.args[0])
     num_c_tile = 1
     if bank_size is not None:
-        for (c,), (num_c_tile,) in get_valid_tiling(
-            (C,), min_sizes=(unroll_dims[0],)
-        ):
-            if min_x_tile * c * input_bytes <= bank_size:
+        input_bytes = get_node_bytes(node.args[0])
+        c_max_size = bank_size / input_bytes / x_min_size
+        for (c,), (num_c_tile,) in get_valid_tiling((C,), min_sizes=(unroll_dims[0],)):
+            if c <= c_max_size:
                 break
+        else:
+            logger.warning(
+                f"Cannot find valid C tiling for {node} that fits bank size {bank_size}."
+            )
 
     full_shape = (X, C // num_c_tile, K)
-    min_sizes = (min_x_tile, unroll_dims[0], unroll_dims[1])
+    min_sizes = (x_min_size, unroll_dims[0], unroll_dims[1])
     order = (2, 0, 1)
 
     logger.info(f"Running L2 tiling for matrix op: {node}")
 
-    return _search_tiling(
+    common_args = dict(
         node=node,
         full_shape=full_shape,
         min_sizes=min_sizes,
@@ -1365,6 +1363,32 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         bank_size=bank_size,
         base_tiling=(1, num_c_tile, 1),
     )
+
+    def _gemm_residual_size(node, tile_sizes, tiled_shapes):
+        """Extra L2 cost of the accumulator buffer when C is tiled."""
+        _, c_tiled, _ = tile_sizes
+        if c_tiled < C:
+            return math.prod(tiled_shapes["output"]) * get_node_bytes(node)
+        return 0
+
+    # Tiling for non-first sub-GEMMs (budget for the accumulator)
+    tile_sizes, tiled_shapes = _search_tiling(
+        **common_args, extra_size_fn=_gemm_residual_size
+    )
+
+    c_tiled = tile_sizes[1]
+
+    if c_tiled < C:
+        # Tiling for the first sub-GEMM (no accumulator buffer)
+        search_args = {
+            **common_args,
+            "full_shape": (full_shape[0], c_tiled, full_shape[2]),
+            "base_tiling": (1, C // c_tiled, 1),
+            "fixed_dims": (1,),  # Fix C dim to ensure same C tile size
+        }
+        tile_sizes, tiled_shapes = _search_tiling(**search_args)
+
+    return tile_sizes, tiled_shapes
 
 
 def run_matrix_op_l2_tiling(
@@ -1397,12 +1421,12 @@ def run_matrix_op_l2_tiling(
                 split_conv2d_node(model, node, tile_sizes)
 
         elif is_linear(node) or is_matmul(node):
-            tile_sizes, tiled_shape = search_gemm_tiling(
+            tile_sizes, tiled_shapes = search_gemm_tiling(
                 node, unroll, cache_size, None, bank_size
             )
 
             if tile_sizes is not None:
-                split_gemm_node(model, node, tile_sizes, tiled_shape)
+                split_gemm_node(model, node, tile_sizes, tiled_shapes)
             else:
                 raise RuntimeError(f"Failed to tile GEMM node: {node}")
 

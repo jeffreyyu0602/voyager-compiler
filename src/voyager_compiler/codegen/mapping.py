@@ -968,11 +968,8 @@ def run_submod_l2_tiling(
             dim = 3 if transposed else 1
             min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1:]
         else:
-            min_x_size = sum(unroll_dims)
-            if first_node.kwargs.get("A_indptr") is not None:
-                min_x_size *= 2  # Double weight reuse
-            min_x_size = min(min_x_size, math.prod(output_shape[:-1]))
-            min_sizes = (min_x_size, unroll_dims[0])
+            x_min_size = min(sum(unroll_dims), math.prod(output_shape[:-1]))
+            min_sizes = (x_min_size, unroll_dims[0])
 
     for tile_sizes, tiling in get_valid_tiling(
         output_shape, min_sizes=min_sizes, reverse=is_gemm
@@ -1012,6 +1009,12 @@ def run_submod_l2_tiling(
                 first_node.meta.pop("l2_tiling", None)
             else:
                 first_node.meta["l2_tiling"] = tiling
+
+                if is_gemm and first_node.kwargs.get("A_indptr") is not None:
+                    input_node = first_node.args[0]
+                    input_node = input_node.meta.get("source_node", input_node)
+                    tile_strides = first_node.meta["tile_strides"]
+                    tile_strides["A_indptr"] = new_shapes[input_node][:-1]
 
             return total_size, scratchpad_map, new_shapes
 
