@@ -45,6 +45,9 @@ from voyager_compiler.approx.app_template import (
     get_compute_dtype,
     linear_app_template,
     quadratic_app_template,
+    quadratic_app_synth,
+    quadratic_app_synth_mp,
+    quadratic_stable_app_template,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,36 +55,95 @@ from voyager_compiler.approx.app_template import (
 # ---------------------------------------------------------------------------
 _TEMPLATE_FN = {
     "quadratic_app_template": quadratic_app_template,
+    "quadratic_app_synth":    quadratic_app_synth,
+    "quadratic_app_synth_mp": quadratic_app_synth_mp,
     "linear_app_template":    linear_app_template,
+    "quadratic_stable_app_template": quadratic_stable_app_template,
 }
 
 # Registry of active patches: name -> (module, original_fn)
 # The module is whichever of F or torch the function was found on.
 _original_fns: dict[str, tuple[ModuleType, Callable]] = {}
 
+# Registry of extra patches for ops that have multiple entry points.
+# e.g. "sigmoid" exists on F, torch, and torch.Tensor — nn.Sigmoid calls
+# torch.sigmoid, some models call x.sigmoid().  Patching only F.sigmoid
+# misses both.  Keys are "{name}@{location}" to avoid collisions.
+_extra_originals: dict[str, tuple[object, str, Callable]] = {}
+
+# Ops that need patching on torch AND torch.Tensor in addition to F.
+_MULTI_ENTRY_OPS = {"sigmoid", "exp", "tanh"}
+
 # When True, binding "exp" also replaces F.softmax with a pure-Python
 # implementation that routes through torch.exp, so the patched exp is used
 # inside softmax as well.
-softmax_via_exp: bool = True
+softmax_via_exp: bool = False
+
+
+def _manual_softmax(input: torch.Tensor, dim: int = -1, **kwargs) -> torch.Tensor:
+    """Numerically-stable softmax that routes through torch.exp so the
+    patched exp is used."""
+    x_max = input.max(dim=dim, keepdim=True).values
+    exp_x = torch.exp(input - x_max)
+    return exp_x / exp_x.sum(dim=dim, keepdim=True)
 
 
 def _bind_softmax_via_exp() -> None:
-    """Replace F.softmax with a numerically-stable pure-Python impl that
-    calls torch.exp, so whatever patch is on torch.exp is also used inside
-    softmax.  Idempotent: does nothing if softmax is already patched.
+    """Replace F.softmax, Tensor.softmax, and F.scaled_dot_product_attention
+    with pure-Python implementations that route through torch.exp, so
+    whatever patch is on torch.exp is also used inside softmax.
+
+    This covers all three softmax paths found in TIMM and HuggingFace models:
+      - F.softmax          (Swin, Lambda-ResNet, HF eager attention)
+      - Tensor.softmax     (HaloNet, SeBotNet, CrossViT)
+      - F.scaled_dot_product_attention  (ViT, DeiT — fused SDPA kernel)
+
+    Idempotent: does nothing if softmax is already patched.
     """
     if "softmax" in _original_fns:
         return
+
+    # 1. Patch F.softmax
     original_softmax = F.softmax
-
-    @functools.wraps(original_softmax)
-    def manual_softmax(input: torch.Tensor, dim: int = -1, **kwargs) -> torch.Tensor:
-        x_max = input.max(dim=dim, keepdim=True).values
-        exp_x = torch.exp(input - x_max)
-        return exp_x / exp_x.sum(dim=dim, keepdim=True)
-
     _original_fns["softmax"] = (F, original_softmax)
-    F.softmax = manual_softmax
+    F.softmax = functools.wraps(original_softmax)(_manual_softmax)
+
+    # 2. Patch Tensor.softmax
+    original_tensor_softmax = torch.Tensor.softmax
+    _extra_originals["softmax@Tensor"] = (torch.Tensor, "softmax", original_tensor_softmax)
+    def _tensor_softmax(self, dim=-1, **kwargs):
+        return _manual_softmax(self, dim=dim, **kwargs)
+    torch.Tensor.softmax = _tensor_softmax
+
+    # 3. Patch F.scaled_dot_product_attention with a manual implementation
+    #    that uses the (now-patched) F.softmax → torch.exp path.
+    if hasattr(F, "scaled_dot_product_attention"):
+        original_sdpa = F.scaled_dot_product_attention
+        _extra_originals["sdpa@F"] = (F, "scaled_dot_product_attention", original_sdpa)
+
+        def manual_sdpa(query, key, value, attn_mask=None, dropout_p=0.0,
+                        is_causal=False, scale=None, **kwargs):
+            import math
+            L, S = query.size(-2), key.size(-2)
+            scale = scale or (1.0 / math.sqrt(query.size(-1)))
+            attn_weight = query @ key.transpose(-2, -1) * scale
+            if is_causal:
+                causal_mask = torch.triu(
+                    torch.ones(L, S, dtype=torch.bool, device=query.device), diagonal=1
+                )
+                attn_weight = attn_weight.masked_fill(causal_mask, float("-inf"))
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn_weight = attn_weight.masked_fill(~attn_mask, float("-inf"))
+                else:
+                    attn_weight = attn_weight + attn_mask
+            # This softmax now routes through torch.exp via our patch
+            attn_weight = _manual_softmax(attn_weight, dim=-1)
+            if dropout_p > 0.0:
+                attn_weight = torch.nn.functional.dropout(attn_weight, p=dropout_p)
+            return attn_weight @ value
+
+        F.scaled_dot_product_attention = manual_sdpa
 
 
 def _resolve_module(name: str) -> ModuleType:
@@ -105,6 +167,7 @@ def _build_piecewise_fn(config: AppTemplateConfig) -> Callable:
     compute_dtype = get_compute_dtype(dtype)
     segments      = config.segments
     eval_segment  = _TEMPLATE_FN[config.template_name]
+    precisions    = config.precisions if config.precisions else None
 
     # Pre-convert segment coefficients to CPU tensors once at build time.
     # They are moved to the input device lazily inside the closure so the
@@ -147,7 +210,10 @@ def _build_piecewise_fn(config: AppTemplateConfig) -> Callable:
             else:
                 mask = (x_c > segments[i - 1].end) & (x_c <= seg.end)
 
-            seg_result = eval_segment(x_c, coeffs, dtype).to(compute_dtype)
+            if precisions is not None:
+                seg_result = eval_segment(x_c, coeffs, dtype, precisions).to(compute_dtype)
+            else:
+                seg_result = eval_segment(x_c, coeffs, dtype).to(compute_dtype)
             out = torch.where(mask, seg_result, out)
 
         return out.to(orig_dtype)
@@ -179,11 +245,12 @@ def _build_quantized_fn(
 
     @functools.wraps(original_fn)
     def quantized_fn(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        orig_dtype = x.dtype
         x_q = x.to(dtype)
         if clamp_range is not None:
             x_q = x_q.clamp(*clamp_range)
         out = original_fn(x_q.to(compute_dtype), *args, **kwargs)
-        return out.to(dtype)
+        return out.to(dtype).to(orig_dtype)
 
     return quantized_fn
 
@@ -192,10 +259,65 @@ def _build_quantized_fn(
 # Public API
 # ---------------------------------------------------------------------------
 
+def _bind_extra_entry_points(name: str, replacement_fn: Callable) -> None:
+    """Patch extra entry points (torch.xxx, torch.Tensor.xxx) for *name*.
+
+    Some ops like sigmoid/exp/tanh are callable via F.xxx, torch.xxx, and
+    x.xxx() (tensor method).  nn.Sigmoid calls torch.sigmoid; some models
+    call x.sigmoid().  This ensures all paths are intercepted.
+    """
+    if name not in _MULTI_ENTRY_OPS:
+        return
+
+    # Patch torch.xxx — use the replacement directly (no recursion risk
+    # because torch.xxx typically delegates to Tensor.xxx or a C++ call).
+    torch_key = f"{name}@torch"
+    if torch_key not in _extra_originals and hasattr(torch, name):
+        _extra_originals[torch_key] = (torch, name, getattr(torch, name))
+        setattr(torch, name, replacement_fn)
+
+    # Patch torch.Tensor.xxx (tensor method).
+    # IMPORTANT: we must NOT route through replacement_fn here if it calls
+    # the original F.xxx or torch.xxx, because those may in turn call
+    # input.xxx() → infinite recursion.  Instead, capture the *original*
+    # Tensor method and build an independent wrapper that operates on it
+    # directly.
+    tensor_key = f"{name}@Tensor"
+    if tensor_key not in _extra_originals and hasattr(torch.Tensor, name):
+        orig_tensor_method = getattr(torch.Tensor, name)
+        _extra_originals[tensor_key] = (torch.Tensor, name, orig_tensor_method)
+
+        def _make_tensor_wrapper(orig_t_method, repl_fn):
+            def _wrapper(self, *args, **kwargs):
+                # Call replacement_fn which expects a tensor as first arg.
+                # But replacement_fn might call F.xxx which calls Tensor.xxx
+                # again.  To break the cycle, temporarily restore the original
+                # Tensor method during the call.
+                setattr(torch.Tensor, name, orig_t_method)
+                try:
+                    return repl_fn(self, *args, **kwargs)
+                finally:
+                    setattr(torch.Tensor, name, _wrapper)
+            return _wrapper
+        setattr(torch.Tensor, name, _make_tensor_wrapper(orig_tensor_method, replacement_fn))
+
+
+def _unbind_extra_entry_points(name: str) -> None:
+    """Restore extra entry points for *name*."""
+    for suffix in ["@torch", "@Tensor"]:
+        key = f"{name}{suffix}"
+        if key in _extra_originals:
+            obj, attr, orig = _extra_originals.pop(key)
+            setattr(obj, attr, orig)
+
+
 def bind_approx(name: str, tag: str) -> None:
     """Bind the piecewise approximation for *name*/*tag*.
 
     Looks up the function in torch.nn.functional first, then torch.
+    For ops with multiple entry points (sigmoid, exp, tanh), also patches
+    torch.xxx and torch.Tensor.xxx so that nn.Module wrappers and tensor
+    methods are intercepted.
 
     Parameters
     ----------
@@ -218,6 +340,7 @@ def bind_approx(name: str, tag: str) -> None:
         _original_fns[name] = (mod, original_fn)
 
     setattr(mod, name, approx_fn)
+    _bind_extra_entry_points(name, approx_fn)
 
     if name == "exp" and softmax_via_exp:
         _bind_softmax_via_exp()
@@ -308,7 +431,9 @@ def bind_quantize(name: str, dtype_str: str, tag: str | None = None, clamp: bool
     if name not in _original_fns:
         _original_fns[name] = (mod, original_fn)
 
-    setattr(mod, name, _build_quantized_fn(original_fn, dtype, clamp_range))
+    quantized_fn = _build_quantized_fn(original_fn, dtype, clamp_range)
+    setattr(mod, name, quantized_fn)
+    _bind_extra_entry_points(name, quantized_fn)
 
     if name == "exp" and softmax_via_exp:
         _bind_softmax_via_exp()
@@ -352,6 +477,7 @@ def unbind_approx(name: str) -> None:
     Unbinding ``exp`` also restores ``F.softmax`` if it was patched as a
     consequence of ``softmax_via_exp`` being set.
     """
+    _unbind_extra_entry_points(name)
     if name in _original_fns:
         mod, fn = _original_fns.pop(name)
         setattr(mod, name, fn)
@@ -361,6 +487,10 @@ def unbind_approx(name: str) -> None:
 
 def unbind_all() -> None:
     """Restore all patched functions in torch.nn.functional and torch."""
+    # Restore extra entry points first
+    for key, (obj, attr, orig) in list(_extra_originals.items()):
+        setattr(obj, attr, orig)
+    _extra_originals.clear()
     for name, (mod, fn) in list(_original_fns.items()):
         setattr(mod, name, fn)
     _original_fns.clear()

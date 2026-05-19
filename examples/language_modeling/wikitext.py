@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
-from voyager_compiler.approx.app_binding import bind_all_by_tag, bind_all_quantize, unbind_all
+from voyager_compiler.approx.app_binding import bind_all_by_tag, bind_all_quantize, unbind_all, bind_approx
 from voyager_compiler import (
     ShapeProp,
     add_qspec_args,
@@ -108,8 +108,16 @@ def main(args):
         "use_cache": None,
     }
 
+    # bind_all_by_tag("formal")
+    # bind_approx("silu", "kartik-thesis")
     # bind_all_by_tag("kartik-thesis")
-    # bind_all_quantize('bf16', 'kartik-thesis', clamp=True)
+    import voyager_compiler.approx.app_binding as ab
+    ab.softmax_via_exp = True
+    # bind_all_by_tag("formal")
+    bind_all_by_tag("formal_quad_syn_sol7")
+    # bind_all_by_tag("kartik-thesis")
+    # bind_all_quantize('bf16', 'formal', clamp=True)
+    # bind_all_quantize('bf16', 'kartik-thesis')
 
     # gm = get_aten_graph_module(model, example_args, example_kwargs, dynamic_shapes)
     # gm.graph.print_tabular()
@@ -193,7 +201,7 @@ def main(args):
         prev_end_loc = end_loc
         if end_loc == seq_len:
             break
-    # unbind_all()
+    unbind_all()
 
     ppl = torch.exp(torch.stack(nlls).mean())
 
