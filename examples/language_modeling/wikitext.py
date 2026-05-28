@@ -10,7 +10,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
 from voyager_compiler import (
-    ShapeProp,
     add_qspec_args,
     get_default_quantizer,
     prepare_pt2e,
@@ -63,6 +62,9 @@ def parse_args():
         default=8,
         help='GPU memory reserved for storing activations'
     )
+    parser.add_argument(
+        '--print_graph', action='store_true', help='Print node scope information'
+    )
     add_qspec_args(parser)
     return parser.parse_args()
 
@@ -92,7 +94,7 @@ def main(args):
     )
 
     if (qconfig := QUANTIZATION_CONFIGS.get(args.qconfig)) is not None:
-        set_qconfig(quantizer, qconfig)
+        set_qconfig(quantizer, qconfig, args.force_scale_power_of_two)
 
     input_ids = torch.randint(
         0, model.config.vocab_size, (1, args.max_length), device=device
@@ -100,16 +102,20 @@ def main(args):
     example_args = (input_ids,)
     example_kwargs = {"labels": input_ids.clone(), "use_cache": False}
 
-    seq_len = torch.export.Dim("seq_length", min=3, max=args.max_length)
+    chunk_dim = torch.export.Dim("chunk_dim", min=2, max=args.max_length // 64)
     dynamic_shapes = {
-        "input_ids": {1: seq_len},
-        "labels": {1: seq_len},
+        "input_ids": {1: chunk_dim * 64},
+        "labels": {1: chunk_dim * 64},
         "use_cache": None,
     }
 
-    # gm = get_aten_graph_module(model, example_args, example_kwargs, dynamic_shapes)
-    # gm.graph.print_tabular()
-    # print_node_scope_tabular(gm)
+    if args.print_graph:
+        with torch.no_grad():
+            gm = get_aten_graph_module(model, example_args, example_kwargs, dynamic_shapes)
+        gm.graph.print_tabular()
+        print_node_scope_tabular(gm)
+
+    quantizer.set_module_name("model.rotary_emb", None)
 
     # LLaMA implementation includes @torch.no_grad() statement, which will turn
     # gradient on if capture_pre_autograd_graph is not called with torch.no_grad().
