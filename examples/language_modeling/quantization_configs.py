@@ -81,6 +81,8 @@ QUANTIZATION_CONFIGS = {
 
 def set_qconfig(quantizer, qconfigs, force_scale_power_of_two=False):
     def make_qspec(spec):
+        if spec is None:
+            return None
         quant_spec = QuantizationSpec.from_str(spec)
         quant_spec.observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize.with_args(
             force_scale_power_of_two=force_scale_power_of_two,

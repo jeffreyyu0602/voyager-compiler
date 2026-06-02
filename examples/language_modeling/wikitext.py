@@ -18,7 +18,6 @@ from voyager_compiler import (
     plot_layer_range,
     with_execution_context,
     print_node_scope_tabular,
-    get_aten_graph_module,
     get_device_map,
     dispatch_model,
     insert_align_device_nodes,
@@ -63,120 +62,93 @@ def parse_args():
         help='GPU memory reserved for storing activations'
     )
     parser.add_argument(
-        '--print_graph', action='store_true', help='Print node scope information'
+        '--print_model', action='store_true', help='Print node scope information'
     )
     add_qspec_args(parser)
     return parser.parse_args()
 
 
-@with_execution_context
-def main(args):
-    device = torch.device(f"cuda:{args.gpu}") if args.gpu is not None else None
-    torch_dtype = (
-        args.torch_dtype
-        if args.torch_dtype in ["auto", None]
-        else getattr(torch, args.torch_dtype)
-    )
+def setup_quantized_model(
+    model_id,
+    quantizer,
+    max_length,
+    device=None,
+    dtype=None,
+    reserved_memory=8,
+    print_model=False
+):
+    """Load model, prepare the quantized graph module, and dispatch to GPU(s).
+
+    When device is not None (single GPU), moves the model to that device.
+    When device is None (multi-GPU), dispatches the graph module across available
+    GPUs after prepare_pt2e, reserving reserved_memory GiB per GPU for activations.
+
+    Returns (model, tokenizer).
+    """
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        torch_dtype=torch_dtype,
-        device_map=args.gpu,
-        attn_implementation="eager", # Turn off flash attention
+        model_id,
+        torch_dtype=dtype,
+        attn_implementation="eager",
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    quantizer = get_default_quantizer(
-        input_activation=args.activation,
-        weight=args.weight,
-        bias=args.bias,
-        record_histogram=args.record_histogram,
-        force_scale_power_of_two=args.force_scale_power_of_two,
-    )
-
-    if (qconfig := QUANTIZATION_CONFIGS.get(args.qconfig)) is not None:
-        set_qconfig(quantizer, qconfig, args.force_scale_power_of_two)
+    if device is not None:
+        model.to(device)
 
     input_ids = torch.randint(
-        0, model.config.vocab_size, (1, args.max_length), device=device
+        0, model.config.vocab_size, (1, max_length), device=device
     )
+    labels = input_ids.clone()
     example_args = (input_ids,)
-    example_kwargs = {"labels": input_ids.clone(), "use_cache": False}
-
-    chunk_dim = torch.export.Dim("chunk_dim", min=2, max=args.max_length // 64)
+    example_kwargs = {"labels": labels, "use_cache": False}
+    chunk_dim = torch.export.Dim("chunk_dim", min=2, max=max_length // 64)
     dynamic_shapes = {
         "input_ids": {1: chunk_dim * 64},
         "labels": {1: chunk_dim * 64},
         "use_cache": None,
     }
 
-    if args.print_graph:
-        with torch.no_grad():
-            gm = get_aten_graph_module(model, example_args, example_kwargs, dynamic_shapes)
-        gm.graph.print_tabular()
-        print_node_scope_tabular(gm)
-
-    quantizer.set_module_name("model.rotary_emb", None)
-
-    # LLaMA implementation includes @torch.no_grad() statement, which will turn
-    # gradient on if capture_pre_autograd_graph is not called with torch.no_grad().
     with torch.no_grad():
-        model = prepare_pt2e(
+        gm = prepare_pt2e(
             model, quantizer, example_args, example_kwargs, dynamic_shapes
         )
 
-    sink_obs_or_fq(model)
+    if print_model:
+        gm.graph.print_tabular()
+        print_node_scope_tabular(gm)
 
-    if args.gpu is None:
-        reserved_memory = args.reserved_memory * 1024 ** 3
+    sink_obs_or_fq(gm)
+
+    if device is None:
+        reserved_bytes = reserved_memory * 1024 ** 3
         max_memory = {
-            k: v - reserved_memory for k, v in get_max_memory().items()
-            if isinstance(k, int) and v > reserved_memory
+            k: v - reserved_bytes for k, v in get_max_memory().items()
+            if isinstance(k, int) and v > reserved_bytes
         }
+        device_map = get_device_map(gm, max_memory)
+        dispatch_model(gm, device_map)
 
-        device_map = get_device_map(model, max_memory, verbose=True)
-        dispatch_model(model, device_map)
-
-        for node in list(model.graph.nodes):
+        for node in list(gm.graph.nodes):
             if node.op not in ["placeholder", "output"] and not node.users:
-                model.graph.erase_node(node)
+                gm.graph.erase_node(node)
 
-        insert_align_device_nodes(model, (input_ids, example_kwargs["labels"]))
+        insert_align_device_nodes(gm, (input_ids, labels))
 
-    def calibrate(model):
-        validation = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
-        encodings = tokenizer("\n\n".join(validation["text"]), return_tensors="pt")
-        seq_len = encodings.input_ids.size(1)
-        for i, begin_loc in enumerate(tqdm(range(0, seq_len - args.max_length, args.stride))):
-            end_loc = min(begin_loc + args.max_length, seq_len)
-            input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
-            target_ids = input_ids.clone()
-            with torch.no_grad():
-                model(input_ids, labels=target_ids, use_cache=False)
+    return gm, tokenizer
 
-            if i == args.calibration_steps - 1:
-                break
 
-    if args.calibration_steps > 0:
-        calibrate(model)
-        for module in model.modules():
-            if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
-                module.disable_observer()
+def evaluate_perplexity(model, encodings, max_length, stride, device, num_steps=None):
+    """Sliding-window perplexity evaluation. Returns a scalar tensor.
 
-    if args.convert_model:
-        model = convert_pt2e(model)
-
-    model.graph.print_tabular()
-
-    test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
-
+    If num_steps is set, exits early after that many windows — useful for
+    activation observer calibration (caller can ignore the returned value).
+    """
     seq_len = encodings.input_ids.size(1)
-
     nlls = []
     prev_end_loc = 0
     # Subtract max_length from seq_len to ensure that the last window has length max_length
-    for begin_loc in tqdm(range(0, seq_len - args.max_length, args.stride)):
-        end_loc = min(begin_loc + args.max_length, seq_len)
+    for i, begin_loc in enumerate(tqdm(range(0, seq_len - max_length, stride))):
+        end_loc = min(begin_loc + max_length, seq_len)
         trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
         input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
         target_ids = input_ids.clone()
@@ -188,15 +160,74 @@ def main(args):
             # loss is calculated using CrossEntropyLoss which averages over valid
             # labels N.B. the model only calculates loss over trg_len - 1 labels,
             # because it internally shifts the labels to the left by 1.
-            neg_log_likelihood = outputs.loss
-
-        nlls.append(neg_log_likelihood)
+            nlls.append(outputs.loss)
 
         prev_end_loc = end_loc
-        if end_loc == seq_len:
+        if end_loc == seq_len or (num_steps is not None and i == num_steps - 1):
             break
 
-    ppl = torch.exp(torch.stack(nlls).mean())
+    return torch.exp(torch.stack(nlls).mean())
+
+
+@with_execution_context
+def main(args):
+    device = torch.device(f"cuda:{args.gpu}") if args.gpu is not None else None
+    torch_dtype = (
+        args.torch_dtype
+        if args.torch_dtype in ["auto", None]
+        else getattr(torch, args.torch_dtype)
+    )
+
+    quantizer = get_default_quantizer(
+        input_activation=args.activation,
+        weight=args.weight,
+        bias=args.bias,
+        record_histogram=args.record_histogram,
+        force_scale_power_of_two=args.force_scale_power_of_two,
+    )
+    quantizer.set_module_name("model.rotary_emb", None)
+
+    if (qconfig := QUANTIZATION_CONFIGS.get(args.qconfig)) is not None:
+        set_qconfig(quantizer, qconfig, args.force_scale_power_of_two)
+
+    model, tokenizer = setup_quantized_model(
+        args.model_id,
+        quantizer,
+        args.max_length,
+        device=device,
+        dtype=torch_dtype,
+        reserved_memory=args.reserved_memory,
+        print_model=args.print_model,
+    )
+
+    if args.calibration_steps > 0:
+        validation = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
+        calib_encodings = tokenizer("\n\n".join(validation["text"]), return_tensors="pt")
+
+        evaluate_perplexity(
+            model,
+            calib_encodings,
+            args.max_length,
+            args.stride,
+            device,
+            num_steps=args.calibration_steps,
+        )
+
+        for module in model.modules():
+            if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+                module.disable_observer()
+
+    if args.convert_model:
+        model = convert_pt2e(model)
+
+    model.graph.print_tabular()
+
+    test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    test_encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
+
+    ppl = evaluate_perplexity(
+        model, test_encodings, args.max_length, args.stride, device
+    )
 
     print(f"model:      {args.model_id}")
     print(f"max length: {args.max_length}")

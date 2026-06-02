@@ -1462,21 +1462,34 @@ def gen_code(model, args, output_dir=None):
     return model_params
 
 
+def _wrap_long_name(name: str, max_len: int = 20) -> str:
+    if len(name) <= max_len:
+        return name
+    lines = []
+    start = 0
+    while start + max_len < len(name):
+        end = start + max_len
+        break_at = end
+        for i in range(end, start, -1):
+            if not name[i].isalpha():
+                break_at = i + 1
+                break
+        lines.append(name[start:break_at])
+        start = break_at
+    lines.append(name[start:])
+    return "&#92;n".join(lines)
+
+
 def gen_compute_graph(model, output_file="compute_graph", max_users=10):
     nodes = {}
     edges = []
     named_modules = dict(model.named_modules(remove_duplicate=False))
 
-    def compress(s, max_len=15):
-        if len(s) <= max_len:
-            return s
-        return s[:10] + "…" + s[-6:]
-
     for node in model.graph.nodes:
         if node.op == "get_attr" and "qmap" in node.name:
             continue
 
-        header = compress(node.name)
+        header = _wrap_long_name(node.name)
 
         if isinstance(node.value, torch.Tensor):
             header += f"&#92;n{str(tuple(node.value.shape))}"

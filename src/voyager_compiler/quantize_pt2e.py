@@ -155,7 +155,7 @@ def derive_bias_qparams_fn(obs_or_fqs: List[ObserverOrFakeQuantize]) -> Tuple[Te
 
 
 def get_default_quantizer(
-    input_activation: Optional[QuantizationSpec],
+    input_activation: Optional[QuantizationSpec] = None,
     output_activation: Optional[QuantizationSpec] = None,
     weight: Optional[QuantizationSpec] = None,
     bias: Optional[QuantizationSpec] = None,

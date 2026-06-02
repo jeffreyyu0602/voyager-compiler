@@ -188,28 +188,39 @@ def get_device_map(model: GraphModule, max_memory=None, verbose=False):
     return device_map
 
 
+def _normalize_device(device):
+    """
+    Convert unsupported device_map values such as 'disk' to CPU.
+    """
+    if isinstance(device, int) and torch.cuda.is_available():
+        return torch.device(f"cuda:{device}")
+
+    logger.warning(f"Unsupported device spec {device!r}. Using CPU instead.")
+    return torch.device("cpu")
+
+
 def dispatch_model(model, device_map=None, max_memory=None):
     if device_map is None:
         device_map = infer_auto_device_map(model, max_memory)
 
     for name, param in model.named_parameters():
-        param.data = param.data.to(device_map[name])
+        param.data = param.data.to(_normalize_device(device_map[name]))
 
     for name, child in model.named_children():
         if name in device_map:
-            child.to(device_map[name])
+            child.to(_normalize_device(device_map[name]))
 
     for name, buffer in model.named_buffers(recurse=False):
         if name not in device_map:
             logger.warning(f"Buffer {name} not found in device_map, skipping.")
             continue
-        buffer.data = buffer.data.to(device_map[name])
+        buffer.data = buffer.data.to(_normalize_device(device_map[name]))
 
 
 def deduplicate_nodes(model: torch.fx.GraphModule):
     """
     Deduplicate identical nodes in a torch.fx.Graph. Nodes are considered
-    identical if hey have the same op type, target, args and kwargs
+    identical if they have the same op type, target, args and kwargs
     """
     seen = {}
     mapping = {}
