@@ -35,6 +35,7 @@ from ..banking import (
     require_allocation,
     _get_scope,
 )
+from ..tiler import run_interstellar_dram
 from ...pt2e_utils import WrapperModule, fetch_attr, propagate_shape
 from ...quantize_pt2e import create_getattr_from_value, export_model
 
@@ -1378,7 +1379,7 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
 
     c_tiled = tile_sizes[1]
 
-    if c_tiled < C:
+    if c_tiled < C and c_tiled != C // num_c_tile:
         # Tiling for the first sub-GEMM (no accumulator buffer)
         search_args = {
             **common_args,
@@ -1392,10 +1393,27 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
 
 
 def run_matrix_op_l2_tiling(
-    model, unroll, cache_size=None, num_banks=None, bank_width=None,
+    model,
+    unroll,
+    cache_size=None,
+    num_banks=None,
+    bank_width=None,
+    interstellar_dram_arch=None,
+    interstellar_dram_schedule=None,
+    dram_bandwidth=0,
+    input_dtype_width=8,
+    weight_dtype_width=8,
+    output_dtype_width=8,
+    double_buffered_accum_buffer=False,
+    double_buffered_l2=True,
 ):
     """
     Perform tiling on GEMM operations to fit intermediate data into cache.
+
+    When interstellar_dram_arch/schedule are provided, runs interstellar with a
+    4-level memory hierarchy before each node's L2 heuristic tiling and logs
+    the resulting tile sizes. The interstellar mapping is stored in
+    node.meta["interstellar_dram_tiling"] but does not yet replace the heuristic.
 
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
@@ -1403,6 +1421,12 @@ def run_matrix_op_l2_tiling(
         cache_size (int): Total cache size in bytes.
         num_banks (int, optional): Number of cache banks for bank-aligned tiling.
         bank_width (int, optional): Width of memory for bank-aligned tiling.
+        interstellar_dram_arch: 4-level Resource from build_architecture_and_schedule_with_dram.
+        interstellar_dram_schedule: Matching Schedule object.
+        dram_bandwidth (int): DRAM bandwidth in elements per cycle.
+        input_dtype_width (int): Input tensor element width in bits (default 8).
+        output_dtype_width (int): Output tensor element width in bits (default 8).
+        double_buffered_accum_buffer (bool): Whether the accumulator buffer is double-buffered.
     """
     graph = model.graph
 
@@ -1412,6 +1436,21 @@ def run_matrix_op_l2_tiling(
     bank_size = None if num_banks is None else cache_size // num_banks
 
     for node in list(graph.nodes):
+        if interstellar_dram_arch is not None and (
+            is_conv2d(node) or is_linear(node) or is_matmul(node)
+        ):
+            run_interstellar_dram(
+                node,
+                interstellar_dram_arch,
+                interstellar_dram_schedule,
+                dram_bandwidth,
+                input_dtype_width,
+                weight_dtype_width,
+                output_dtype_width,
+                double_buffered_accum_buffer,
+                double_buffered_l2=double_buffered_l2,
+            )
+
         if is_conv2d(node):
             tile_sizes, tiled_shape = search_conv2d_tiling(
                 node, unroll, cache_size, None, bank_size

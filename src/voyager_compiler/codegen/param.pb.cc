@@ -77,6 +77,59 @@ struct MemoryDefaultTypeInternal {
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 MemoryDefaultTypeInternal _Memory_default_instance_;
 
+inline constexpr LoopBound::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : loop_{static_cast< ::codegen::LoopIndex >(0)},
+        bound_{0},
+        _cached_size_{0} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR LoopBound::LoopBound(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct LoopBoundDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR LoopBoundDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~LoopBoundDefaultTypeInternal() {}
+  union {
+    LoopBound _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 LoopBoundDefaultTypeInternal _LoopBound_default_instance_;
+
+inline constexpr LevelAccessCount::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : input_access_count_{::uint64_t{0u}},
+        output_access_count_{::uint64_t{0u}},
+        weight_access_count_{::uint64_t{0u}},
+        _cached_size_{0} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR LevelAccessCount::LevelAccessCount(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct LevelAccessCountDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR LevelAccessCountDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~LevelAccessCountDefaultTypeInternal() {}
+  union {
+    LevelAccessCount _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 LevelAccessCountDefaultTypeInternal _LevelAccessCount_default_instance_;
+
 inline constexpr IntList::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
       : values_{},
@@ -127,6 +180,31 @@ struct BoolListDefaultTypeInternal {
 
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 BoolListDefaultTypeInternal _BoolList_default_instance_;
+
+inline constexpr LevelTiling::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : loop_bounds_{},
+        _cached_size_{0} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR LevelTiling::LevelTiling(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct LevelTilingDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR LevelTilingDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~LevelTilingDefaultTypeInternal() {}
+  union {
+    LevelTiling _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 LevelTilingDefaultTypeInternal _LevelTiling_default_instance_;
 
 inline constexpr Argument::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
@@ -273,6 +351,35 @@ struct TensorListDefaultTypeInternal {
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 TensorListDefaultTypeInternal _TensorList_default_instance_;
 
+inline constexpr Tiling::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : level_tilings_{},
+        level_access_counts_{},
+        name_(
+            &::google::protobuf::internal::fixed_address_empty_string,
+            ::_pbi::ConstantInitialized()),
+        _cached_size_{0} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR Tiling::Tiling(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct TilingDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR TilingDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~TilingDefaultTypeInternal() {}
+  union {
+    Tiling _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 TilingDefaultTypeInternal _Tiling_default_instance_;
+
 inline constexpr OpOverloadList::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
       : op_list_{},
@@ -334,9 +441,10 @@ PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
 
 inline constexpr Operation::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
-      : op_type_{},
+      : _cached_size_{0},
+        tiling_{nullptr},
+        op_type_{},
         return_type_{},
-        _cached_size_{0},
         _oneof_case_{} {}
 
 template <typename>
@@ -386,8 +494,7 @@ struct ModelDefaultTypeInternal {
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 ModelDefaultTypeInternal _Model_default_instance_;
 }  // namespace codegen
-static constexpr const ::_pb::EnumDescriptor**
-    file_level_enum_descriptors_param_2eproto = nullptr;
+static const ::_pb::EnumDescriptor* file_level_enum_descriptors_param_2eproto[1];
 static constexpr const ::_pb::ServiceDescriptor**
     file_level_service_descriptors_param_2eproto = nullptr;
 const ::uint32_t
@@ -534,6 +641,47 @@ const ::uint32_t
         PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.step_),
         PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.body_),
         ~0u,  // no _has_bits_
+        PROTOBUF_FIELD_OFFSET(::codegen::LoopBound, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::LoopBound, _impl_.loop_),
+        PROTOBUF_FIELD_OFFSET(::codegen::LoopBound, _impl_.bound_),
+        ~0u,  // no _has_bits_
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelTiling, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelTiling, _impl_.loop_bounds_),
+        ~0u,  // no _has_bits_
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelAccessCount, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelAccessCount, _impl_.input_access_count_),
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelAccessCount, _impl_.output_access_count_),
+        PROTOBUF_FIELD_OFFSET(::codegen::LevelAccessCount, _impl_.weight_access_count_),
+        ~0u,  // no _has_bits_
+        PROTOBUF_FIELD_OFFSET(::codegen::Tiling, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::Tiling, _impl_.name_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Tiling, _impl_.level_tilings_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Tiling, _impl_.level_access_counts_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_._has_bits_),
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _internal_metadata_),
         ~0u,  // no _extensions_
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_._oneof_case_[0]),
@@ -546,8 +694,15 @@ const ::uint32_t
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
+        PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.tiling_),
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.op_type_),
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.return_type_),
+        ~0u,
+        ~0u,
+        ~0u,
+        ~0u,
+        ~0u,
+        0,
         ~0u,  // no _has_bits_
         PROTOBUF_FIELD_OFFSET(::codegen::Model, _internal_metadata_),
         ~0u,  // no _extensions_
@@ -574,8 +729,12 @@ static const ::_pbi::MigrationSchema
         {104, -1, -1, sizeof(::codegen::OpOverload)},
         {117, -1, -1, sizeof(::codegen::OpOverloadList)},
         {127, -1, -1, sizeof(::codegen::Loop)},
-        {140, -1, -1, sizeof(::codegen::Operation)},
-        {155, -1, -1, sizeof(::codegen::Model)},
+        {140, -1, -1, sizeof(::codegen::LoopBound)},
+        {150, -1, -1, sizeof(::codegen::LevelTiling)},
+        {159, -1, -1, sizeof(::codegen::LevelAccessCount)},
+        {170, -1, -1, sizeof(::codegen::Tiling)},
+        {181, 197, -1, sizeof(::codegen::Operation)},
+        {203, -1, -1, sizeof(::codegen::Model)},
 };
 static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_Memory_default_instance_._instance,
@@ -589,6 +748,10 @@ static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_OpOverload_default_instance_._instance,
     &::codegen::_OpOverloadList_default_instance_._instance,
     &::codegen::_Loop_default_instance_._instance,
+    &::codegen::_LoopBound_default_instance_._instance,
+    &::codegen::_LevelTiling_default_instance_._instance,
+    &::codegen::_LevelAccessCount_default_instance_._instance,
+    &::codegen::_Tiling_default_instance_._instance,
     &::codegen::_Operation_default_instance_._instance,
     &::codegen::_Model_default_instance_._instance,
 };
@@ -624,28 +787,39 @@ const char descriptor_table_protodef_param_2eproto[] ABSL_ATTRIBUTE_SECTION_VARI
     "(\t\022$\n\007op_list\030\002 \003(\0132\023.codegen.OpOverload"
     "\"`\n\004Loop\022\014\n\004node\030\001 \001(\t\022\r\n\005start\030\002 \001(\005\022\013\n"
     "\003end\030\003 \001(\005\022\014\n\004step\030\004 \001(\005\022 \n\004body\030\005 \003(\0132\022"
-    ".codegen.Operation\"\337\001\n\tOperation\022!\n\002op\030\001"
-    " \001(\0132\023.codegen.OpOverloadH\000\022+\n\010fused_op\030"
-    "\002 \001(\0132\027.codegen.OpOverloadListH\000\022\035\n\004loop"
-    "\030\003 \001(\0132\r.codegen.LoopH\000\022!\n\006output\030\004 \001(\0132"
-    "\017.codegen.TensorH\001\022&\n\007outputs\030\005 \001(\0132\023.co"
-    "degen.TensorListH\001B\t\n\007op_typeB\r\n\013return_"
-    "type\"n\n\005Model\022\037\n\006inputs\030\001 \003(\0132\017.codegen."
-    "Tensor\022#\n\nparameters\030\002 \003(\0132\017.codegen.Ten"
-    "sor\022\037\n\003ops\030\003 \003(\0132\022.codegen.Operationb\006pr"
-    "oto3"
+    ".codegen.Operation\"<\n\tLoopBound\022 \n\004loop\030"
+    "\001 \001(\0162\022.codegen.LoopIndex\022\r\n\005bound\030\002 \001(\005"
+    "\"6\n\013LevelTiling\022\'\n\013loop_bounds\030\001 \003(\0132\022.c"
+    "odegen.LoopBound\"h\n\020LevelAccessCount\022\032\n\022"
+    "input_access_count\030\001 \001(\004\022\033\n\023output_acces"
+    "s_count\030\002 \001(\004\022\033\n\023weight_access_count\030\003 \001"
+    "(\004\"{\n\006Tiling\022\014\n\004name\030\001 \001(\t\022+\n\rlevel_tili"
+    "ngs\030\002 \003(\0132\024.codegen.LevelTiling\0226\n\023level"
+    "_access_counts\030\003 \003(\0132\031.codegen.LevelAcce"
+    "ssCount\"\220\002\n\tOperation\022!\n\002op\030\001 \001(\0132\023.code"
+    "gen.OpOverloadH\000\022+\n\010fused_op\030\002 \001(\0132\027.cod"
+    "egen.OpOverloadListH\000\022\035\n\004loop\030\003 \001(\0132\r.co"
+    "degen.LoopH\000\022!\n\006output\030\004 \001(\0132\017.codegen.T"
+    "ensorH\001\022&\n\007outputs\030\005 \001(\0132\023.codegen.Tenso"
+    "rListH\001\022$\n\006tiling\030\006 \001(\0132\017.codegen.Tiling"
+    "H\002\210\001\001B\t\n\007op_typeB\r\n\013return_typeB\t\n\007_tili"
+    "ng\"n\n\005Model\022\037\n\006inputs\030\001 \003(\0132\017.codegen.Te"
+    "nsor\022#\n\nparameters\030\002 \003(\0132\017.codegen.Tenso"
+    "r\022\037\n\003ops\030\003 \003(\0132\022.codegen.Operation*C\n\tLo"
+    "opIndex\022\006\n\002FX\020\000\022\006\n\002FY\020\001\022\006\n\002OX\020\002\022\006\n\002OY\020\003\022"
+    "\006\n\002OC\020\004\022\006\n\002IC\020\005\022\006\n\002ON\020\006b\006proto3"
 };
 static ::absl::once_flag descriptor_table_param_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_param_2eproto = {
     false,
     false,
-    1564,
+    2031,
     descriptor_table_protodef_param_2eproto,
     "param.proto",
     &descriptor_table_param_2eproto_once,
     nullptr,
     0,
-    13,
+    17,
     schemas,
     file_default_instances,
     TableStruct_param_2eproto::offsets,
@@ -653,6 +827,15 @@ PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_param_2eproto 
     file_level_service_descriptors_param_2eproto,
 };
 namespace codegen {
+const ::google::protobuf::EnumDescriptor* LoopIndex_descriptor() {
+  ::google::protobuf::internal::AssignDescriptors(&descriptor_table_param_2eproto);
+  return file_level_enum_descriptors_param_2eproto[0];
+}
+PROTOBUF_CONSTINIT const uint32_t LoopIndex_internal_data_[] = {
+    458752u, 0u, };
+bool LoopIndex_IsValid(int value) {
+  return 0 <= value && value <= 6;
+}
 // ===================================================================
 
 class Memory::_Internal {
@@ -4154,8 +4337,1070 @@ void Loop::InternalSwap(Loop* PROTOBUF_RESTRICT other) {
 }
 // ===================================================================
 
+class LoopBound::_Internal {
+ public:
+};
+
+LoopBound::LoopBound(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.LoopBound)
+}
+LoopBound::LoopBound(
+    ::google::protobuf::Arena* arena, const LoopBound& from)
+    : LoopBound(arena) {
+  MergeFrom(from);
+}
+inline PROTOBUF_NDEBUG_INLINE LoopBound::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : _cached_size_{0} {}
+
+inline void LoopBound::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  ::memset(reinterpret_cast<char *>(&_impl_) +
+               offsetof(Impl_, loop_),
+           0,
+           offsetof(Impl_, bound_) -
+               offsetof(Impl_, loop_) +
+               sizeof(Impl_::bound_));
+}
+LoopBound::~LoopBound() {
+  // @@protoc_insertion_point(destructor:codegen.LoopBound)
+  SharedDtor(*this);
+}
+inline void LoopBound::SharedDtor(MessageLite& self) {
+  LoopBound& this_ = static_cast<LoopBound&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.~Impl_();
+}
+
+inline void* LoopBound::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) LoopBound(arena);
+}
+constexpr auto LoopBound::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::ZeroInit(sizeof(LoopBound),
+                                            alignof(LoopBound));
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull LoopBound::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_LoopBound_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &LoopBound::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<LoopBound>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &LoopBound::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<LoopBound>(), &LoopBound::ByteSizeLong,
+            &LoopBound::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(LoopBound, _impl_._cached_size_),
+        false,
+    },
+    &LoopBound::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* LoopBound::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<1, 2, 0, 0, 2> LoopBound::_table_ = {
+  {
+    0,  // no _has_bits_
+    0, // no _extensions_
+    2, 8,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967292,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    2,  // num_field_entries
+    0,  // num_aux_entries
+    offsetof(decltype(_table_), field_names),  // no aux_entries
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::LoopBound>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    // int32 bound = 2;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(LoopBound, _impl_.bound_), 63>(),
+     {16, 63, 0, PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.bound_)}},
+    // .codegen.LoopIndex loop = 1;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint32_t, offsetof(LoopBound, _impl_.loop_), 63>(),
+     {8, 63, 0, PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.loop_)}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // .codegen.LoopIndex loop = 1;
+    {PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.loop_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kOpenEnum)},
+    // int32 bound = 2;
+    {PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.bound_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kInt32)},
+  }},
+  // no aux_entries
+  {{
+  }},
+};
+
+PROTOBUF_NOINLINE void LoopBound::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.LoopBound)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  ::memset(&_impl_.loop_, 0, static_cast<::size_t>(
+      reinterpret_cast<char*>(&_impl_.bound_) -
+      reinterpret_cast<char*>(&_impl_.loop_)) + sizeof(_impl_.bound_));
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* LoopBound::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const LoopBound& this_ = static_cast<const LoopBound&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* LoopBound::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const LoopBound& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.LoopBound)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          // .codegen.LoopIndex loop = 1;
+          if (this_._internal_loop() != 0) {
+            target = stream->EnsureSpace(target);
+            target = ::_pbi::WireFormatLite::WriteEnumToArray(
+                1, this_._internal_loop(), target);
+          }
+
+          // int32 bound = 2;
+          if (this_._internal_bound() != 0) {
+            target = ::google::protobuf::internal::WireFormatLite::
+                WriteInt32ToArrayWithField<2>(
+                    stream, this_._internal_bound(), target);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.LoopBound)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t LoopBound::ByteSizeLong(const MessageLite& base) {
+          const LoopBound& this_ = static_cast<const LoopBound&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t LoopBound::ByteSizeLong() const {
+          const LoopBound& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.LoopBound)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // .codegen.LoopIndex loop = 1;
+            if (this_._internal_loop() != 0) {
+              total_size += 1 +
+                            ::_pbi::WireFormatLite::EnumSize(this_._internal_loop());
+            }
+            // int32 bound = 2;
+            if (this_._internal_bound() != 0) {
+              total_size += ::_pbi::WireFormatLite::Int32SizePlusOne(
+                  this_._internal_bound());
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void LoopBound::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<LoopBound*>(&to_msg);
+  auto& from = static_cast<const LoopBound&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.LoopBound)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  if (from._internal_loop() != 0) {
+    _this->_impl_.loop_ = from._impl_.loop_;
+  }
+  if (from._internal_bound() != 0) {
+    _this->_impl_.bound_ = from._impl_.bound_;
+  }
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void LoopBound::CopyFrom(const LoopBound& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.LoopBound)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void LoopBound::InternalSwap(LoopBound* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  ::google::protobuf::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.bound_)
+      + sizeof(LoopBound::_impl_.bound_)
+      - PROTOBUF_FIELD_OFFSET(LoopBound, _impl_.loop_)>(
+          reinterpret_cast<char*>(&_impl_.loop_),
+          reinterpret_cast<char*>(&other->_impl_.loop_));
+}
+
+::google::protobuf::Metadata LoopBound::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+class LevelTiling::_Internal {
+ public:
+};
+
+LevelTiling::LevelTiling(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.LevelTiling)
+}
+inline PROTOBUF_NDEBUG_INLINE LevelTiling::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility, ::google::protobuf::Arena* arena,
+    const Impl_& from, const ::codegen::LevelTiling& from_msg)
+      : loop_bounds_{visibility, arena, from.loop_bounds_},
+        _cached_size_{0} {}
+
+LevelTiling::LevelTiling(
+    ::google::protobuf::Arena* arena,
+    const LevelTiling& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  LevelTiling* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+
+  // @@protoc_insertion_point(copy_constructor:codegen.LevelTiling)
+}
+inline PROTOBUF_NDEBUG_INLINE LevelTiling::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : loop_bounds_{visibility, arena},
+        _cached_size_{0} {}
+
+inline void LevelTiling::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+}
+LevelTiling::~LevelTiling() {
+  // @@protoc_insertion_point(destructor:codegen.LevelTiling)
+  SharedDtor(*this);
+}
+inline void LevelTiling::SharedDtor(MessageLite& self) {
+  LevelTiling& this_ = static_cast<LevelTiling&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.~Impl_();
+}
+
+inline void* LevelTiling::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) LevelTiling(arena);
+}
+constexpr auto LevelTiling::InternalNewImpl_() {
+  constexpr auto arena_bits = ::google::protobuf::internal::EncodePlacementArenaOffsets({
+      PROTOBUF_FIELD_OFFSET(LevelTiling, _impl_.loop_bounds_) +
+          decltype(LevelTiling::_impl_.loop_bounds_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+  });
+  if (arena_bits.has_value()) {
+    return ::google::protobuf::internal::MessageCreator::ZeroInit(
+        sizeof(LevelTiling), alignof(LevelTiling), *arena_bits);
+  } else {
+    return ::google::protobuf::internal::MessageCreator(&LevelTiling::PlacementNew_,
+                                 sizeof(LevelTiling),
+                                 alignof(LevelTiling));
+  }
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull LevelTiling::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_LevelTiling_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &LevelTiling::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<LevelTiling>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &LevelTiling::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<LevelTiling>(), &LevelTiling::ByteSizeLong,
+            &LevelTiling::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(LevelTiling, _impl_._cached_size_),
+        false,
+    },
+    &LevelTiling::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* LevelTiling::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<0, 1, 1, 0, 2> LevelTiling::_table_ = {
+  {
+    0,  // no _has_bits_
+    0, // no _extensions_
+    1, 0,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967294,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    1,  // num_field_entries
+    1,  // num_aux_entries
+    offsetof(decltype(_table_), aux_entries),
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::LevelTiling>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    // repeated .codegen.LoopBound loop_bounds = 1;
+    {::_pbi::TcParser::FastMtR1,
+     {10, 63, 0, PROTOBUF_FIELD_OFFSET(LevelTiling, _impl_.loop_bounds_)}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // repeated .codegen.LoopBound loop_bounds = 1;
+    {PROTOBUF_FIELD_OFFSET(LevelTiling, _impl_.loop_bounds_), 0, 0,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+  }}, {{
+    {::_pbi::TcParser::GetTable<::codegen::LoopBound>()},
+  }}, {{
+  }},
+};
+
+PROTOBUF_NOINLINE void LevelTiling::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.LevelTiling)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.loop_bounds_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* LevelTiling::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const LevelTiling& this_ = static_cast<const LevelTiling&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* LevelTiling::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const LevelTiling& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.LevelTiling)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          // repeated .codegen.LoopBound loop_bounds = 1;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_loop_bounds_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_loop_bounds().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    1, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.LevelTiling)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t LevelTiling::ByteSizeLong(const MessageLite& base) {
+          const LevelTiling& this_ = static_cast<const LevelTiling&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t LevelTiling::ByteSizeLong() const {
+          const LevelTiling& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.LevelTiling)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // repeated .codegen.LoopBound loop_bounds = 1;
+            {
+              total_size += 1UL * this_._internal_loop_bounds_size();
+              for (const auto& msg : this_._internal_loop_bounds()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void LevelTiling::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<LevelTiling*>(&to_msg);
+  auto& from = static_cast<const LevelTiling&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.LevelTiling)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  _this->_internal_mutable_loop_bounds()->MergeFrom(
+      from._internal_loop_bounds());
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void LevelTiling::CopyFrom(const LevelTiling& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.LevelTiling)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void LevelTiling::InternalSwap(LevelTiling* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  _impl_.loop_bounds_.InternalSwap(&other->_impl_.loop_bounds_);
+}
+
+::google::protobuf::Metadata LevelTiling::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+class LevelAccessCount::_Internal {
+ public:
+};
+
+LevelAccessCount::LevelAccessCount(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.LevelAccessCount)
+}
+LevelAccessCount::LevelAccessCount(
+    ::google::protobuf::Arena* arena, const LevelAccessCount& from)
+    : LevelAccessCount(arena) {
+  MergeFrom(from);
+}
+inline PROTOBUF_NDEBUG_INLINE LevelAccessCount::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : _cached_size_{0} {}
+
+inline void LevelAccessCount::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  ::memset(reinterpret_cast<char *>(&_impl_) +
+               offsetof(Impl_, input_access_count_),
+           0,
+           offsetof(Impl_, weight_access_count_) -
+               offsetof(Impl_, input_access_count_) +
+               sizeof(Impl_::weight_access_count_));
+}
+LevelAccessCount::~LevelAccessCount() {
+  // @@protoc_insertion_point(destructor:codegen.LevelAccessCount)
+  SharedDtor(*this);
+}
+inline void LevelAccessCount::SharedDtor(MessageLite& self) {
+  LevelAccessCount& this_ = static_cast<LevelAccessCount&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.~Impl_();
+}
+
+inline void* LevelAccessCount::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) LevelAccessCount(arena);
+}
+constexpr auto LevelAccessCount::InternalNewImpl_() {
+  return ::google::protobuf::internal::MessageCreator::ZeroInit(sizeof(LevelAccessCount),
+                                            alignof(LevelAccessCount));
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull LevelAccessCount::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_LevelAccessCount_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &LevelAccessCount::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<LevelAccessCount>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &LevelAccessCount::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<LevelAccessCount>(), &LevelAccessCount::ByteSizeLong,
+            &LevelAccessCount::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_._cached_size_),
+        false,
+    },
+    &LevelAccessCount::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* LevelAccessCount::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<2, 3, 0, 0, 2> LevelAccessCount::_table_ = {
+  {
+    0,  // no _has_bits_
+    0, // no _extensions_
+    3, 24,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967288,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    3,  // num_field_entries
+    0,  // num_aux_entries
+    offsetof(decltype(_table_), field_names),  // no aux_entries
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::LevelAccessCount>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    {::_pbi::TcParser::MiniParse, {}},
+    // uint64 input_access_count = 1;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(LevelAccessCount, _impl_.input_access_count_), 63>(),
+     {8, 63, 0, PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.input_access_count_)}},
+    // uint64 output_access_count = 2;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(LevelAccessCount, _impl_.output_access_count_), 63>(),
+     {16, 63, 0, PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.output_access_count_)}},
+    // uint64 weight_access_count = 3;
+    {::_pbi::TcParser::SingularVarintNoZag1<::uint64_t, offsetof(LevelAccessCount, _impl_.weight_access_count_), 63>(),
+     {24, 63, 0, PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.weight_access_count_)}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // uint64 input_access_count = 1;
+    {PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.input_access_count_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kUInt64)},
+    // uint64 output_access_count = 2;
+    {PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.output_access_count_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kUInt64)},
+    // uint64 weight_access_count = 3;
+    {PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.weight_access_count_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kUInt64)},
+  }},
+  // no aux_entries
+  {{
+  }},
+};
+
+PROTOBUF_NOINLINE void LevelAccessCount::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.LevelAccessCount)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  ::memset(&_impl_.input_access_count_, 0, static_cast<::size_t>(
+      reinterpret_cast<char*>(&_impl_.weight_access_count_) -
+      reinterpret_cast<char*>(&_impl_.input_access_count_)) + sizeof(_impl_.weight_access_count_));
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* LevelAccessCount::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const LevelAccessCount& this_ = static_cast<const LevelAccessCount&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* LevelAccessCount::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const LevelAccessCount& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.LevelAccessCount)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          // uint64 input_access_count = 1;
+          if (this_._internal_input_access_count() != 0) {
+            target = stream->EnsureSpace(target);
+            target = ::_pbi::WireFormatLite::WriteUInt64ToArray(
+                1, this_._internal_input_access_count(), target);
+          }
+
+          // uint64 output_access_count = 2;
+          if (this_._internal_output_access_count() != 0) {
+            target = stream->EnsureSpace(target);
+            target = ::_pbi::WireFormatLite::WriteUInt64ToArray(
+                2, this_._internal_output_access_count(), target);
+          }
+
+          // uint64 weight_access_count = 3;
+          if (this_._internal_weight_access_count() != 0) {
+            target = stream->EnsureSpace(target);
+            target = ::_pbi::WireFormatLite::WriteUInt64ToArray(
+                3, this_._internal_weight_access_count(), target);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.LevelAccessCount)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t LevelAccessCount::ByteSizeLong(const MessageLite& base) {
+          const LevelAccessCount& this_ = static_cast<const LevelAccessCount&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t LevelAccessCount::ByteSizeLong() const {
+          const LevelAccessCount& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.LevelAccessCount)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // uint64 input_access_count = 1;
+            if (this_._internal_input_access_count() != 0) {
+              total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(
+                  this_._internal_input_access_count());
+            }
+            // uint64 output_access_count = 2;
+            if (this_._internal_output_access_count() != 0) {
+              total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(
+                  this_._internal_output_access_count());
+            }
+            // uint64 weight_access_count = 3;
+            if (this_._internal_weight_access_count() != 0) {
+              total_size += ::_pbi::WireFormatLite::UInt64SizePlusOne(
+                  this_._internal_weight_access_count());
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void LevelAccessCount::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<LevelAccessCount*>(&to_msg);
+  auto& from = static_cast<const LevelAccessCount&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.LevelAccessCount)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  if (from._internal_input_access_count() != 0) {
+    _this->_impl_.input_access_count_ = from._impl_.input_access_count_;
+  }
+  if (from._internal_output_access_count() != 0) {
+    _this->_impl_.output_access_count_ = from._impl_.output_access_count_;
+  }
+  if (from._internal_weight_access_count() != 0) {
+    _this->_impl_.weight_access_count_ = from._impl_.weight_access_count_;
+  }
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void LevelAccessCount::CopyFrom(const LevelAccessCount& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.LevelAccessCount)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void LevelAccessCount::InternalSwap(LevelAccessCount* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  ::google::protobuf::internal::memswap<
+      PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.weight_access_count_)
+      + sizeof(LevelAccessCount::_impl_.weight_access_count_)
+      - PROTOBUF_FIELD_OFFSET(LevelAccessCount, _impl_.input_access_count_)>(
+          reinterpret_cast<char*>(&_impl_.input_access_count_),
+          reinterpret_cast<char*>(&other->_impl_.input_access_count_));
+}
+
+::google::protobuf::Metadata LevelAccessCount::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
+class Tiling::_Internal {
+ public:
+};
+
+Tiling::Tiling(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.Tiling)
+}
+inline PROTOBUF_NDEBUG_INLINE Tiling::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility, ::google::protobuf::Arena* arena,
+    const Impl_& from, const ::codegen::Tiling& from_msg)
+      : level_tilings_{visibility, arena, from.level_tilings_},
+        level_access_counts_{visibility, arena, from.level_access_counts_},
+        name_(arena, from.name_),
+        _cached_size_{0} {}
+
+Tiling::Tiling(
+    ::google::protobuf::Arena* arena,
+    const Tiling& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  Tiling* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+
+  // @@protoc_insertion_point(copy_constructor:codegen.Tiling)
+}
+inline PROTOBUF_NDEBUG_INLINE Tiling::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : level_tilings_{visibility, arena},
+        level_access_counts_{visibility, arena},
+        name_(arena),
+        _cached_size_{0} {}
+
+inline void Tiling::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+}
+Tiling::~Tiling() {
+  // @@protoc_insertion_point(destructor:codegen.Tiling)
+  SharedDtor(*this);
+}
+inline void Tiling::SharedDtor(MessageLite& self) {
+  Tiling& this_ = static_cast<Tiling&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  this_._impl_.name_.Destroy();
+  this_._impl_.~Impl_();
+}
+
+inline void* Tiling::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) Tiling(arena);
+}
+constexpr auto Tiling::InternalNewImpl_() {
+  constexpr auto arena_bits = ::google::protobuf::internal::EncodePlacementArenaOffsets({
+      PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_tilings_) +
+          decltype(Tiling::_impl_.level_tilings_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+      PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_access_counts_) +
+          decltype(Tiling::_impl_.level_access_counts_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+  });
+  if (arena_bits.has_value()) {
+    return ::google::protobuf::internal::MessageCreator::CopyInit(
+        sizeof(Tiling), alignof(Tiling), *arena_bits);
+  } else {
+    return ::google::protobuf::internal::MessageCreator(&Tiling::PlacementNew_,
+                                 sizeof(Tiling),
+                                 alignof(Tiling));
+  }
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull Tiling::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_Tiling_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &Tiling::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<Tiling>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &Tiling::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<Tiling>(), &Tiling::ByteSizeLong,
+            &Tiling::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(Tiling, _impl_._cached_size_),
+        false,
+    },
+    &Tiling::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* Tiling::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<2, 3, 2, 27, 2> Tiling::_table_ = {
+  {
+    0,  // no _has_bits_
+    0, // no _extensions_
+    3, 24,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967288,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    3,  // num_field_entries
+    2,  // num_aux_entries
+    offsetof(decltype(_table_), aux_entries),
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::Tiling>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    {::_pbi::TcParser::MiniParse, {}},
+    // string name = 1;
+    {::_pbi::TcParser::FastUS1,
+     {10, 63, 0, PROTOBUF_FIELD_OFFSET(Tiling, _impl_.name_)}},
+    // repeated .codegen.LevelTiling level_tilings = 2;
+    {::_pbi::TcParser::FastMtR1,
+     {18, 63, 0, PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_tilings_)}},
+    // repeated .codegen.LevelAccessCount level_access_counts = 3;
+    {::_pbi::TcParser::FastMtR1,
+     {26, 63, 1, PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_access_counts_)}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // string name = 1;
+    {PROTOBUF_FIELD_OFFSET(Tiling, _impl_.name_), 0, 0,
+    (0 | ::_fl::kFcSingular | ::_fl::kUtf8String | ::_fl::kRepAString)},
+    // repeated .codegen.LevelTiling level_tilings = 2;
+    {PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_tilings_), 0, 0,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+    // repeated .codegen.LevelAccessCount level_access_counts = 3;
+    {PROTOBUF_FIELD_OFFSET(Tiling, _impl_.level_access_counts_), 0, 1,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+  }}, {{
+    {::_pbi::TcParser::GetTable<::codegen::LevelTiling>()},
+    {::_pbi::TcParser::GetTable<::codegen::LevelAccessCount>()},
+  }}, {{
+    "\16\4\0\0\0\0\0\0"
+    "codegen.Tiling"
+    "name"
+  }},
+};
+
+PROTOBUF_NOINLINE void Tiling::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.Tiling)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.level_tilings_.Clear();
+  _impl_.level_access_counts_.Clear();
+  _impl_.name_.ClearToEmpty();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* Tiling::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const Tiling& this_ = static_cast<const Tiling&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* Tiling::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const Tiling& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.Tiling)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          // string name = 1;
+          if (!this_._internal_name().empty()) {
+            const std::string& _s = this_._internal_name();
+            ::google::protobuf::internal::WireFormatLite::VerifyUtf8String(
+                _s.data(), static_cast<int>(_s.length()), ::google::protobuf::internal::WireFormatLite::SERIALIZE, "codegen.Tiling.name");
+            target = stream->WriteStringMaybeAliased(1, _s, target);
+          }
+
+          // repeated .codegen.LevelTiling level_tilings = 2;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_level_tilings_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_level_tilings().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    2, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          // repeated .codegen.LevelAccessCount level_access_counts = 3;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_level_access_counts_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_level_access_counts().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    3, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.Tiling)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t Tiling::ByteSizeLong(const MessageLite& base) {
+          const Tiling& this_ = static_cast<const Tiling&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t Tiling::ByteSizeLong() const {
+          const Tiling& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.Tiling)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // repeated .codegen.LevelTiling level_tilings = 2;
+            {
+              total_size += 1UL * this_._internal_level_tilings_size();
+              for (const auto& msg : this_._internal_level_tilings()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+            // repeated .codegen.LevelAccessCount level_access_counts = 3;
+            {
+              total_size += 1UL * this_._internal_level_access_counts_size();
+              for (const auto& msg : this_._internal_level_access_counts()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+          }
+           {
+            // string name = 1;
+            if (!this_._internal_name().empty()) {
+              total_size += 1 + ::google::protobuf::internal::WireFormatLite::StringSize(
+                                              this_._internal_name());
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void Tiling::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<Tiling*>(&to_msg);
+  auto& from = static_cast<const Tiling&>(from_msg);
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.Tiling)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  _this->_internal_mutable_level_tilings()->MergeFrom(
+      from._internal_level_tilings());
+  _this->_internal_mutable_level_access_counts()->MergeFrom(
+      from._internal_level_access_counts());
+  if (!from._internal_name().empty()) {
+    _this->_internal_set_name(from._internal_name());
+  }
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void Tiling::CopyFrom(const Tiling& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.Tiling)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void Tiling::InternalSwap(Tiling* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  auto* arena = GetArena();
+  ABSL_DCHECK_EQ(arena, other->GetArena());
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  _impl_.level_tilings_.InternalSwap(&other->_impl_.level_tilings_);
+  _impl_.level_access_counts_.InternalSwap(&other->_impl_.level_access_counts_);
+  ::_pbi::ArenaStringPtr::InternalSwap(&_impl_.name_, &other->_impl_.name_, arena);
+}
+
+::google::protobuf::Metadata Tiling::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
 class Operation::_Internal {
  public:
+  using HasBits =
+      decltype(std::declval<Operation>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(Operation, _impl_._has_bits_);
   static constexpr ::int32_t kOneofCaseOffset =
       PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_._oneof_case_);
 };
@@ -4237,9 +5482,10 @@ Operation::Operation(::google::protobuf::Arena* arena)
 inline PROTOBUF_NDEBUG_INLINE Operation::Impl_::Impl_(
     ::google::protobuf::internal::InternalVisibility visibility, ::google::protobuf::Arena* arena,
     const Impl_& from, const ::codegen::Operation& from_msg)
-      : op_type_{},
-        return_type_{},
+      : _has_bits_{from._has_bits_},
         _cached_size_{0},
+        op_type_{},
+        return_type_{},
         _oneof_case_{from._oneof_case_[0], from._oneof_case_[1]} {}
 
 Operation::Operation(
@@ -4255,6 +5501,10 @@ Operation::Operation(
   _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
       from._internal_metadata_);
   new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  ::uint32_t cached_has_bits = _impl_._has_bits_[0];
+  _impl_.tiling_ = (cached_has_bits & 0x00000001u) ? ::google::protobuf::Message::CopyConstruct<::codegen::Tiling>(
+                              arena, *from._impl_.tiling_)
+                        : nullptr;
   switch (op_type_case()) {
     case OP_TYPE_NOT_SET:
       break;
@@ -4284,13 +5534,14 @@ Operation::Operation(
 inline PROTOBUF_NDEBUG_INLINE Operation::Impl_::Impl_(
     ::google::protobuf::internal::InternalVisibility visibility,
     ::google::protobuf::Arena* arena)
-      : op_type_{},
+      : _cached_size_{0},
+        op_type_{},
         return_type_{},
-        _cached_size_{0},
         _oneof_case_{} {}
 
 inline void Operation::SharedCtor(::_pb::Arena* arena) {
   new (&_impl_) Impl_(internal_visibility(), arena);
+  _impl_.tiling_ = {};
 }
 Operation::~Operation() {
   // @@protoc_insertion_point(destructor:codegen.Operation)
@@ -4300,6 +5551,7 @@ inline void Operation::SharedDtor(MessageLite& self) {
   Operation& this_ = static_cast<Operation&>(self);
   this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
   ABSL_DCHECK(this_.GetArena() == nullptr);
+  delete this_._impl_.tiling_;
   if (this_.has_op_type()) {
     this_.clear_op_type();
   }
@@ -4408,16 +5660,16 @@ const ::google::protobuf::internal::ClassData* Operation::GetClassData() const {
   return _class_data_.base();
 }
 PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
-const ::_pbi::TcParseTable<0, 5, 5, 0, 2> Operation::_table_ = {
+const ::_pbi::TcParseTable<0, 6, 6, 0, 2> Operation::_table_ = {
   {
-    0,  // no _has_bits_
+    PROTOBUF_FIELD_OFFSET(Operation, _impl_._has_bits_),
     0, // no _extensions_
-    5, 0,  // max_field_number, fast_idx_mask
+    6, 0,  // max_field_number, fast_idx_mask
     offsetof(decltype(_table_), field_lookup_table),
-    4294967264,  // skipmap
+    4294967232,  // skipmap
     offsetof(decltype(_table_), field_entries),
-    5,  // num_field_entries
-    5,  // num_aux_entries
+    6,  // num_field_entries
+    6,  // num_aux_entries
     offsetof(decltype(_table_), aux_entries),
     _class_data_.base(),
     nullptr,  // post_loop_handler
@@ -4426,7 +5678,9 @@ const ::_pbi::TcParseTable<0, 5, 5, 0, 2> Operation::_table_ = {
     ::_pbi::TcParser::GetTable<::codegen::Operation>(),  // to_prefetch
     #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
   }, {{
-    {::_pbi::TcParser::MiniParse, {}},
+    // optional .codegen.Tiling tiling = 6;
+    {::_pbi::TcParser::FastMtS1,
+     {50, 0, 5, PROTOBUF_FIELD_OFFSET(Operation, _impl_.tiling_)}},
   }}, {{
     65535, 65535
   }}, {{
@@ -4445,12 +5699,16 @@ const ::_pbi::TcParseTable<0, 5, 5, 0, 2> Operation::_table_ = {
     // .codegen.TensorList outputs = 5;
     {PROTOBUF_FIELD_OFFSET(Operation, _impl_.return_type_.outputs_), _Internal::kOneofCaseOffset + 4, 4,
     (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
+    // optional .codegen.Tiling tiling = 6;
+    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.tiling_), _Internal::kHasBitsOffset + 0, 5,
+    (0 | ::_fl::kFcOptional | ::_fl::kMessage | ::_fl::kTvTable)},
   }}, {{
     {::_pbi::TcParser::GetTable<::codegen::OpOverload>()},
     {::_pbi::TcParser::GetTable<::codegen::OpOverloadList>()},
     {::_pbi::TcParser::GetTable<::codegen::Loop>()},
     {::_pbi::TcParser::GetTable<::codegen::Tensor>()},
     {::_pbi::TcParser::GetTable<::codegen::TensorList>()},
+    {::_pbi::TcParser::GetTable<::codegen::Tiling>()},
   }}, {{
   }},
 };
@@ -4462,8 +5720,14 @@ PROTOBUF_NOINLINE void Operation::Clear() {
   // Prevent compiler warnings about cached_has_bits being unused
   (void) cached_has_bits;
 
+  cached_has_bits = _impl_._has_bits_[0];
+  if (cached_has_bits & 0x00000001u) {
+    ABSL_DCHECK(_impl_.tiling_ != nullptr);
+    _impl_.tiling_->Clear();
+  }
   clear_op_type();
   clear_return_type();
+  _impl_._has_bits_.Clear();
   _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
 }
 
@@ -4520,6 +5784,14 @@ PROTOBUF_NOINLINE void Operation::Clear() {
             default:
               break;
           }
+          cached_has_bits = this_._impl_._has_bits_[0];
+          // optional .codegen.Tiling tiling = 6;
+          if (cached_has_bits & 0x00000001u) {
+            target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                6, *this_._impl_.tiling_, this_._impl_.tiling_->GetCachedSize(), target,
+                stream);
+          }
+
           if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
             target =
                 ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
@@ -4543,6 +5815,14 @@ PROTOBUF_NOINLINE void Operation::Clear() {
           // Prevent compiler warnings about cached_has_bits being unused
           (void)cached_has_bits;
 
+           {
+            // optional .codegen.Tiling tiling = 6;
+            cached_has_bits = this_._impl_._has_bits_[0];
+            if (cached_has_bits & 0x00000001u) {
+              total_size += 1 +
+                            ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.tiling_);
+            }
+          }
           switch (this_.op_type_case()) {
             // .codegen.OpOverload op = 1;
             case kOp: {
@@ -4596,6 +5876,17 @@ void Operation::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::googl
   ::uint32_t cached_has_bits = 0;
   (void) cached_has_bits;
 
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (cached_has_bits & 0x00000001u) {
+    ABSL_DCHECK(from._impl_.tiling_ != nullptr);
+    if (_this->_impl_.tiling_ == nullptr) {
+      _this->_impl_.tiling_ =
+          ::google::protobuf::Message::CopyConstruct<::codegen::Tiling>(arena, *from._impl_.tiling_);
+    } else {
+      _this->_impl_.tiling_->MergeFrom(*from._impl_.tiling_);
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
   if (const uint32_t oneof_from_case = from._impl_._oneof_case_[0]) {
     const uint32_t oneof_to_case = _this->_impl_._oneof_case_[0];
     const bool oneof_needs_init = oneof_to_case != oneof_from_case;
@@ -4685,6 +5976,8 @@ void Operation::CopyFrom(const Operation& from) {
 void Operation::InternalSwap(Operation* PROTOBUF_RESTRICT other) {
   using std::swap;
   _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  swap(_impl_.tiling_, other->_impl_.tiling_);
   swap(_impl_.op_type_, other->_impl_.op_type_);
   swap(_impl_.return_type_, other->_impl_.return_type_);
   swap(_impl_._oneof_case_[0], other->_impl_._oneof_case_[0]);

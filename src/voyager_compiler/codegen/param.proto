@@ -66,6 +66,37 @@ message Loop {
   repeated Operation body = 5; // The recursive body
 }
 
+enum LoopIndex {
+  FX = 0;
+  FY = 1;
+  OX = 2;
+  OY = 3;
+  OC = 4;
+  IC = 5;
+  ON = 6;
+}
+
+message LoopBound {
+  LoopIndex loop = 1;
+  int32 bound = 2;
+}
+
+message LevelTiling {
+  repeated LoopBound loop_bounds = 1;
+}
+
+message LevelAccessCount {
+  uint64 input_access_count = 1;
+  uint64 output_access_count = 2;
+  uint64 weight_access_count = 3;
+}
+
+message Tiling {
+  string name = 1;
+  repeated LevelTiling level_tilings = 2;
+  repeated LevelAccessCount level_access_counts = 3;
+}
+
 message Operation {
   oneof op_type {
     OpOverload op = 1;
@@ -77,6 +108,8 @@ message Operation {
     Tensor output = 4;
     TensorList outputs = 5;
   }
+
+  optional Tiling tiling = 6;
 }
 
 // Represents a torch.fx.Graph

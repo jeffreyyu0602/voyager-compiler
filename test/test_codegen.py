@@ -208,6 +208,55 @@ if __name__ == "__main__":
         help="Number of banks in the accelerator."
     )
     parser.add_argument(
+        "--input_buffer_size",
+        type=int,
+        default=1024,
+        help="Input buffer size per IC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--weight_buffer_size",
+        type=int,
+        default=1024,
+        help="Weight buffer size per OC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--accum_buffer_size",
+        type=int,
+        default=1024,
+        help="Accum buffer size per OC dim (in # elements).",
+    )
+    parser.add_argument(
+        "--double_buffered_accum_buffer",
+        action="store_true",
+        help="Use double-buffered accumulation buffer for interstellar tiling.",
+    )
+    parser.add_argument(
+        "--double_buffered_l2",
+        action="store_true",
+        help=(
+            "Overlap DRAM I/O with compute (ping-pong). "
+            "Halves the effective L2 capacity seen by the tiling optimizer."
+        ),
+    )
+    parser.add_argument(
+        "--dram_size",
+        type=int,
+        default=16 * 1024 ** 3,
+        help="DRAM capacity in bytes. When set, runs interstellar with a 4-level memory hierarchy.",
+    )
+    parser.add_argument(
+        "--dram_bandwidth",
+        type=float,
+        default=200.0,
+        help="DRAM bandwidth in GB/s.",
+    )
+    parser.add_argument(
+        "--frequency",
+        type=float,
+        default=1.0,
+        help="Accelerator clock frequency in GHz. Used with --dram_bandwidth to compute bandwidth in input elements per cycle.",
+    )
+    parser.add_argument(
         "--transform_layout",
         action="store_true",
         help=(
@@ -298,6 +347,40 @@ if __name__ == "__main__":
         )
     )
 
+    # Convert DRAM bandwidth from GB/s to input elements per cycle.
+    # GB/s and GHz share the same 1e9 factor, so they cancel:
+    #   elem/cycle = (bandwidth_GBs * 1e9 B/s) / (freq_GHz * 1e9 Hz * elem_bytes)
+    #              = bandwidth_GBs / (freq_GHz * elem_bytes)
+    if args.dram_bandwidth > 0 and args.activation is not None:
+        import re as _re
+        _dtype_str = args.activation.split(",")[0]
+        _bits_match = _re.search(r"(\d+)", _dtype_str)
+        _input_bits = int(_bits_match.group(1)) if _bits_match else 8
+        _input_elem_bytes = _input_bits / 8
+        dram_bandwidth_elem_per_cycle = int(
+            args.dram_bandwidth / (args.frequency * _input_elem_bytes)
+        )
+    else:
+        dram_bandwidth_elem_per_cycle = int(args.dram_bandwidth)
+
+    interstellar_dram_arch = None
+    interstellar_dram_schedule = None
+    if args.dram_size is not None and args.hardware_unrolling is not None:
+        from voyager_compiler.codegen.tiler import build_architecture_and_schedule_with_dram
+        (
+            interstellar_dram_arch,
+            interstellar_dram_schedule,
+        ) = build_architecture_and_schedule_with_dram(
+            ic_dim=args.hardware_unrolling[0],
+            oc_dim=args.hardware_unrolling[1],
+            l2_cache_size=args.cache_size * 2,
+            input_buffer_size=args.input_buffer_size,
+            weight_buffer_size=args.weight_buffer_size,
+            accum_buffer_size=args.accum_buffer_size,
+            dram_size=args.dram_size,
+            double_buffered_l2=args.double_buffered_l2,
+        )
+
     transform_args = {
         "patterns": VECTOR_PIPELINE,
         "transform_layout": args.transform_layout,
@@ -307,6 +390,11 @@ if __name__ == "__main__":
         "unroll_dims": args.hardware_unrolling,
         "fuse_reshape": fuse_reshape,
         "split_spmm": args.split_spmm,
+        "interstellar_dram_arch": interstellar_dram_arch,
+        "interstellar_dram_schedule": interstellar_dram_schedule,
+        "dram_bandwidth": dram_bandwidth_elem_per_cycle,
+        "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
+        "double_buffered_l2": args.double_buffered_l2,
     }
 
     compile_args = {
@@ -317,6 +405,10 @@ if __name__ == "__main__":
         "output_dir": args.model_output_dir,
         "output_file": args.model,
         "dump_tensors": args.dump_tensors,
+        "input_buffer_size": args.input_buffer_size,
+        "weight_buffer_size": args.weight_buffer_size,
+        "accum_buffer_size": args.accum_buffer_size,
+        "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
     }
 
     if args.model in models.__dict__:
@@ -781,32 +873,84 @@ if __name__ == "__main__":
         new_output = gm(*example_args)
 
         compile(gm, example_args, **compile_args)
-    elif args.model == "mamba":
+    elif args.model == "mamba_prefill" or args.model == "mamba_decode":
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers.models.mamba.modeling_mamba import MambaCache
 
         if args.model_name_or_path is None:
             args.model_name_or_path = "state-spaces/mamba-130m-hf"
 
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path).eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
+        ).eval()
 
-        if args.bf16:
-            model.bfloat16()
+        context_length = args.context_length
+        input_ids = torch.randint(low=0, high=tokenizer.vocab_size, size=(1, context_length))
 
-        input_ids = torch.randint(low=0, high=tokenizer.vocab_size, size=(1, 2))
-        example_args = (input_ids,)
-        example_kwargs = {"use_cache": False, "return_dict": False}
+        if args.model == "mamba_decode":
+            # Run prefill to populate SSM conv/ssm states
+            with torch.no_grad():
+                prefill_out = model(input_ids, return_dict=True, use_cache=True)
+                cache = prefill_out.cache_params
+                decode_input = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+
+            # Register each layer's conv and SSM states as model buffers so they
+            # appear as constant tensors in the exported graph
+            num_layers = model.config.num_hidden_layers
+            for i in range(num_layers):
+                model.register_buffer(f"conv_state_{i}", cache.conv_states[i], persistent=False)
+                model.register_buffer(f"ssm_state_{i}", cache.ssm_states[i], persistent=False)
+                # Redirect the cache lists to the same underlying tensors
+                cache.conv_states[i] = getattr(model, f"conv_state_{i}")
+                cache.ssm_states[i] = getattr(model, f"ssm_state_{i}")
+
+            # Store cache on the backbone so it can be accessed without being
+            # passed as an export input (MambaCache is not a pytree-compatible type)
+            model.backbone._static_cache = cache
+
+            _orig_backbone_fwd = model.backbone.forward
+
+            def _patched_backbone_fwd(
+                input_ids=None, inputs_embeds=None, cache_params=None, use_cache=None,
+                output_hidden_states=None, return_dict=None, cache_position=None,
+                attention_mask=None, **kwargs,
+            ):
+                if use_cache and cache_params is None:
+                    cache_params = model.backbone._static_cache
+                # Pass use_cache=False so MambaCache is not included in the output
+                # tuple (it is not a pytree-compatible type and would break export)
+                return _orig_backbone_fwd(
+                    input_ids=input_ids, inputs_embeds=inputs_embeds,
+                    cache_params=cache_params, use_cache=False,
+                    output_hidden_states=output_hidden_states, return_dict=False,
+                    cache_position=cache_position, attention_mask=attention_mask,
+                    **kwargs,
+                )
+
+            model.backbone.forward = _patched_backbone_fwd
+
+            cache_position = torch.tensor([context_length], dtype=torch.long)
+            example_args = (decode_input,)
+            example_kwargs = {"cache_position": cache_position, "return_dict": False, "use_cache": True}
+        else:
+            example_args = (input_ids,)
+            example_kwargs = {"return_dict": False, "use_cache": False}
 
         gm = prepare_pt2e(model, quantizer, example_args, example_kwargs)
 
+        for _ in range(2):
+            gm(*example_args, **example_kwargs)
+
         convert_pt2e(gm, args.bias)
 
-        old_output = gm(input_ids, False, False)[0]
+        old_output = gm(*example_args, **example_kwargs)[0]
 
-        transform(gm, example_args, example_kwargs, patterns=VECTOR_PIPELINE)
+        transform(gm, example_args, example_kwargs, **transform_args)
         gm.graph.print_tabular()
 
-        new_output = gm(input_ids, False, False)[0]
+        new_output = gm(*example_args, **example_kwargs)[0]
 
         compile(gm, example_args, example_kwargs, **compile_args)
     else:

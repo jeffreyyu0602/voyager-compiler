@@ -246,7 +246,7 @@ def deduplicate_nodes(model: torch.fx.GraphModule):
             seen[key] = node
 
     for old, new in mapping.items():
-        logger.info(f"Deduplicated {old} to {new}")
+        logger.debug(f"Deduplicated {old} to {new}")
 
     named_modules = dict(model.named_modules())
 

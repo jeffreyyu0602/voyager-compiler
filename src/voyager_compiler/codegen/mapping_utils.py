@@ -10,7 +10,17 @@ import torch
 from torch.fx import Node
 from torch.fx.operator_schemas import normalize_function
 
-from .param_pb2 import Argument, OpOverload, Tensor
+import interstellar
+from .param_pb2 import (
+    Argument,
+    OpOverload,
+    Tensor,
+    Tiling,
+    LevelTiling,
+    LoopBound,
+    LevelAccessCount,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +176,38 @@ def set_output_field(param, node, output_dir):
             param.outputs.tensors.append(tensor)
     else:
         logger.warning(f"Unsupported output type: {type(node.value)}")
+
+
+def build_tiling_proto(node):
+    """Convert node.meta['interstellar_tiling'] to a Tiling proto."""
+    mapping, access_list = node.meta["interstellar_tiling"]
+    architecture = node.meta["interstellar_architecture"]
+    tiling = Tiling(name=node.name)
+
+    for level in range(1, architecture.num_levels):  # skip level 0 (PE)
+        lt = LevelTiling()
+        loop_index = 0
+        while loop_index < interstellar.le.NUM:
+            matched = False
+            for loop in range(interstellar.le.NUM):
+                if mapping.loop_orders[loop][level] == loop_index:
+                    lt.loop_bounds.append(LoopBound(
+                        loop=loop,
+                        bound=mapping.loop_blockings[loop][level],
+                    ))
+                    loop_index += 1
+                    matched = True
+                    break
+            if not matched:
+                break
+        tiling.level_tilings.append(lt)
+        tiling.level_access_counts.append(LevelAccessCount(
+            input_access_count=int(access_list[level][0]),
+            output_access_count=int(access_list[level][1]),
+            weight_access_count=int(access_list[level][2]),
+        ))
+
+    return tiling
 
 
 def convert_arg(value, output_dir=None) -> Argument:

@@ -31,6 +31,7 @@
 #include "google/protobuf/map.h"  // IWYU pragma: export
 #include "google/protobuf/map_entry.h"
 #include "google/protobuf/map_field_inl.h"
+#include "google/protobuf/generated_enum_reflection.h"
 #include "google/protobuf/unknown_field_set.h"
 // @@protoc_insertion_point(includes)
 
@@ -64,9 +65,18 @@ extern BoolListDefaultTypeInternal _BoolList_default_instance_;
 class IntList;
 struct IntListDefaultTypeInternal;
 extern IntListDefaultTypeInternal _IntList_default_instance_;
+class LevelAccessCount;
+struct LevelAccessCountDefaultTypeInternal;
+extern LevelAccessCountDefaultTypeInternal _LevelAccessCount_default_instance_;
+class LevelTiling;
+struct LevelTilingDefaultTypeInternal;
+extern LevelTilingDefaultTypeInternal _LevelTiling_default_instance_;
 class Loop;
 struct LoopDefaultTypeInternal;
 extern LoopDefaultTypeInternal _Loop_default_instance_;
+class LoopBound;
+struct LoopBoundDefaultTypeInternal;
+extern LoopBoundDefaultTypeInternal _LoopBound_default_instance_;
 class Memory;
 struct MemoryDefaultTypeInternal;
 extern MemoryDefaultTypeInternal _Memory_default_instance_;
@@ -94,6 +104,9 @@ extern TensorDefaultTypeInternal _Tensor_default_instance_;
 class TensorList;
 struct TensorListDefaultTypeInternal;
 extern TensorListDefaultTypeInternal _TensorList_default_instance_;
+class Tiling;
+struct TilingDefaultTypeInternal;
+extern TilingDefaultTypeInternal _Tiling_default_instance_;
 }  // namespace codegen
 namespace google {
 namespace protobuf {
@@ -101,6 +114,44 @@ namespace protobuf {
 }  // namespace google
 
 namespace codegen {
+enum LoopIndex : int {
+  FX = 0,
+  FY = 1,
+  OX = 2,
+  OY = 3,
+  OC = 4,
+  IC = 5,
+  ON = 6,
+  LoopIndex_INT_MIN_SENTINEL_DO_NOT_USE_ =
+      std::numeric_limits<::int32_t>::min(),
+  LoopIndex_INT_MAX_SENTINEL_DO_NOT_USE_ =
+      std::numeric_limits<::int32_t>::max(),
+};
+
+bool LoopIndex_IsValid(int value);
+extern const uint32_t LoopIndex_internal_data_[];
+constexpr LoopIndex LoopIndex_MIN = static_cast<LoopIndex>(0);
+constexpr LoopIndex LoopIndex_MAX = static_cast<LoopIndex>(6);
+constexpr int LoopIndex_ARRAYSIZE = 6 + 1;
+const ::google::protobuf::EnumDescriptor*
+LoopIndex_descriptor();
+template <typename T>
+const std::string& LoopIndex_Name(T value) {
+  static_assert(std::is_same<T, LoopIndex>::value ||
+                    std::is_integral<T>::value,
+                "Incorrect type passed to LoopIndex_Name().");
+  return LoopIndex_Name(static_cast<LoopIndex>(value));
+}
+template <>
+inline const std::string& LoopIndex_Name(LoopIndex value) {
+  return ::google::protobuf::internal::NameOfDenseEnum<LoopIndex_descriptor,
+                                                 0, 6>(
+      static_cast<int>(value));
+}
+inline bool LoopIndex_Parse(absl::string_view name, LoopIndex* value) {
+  return ::google::protobuf::internal::ParseNamedEnum<LoopIndex>(
+      LoopIndex_descriptor(), name, value);
+}
 
 // ===================================================================
 
@@ -507,6 +558,422 @@ class Memory final : public ::google::protobuf::Message
 };
 // -------------------------------------------------------------------
 
+class LoopBound final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.LoopBound) */ {
+ public:
+  inline LoopBound() : LoopBound(nullptr) {}
+  ~LoopBound() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(LoopBound* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(LoopBound));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR LoopBound(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline LoopBound(const LoopBound& from) : LoopBound(nullptr, from) {}
+  inline LoopBound(LoopBound&& from) noexcept
+      : LoopBound(nullptr, std::move(from)) {}
+  inline LoopBound& operator=(const LoopBound& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline LoopBound& operator=(LoopBound&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const LoopBound& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const LoopBound* internal_default_instance() {
+    return reinterpret_cast<const LoopBound*>(
+        &_LoopBound_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 11;
+  friend void swap(LoopBound& a, LoopBound& b) { a.Swap(&b); }
+  inline void Swap(LoopBound* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(LoopBound* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  LoopBound* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<LoopBound>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const LoopBound& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const LoopBound& from) { LoopBound::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(LoopBound* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.LoopBound"; }
+
+ protected:
+  explicit LoopBound(::google::protobuf::Arena* arena);
+  LoopBound(::google::protobuf::Arena* arena, const LoopBound& from);
+  LoopBound(::google::protobuf::Arena* arena, LoopBound&& from) noexcept
+      : LoopBound(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kLoopFieldNumber = 1,
+    kBoundFieldNumber = 2,
+  };
+  // .codegen.LoopIndex loop = 1;
+  void clear_loop() ;
+  ::codegen::LoopIndex loop() const;
+  void set_loop(::codegen::LoopIndex value);
+
+  private:
+  ::codegen::LoopIndex _internal_loop() const;
+  void _internal_set_loop(::codegen::LoopIndex value);
+
+  public:
+  // int32 bound = 2;
+  void clear_bound() ;
+  ::int32_t bound() const;
+  void set_bound(::int32_t value);
+
+  private:
+  ::int32_t _internal_bound() const;
+  void _internal_set_bound(::int32_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:codegen.LoopBound)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      1, 2, 0,
+      0, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const LoopBound& from_msg);
+    int loop_;
+    ::int32_t bound_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
+class LevelAccessCount final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.LevelAccessCount) */ {
+ public:
+  inline LevelAccessCount() : LevelAccessCount(nullptr) {}
+  ~LevelAccessCount() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(LevelAccessCount* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(LevelAccessCount));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR LevelAccessCount(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline LevelAccessCount(const LevelAccessCount& from) : LevelAccessCount(nullptr, from) {}
+  inline LevelAccessCount(LevelAccessCount&& from) noexcept
+      : LevelAccessCount(nullptr, std::move(from)) {}
+  inline LevelAccessCount& operator=(const LevelAccessCount& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline LevelAccessCount& operator=(LevelAccessCount&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const LevelAccessCount& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const LevelAccessCount* internal_default_instance() {
+    return reinterpret_cast<const LevelAccessCount*>(
+        &_LevelAccessCount_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 13;
+  friend void swap(LevelAccessCount& a, LevelAccessCount& b) { a.Swap(&b); }
+  inline void Swap(LevelAccessCount* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(LevelAccessCount* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  LevelAccessCount* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<LevelAccessCount>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const LevelAccessCount& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const LevelAccessCount& from) { LevelAccessCount::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(LevelAccessCount* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.LevelAccessCount"; }
+
+ protected:
+  explicit LevelAccessCount(::google::protobuf::Arena* arena);
+  LevelAccessCount(::google::protobuf::Arena* arena, const LevelAccessCount& from);
+  LevelAccessCount(::google::protobuf::Arena* arena, LevelAccessCount&& from) noexcept
+      : LevelAccessCount(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kInputAccessCountFieldNumber = 1,
+    kOutputAccessCountFieldNumber = 2,
+    kWeightAccessCountFieldNumber = 3,
+  };
+  // uint64 input_access_count = 1;
+  void clear_input_access_count() ;
+  ::uint64_t input_access_count() const;
+  void set_input_access_count(::uint64_t value);
+
+  private:
+  ::uint64_t _internal_input_access_count() const;
+  void _internal_set_input_access_count(::uint64_t value);
+
+  public:
+  // uint64 output_access_count = 2;
+  void clear_output_access_count() ;
+  ::uint64_t output_access_count() const;
+  void set_output_access_count(::uint64_t value);
+
+  private:
+  ::uint64_t _internal_output_access_count() const;
+  void _internal_set_output_access_count(::uint64_t value);
+
+  public:
+  // uint64 weight_access_count = 3;
+  void clear_weight_access_count() ;
+  ::uint64_t weight_access_count() const;
+  void set_weight_access_count(::uint64_t value);
+
+  private:
+  ::uint64_t _internal_weight_access_count() const;
+  void _internal_set_weight_access_count(::uint64_t value);
+
+  public:
+  // @@protoc_insertion_point(class_scope:codegen.LevelAccessCount)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      2, 3, 0,
+      0, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const LevelAccessCount& from_msg);
+    ::uint64_t input_access_count_;
+    ::uint64_t output_access_count_;
+    ::uint64_t weight_access_count_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
 class IntList final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:codegen.IntList) */ {
  public:
@@ -896,6 +1363,203 @@ class BoolList final : public ::google::protobuf::Message
                           ::google::protobuf::Arena* arena, const Impl_& from,
                           const BoolList& from_msg);
     ::google::protobuf::RepeatedField<bool> values_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
+class LevelTiling final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.LevelTiling) */ {
+ public:
+  inline LevelTiling() : LevelTiling(nullptr) {}
+  ~LevelTiling() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(LevelTiling* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(LevelTiling));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR LevelTiling(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline LevelTiling(const LevelTiling& from) : LevelTiling(nullptr, from) {}
+  inline LevelTiling(LevelTiling&& from) noexcept
+      : LevelTiling(nullptr, std::move(from)) {}
+  inline LevelTiling& operator=(const LevelTiling& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline LevelTiling& operator=(LevelTiling&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const LevelTiling& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const LevelTiling* internal_default_instance() {
+    return reinterpret_cast<const LevelTiling*>(
+        &_LevelTiling_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 12;
+  friend void swap(LevelTiling& a, LevelTiling& b) { a.Swap(&b); }
+  inline void Swap(LevelTiling* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(LevelTiling* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  LevelTiling* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<LevelTiling>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const LevelTiling& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const LevelTiling& from) { LevelTiling::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(LevelTiling* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.LevelTiling"; }
+
+ protected:
+  explicit LevelTiling(::google::protobuf::Arena* arena);
+  LevelTiling(::google::protobuf::Arena* arena, const LevelTiling& from);
+  LevelTiling(::google::protobuf::Arena* arena, LevelTiling&& from) noexcept
+      : LevelTiling(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kLoopBoundsFieldNumber = 1,
+  };
+  // repeated .codegen.LoopBound loop_bounds = 1;
+  int loop_bounds_size() const;
+  private:
+  int _internal_loop_bounds_size() const;
+
+  public:
+  void clear_loop_bounds() ;
+  ::codegen::LoopBound* mutable_loop_bounds(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>* mutable_loop_bounds();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>& _internal_loop_bounds() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>* _internal_mutable_loop_bounds();
+  public:
+  const ::codegen::LoopBound& loop_bounds(int index) const;
+  ::codegen::LoopBound* add_loop_bounds();
+  const ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>& loop_bounds() const;
+  // @@protoc_insertion_point(class_scope:codegen.LevelTiling)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      0, 1, 1,
+      0, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const LevelTiling& from_msg);
+    ::google::protobuf::RepeatedPtrField< ::codegen::LoopBound > loop_bounds_;
     ::google::protobuf::internal::CachedSize _cached_size_;
     PROTOBUF_TSAN_DECLARE_MEMBER
   };
@@ -2140,6 +2804,240 @@ class TensorList final : public ::google::protobuf::Message
 };
 // -------------------------------------------------------------------
 
+class Tiling final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.Tiling) */ {
+ public:
+  inline Tiling() : Tiling(nullptr) {}
+  ~Tiling() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(Tiling* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(Tiling));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR Tiling(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline Tiling(const Tiling& from) : Tiling(nullptr, from) {}
+  inline Tiling(Tiling&& from) noexcept
+      : Tiling(nullptr, std::move(from)) {}
+  inline Tiling& operator=(const Tiling& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline Tiling& operator=(Tiling&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const Tiling& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const Tiling* internal_default_instance() {
+    return reinterpret_cast<const Tiling*>(
+        &_Tiling_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 14;
+  friend void swap(Tiling& a, Tiling& b) { a.Swap(&b); }
+  inline void Swap(Tiling* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(Tiling* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  Tiling* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<Tiling>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const Tiling& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const Tiling& from) { Tiling::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(Tiling* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.Tiling"; }
+
+ protected:
+  explicit Tiling(::google::protobuf::Arena* arena);
+  Tiling(::google::protobuf::Arena* arena, const Tiling& from);
+  Tiling(::google::protobuf::Arena* arena, Tiling&& from) noexcept
+      : Tiling(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kLevelTilingsFieldNumber = 2,
+    kLevelAccessCountsFieldNumber = 3,
+    kNameFieldNumber = 1,
+  };
+  // repeated .codegen.LevelTiling level_tilings = 2;
+  int level_tilings_size() const;
+  private:
+  int _internal_level_tilings_size() const;
+
+  public:
+  void clear_level_tilings() ;
+  ::codegen::LevelTiling* mutable_level_tilings(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>* mutable_level_tilings();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>& _internal_level_tilings() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>* _internal_mutable_level_tilings();
+  public:
+  const ::codegen::LevelTiling& level_tilings(int index) const;
+  ::codegen::LevelTiling* add_level_tilings();
+  const ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>& level_tilings() const;
+  // repeated .codegen.LevelAccessCount level_access_counts = 3;
+  int level_access_counts_size() const;
+  private:
+  int _internal_level_access_counts_size() const;
+
+  public:
+  void clear_level_access_counts() ;
+  ::codegen::LevelAccessCount* mutable_level_access_counts(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>* mutable_level_access_counts();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>& _internal_level_access_counts() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>* _internal_mutable_level_access_counts();
+  public:
+  const ::codegen::LevelAccessCount& level_access_counts(int index) const;
+  ::codegen::LevelAccessCount* add_level_access_counts();
+  const ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>& level_access_counts() const;
+  // string name = 1;
+  void clear_name() ;
+  const std::string& name() const;
+  template <typename Arg_ = const std::string&, typename... Args_>
+  void set_name(Arg_&& arg, Args_... args);
+  std::string* mutable_name();
+  PROTOBUF_NODISCARD std::string* release_name();
+  void set_allocated_name(std::string* value);
+
+  private:
+  const std::string& _internal_name() const;
+  inline PROTOBUF_ALWAYS_INLINE void _internal_set_name(
+      const std::string& value);
+  std::string* _internal_mutable_name();
+
+  public:
+  // @@protoc_insertion_point(class_scope:codegen.Tiling)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      2, 3, 2,
+      27, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const Tiling& from_msg);
+    ::google::protobuf::RepeatedPtrField< ::codegen::LevelTiling > level_tilings_;
+    ::google::protobuf::RepeatedPtrField< ::codegen::LevelAccessCount > level_access_counts_;
+    ::google::protobuf::internal::ArenaStringPtr name_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
 class OpOverloadList final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:codegen.OpOverloadList) */ {
  public:
@@ -2676,7 +3574,7 @@ class Operation final : public ::google::protobuf::Message
     return reinterpret_cast<const Operation*>(
         &_Operation_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 11;
+  static constexpr int kIndexInFileMessages = 15;
   friend void swap(Operation& a, Operation& b) { a.Swap(&b); }
   inline void Swap(Operation* other) {
     if (other == this) return;
@@ -2763,12 +3661,28 @@ class Operation final : public ::google::protobuf::Message
 
   // accessors -------------------------------------------------------
   enum : int {
+    kTilingFieldNumber = 6,
     kOpFieldNumber = 1,
     kFusedOpFieldNumber = 2,
     kLoopFieldNumber = 3,
     kOutputFieldNumber = 4,
     kOutputsFieldNumber = 5,
   };
+  // optional .codegen.Tiling tiling = 6;
+  bool has_tiling() const;
+  void clear_tiling() ;
+  const ::codegen::Tiling& tiling() const;
+  PROTOBUF_NODISCARD ::codegen::Tiling* release_tiling();
+  ::codegen::Tiling* mutable_tiling();
+  void set_allocated_tiling(::codegen::Tiling* value);
+  void unsafe_arena_set_allocated_tiling(::codegen::Tiling* value);
+  ::codegen::Tiling* unsafe_arena_release_tiling();
+
+  private:
+  const ::codegen::Tiling& _internal_tiling() const;
+  ::codegen::Tiling* _internal_mutable_tiling();
+
+  public:
   // .codegen.OpOverload op = 1;
   bool has_op() const;
   private:
@@ -2882,7 +3796,7 @@ class Operation final : public ::google::protobuf::Message
   inline void clear_has_return_type();
   friend class ::google::protobuf::internal::TcParser;
   static const ::google::protobuf::internal::TcParseTable<
-      0, 5, 5,
+      0, 6, 6,
       0, 2>
       _table_;
 
@@ -2900,6 +3814,9 @@ class Operation final : public ::google::protobuf::Message
     inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
                           ::google::protobuf::Arena* arena, const Impl_& from,
                           const Operation& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::codegen::Tiling* tiling_;
     union OpTypeUnion {
       constexpr OpTypeUnion() : _constinit_{} {}
       ::google::protobuf::internal::ConstantInitialized _constinit_;
@@ -2913,7 +3830,6 @@ class Operation final : public ::google::protobuf::Message
       ::codegen::Tensor* output_;
       ::codegen::TensorList* outputs_;
     } return_type_;
-    ::google::protobuf::internal::CachedSize _cached_size_;
     ::uint32_t _oneof_case_[2];
     PROTOBUF_TSAN_DECLARE_MEMBER
   };
@@ -2981,7 +3897,7 @@ class Model final : public ::google::protobuf::Message
     return reinterpret_cast<const Model*>(
         &_Model_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 12;
+  static constexpr int kIndexInFileMessages = 16;
   friend void swap(Model& a, Model& b) { a.Swap(&b); }
   inline void Swap(Model* other) {
     if (other == this) return;
@@ -5146,6 +6062,327 @@ Loop::_internal_mutable_body() {
 
 // -------------------------------------------------------------------
 
+// LoopBound
+
+// .codegen.LoopIndex loop = 1;
+inline void LoopBound::clear_loop() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.loop_ = 0;
+}
+inline ::codegen::LoopIndex LoopBound::loop() const {
+  // @@protoc_insertion_point(field_get:codegen.LoopBound.loop)
+  return _internal_loop();
+}
+inline void LoopBound::set_loop(::codegen::LoopIndex value) {
+  _internal_set_loop(value);
+  // @@protoc_insertion_point(field_set:codegen.LoopBound.loop)
+}
+inline ::codegen::LoopIndex LoopBound::_internal_loop() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return static_cast<::codegen::LoopIndex>(_impl_.loop_);
+}
+inline void LoopBound::_internal_set_loop(::codegen::LoopIndex value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.loop_ = value;
+}
+
+// int32 bound = 2;
+inline void LoopBound::clear_bound() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.bound_ = 0;
+}
+inline ::int32_t LoopBound::bound() const {
+  // @@protoc_insertion_point(field_get:codegen.LoopBound.bound)
+  return _internal_bound();
+}
+inline void LoopBound::set_bound(::int32_t value) {
+  _internal_set_bound(value);
+  // @@protoc_insertion_point(field_set:codegen.LoopBound.bound)
+}
+inline ::int32_t LoopBound::_internal_bound() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.bound_;
+}
+inline void LoopBound::_internal_set_bound(::int32_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.bound_ = value;
+}
+
+// -------------------------------------------------------------------
+
+// LevelTiling
+
+// repeated .codegen.LoopBound loop_bounds = 1;
+inline int LevelTiling::_internal_loop_bounds_size() const {
+  return _internal_loop_bounds().size();
+}
+inline int LevelTiling::loop_bounds_size() const {
+  return _internal_loop_bounds_size();
+}
+inline void LevelTiling::clear_loop_bounds() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.loop_bounds_.Clear();
+}
+inline ::codegen::LoopBound* LevelTiling::mutable_loop_bounds(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.LevelTiling.loop_bounds)
+  return _internal_mutable_loop_bounds()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>* LevelTiling::mutable_loop_bounds()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.LevelTiling.loop_bounds)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_loop_bounds();
+}
+inline const ::codegen::LoopBound& LevelTiling::loop_bounds(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.LevelTiling.loop_bounds)
+  return _internal_loop_bounds().Get(index);
+}
+inline ::codegen::LoopBound* LevelTiling::add_loop_bounds() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::LoopBound* _add = _internal_mutable_loop_bounds()->Add();
+  // @@protoc_insertion_point(field_add:codegen.LevelTiling.loop_bounds)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>& LevelTiling::loop_bounds() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.LevelTiling.loop_bounds)
+  return _internal_loop_bounds();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>&
+LevelTiling::_internal_loop_bounds() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.loop_bounds_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LoopBound>*
+LevelTiling::_internal_mutable_loop_bounds() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.loop_bounds_;
+}
+
+// -------------------------------------------------------------------
+
+// LevelAccessCount
+
+// uint64 input_access_count = 1;
+inline void LevelAccessCount::clear_input_access_count() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.input_access_count_ = ::uint64_t{0u};
+}
+inline ::uint64_t LevelAccessCount::input_access_count() const {
+  // @@protoc_insertion_point(field_get:codegen.LevelAccessCount.input_access_count)
+  return _internal_input_access_count();
+}
+inline void LevelAccessCount::set_input_access_count(::uint64_t value) {
+  _internal_set_input_access_count(value);
+  // @@protoc_insertion_point(field_set:codegen.LevelAccessCount.input_access_count)
+}
+inline ::uint64_t LevelAccessCount::_internal_input_access_count() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.input_access_count_;
+}
+inline void LevelAccessCount::_internal_set_input_access_count(::uint64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.input_access_count_ = value;
+}
+
+// uint64 output_access_count = 2;
+inline void LevelAccessCount::clear_output_access_count() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.output_access_count_ = ::uint64_t{0u};
+}
+inline ::uint64_t LevelAccessCount::output_access_count() const {
+  // @@protoc_insertion_point(field_get:codegen.LevelAccessCount.output_access_count)
+  return _internal_output_access_count();
+}
+inline void LevelAccessCount::set_output_access_count(::uint64_t value) {
+  _internal_set_output_access_count(value);
+  // @@protoc_insertion_point(field_set:codegen.LevelAccessCount.output_access_count)
+}
+inline ::uint64_t LevelAccessCount::_internal_output_access_count() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.output_access_count_;
+}
+inline void LevelAccessCount::_internal_set_output_access_count(::uint64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.output_access_count_ = value;
+}
+
+// uint64 weight_access_count = 3;
+inline void LevelAccessCount::clear_weight_access_count() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.weight_access_count_ = ::uint64_t{0u};
+}
+inline ::uint64_t LevelAccessCount::weight_access_count() const {
+  // @@protoc_insertion_point(field_get:codegen.LevelAccessCount.weight_access_count)
+  return _internal_weight_access_count();
+}
+inline void LevelAccessCount::set_weight_access_count(::uint64_t value) {
+  _internal_set_weight_access_count(value);
+  // @@protoc_insertion_point(field_set:codegen.LevelAccessCount.weight_access_count)
+}
+inline ::uint64_t LevelAccessCount::_internal_weight_access_count() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.weight_access_count_;
+}
+inline void LevelAccessCount::_internal_set_weight_access_count(::uint64_t value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.weight_access_count_ = value;
+}
+
+// -------------------------------------------------------------------
+
+// Tiling
+
+// string name = 1;
+inline void Tiling::clear_name() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.name_.ClearToEmpty();
+}
+inline const std::string& Tiling::name() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Tiling.name)
+  return _internal_name();
+}
+template <typename Arg_, typename... Args_>
+inline PROTOBUF_ALWAYS_INLINE void Tiling::set_name(Arg_&& arg,
+                                                     Args_... args) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.name_.Set(static_cast<Arg_&&>(arg), args..., GetArena());
+  // @@protoc_insertion_point(field_set:codegen.Tiling.name)
+}
+inline std::string* Tiling::mutable_name() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  std::string* _s = _internal_mutable_name();
+  // @@protoc_insertion_point(field_mutable:codegen.Tiling.name)
+  return _s;
+}
+inline const std::string& Tiling::_internal_name() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.name_.Get();
+}
+inline void Tiling::_internal_set_name(const std::string& value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.name_.Set(value, GetArena());
+}
+inline std::string* Tiling::_internal_mutable_name() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _impl_.name_.Mutable( GetArena());
+}
+inline std::string* Tiling::release_name() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:codegen.Tiling.name)
+  return _impl_.name_.Release();
+}
+inline void Tiling::set_allocated_name(std::string* value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.name_.SetAllocated(value, GetArena());
+  if (::google::protobuf::internal::DebugHardenForceCopyDefaultString() && _impl_.name_.IsDefault()) {
+    _impl_.name_.Set("", GetArena());
+  }
+  // @@protoc_insertion_point(field_set_allocated:codegen.Tiling.name)
+}
+
+// repeated .codegen.LevelTiling level_tilings = 2;
+inline int Tiling::_internal_level_tilings_size() const {
+  return _internal_level_tilings().size();
+}
+inline int Tiling::level_tilings_size() const {
+  return _internal_level_tilings_size();
+}
+inline void Tiling::clear_level_tilings() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.level_tilings_.Clear();
+}
+inline ::codegen::LevelTiling* Tiling::mutable_level_tilings(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.Tiling.level_tilings)
+  return _internal_mutable_level_tilings()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>* Tiling::mutable_level_tilings()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.Tiling.level_tilings)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_level_tilings();
+}
+inline const ::codegen::LevelTiling& Tiling::level_tilings(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Tiling.level_tilings)
+  return _internal_level_tilings().Get(index);
+}
+inline ::codegen::LevelTiling* Tiling::add_level_tilings() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::LevelTiling* _add = _internal_mutable_level_tilings()->Add();
+  // @@protoc_insertion_point(field_add:codegen.Tiling.level_tilings)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>& Tiling::level_tilings() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.Tiling.level_tilings)
+  return _internal_level_tilings();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>&
+Tiling::_internal_level_tilings() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.level_tilings_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LevelTiling>*
+Tiling::_internal_mutable_level_tilings() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.level_tilings_;
+}
+
+// repeated .codegen.LevelAccessCount level_access_counts = 3;
+inline int Tiling::_internal_level_access_counts_size() const {
+  return _internal_level_access_counts().size();
+}
+inline int Tiling::level_access_counts_size() const {
+  return _internal_level_access_counts_size();
+}
+inline void Tiling::clear_level_access_counts() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.level_access_counts_.Clear();
+}
+inline ::codegen::LevelAccessCount* Tiling::mutable_level_access_counts(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.Tiling.level_access_counts)
+  return _internal_mutable_level_access_counts()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>* Tiling::mutable_level_access_counts()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.Tiling.level_access_counts)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_level_access_counts();
+}
+inline const ::codegen::LevelAccessCount& Tiling::level_access_counts(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Tiling.level_access_counts)
+  return _internal_level_access_counts().Get(index);
+}
+inline ::codegen::LevelAccessCount* Tiling::add_level_access_counts() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::LevelAccessCount* _add = _internal_mutable_level_access_counts()->Add();
+  // @@protoc_insertion_point(field_add:codegen.Tiling.level_access_counts)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>& Tiling::level_access_counts() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.Tiling.level_access_counts)
+  return _internal_level_access_counts();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>&
+Tiling::_internal_level_access_counts() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.level_access_counts_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::LevelAccessCount>*
+Tiling::_internal_mutable_level_access_counts() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.level_access_counts_;
+}
+
+// -------------------------------------------------------------------
+
 // Operation
 
 // .codegen.OpOverload op = 1;
@@ -5543,6 +6780,102 @@ inline ::codegen::TensorList* Operation::mutable_outputs() ABSL_ATTRIBUTE_LIFETI
   return _msg;
 }
 
+// optional .codegen.Tiling tiling = 6;
+inline bool Operation::has_tiling() const {
+  bool value = (_impl_._has_bits_[0] & 0x00000001u) != 0;
+  PROTOBUF_ASSUME(!value || _impl_.tiling_ != nullptr);
+  return value;
+}
+inline void Operation::clear_tiling() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.tiling_ != nullptr) _impl_.tiling_->Clear();
+  _impl_._has_bits_[0] &= ~0x00000001u;
+}
+inline const ::codegen::Tiling& Operation::_internal_tiling() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  const ::codegen::Tiling* p = _impl_.tiling_;
+  return p != nullptr ? *p : reinterpret_cast<const ::codegen::Tiling&>(::codegen::_Tiling_default_instance_);
+}
+inline const ::codegen::Tiling& Operation::tiling() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Operation.tiling)
+  return _internal_tiling();
+}
+inline void Operation::unsafe_arena_set_allocated_tiling(::codegen::Tiling* value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (GetArena() == nullptr) {
+    delete reinterpret_cast<::google::protobuf::MessageLite*>(_impl_.tiling_);
+  }
+  _impl_.tiling_ = reinterpret_cast<::codegen::Tiling*>(value);
+  if (value != nullptr) {
+    _impl_._has_bits_[0] |= 0x00000001u;
+  } else {
+    _impl_._has_bits_[0] &= ~0x00000001u;
+  }
+  // @@protoc_insertion_point(field_unsafe_arena_set_allocated:codegen.Operation.tiling)
+}
+inline ::codegen::Tiling* Operation::release_tiling() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+
+  _impl_._has_bits_[0] &= ~0x00000001u;
+  ::codegen::Tiling* released = _impl_.tiling_;
+  _impl_.tiling_ = nullptr;
+  if (::google::protobuf::internal::DebugHardenForceCopyInRelease()) {
+    auto* old = reinterpret_cast<::google::protobuf::MessageLite*>(released);
+    released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    if (GetArena() == nullptr) {
+      delete old;
+    }
+  } else {
+    if (GetArena() != nullptr) {
+      released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    }
+  }
+  return released;
+}
+inline ::codegen::Tiling* Operation::unsafe_arena_release_tiling() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:codegen.Operation.tiling)
+
+  _impl_._has_bits_[0] &= ~0x00000001u;
+  ::codegen::Tiling* temp = _impl_.tiling_;
+  _impl_.tiling_ = nullptr;
+  return temp;
+}
+inline ::codegen::Tiling* Operation::_internal_mutable_tiling() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.tiling_ == nullptr) {
+    auto* p = ::google::protobuf::Message::DefaultConstruct<::codegen::Tiling>(GetArena());
+    _impl_.tiling_ = reinterpret_cast<::codegen::Tiling*>(p);
+  }
+  return _impl_.tiling_;
+}
+inline ::codegen::Tiling* Operation::mutable_tiling() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  _impl_._has_bits_[0] |= 0x00000001u;
+  ::codegen::Tiling* _msg = _internal_mutable_tiling();
+  // @@protoc_insertion_point(field_mutable:codegen.Operation.tiling)
+  return _msg;
+}
+inline void Operation::set_allocated_tiling(::codegen::Tiling* value) {
+  ::google::protobuf::Arena* message_arena = GetArena();
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (message_arena == nullptr) {
+    delete (_impl_.tiling_);
+  }
+
+  if (value != nullptr) {
+    ::google::protobuf::Arena* submessage_arena = (value)->GetArena();
+    if (message_arena != submessage_arena) {
+      value = ::google::protobuf::internal::GetOwnedMessage(message_arena, value, submessage_arena);
+    }
+    _impl_._has_bits_[0] |= 0x00000001u;
+  } else {
+    _impl_._has_bits_[0] &= ~0x00000001u;
+  }
+
+  _impl_.tiling_ = reinterpret_cast<::codegen::Tiling*>(value);
+  // @@protoc_insertion_point(field_set_allocated:codegen.Operation.tiling)
+}
+
 inline bool Operation::has_op_type() const {
   return op_type_case() != OP_TYPE_NOT_SET;
 }
@@ -5719,6 +7052,19 @@ Model::_internal_mutable_ops() {
 // @@protoc_insertion_point(namespace_scope)
 }  // namespace codegen
 
+
+namespace google {
+namespace protobuf {
+
+template <>
+struct is_proto_enum<::codegen::LoopIndex> : std::true_type {};
+template <>
+inline const EnumDescriptor* GetEnumDescriptor<::codegen::LoopIndex>() {
+  return ::codegen::LoopIndex_descriptor();
+}
+
+}  // namespace protobuf
+}  // namespace google
 
 // @@protoc_insertion_point(global_scope)
 

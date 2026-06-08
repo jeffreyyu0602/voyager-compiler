@@ -133,7 +133,15 @@ def transform(
     fuse_operator=True,
     fuse_reshape=True,
     split_spmm=False,
-    use_fake_mode=True
+    use_fake_mode=True,
+    interstellar_dram_arch=None,
+    interstellar_dram_schedule=None,
+    dram_bandwidth=0,
+    input_dtype_width=8,
+    weight_dtype_width=8,
+    output_dtype_width=8,
+    double_buffered_accum_buffer=False,
+    double_buffered_l2=False,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -175,7 +183,20 @@ def transform(
     # Apply L2 tiling logic specifically for matrix operations (GEMM/Conv) to
     # optimize for the specific cache size and memory bank configuration.
     if cache_size is not None:
-        run_matrix_op_l2_tiling(model, unroll_dims, cache_size, num_banks)
+        run_matrix_op_l2_tiling(
+            model,
+            unroll_dims,
+            cache_size,
+            num_banks,
+            interstellar_dram_arch=interstellar_dram_arch,
+            interstellar_dram_schedule=interstellar_dram_schedule,
+            dram_bandwidth=dram_bandwidth,
+            input_dtype_width=input_dtype_width,
+            weight_dtype_width=weight_dtype_width,
+            output_dtype_width=output_dtype_width,
+            double_buffered_accum_buffer=double_buffered_accum_buffer,
+            double_buffered_l2=double_buffered_l2,
+        )
 
     # -------------------------------------------------------------------------
     # 4. Data Layout Transformation
@@ -241,6 +262,10 @@ def compile(
     output_file="compute_graph",
     dump_tensors=True,
     dump_snapshot=False,
+    double_buffered_accum_buffer: bool = False,
+    input_buffer_size: int = None,
+    weight_buffer_size: int = None,
+    accum_buffer_size: int = None,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -249,7 +274,16 @@ def compile(
 
     allocator = MemoryAllocator(total_memory, bank_width=bank_width)
     run_memory_mapping(
-        model, allocator, cache_size, num_banks, bank_width, unroll_dims
+        model,
+        allocator,
+        cache_size,
+        num_banks,
+        bank_width,
+        unroll_dims,
+        double_buffered_accum_buffer=double_buffered_accum_buffer,
+        input_buffer_size=input_buffer_size,
+        weight_buffer_size=weight_buffer_size,
+        accum_buffer_size=accum_buffer_size,
     )
 
 
