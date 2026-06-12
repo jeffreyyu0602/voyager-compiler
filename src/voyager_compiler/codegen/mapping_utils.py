@@ -324,6 +324,7 @@ def is_gemm_op(node: Node) -> bool:
         torch.ops.aten.matmul.default,
         torch.ops.quantized_ops.conv2d.default,
         torch.ops.quantized_ops.linear.default,
+        torch.ops.quantized_ops.matmul.default,
         torch.ops.quantized_ops.conv2d_mx.default,
         torch.ops.quantized_ops.linear_mx.default,
         torch.ops.quantized_ops.matmul_mx.default,
@@ -360,6 +361,7 @@ def is_linear(node: Node) -> bool:
 def is_matmul(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.matmul.default,
+        torch.ops.quantized_ops.matmul.default,
         torch.ops.quantized_ops.matmul_mx.default,
     ]
 
@@ -404,6 +406,9 @@ def is_pooling(node: Node) -> bool:
         aten.adaptive_avg_pool2d.default,
         aten.avg_pool2d.default,
         aten.max_pool2d.default,
+        # NHWC variants (after the data-layout transform)
+        torch.ops.quantized_ops.max_pool2d.default,
+        torch.ops.quantized_ops.adaptive_avg_pool2d.default,
     ]
 
 

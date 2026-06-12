@@ -58,22 +58,28 @@ DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
 
 def replace_node_with_graph_module(
-    gm: GraphModule,
+    model: GraphModule,
     source: Node,
     replacement: GraphModule,
-    value_remap=None
+    value_remap=None,
 ) -> List[Node]:
+    """Copy ``replacement`` (an exported subgraph) into ``model`` just before
+    ``source``, mapping its placeholders to ``source.all_input_nodes``; return
+    the output value node(s).
+    """
+    graph = model.graph
     if value_remap is None:
         value_remap = {}
 
-    args_iter = iter(source.all_input_nodes)
+    arg_nodes = iter(source.all_input_nodes)
     output = None
 
-    for node in list(replacement.graph.nodes):
-        if node.op == 'placeholder':
-            value_remap[node] = next(args_iter, None)
-        elif node.op == 'output':
-            output = node.args[0]
+    for n in list(replacement.graph.nodes):
+        if n.op == 'placeholder':
+            value_remap[n] = next(arg_nodes, None)
+            continue
+        if n.op == 'output':
+            output = n.args[0]
             if len(output) == 1:
                 source.replace_all_uses_with(value_remap[output[0]])
             else:
@@ -81,16 +87,22 @@ def replace_node_with_graph_module(
                     assert user.target == operator.getitem
                     idx = user.args[1]
                     user.replace_all_uses_with(value_remap[output[idx]])
-        else:
-            with gm.graph.inserting_before(source):
-                if node.op == 'get_attr':
-                    param = fetch_attr(replacement, node.target)
-                    value_remap[node] = create_getattr_from_value(
-                        gm, gm.graph, "_tensor_constant_", param
-                    )
+            continue
+        with graph.inserting_before(source):
+            if n.op == 'get_attr':
+                attr = fetch_attr(replacement, n.target)
+                if isinstance(attr, GraphModule):
+                    # cond / body subgraph of a while_loop: register as a submodule
+                    name = get_new_node_name_with_prefix(n.target)(model)
+                    setattr(model, name, attr)
+                    value_remap[n] = graph.create_node("get_attr", name)
                 else:
-                    value_remap[node] = gm.graph.node_copy(node, lambda n: value_remap[n])
-                propagate_shape(value_remap[node], gm)
+                    value_remap[n] = create_getattr_from_value(
+                        model, graph, "_tensor_constant_", attr
+                    )
+            else:
+                value_remap[n] = graph.node_copy(n, lambda n: value_remap[n])
+            propagate_shape(value_remap[n], model)
 
     return [value_remap[n] for n in output]
 
@@ -875,7 +887,7 @@ def get_reference_node(nodes):
     return first_node
 
 
-def _build_shape_map(node, output_shape):
+def _build_conv2d_and_gemm_shape_map(node, output_shape):
     from .passes.tiling import _conv2d_layout, _build_gemm_shape_map
 
     input_node = node.args[0]
@@ -940,19 +952,6 @@ def run_submod_l2_tiling(
         key_to_node, node, tiled_shapes, bank_width, bank_size, unroll_dims[1]
     )
 
-    # Unsupported operations for L2 tiling adjustment
-    if (
-        not is_gemm_op(first_node) and
-        not is_elementwise_op(first_node) and
-        first_node.target not in [
-            torch.ops.aten.softmax.int,
-            torch.ops.aten.layer_norm.default,
-            torch.ops.quantized_ops.calculate_mx_qparam.default,
-            torch.ops.quantized_ops.quantize_mx.default,
-        ]
-    ):
-        return total_size, scratchpad_map, None
-
     # Skip if GEMM already has fused reshape op
     is_gemm = is_gemm_op(first_node)
     submod_nodes = list(module.graph.nodes) + [node]
@@ -985,7 +984,7 @@ def run_submod_l2_tiling(
         new_shapes = {}
 
         if is_gemm:
-            new_shapes = _build_shape_map(first_node, tile_sizes)
+            new_shapes = _build_conv2d_and_gemm_shape_map(first_node, tile_sizes)
             propagate_tiled_shapes_upstream(first_node, new_shapes)
 
         for n in node.all_input_nodes:
@@ -1023,6 +1022,8 @@ def run_submod_l2_tiling(
                     input_node = input_node.meta.get("source_node", input_node)
                     tile_strides = first_node.meta["tile_strides"]
                     tile_strides["A_indptr"] = new_shapes[input_node][:-1]
+
+            first_node.meta.pop("tiled_shapes", None)
 
             return total_size, scratchpad_map, new_shapes
 
@@ -1188,6 +1189,150 @@ def _run_interstellar_for_node(
     output_node.meta["interstellar_architecture"] = architecture
 
 
+def adjust_tiling(
+    node: Node,
+    named_modules: dict,
+    cache_size: int,
+    num_banks: int = None,
+    bank_width: int = None,
+    unroll_dims=None,
+    interstellar=None,
+):
+    """Tile one node for the scratchpad and return its ``scratchpad_map``.
+
+    For a fused ``call_module`` this runs per-submodule L2 tiling
+    (``run_submod_l2_tiling``), fitting the reference op's tiling to ``cache_size``
+    and node-keying the tiling dict; for a standalone tiled node it evaluates the
+    banking strategy directly.  Mutates ``node.meta`` (``tiled_shapes`` /
+    ``tile_strides``) and the reference op's ``l2_tiling`` in place, and (for GEMMs,
+    when ``interstellar`` is given) runs the interstellar tiler.  Returns the
+    ``scratchpad_map`` for the caller to attach (``run_memory_mapping`` does; the
+    bufferized path, which only needs the tiling, ignores it).
+
+    ``interstellar`` is ``(arch, schedule, cache, double_buffered)`` or ``None``.
+    Was ``run_memory_mapping.allocate_scratchpad`` (closures lifted to params).
+    """
+    from .passes.tiling import compute_output_tiled_shapes, compute_tiled_shape
+
+    if cache_size is None:
+        return None
+
+    bank_size = cache_size // num_banks if num_banks is not None else None
+
+    if node.op == "call_module":
+        mod = named_modules[node.target]
+        first_node = get_reference_node(mod.graph.nodes)
+
+        for n in list(mod.graph.nodes):
+            if n != first_node:
+                n.meta.pop("l2_tiling", None)
+    else:
+        first_node = node
+
+    l2_tiling = first_node.meta.get("l2_tiling")
+    tiled_shapes = normalize_shape(
+        first_node, first_node.meta.get("tiled_shapes", {})
+    )
+
+    if not tiled_shapes:
+        tiled_shapes = {n: n.shape for n in node.all_input_nodes}
+        if isinstance(node.value, torch.Tensor):
+            tiled_shapes[node] = node.shape
+        else:
+            tiled_shapes[node] = tuple(t.shape for t in node.value)
+    elif node.op == "call_module":
+        # TODO Skip if GEMM does not have fused dequantize op
+        args = map_arg(node.args, lambda n: get_tiled_tensor(n))
+        ShapeProp(mod).propagate(*args)
+        propagate_tiled_shapes_upstream(first_node, tiled_shapes)
+
+        # Calculate tiled shape for other input/output nodes
+        for n in node.all_input_nodes:
+            if n not in tiled_shapes:
+                tiled_shapes[n] = compute_tiled_shape(n.shape, l2_tiling)
+
+        tiled_shapes[node] = compute_output_tiled_shapes(node, l2_tiling)
+
+    tiled_shapes = {
+        n: s for n, s in tiled_shapes.items()
+        if n in node.all_input_nodes and require_allocation(n) or n is node
+    }
+
+    op_scope = _get_scope(first_node.target)
+    node_to_key = get_node_to_key_map(first_node)
+    key_to_node = {f"{op_scope}::{v}": k for k, v in node_to_key.items()}
+
+    strategies = get_banking_strategies_for_op(first_node.target)
+
+    logger.debug(f"Allocating scratchpad for {node} with strategies:")
+
+    final_tiled_shapes = tiled_shapes
+    for strategy in strategies:
+        if node.op == "call_module":
+            total_size, scratchpad_map, new_shapes = run_submod_l2_tiling(
+                node,
+                mod,
+                key_to_node,
+                tiled_shapes,
+                unroll_dims,
+                strategy,
+                cache_size=cache_size,
+                bank_width=bank_width,
+                bank_size=bank_size,
+            )
+        else:
+            total_size, scratchpad_map = strategy.evaluate(
+                key_to_node,
+                node,
+                tiled_shapes,
+                bank_width,
+                bank_size,
+                unroll_dims[1]
+            )
+            new_shapes = tiled_shapes if l2_tiling else None
+
+        if total_size <= cache_size:
+            node.meta["tiled_shapes"] = new_shapes
+            if new_shapes is not None:
+                final_tiled_shapes = new_shapes
+            logger.info(f"  Successfully tiled {node} with strategy: {strategy}")
+            break
+
+    logger.debug("Scratchpad allocation result:")
+    for n, s in scratchpad_map.items():
+        logger.debug(f"  {n}: {s}")
+
+    strides = first_node.meta.get("tile_strides")
+    if strides is not None:
+        node.meta["tile_strides"] = normalize_shape(first_node, strides)
+
+    strategy.print_banking_info(key_to_node, node)
+
+    if total_size > cache_size:
+        logger.warning(
+            f"[MEM_ALLOC_FAIL] {node}: Could not allocate scratchpad "
+            f"memory of size {total_size} bytes (limit: {cache_size} bytes)"
+        )
+
+    # Run interstellar tiler for GEMM nodes if hardware config is provided
+    if interstellar is not None:
+        _interstellar_arch, _interstellar_schedule, _interstellar_cache, \
+            double_buffered_accum_buffer = interstellar
+        if _interstellar_arch is not None and is_gemm_op(first_node):
+            _run_interstellar_for_node(
+                node,
+                first_node,
+                final_tiled_shapes,
+                _interstellar_arch,
+                _interstellar_schedule,
+                double_buffered_accum_buffer,
+                _interstellar_cache,
+                named_modules,
+            )
+
+    return scratchpad_map
+
+
 def run_memory_mapping(
     model: GraphModule,
     allocator: MemoryAllocator = None,
@@ -1283,123 +1428,25 @@ def run_memory_mapping(
         nodes_to_delete = user_to_last_uses.get(user, [])
         return nodes_to_delete
 
+    interstellar = (
+        _interstellar_arch,
+        _interstellar_schedule,
+        _interstellar_cache,
+        double_buffered_accum_buffer,
+    )
+
     def allocate_scratchpad(node: Node):
-        from .passes.tiling import compute_tiled_shape, compute_output_tiled_shapes
-
-        if cache_size is None:
-            return
-
-        bank_size = cache_size // num_banks if num_banks is not None else None
-
-        if node.op == "call_module":
-            mod = named_modules[node.target]
-            first_node = get_reference_node(mod.graph.nodes)
-
-            for n in list(mod.graph.nodes):
-                if n != first_node:
-                    n.meta.pop("l2_tiling", None)
-        else:
-            first_node = node
-
-        l2_tiling = first_node.meta.get("l2_tiling")
-        tiled_shapes = normalize_shape(
-            first_node, first_node.meta.get("tiled_shapes", {})
+        # Tiling + scratchpad logic lives in the module-level ``adjust_tiling``
+        # (shared with the bufferized path); here we just attach the map.
+        node.meta["scratchpad_map"] = adjust_tiling(
+            node,
+            named_modules,
+            cache_size,
+            num_banks,
+            bank_width,
+            unroll_dims,
+            interstellar,
         )
-
-        if not tiled_shapes:
-            tiled_shapes = {n: n.shape for n in node.all_input_nodes}
-            if isinstance(node.value, torch.Tensor):
-                tiled_shapes[node] = node.shape
-            else:
-                tiled_shapes[node] = tuple(t.shape for t in node.value)
-        elif node.op == "call_module":
-            # TODO Skip if GEMM does not have fused dequantize op
-            args = map_arg(node.args, lambda n: get_tiled_tensor(n))
-            ShapeProp(mod).propagate(*args)
-            propagate_tiled_shapes_upstream(first_node, tiled_shapes)
-
-            # Calculate tiled shape for other input/output nodes
-            for n in node.all_input_nodes:
-                if n not in tiled_shapes:
-                    tiled_shapes[n] = compute_tiled_shape(n.shape, l2_tiling)
-
-            tiled_shapes[node] = compute_output_tiled_shapes(node, l2_tiling)
-
-        tiled_shapes = {
-            n: s for n, s in tiled_shapes.items()
-            if n in node.all_input_nodes and require_allocation(n) or n is node
-        }
-
-        op_scope = _get_scope(first_node.target)
-        node_to_key = get_node_to_key_map(first_node)
-        key_to_node = {f"{op_scope}::{v}": k for k, v in node_to_key.items()}
-
-        strategies = get_banking_strategies_for_op(first_node.target)
-
-        logger.debug(f"Allocating scratchpad for {node} with strategies:")
-
-        final_tiled_shapes = tiled_shapes
-        for strategy in strategies:
-            if node.op == "call_module":
-                total_size, scratchpad_map, new_shapes = run_submod_l2_tiling(
-                    node,
-                    mod,
-                    key_to_node,
-                    tiled_shapes,
-                    unroll_dims,
-                    strategy,
-                    cache_size=cache_size,
-                    bank_width=bank_width,
-                    bank_size=bank_size,
-                )
-            else:
-                total_size, scratchpad_map = strategy.evaluate(
-                    key_to_node,
-                    node,
-                    tiled_shapes,
-                    bank_width,
-                    bank_size,
-                    unroll_dims[1]
-                )
-                new_shapes = tiled_shapes if l2_tiling else None
-
-            if total_size <= cache_size:
-                node.meta["tiled_shapes"] = new_shapes
-                if new_shapes is not None:
-                    final_tiled_shapes = new_shapes
-                logger.info(f"  Successfully tiled {node} with strategy: {strategy}")
-                break
-
-        logger.debug("Scratchpad allocation result:")
-        for n, s in scratchpad_map.items():
-            logger.debug(f"  {n}: {s}")
-
-        strides = first_node.meta.get("tile_strides")
-        if strides is not None:
-            node.meta["tile_strides"] = normalize_shape(first_node, strides)
-
-        strategy.print_banking_info(key_to_node, node)
-
-        if total_size > cache_size:
-            logger.warning(
-                f"[MEM_ALLOC_FAIL] {node}: Could not allocate scratchpad "
-                f"memory of size {total_size} bytes (limit: {cache_size} bytes)"
-            )
-
-        node.meta["scratchpad_map"] = scratchpad_map
-
-        # Run interstellar tiler for GEMM nodes if hardware config is provided
-        if _interstellar_arch is not None and is_gemm_op(first_node):
-            _run_interstellar_for_node(
-                node,
-                first_node,
-                final_tiled_shapes,
-                _interstellar_arch,
-                _interstellar_schedule,
-                double_buffered_accum_buffer,
-                _interstellar_cache,
-                named_modules,
-            )
 
     def get_path_to_target(node: torch.fx.Node, targets):
         if not isinstance(targets, (list, tuple)):

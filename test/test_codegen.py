@@ -44,6 +44,7 @@ from voyager_compiler.codegen.mapping_utils import is_fully_connected
 from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
+from utils.models.utils import compute_interstellar_dram
 from utils.dataset import glue, imagenet
 
 logger = logging.getLogger()
@@ -241,7 +242,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dram_size",
         type=int,
-        default=16 * 1024 ** 3,
+        default=None,
         help="DRAM capacity in bytes. When set, runs interstellar with a 4-level memory hierarchy.",
     )
     parser.add_argument(
@@ -318,6 +319,18 @@ if __name__ == "__main__":
         default="eager",
         choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
     )
+    parser.add_argument(
+        "--bufferize",
+        action="store_true",
+        help=(
+            "Use the bufferized FX lowering path: rewrite tiled "
+            "GEMM/conv/pointwise nodes into explicit while_loop nests over "
+            "voyager.* primitives and emit model.txt / bufferized_graph.txt / "
+            "compute_graph from that graph, instead of run_memory_mapping + "
+            "gen_code.  Requires --cache_size (the L2 tiling pass sets the "
+            "l2_tiling/tiled_shapes meta the bufferizer consumes)."
+        ),
+    )
     add_qspec_args(parser)
     args = parser.parse_args()
 
@@ -347,39 +360,13 @@ if __name__ == "__main__":
         )
     )
 
-    # Convert DRAM bandwidth from GB/s to input elements per cycle.
-    # GB/s and GHz share the same 1e9 factor, so they cancel:
-    #   elem/cycle = (bandwidth_GBs * 1e9 B/s) / (freq_GHz * 1e9 Hz * elem_bytes)
-    #              = bandwidth_GBs / (freq_GHz * elem_bytes)
-    if args.dram_bandwidth > 0 and args.activation is not None:
-        import re as _re
-        _dtype_str = args.activation.split(",")[0]
-        _bits_match = _re.search(r"(\d+)", _dtype_str)
-        _input_bits = int(_bits_match.group(1)) if _bits_match else 8
-        _input_elem_bytes = _input_bits / 8
-        dram_bandwidth_elem_per_cycle = int(
-            args.dram_bandwidth / (args.frequency * _input_elem_bytes)
-        )
-    else:
-        dram_bandwidth_elem_per_cycle = int(args.dram_bandwidth)
-
-    interstellar_dram_arch = None
-    interstellar_dram_schedule = None
-    if args.dram_size is not None and args.hardware_unrolling is not None:
-        from voyager_compiler.codegen.tiler import build_architecture_and_schedule_with_dram
-        (
-            interstellar_dram_arch,
-            interstellar_dram_schedule,
-        ) = build_architecture_and_schedule_with_dram(
-            ic_dim=args.hardware_unrolling[0],
-            oc_dim=args.hardware_unrolling[1],
-            l2_cache_size=args.cache_size * 2,
-            input_buffer_size=args.input_buffer_size,
-            weight_buffer_size=args.weight_buffer_size,
-            accum_buffer_size=args.accum_buffer_size,
-            dram_size=args.dram_size,
-            double_buffered_l2=args.double_buffered_l2,
-        )
+    # DRAM bandwidth (elem/cycle) + interstellar 4-level arch/schedule, shared
+    # with the model helpers' get_transform_args (utils.models.utils).
+    (
+        interstellar_dram_arch,
+        interstellar_dram_schedule,
+        dram_bandwidth_elem_per_cycle,
+    ) = compute_interstellar_dram(args)
 
     transform_args = {
         "patterns": VECTOR_PIPELINE,
@@ -409,6 +396,7 @@ if __name__ == "__main__":
         "weight_buffer_size": args.weight_buffer_size,
         "accum_buffer_size": args.accum_buffer_size,
         "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
+        "bufferize": args.bufferize,
     }
 
     if args.model in models.__dict__:

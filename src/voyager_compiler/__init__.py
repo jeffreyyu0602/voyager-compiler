@@ -266,11 +266,57 @@ def compile(
     input_buffer_size: int = None,
     weight_buffer_size: int = None,
     accum_buffer_size: int = None,
+    bufferize: bool = False,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*flatten_args)
+
+    # ---------------------------------------------------------------------
+    # Optional add-on: bufferized FX lowering + loop-aware code generation.
+    # Rewrites tiled GEMM/pointwise nodes into explicit while_loop nests over
+    # buf.* primitives, then emits protobuf / graph / text from that FX graph.
+    # Terminal alternative to the per-node run_memory_mapping + gen_code path.
+    # ---------------------------------------------------------------------
+    if bufferize:
+        from .codegen.lowering import (
+            bufferize_graph,
+            gen_code_bufferized,
+            gen_compute_graph_bufferized,
+            print_bufferized_graph,
+        )
+        from .codegen.mapping import adjust_tiling
+
+        # Fit each fused submodule's / tiled op's L2 tiling to the scratchpad and
+        # node-key its tiling meta BEFORE bufferizing, so the loop nests use the
+        # SRAM-fit tile sizes.  ``adjust_tiling`` parks the node-keyed result on each
+        # node; its returned scratchpad map is unused here (the bufferized path does
+        # no per-node memory allocation).  ``run_memory_mapping`` is skipped.
+        ShapeProp(model).propagate(*flatten_args)
+        named = dict(model.named_modules(remove_duplicate=False))
+        for node in list(model.graph.nodes):
+            if node.op == "call_module" or "tiled_shapes" in node.meta:
+                adjust_tiling(
+                    node, named, cache_size, num_banks, bank_width, unroll_dims
+                )
+
+        bufferize_graph(model)
+        print_bufferized_graph(model)
+
+        path = os.path.join(output_dir, "tensor_files")
+        params = gen_code_bufferized(
+            model, flatten_args, path if dump_tensors else None
+        )
+        with open(os.path.join(output_dir, "model.txt"), "w") as f:
+            f.write(text_format.MessageToString(params))
+        with open(os.path.join(output_dir, "bufferized_graph.txt"), "w") as f:
+            f.write(print_bufferized_graph(model, to_string=True))
+        if len(model.graph.nodes) < 10000:
+            gen_compute_graph_bufferized(
+                model, os.path.join(output_dir, output_file)
+            )
+        return params
 
     allocator = MemoryAllocator(total_memory, bank_width=bank_width)
     run_memory_mapping(
@@ -285,7 +331,6 @@ def compile(
         weight_buffer_size=weight_buffer_size,
         accum_buffer_size=accum_buffer_size,
     )
-
 
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))

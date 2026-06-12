@@ -100,8 +100,16 @@ class ShapeProp:
                 node.shape = result.shape
                 node.value = result.cpu().clone()
             elif isinstance(result, (tuple, list)):
-                node.shape = tuple(x.shape if x is not None else None for x in result)
-                node.value = tuple(x.cpu().clone() if x is not None else None for x in result)
+                # Tuples may mix tensors with scalars (e.g. integer loop counters
+                # carried by a while_loop); keep non-tensor elements as-is.
+                node.shape = tuple(
+                    x.shape if isinstance(x, torch.Tensor) else None
+                    for x in result
+                )
+                node.value = tuple(
+                    x.cpu().clone() if isinstance(x, torch.Tensor) else x
+                    for x in result
+                )
             else:
                 node.value = result
                 logger.info(f"Node {node} produced non-tensor output {result}")

@@ -99,8 +99,14 @@ def propagate_shape(node: Node, model: GraphModule = None):
         node.shape = result.shape
         node.value = result.cpu().clone()
     elif isinstance(result, (tuple, list)):
-        node.shape = tuple(x.shape for x in result)
-        node.value = tuple(x.cpu().clone() for x in result)
+        # A tuple may mix tensors with scalars (e.g. the integer loop counters carried
+        # by a while_loop); keep non-tensor elements as-is.
+        node.shape = tuple(
+            x.shape if isinstance(x, torch.Tensor) else None for x in result
+        )
+        node.value = tuple(
+            x.cpu().clone() if isinstance(x, torch.Tensor) else x for x in result
+        )
     else:
         node.value = result
 
