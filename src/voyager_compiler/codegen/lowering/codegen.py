@@ -20,11 +20,17 @@ import graphviz
 import torch
 from torch.fx import GraphModule
 
-from ..mapping_utils import is_nop, map_node, set_output_field, set_tensor_field
+from ..mapping_utils import (
+    is_nop,
+    map_node,
+    set_output_field,
+    set_tensor_field,
+)
 from ..param_pb2 import Model, Operation, Tensor
 from ..shape_prop import ShapeProp
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
+COND = torch.ops.higher_order.cond
 INCREMENT_INDICES = torch.ops.voyager.increment_indices.default
 
 
@@ -123,6 +129,34 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
     return op
 
 
+_LOAD_TILE = torch.ops.voyager.load_tile.default
+_STORE_TILE = torch.ops.voyager.store_tile.default
+_COPY_TILE = torch.ops.voyager.copy_tile.default
+
+
+def _feeds_tile_index(node, _seen=None) -> bool:
+    """True if ``node`` (transitively) computes a tile DMA block index — it reaches the
+    ``indices`` argument of a ``load_tile`` / ``store_tile`` / ``copy_tile`` through a
+    chain of scalar index arithmetic.  Such addressing (a pipelined prefetch's ``j+1``,
+    or a ``delinearize_index(i)`` of the linear counter) is real computation, not loop
+    control, so the whole cone must be emitted rather than dropped."""
+    if _seen is None:
+        _seen = set()
+    for u in node.users:
+        if u in _seen or u.op != "call_function":
+            continue
+        _seen.add(u)
+        if u.target in (_LOAD_TILE, _STORE_TILE, _COPY_TILE):
+            ix = 1 if u.target is _LOAD_TILE else 2  # position of the ``indices`` arg
+            if len(u.args) > ix and node in (u.args[ix] or ()):
+                return True
+        elif not isinstance(getattr(u, "value", None), (torch.Tensor, list, tuple)):
+            # scalar index arithmetic (add / floordiv / mod / getitem) — recurse.
+            if _feeds_tile_index(u, _seen):
+                return True
+    return False
+
+
 def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
     if node.op == "call_module":
         ops.append(_emit_fused_op(node, named, output_dir))
@@ -134,20 +168,31 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
         ops.append(_emit_loop(node, gm, named, output_dir))
         return
 
-    # getitem (tuple unpacking of loop results) and other nops carry no compute.
-    if node.target is operator.getitem or is_nop(node):
+    # getitem usually just unpacks loop results (no compute) — dropped, UNLESS it
+    # extracts a tile-index component (a ``delinearize_index`` output) that a tile DMA
+    # addresses by, which is genuine address-gen and must be emitted.
+    if node.target is operator.getitem:
+        if not _feeds_tile_index(node):
+            return
+    elif is_nop(node):
         return
-
-    # increment_indices is loop-counter bookkeeping; the nested Loop's
-    # start/end/step already encodes the iteration, so it is not a compute op.
-    if node.target is INCREMENT_INDICES:
+    # increment_indices is loop-counter bookkeeping; the nested Loop's start/end/step
+    # already encodes the iteration, so it is not a compute op.
+    elif node.target is INCREMENT_INDICES:
         return
-
-    # Scalar-valued call_functions are the integer loop-index carry arithmetic
-    # (k+1, x + k//num_k, k % num_k, ...).  They are loop control, made explicit
-    # by the nested Loop structure, so they are not emitted as operations.
-    if not isinstance(getattr(node, "value", None), (torch.Tensor, list, tuple)):
-        return
+    # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns ``None`` since
+    # the buffer is a closed-over additional input mutated in place) is a real
+    # instruction, always emitted despite its non-tensor value — its output is the tile
+    # it writes (set from the dest in ``set_output_field``).
+    elif node.target not in (_COPY_TILE, _STORE_TILE):
+        # A non-tensor call_function is usually integer loop-index carry arithmetic
+        # (k+1, k % num_k, ...) — loop control made explicit by the Loop structure, so not
+        # emitted.  The exception is a value that *indexes* a tile DMA (a prefetch's
+        # ``j+1``, or a ``delinearize_index`` vector): genuine addressing — emit it so the
+        # DMA can reference it by name (``map_node`` serialises it like any op).
+        if not isinstance(getattr(node, "value", None), (torch.Tensor, list, tuple)):
+            if not _feeds_tile_index(node):
+                return
 
     op = Operation()
     op.op.CopyFrom(map_node(node, output_dir))
@@ -371,7 +416,10 @@ def _type_str(node) -> str:
 
 def _fmt_arg(a):
     if isinstance(a, torch.fx.Node):
-        return a.name
+        # Annotate every tensor argument with its ``<shape×dtype, space>`` so a copy_tile's
+        # direction is legible inline (e.g. ``copy_tile(src<…,DRAM>, dst<…,Scratchpad>)`` =
+        # a load); scalar / index args (``_type_str`` empty) print as the bare name.
+        return f"{a.name}{_type_str(a)}"
     if isinstance(a, (list, tuple)):
         return "[" + ", ".join(_fmt_arg(x) for x in a) + "]"
     return repr(a)
@@ -397,8 +445,10 @@ def _print_loop(node, gm, named, lines: List[str], indent: int, pad: str) -> Non
     )
 
     def _bindings(ph_list, src_list):
+        # Annotate only the bound placeholder (LHS); the source (RHS) is a node already
+        # defined and annotated above, so printing it bare (just its name) avoids the noise.
         return ", ".join(
-            f"{ph.name}{_type_str(ph)} = {_fmt_arg(src)}"
+            f"{ph.name}{_type_str(ph)} = {src}"
             for ph, src in zip(ph_list, src_list)
         )
 
@@ -411,11 +461,54 @@ def _print_loop(node, gm, named, lines: List[str], indent: int, pad: str) -> Non
     lines.append(f"{pad}}}")
 
 
+def _print_cond(node, gm, named, lines: List[str], indent: int, pad: str) -> None:
+    """Print a ``torch.cond`` in MLIR ``scf.if`` form — both branch regions descended into,
+    operands bound to each branch's placeholders, the branch output rendered as ``yield``:
+
+        cond = if pred (b_arg0 = src0, ...) {
+          <true region>
+          yield <true results>
+        } else (b_arg0 = src0, ...) {
+          <false region>
+          yield <false results>
+        }
+    """
+    pred = _fmt_arg(node.args[0])
+    operands = list(node.args[3]) if len(node.args) > 3 else []
+
+    def _branch(graph_arg):
+        mod = named.get(str(graph_arg.target)) or getattr(gm, str(graph_arg.target), None)
+        phs = (
+            [n for n in mod.graph.nodes if n.op == "placeholder"]
+            if isinstance(mod, GraphModule) else []
+        )
+        binds = ", ".join(
+            f"{ph.name}{_type_str(ph)} = {src}" for ph, src in zip(phs, operands)
+        )
+        return mod, binds
+
+    true_mod, true_binds = _branch(node.args[1])
+    false_mod, false_binds = _branch(node.args[2])
+
+    lines.append(f"{pad}{node.name}{_type_str(node)} = if {pred} ({true_binds}) {{")
+    if isinstance(true_mod, GraphModule):
+        _print_graph(
+            true_mod, lines, indent + 1, skip_placeholders=True, terminator="yield"
+        )
+    lines.append(f"{pad}}} else ({false_binds}) {{")
+    if isinstance(false_mod, GraphModule):
+        _print_graph(
+            false_mod, lines, indent + 1, skip_placeholders=True, terminator="yield"
+        )
+    lines.append(f"{pad}}}")
+
+
 def _print_graph(
     gm: GraphModule,
     lines: List[str],
     indent: int,
     skip_placeholders: bool = False,
+    terminator: str = "return",
 ) -> None:
     pad = "  " * indent
     named = dict(gm.named_modules())
@@ -428,7 +521,7 @@ def _print_graph(
                 lines.append(f"{pad}arg {node.name}{_type_str(node)}")
             continue
         if node.op == "output":
-            lines.append(f"{pad}return {_fmt_arg(node.args[0])}")
+            lines.append(f"{pad}{terminator} {_fmt_arg(node.args[0])}")
             continue
         if node.op == "get_attr":
             sub = getattr(gm, str(node.target), None)
@@ -439,6 +532,10 @@ def _print_graph(
 
         if node.op == "call_function" and node.target is WHILE_LOOP:
             _print_loop(node, gm, named, lines, indent, pad)
+            continue
+
+        if node.op == "call_function" and node.target is COND:
+            _print_cond(node, gm, named, lines, indent, pad)
             continue
 
         if node.op == "call_module":

@@ -60,6 +60,49 @@ class Conv2dAxes(NamedTuple):
     c: int  # input channels (reduction)
 
 
+# --- Double-buffered reduction --------------------------------------------------
+# Two ways to sum a tiled C-reduction with the operand loads software-pipelined
+# ahead of the matmuls (so a later async-DMA pass can overlap them).  Both take a
+# ``load_fn(c) -> tuple[Tensor, ...]`` that DMA-loads block ``c``'s operand tiles
+# (no compute) and a ``compute_fn(tiles) -> Tensor`` that runs the op on
+# already-loaded tiles and returns the partial to accumulate; ``load_fn`` returns
+# an all-Tensor tuple so its tiles can be carried as ``while_loop`` state.
+
+
+def _double_buffered_reduce(psum, num_c, load_fn, compute_fn):
+    """Rolled 2-deep double buffer (``num_c >= 3``).
+
+    The prologue loads block 0, the steady ``while_loop`` runs ``c`` in
+    ``1..num_c-1`` (prefetch block ``c`` while accumulating block ``c-1``), and the
+    epilogue drains the last block.  The steady-state extent is therefore
+    ``(1, num_c, 1)`` — see ``build_gemm_buffers``.
+    """
+    tiles0 = load_fn(0)
+
+    def cond_fn(c, psum_buf, *carried):
+        return c < num_c
+
+    def body_fn(c, psum_buf, *carried):
+        # Prefetch block c, then accumulate the previously-loaded block (c-1).
+        nxt = load_fn(c)
+        psum_buf = psum_buf + compute_fn(carried)
+        return (c + 1, psum_buf, *nxt)
+
+    result = while_loop(cond_fn, body_fn, (1, psum, *tiles0))
+    return result[1] + compute_fn(tuple(result[2:]))
+
+
+def _unrolled_reduce(psum, num_c, load_fn, compute_fn):
+    """Fully-unrolled reduction (Python ``for``), used when there are too few blocks
+    (``num_c < 3``) to fill/drain a rolled pipeline.  All blocks are loaded up front
+    and then accumulated, so the loads precede the matmuls in the straight-line
+    schedule (the same prefetch-ahead ordering, just unrolled rather than rolled)."""
+    loaded = [load_fn(c) for c in range(num_c)]
+    for tiles in loaded:
+        psum = psum + compute_fn(tiles)
+    return psum
+
+
 class TiledGEMM(torch.nn.Module):
     """
     Bufferized tiled GEMM for linear / matmul / bmm.
@@ -87,15 +130,16 @@ class TiledGEMM(torch.nn.Module):
         batched_weight: bool = False,
         transpose_weight: bool = False,
         weight_ck: bool = False,
+        pipelined: bool = False,
         tail_fn: Optional[Callable[..., torch.Tensor]] = None,
         tail_input_specs: Optional[list] = None,
         output_specs: Optional[List[Tuple[tuple, tuple, torch.dtype]]] = None,
     ):
         super().__init__()
         self.target = target
-        # One ``_InputSpec`` per fused-tail operand (built by the caller, which has
-        # the whole submodule).  ``is_scalar`` => pass whole (codebook / scalar);
-        # else load each tile per the spec.  See ``_apply_tail``.
+        # One ``_InputSpec`` per fused-tail operand (built by the caller, which has the
+        # whole submodule), or ``None`` => pass whole (codebook / scalar); else load each
+        # tile per the spec.  See ``_apply_tail``.
         self.tail_input_specs = tail_input_specs
         # One ``(full_shape, tile_shape, dtype)`` per output buffer.  A fused
         # ``tail_fn`` may be multi-output (e.g. ``quantize_mx`` returns
@@ -110,6 +154,10 @@ class TiledGEMM(torch.nn.Module):
         self.accumulate_fp32 = accumulate_fp32
         self.batched_weight = batched_weight
         self.transpose_weight = transpose_weight
+        # When True the C-reduction is software-pipelined (double-buffered): operand
+        # tile loads are issued one block ahead of the matmul that consumes them.
+        # Rolled for >= 3 blocks, fully unrolled for fewer; see ``_reduce_pipelined``.
+        self.pipelined = pipelined
         # ``weight_ck`` names the weight's physical layout directly (like conv's
         # ``nhwc``), avoiding the ambiguous word "transposed" — which means opposite
         # things for linear (natural K,C) and matmul (natural C,K).  ``True`` => the
@@ -126,18 +174,20 @@ class TiledGEMM(torch.nn.Module):
         default, ``(C, K)`` under ``weight_ck``."""
         return (c_val, k_val) if self.weight_ck else (k_val, c_val)
 
-    def _tile_op(
+    def _load_tiles(
         self,
         indices: GemmAxes,
         input: torch.Tensor,
         weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
         input_scale: Optional[torch.Tensor] = None,
         weight_scale: Optional[torch.Tensor] = None,
-        input_code: Optional[torch.Tensor] = None,
-        weight_code: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Multiply one (output, C-block) tile; ``bias`` (if given) is fused."""
+    ) -> Tuple[torch.Tensor, ...]:
+        """DMA-load one (output, C-block) tile's operands (no compute).
+
+        Returns ``(input_tile, weight_tile)``, plus the two scale tiles under
+        microscaling.  The tuple is all-Tensor (no ``None``) so it can be carried
+        as ``while_loop`` state by the double-buffered reduction.
+        """
         tile = self.tile_sizes
         bs = self.block_size
 
@@ -160,44 +210,121 @@ class TiledGEMM(torch.nn.Module):
                 transposed=self.transpose_weight,
             )
 
+        if input_scale is None or weight_scale is None:
+            return (input_tile, weight_tile)
+
+        input_scale_tile = voyager.load_tile(
+            input_scale,
+            (indices.b, indices.x, indices.c),
+            (tile.b, tile.x, tile.c // bs),
+        )
+        if self.batched_weight:
+            weight_scale_tile = voyager.load_tile(
+                weight_scale,
+                (indices.b, *self._wkc(indices.k, indices.c)),
+                (tile.b, *self._wkc(tile.k, tile.c // bs)),
+                transposed=self.transpose_weight,
+            )
+        else:
+            weight_scale_tile = voyager.load_tile(
+                weight_scale,
+                self._wkc(indices.k, indices.c),
+                self._wkc(tile.k, tile.c // bs),
+                transposed=self.transpose_weight,
+            )
+        return (input_tile, weight_tile, input_scale_tile, weight_scale_tile)
+
+    def _matmul_tiles(
+        self,
+        tiles: Tuple[torch.Tensor, ...],
+        bias: Optional[torch.Tensor],
+        input_code: Optional[torch.Tensor] = None,
+        weight_code: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the GEMM op on already-loaded operand tiles; ``bias`` (if given) is
+        fused.  ``tiles`` is the tuple returned by ``_load_tiles``."""
         # Bias is the 3rd positional arg; everything after it (scales / codes) is
         # keyword, so just append it when present.
-        args = [input_tile, weight_tile]
+        args = [tiles[0], tiles[1]]
         if bias is not None:
             args.append(bias)
 
-        if input_scale is not None and weight_scale is not None:
-            input_scale_tile = voyager.load_tile(
-                input_scale,
-                (indices.b, indices.x, indices.c),
-                (tile.b, tile.x, tile.c // bs),
-            )
-            if self.batched_weight:
-                weight_scale_tile = voyager.load_tile(
-                    weight_scale,
-                    (indices.b, *self._wkc(indices.k, indices.c)),
-                    (tile.b, *self._wkc(tile.k, tile.c // bs)),
-                    transposed=self.transpose_weight,
-                )
-            else:
-                weight_scale_tile = voyager.load_tile(
-                    weight_scale,
-                    self._wkc(indices.k, indices.c),
-                    self._wkc(tile.k, tile.c // bs),
-                    transposed=self.transpose_weight,
-                )
-            output_tile = self.target(
+        if len(tiles) > 2:
+            return self.target(
                 *args,
-                input_scale=input_scale_tile,
-                weight_scale=weight_scale_tile,
+                input_scale=tiles[2],
+                weight_scale=tiles[3],
                 block_size=self.block_size,
                 input_code=input_code,
                 weight_code=weight_code,
             )
-        else:
-            output_tile = self.target(*args)
+        return self.target(*args)
 
-        return output_tile
+    def _tile_op(
+        self,
+        indices: GemmAxes,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        input_scale: Optional[torch.Tensor] = None,
+        weight_scale: Optional[torch.Tensor] = None,
+        input_code: Optional[torch.Tensor] = None,
+        weight_code: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Multiply one (output, C-block) tile; ``bias`` (if given) is fused."""
+        tiles = self._load_tiles(
+            indices, input, weight, input_scale=input_scale, weight_scale=weight_scale
+        )
+        return self._matmul_tiles(
+            tiles, bias, input_code=input_code, weight_code=weight_code
+        )
+
+    def _reduce_sequential(self, b, x, k, input, weight, psum, num_c, **kwargs):
+        """Sequential C-reduction: load + matmul + accumulate one block per iteration
+        (today's default; no prefetch)."""
+        def cond_fn(c, psum_buf):
+            return c < num_c
+
+        def body_fn(c, psum_buf):
+            # Partials are bias-free; bias is added once before the reduction.
+            output_tile = self._tile_op(
+                GemmAxes(b, x, k, c), input, weight, None, **kwargs
+            )
+            if self.accumulate_fp32 and output_tile.dtype != torch.float32:
+                output_tile = output_tile.to(torch.float32)
+            return (c + 1, psum_buf + output_tile)
+
+        _, final_psum = while_loop(cond_fn, body_fn, (0, psum))
+        return final_psum
+
+    def _reduce_pipelined(self, b, x, k, input, weight, psum, num_c, **kwargs):
+        """Double-buffered C-reduction: prefetch each block's operand tiles one step
+        ahead of the matmul that consumes them.  Rolled for ``num_c >= 3``, fully
+        unrolled for fewer; both keep the prefetch-ahead ordering."""
+        input_scale = kwargs.get("input_scale")
+        weight_scale = kwargs.get("weight_scale")
+        input_code = kwargs.get("input_code")
+        weight_code = kwargs.get("weight_code")
+
+        def load_fn(c):
+            return self._load_tiles(
+                GemmAxes(b, x, k, c),
+                input,
+                weight,
+                input_scale=input_scale,
+                weight_scale=weight_scale,
+            )
+
+        def compute_fn(tiles):
+            out = self._matmul_tiles(
+                tiles, None, input_code=input_code, weight_code=weight_code
+            )
+            if self.accumulate_fp32 and out.dtype != torch.float32:
+                out = out.to(torch.float32)
+            return out
+
+        reduce_fn = _double_buffered_reduce if num_c >= 3 else _unrolled_reduce
+        return reduce_fn(psum, num_c, load_fn, compute_fn)
 
     def _outer_loop_body(
         self,
@@ -227,22 +354,11 @@ class TiledGEMM(torch.nn.Module):
             acc_dtype = torch.float32 if self.accumulate_fp32 else input.dtype
             psum = voyager.zero_tile((tile.b, tile.x, tile.k), acc_dtype)
 
-            def cond_fn(c, psum_buf):
-                return c < num_c
-
-            def body_fn(c, psum_buf):
-                # Partials are bias-free; bias is added once after the reduction.
-                output_tile = self._tile_op(
-                    GemmAxes(b, x, k, c), input, weight, None, **kwargs
-                )
-                if self.accumulate_fp32 and output_tile.dtype != torch.float32:
-                    output_tile = output_tile.to(torch.float32)
-                return (c + 1, psum_buf + output_tile)
-
-            _, final_psum = while_loop(cond_fn, body_fn, (0, psum))
-
             if bias_tile is not None:
-                final_psum = final_psum + bias_tile
+                psum = psum + bias_tile.to(acc_dtype)
+
+            reduce = self._reduce_pipelined if self.pipelined else self._reduce_sequential
+            final_psum = reduce(b, x, k, input, weight, psum, num_c, **kwargs)
 
         if self.accumulate_fp32 and final_psum.dtype != input.dtype:
             final_psum = final_psum.to(input.dtype)
@@ -280,10 +396,13 @@ class TiledGEMM(torch.nn.Module):
             if self.batched_weight:
                 weight = weight.reshape(-1, *weight.shape[nb:])
             if tail_operands is not None:
-                specs = self.tail_input_specs or [None] * len(tail_operands)
+                specs = self.tail_input_specs
                 new_operands = []
-                for t, s in zip(tail_operands, specs):
-                    if s is not None and s.is_scalar:
+                for i, t in enumerate(tail_operands):
+                    # A whole (scalar / codebook) operand has spec ``None`` when specs are
+                    # given — pass it through; tiled operands (and the no-specs case at all)
+                    # fold the batch dims.
+                    if specs is not None and specs[i] is None:
                         new_operands.append(t)
                     else:
                         new_operands.append(t.reshape(-1, *t.shape[nb:]))
@@ -309,10 +428,12 @@ class TiledGEMM(torch.nn.Module):
             voyager.alloc(shape, dtype) for shape, _, dtype in self.output_specs
         ]
 
-        def cond_fn(b, x, k, *bufs):
+        # ``output_bufs`` are closed over (additional inputs); ``store_tile`` writes them
+        # in place (a side effect), so the loop carries only the (b, x, k) tile index.
+        def cond_fn(b, x, k):
             return b < num_b
 
-        def body_fn(b, x, k, *bufs):
+        def body_fn(b, x, k):
             output_tiles = self._outer_loop_body(
                 b,
                 x,
@@ -325,18 +446,15 @@ class TiledGEMM(torch.nn.Module):
             )
             if not isinstance(output_tiles, (tuple, list)):
                 output_tiles = (output_tiles,)
-            new_bufs = [
+            for output_tile, output_buf, (_s, ts, _d) in zip(
+                output_tiles, output_bufs, self.output_specs
+            ):
                 voyager.store_tile(output_tile, output_buf, (b, x, k), ts)
-                for output_tile, output_buf, (_s, ts, _d) in zip(
-                    output_tiles, bufs, self.output_specs
-                )
-            ]
             # Advance the (b, x, k) tile grid (one fused increment op).
-            indices = voyager.increment_indices((b, x, k), (num_b, num_x, num_k))
-            return (*indices, *new_bufs)
+            return voyager.increment_indices((b, x, k), (num_b, num_x, num_k))
 
-        final = while_loop(cond_fn, body_fn, (0, 0, 0, *output_bufs))
-        outputs = list(final[3:])
+        while_loop(cond_fn, body_fn, (0, 0, 0))
+        outputs = list(output_bufs)
 
         if nb > 1:  # restore the folded batch dims
             outputs = [o.reshape(*batch_dims, *o.shape[1:]) for o in outputs]
@@ -429,6 +547,7 @@ class TiledConv2d(torch.nn.Module):
         nhwc: bool = False,
         block_size: Optional[int] = None,
         accumulate_fp32: bool = False,
+        pipelined: bool = False,
         tail_fn: Optional[Callable[..., torch.Tensor]] = None,
         tail_input_specs: Optional[list] = None,
         output_specs: Optional[List[Tuple[tuple, tuple, torch.dtype]]] = None,
@@ -462,6 +581,9 @@ class TiledConv2d(torch.nn.Module):
         self.output_dims = _NHWC if nhwc else None
         self.block_size = block_size
         self.accumulate_fp32 = accumulate_fp32
+        # See ``TiledGEMM.pipelined``: double-buffer the C-reduction (prefetch the
+        # next channel block's operand tiles while the current block convolves).
+        self.pipelined = pipelined
         self.tail_fn = tail_fn
 
     def _input_halo(self, kH, kW, tile_oh, tile_ow):
@@ -478,18 +600,20 @@ class TiledConv2d(torch.nn.Module):
         iw = (tile_ow - 1) * sw + dw * (kW - 1) + 1
         return ih, iw, tile_oh * sh, tile_ow * sw
 
-    def _tile_op(
+    def _load_tiles(
         self,
         indices: Conv2dAxes,
         input,
         weight,
-        bias,
         input_scale: Optional[torch.Tensor] = None,
         weight_scale: Optional[torch.Tensor] = None,
-        input_code: Optional[torch.Tensor] = None,
-        weight_code: Optional[torch.Tensor] = None,
-    ):
-        """Convolve one (output, C-block) tile; ``bias`` (if given) is fused."""
+    ) -> Tuple[torch.Tensor, ...]:
+        """DMA-load one (output, C-block) tile's operands (no compute).
+
+        Returns ``(input_tile, weight_tile)``, plus the two scale tiles under
+        microscaling.  The tuple is all-Tensor (no ``None``) so it can be carried as
+        ``while_loop`` state by the double-buffered reduction.
+        """
         tile = self.tile_sizes
         bs = self.block_size
         _, _, kH, kW = _unproject(weight.shape, self.weight_dims)
@@ -515,48 +639,125 @@ class TiledConv2d(torch.nn.Module):
             dims=w_dims,
         )
 
-        if input_scale is not None and weight_scale is not None:
-            # Microscaling: per-C-block scales, same spatial halo as the input.
-            input_scale_tile = voyager.load_tile(
-                input_scale,
-                _project(in_idx, self.input_dims),
-                _project((tile.n, tile.c // bs, ih, iw), self.input_dims),
-                tile_strides=_project(
-                    (tile.n, tile.c // bs, step_h, step_w), self.input_dims
-                ),
-            )
-            weight_scale_tile = voyager.load_tile(
-                weight_scale,
-                (indices.k, indices.c),
-                _project((tile.k, tile.c // bs, kH, kW), self.weight_dims),
-                dims=w_dims,
-            )
-            output_tile = self.target(
-                input_tile,
-                weight_tile,
+        if input_scale is None or weight_scale is None:
+            return (input_tile, weight_tile)
+
+        # Microscaling: per-C-block scales, same spatial halo as the input.
+        input_scale_tile = voyager.load_tile(
+            input_scale,
+            _project(in_idx, self.input_dims),
+            _project((tile.n, tile.c // bs, ih, iw), self.input_dims),
+            tile_strides=_project(
+                (tile.n, tile.c // bs, step_h, step_w), self.input_dims
+            ),
+        )
+        weight_scale_tile = voyager.load_tile(
+            weight_scale,
+            (indices.k, indices.c),
+            _project((tile.k, tile.c // bs, kH, kW), self.weight_dims),
+            dims=w_dims,
+        )
+        return (input_tile, weight_tile, input_scale_tile, weight_scale_tile)
+
+    def _conv_tiles(
+        self,
+        tiles: Tuple[torch.Tensor, ...],
+        bias,
+        input_code: Optional[torch.Tensor] = None,
+        weight_code: Optional[torch.Tensor] = None,
+    ):
+        """Run the conv op on already-loaded operand tiles; ``bias`` (if given) is
+        fused.  ``tiles`` is the tuple returned by ``_load_tiles``."""
+        if len(tiles) > 2:
+            return self.target(
+                tiles[0],
+                tiles[1],
                 bias,
                 self.stride,
                 (0, 0),
                 self.dilation,
                 self.groups,
-                input_scale=input_scale_tile,
-                weight_scale=weight_scale_tile,
+                input_scale=tiles[2],
+                weight_scale=tiles[3],
                 block_size=self.block_size,
                 input_code=input_code,
                 weight_code=weight_code,
             )
-        else:
-            output_tile = self.target(
-                input_tile,
-                weight_tile,
-                bias,
-                self.stride,
-                (0, 0),
-                self.dilation,
-                self.groups,
+        return self.target(
+            tiles[0],
+            tiles[1],
+            bias,
+            self.stride,
+            (0, 0),
+            self.dilation,
+            self.groups,
+        )
+
+    def _tile_op(
+        self,
+        indices: Conv2dAxes,
+        input,
+        weight,
+        bias,
+        input_scale: Optional[torch.Tensor] = None,
+        weight_scale: Optional[torch.Tensor] = None,
+        input_code: Optional[torch.Tensor] = None,
+        weight_code: Optional[torch.Tensor] = None,
+    ):
+        """Convolve one (output, C-block) tile; ``bias`` (if given) is fused."""
+        tiles = self._load_tiles(
+            indices, input, weight, input_scale=input_scale, weight_scale=weight_scale
+        )
+        return self._conv_tiles(
+            tiles, bias, input_code=input_code, weight_code=weight_code
+        )
+
+    def _reduce_sequential(self, n, oy, ox, k, input, weight, psum, num_c, **kwargs):
+        """Sequential C-reduction: load + conv + accumulate one channel block per
+        iteration (today's default; no prefetch)."""
+        def cond_fn(c, psum_buf):
+            return c < num_c
+
+        def body_fn(c, psum_buf):
+            # Partials are bias-free; bias is added once after the reduction.
+            output_tile = self._tile_op(
+                Conv2dAxes(n=n, h=oy, w=ox, k=k, c=c), input, weight, None, **kwargs
+            )
+            if self.accumulate_fp32 and output_tile.dtype != torch.float32:
+                output_tile = output_tile.to(torch.float32)
+            return (c + 1, psum_buf + output_tile)
+
+        _, final_psum = while_loop(cond_fn, body_fn, (0, psum))
+        return final_psum
+
+    def _reduce_pipelined(self, n, oy, ox, k, input, weight, psum, num_c, **kwargs):
+        """Double-buffered C-reduction: prefetch each channel block's operand tiles
+        one step ahead of the conv that consumes them.  Rolled for ``num_c >= 3``,
+        fully unrolled for fewer."""
+        input_scale = kwargs.get("input_scale")
+        weight_scale = kwargs.get("weight_scale")
+        input_code = kwargs.get("input_code")
+        weight_code = kwargs.get("weight_code")
+
+        def load_fn(c):
+            return self._load_tiles(
+                Conv2dAxes(n=n, h=oy, w=ox, k=k, c=c),
+                input,
+                weight,
+                input_scale=input_scale,
+                weight_scale=weight_scale,
             )
 
-        return output_tile
+        def compute_fn(tiles):
+            out = self._conv_tiles(
+                tiles, None, input_code=input_code, weight_code=weight_code
+            )
+            if self.accumulate_fp32 and out.dtype != torch.float32:
+                out = out.to(torch.float32)
+            return out
+
+        reduce_fn = _double_buffered_reduce if num_c >= 3 else _unrolled_reduce
+        return reduce_fn(psum, num_c, load_fn, compute_fn)
 
     def _outer_loop_body(
         self,
@@ -595,23 +796,8 @@ class TiledConv2d(torch.nn.Module):
                 acc_dtype,
             )
 
-            def cond_fn(c, psum_buf):
-                return c < num_c
-
-            def body_fn(c, psum_buf):
-                # Partials are bias-free; bias is added once after the reduction.
-                output_tile = self._tile_op(
-                    Conv2dAxes(n=n, h=oy, w=ox, k=k, c=c),
-                    input,
-                    weight,
-                    None,
-                    **kwargs,
-                )
-                if self.accumulate_fp32 and output_tile.dtype != torch.float32:
-                    output_tile = output_tile.to(torch.float32)
-                return (c + 1, psum_buf + output_tile)
-
-            _, final_psum = while_loop(cond_fn, body_fn, (0, psum))
+            reduce = self._reduce_pipelined if self.pipelined else self._reduce_sequential
+            final_psum = reduce(n, oy, ox, k, input, weight, psum, num_c, **kwargs)
 
             if bias_tile is not None:
                 # Broadcast bias along the output channel (K's physical position).
@@ -676,10 +862,12 @@ class TiledConv2d(torch.nn.Module):
             voyager.alloc(shape, dtype) for shape, _t, dtype in self.output_specs
         ]
 
-        def cond_fn(n, oy, ox, k, *bufs):
+        # ``output_bufs`` are closed over (additional inputs); ``store_tile`` writes them
+        # in place (a side effect), so the loop carries only the (n, oy, ox, k) index.
+        def cond_fn(n, oy, ox, k):
             return n < num_n
 
-        def body_fn(n, oy, ox, k, *bufs):
+        def body_fn(n, oy, ox, k):
             output_tiles = self._outer_loop_body(
                 n,
                 oy,
@@ -693,25 +881,22 @@ class TiledConv2d(torch.nn.Module):
             )
             if not isinstance(output_tiles, (tuple, list)):
                 output_tiles = (output_tiles,)
-            new_bufs = [
+            for output_tile, output_buf, (_s, ts, _d) in zip(
+                output_tiles, output_bufs, self.output_specs
+            ):
                 voyager.store_tile(
                     output_tile,
                     output_buf,
                     _project((n, k, oy, ox), self.output_dims),
                     ts,
                 )
-                for output_tile, output_buf, (_s, ts, _d) in zip(
-                    output_tiles, bufs, self.output_specs
-                )
-            ]
             # Advance the (n, h, w, k) tile grid (one fused increment op).
-            indices = voyager.increment_indices(
+            return voyager.increment_indices(
                 (n, oy, ox, k), (num_n, num_oy, num_ox, num_k)
             )
-            return (*indices, *new_bufs)
 
-        final = while_loop(cond_fn, body_fn, (0, 0, 0, 0, *output_bufs))
-        outputs = list(final[4:])
+        while_loop(cond_fn, body_fn, (0, 0, 0, 0))
+        outputs = list(output_bufs)
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
@@ -726,6 +911,7 @@ def build_gemm_buffers(
     batched_weight: bool = False,
     transpose_weight: bool = False,
     weight_ck: bool = False,
+    pipelined: bool = False,
     block_size: Optional[int] = None,
     tail_fn: Optional[Callable[..., torch.Tensor]] = None,
     tail_operands: Optional[Tuple[torch.Tensor, ...]] = None,
@@ -746,7 +932,8 @@ def build_gemm_buffers(
                      the per-tile loads of ``tail_operands`` (per ``tail_input_specs``).
         tail_operands: tail tensor operands (residual / mul / add operands and
                      quantization codebooks), in a single tuple.
-        tail_input_specs: one ``_InputSpec`` per tail operand (whole vs tiled).
+        tail_input_specs: one ``_InputSpec`` per *tiled* tail operand, or ``None`` for a
+                     whole (scalar / codebook) one.
         kwargs:      extra forward kwargs (e.g. MX input_scale/weight_scale/codes).
 
     Returns:
@@ -774,6 +961,7 @@ def build_gemm_buffers(
         batched_weight=batched_weight,
         transpose_weight=transpose_weight,
         weight_ck=weight_ck,
+        pipelined=pipelined,
         tail_fn=tail_fn,
         tail_input_specs=tail_input_specs,
         output_specs=output_specs,
@@ -786,15 +974,23 @@ def build_gemm_buffers(
     with _lenient_verifier():
         gm = export_model(pattern, (input, weight, bias), kwargs=export_kwargs)
     gm = _finalize_exported_gm(gm)
+    # Only num_c == 1 fuses the GEMM op into the tail (one accelerator pass); for a
+    # tiled reduction the GEMM stays separate and just the tail fuses — true whether
+    # the reduction is sequential or double-buffered (whose epilogue matmul lands in
+    # the store body).  See ``_fuse_tail_in_body``.
+    num_c = C // tile_c
     if tail_fn is not None:
-        # Re-group the GEMM op + its tail into a nested call_module (L1 fusion).
-        _fuse_tail_in_body(gm, target, tail_fn)
+        _fuse_tail_in_body(gm, target, tail_fn, fuse_ref_with_tail=(num_c == 1))
 
+    # Pipelined (rolled) reduction primes block 0 in the prologue, so the steady
+    # while_loop runs blocks 1..num_c-1; the unrolled path (num_c < 3) has no inner
+    # loop, so the inner extent is ignored either way.
+    inner = [(1, num_c, 1)] if (pipelined and num_c >= 3) else [num_c]
     _tag_loop_extents(
         gm,
         [
             [B // tile_b, X // tile_x, K // tile_k],  # outer (b, x, k) grid
-            [C // tile_c],                            # inner reduction (c)
+            inner,                                    # inner reduction (c)
         ],
     )
     return gm
@@ -814,6 +1010,7 @@ def build_conv2d_buffers(
     nhwc: bool = False,
     block_size: Optional[int] = None,
     accumulate_fp32: bool = False,
+    pipelined: bool = False,
     tail_fn: Optional[Callable[..., torch.Tensor]] = None,
     tail_operands: Optional[Tuple[torch.Tensor, ...]] = None,
     tail_input_specs: Optional[list] = None,
@@ -884,6 +1081,7 @@ def build_conv2d_buffers(
         nhwc=nhwc,
         block_size=block_size,
         accumulate_fp32=accumulate_fp32,
+        pipelined=pipelined,
         tail_fn=tail_fn,
         tail_input_specs=tail_input_specs,
         output_specs=output_specs,
@@ -897,16 +1095,20 @@ def build_conv2d_buffers(
     with _lenient_verifier():
         gm = export_model(pattern, (input, weight, bias), kwargs=export_kwargs)
     gm = _finalize_exported_gm(gm)
+    # Only num_c == 1 fuses the conv op into the tail; a tiled reduction (sequential or
+    # double-buffered) keeps the conv separate and fuses just the tail.
+    num_c = C // tile_c
     if tail_fn is not None:
-        # Re-group the conv op + its tail into a nested call_module (L1 fusion).
-        _fuse_tail_in_body(gm, target, tail_fn)
+        _fuse_tail_in_body(gm, target, tail_fn, fuse_ref_with_tail=(num_c == 1))
 
+    # See ``build_gemm_buffers``: the rolled pipeline runs channel blocks 1..num_c-1.
+    inner = [(1, num_c, 1)] if (pipelined and num_c >= 3) else [num_c]
     _tag_loop_extents(
         gm,
         [
             # outer (n, h, w, k) grid
             [N // tile_n, oH // tile_oh, oW // tile_ow, K // tile_k],
-            [C // tile_c],  # inner reduction (c)
+            inner,  # inner reduction (c)
         ],
     )
     return gm

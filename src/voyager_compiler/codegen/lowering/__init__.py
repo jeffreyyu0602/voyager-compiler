@@ -19,6 +19,7 @@ from .codegen import (  # noqa: F401
     gen_compute_graph_bufferized,
     print_bufferized_graph,
 )
+from .memory_planning import MemoryPlan, plan_memory  # noqa: F401
 
 __all__ = [
     "ops",
@@ -27,4 +28,6 @@ __all__ = [
     "gen_code_bufferized",
     "gen_compute_graph_bufferized",
     "print_bufferized_graph",
+    "plan_memory",
+    "MemoryPlan",
 ]

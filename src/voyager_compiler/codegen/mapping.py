@@ -182,22 +182,22 @@ def get_new_node_name_with_prefix(prefix: str):
 def get_submodule_name(module, nodes: List[Node]):
     prefix = "submodule"
     if is_torch_greater_or_equal("2.5"):
-        first_node = None
+        anchor_node = None
         for n in nodes:
             if n.target in OP_PARAM_ARG_INDEX or is_gemm_op(n):
-                first_node = n
+                anchor_node = n
                 break
             if (
                 n.op == 'call_function'
                 and not is_nop(n)
                 and not is_reshape_op(n)
                 and (
-                    first_node is None
-                    or first_node.target == torch.ops.quantized_ops.dequantize.default
+                    anchor_node is None
+                    or anchor_node.target == torch.ops.quantized_ops.dequantize.default
                 )
             ):
-                first_node = n
-        prefix = get_unique_node_name(first_node)
+                anchor_node = n
+        prefix = get_unique_node_name(anchor_node)
         if len(nodes) > 1:
             prefix += "_fused"
 
@@ -874,17 +874,17 @@ def normalize_shape(node, shape):
     return shape
 
 
-def get_reference_node(nodes):
-    first_node = None
+def get_anchor_node(nodes):
+    anchor_node = None
     for n in nodes:
         if is_gemm_op(n):
             return n
         if n.op == "call_function" and (
-            first_node is None
-            or first_node.target == torch.ops.quantized_ops.dequantize.default
+            anchor_node is None
+            or anchor_node.target == torch.ops.quantized_ops.dequantize.default
         ):
-            first_node = n
-    return first_node
+            anchor_node = n
+    return anchor_node
 
 
 def _build_conv2d_and_gemm_shape_map(node, output_shape):
@@ -946,21 +946,21 @@ def run_submod_l2_tiling(
         _merge_tiling
     )
 
-    first_node = get_reference_node(module.graph.nodes)
+    anchor_node = get_anchor_node(module.graph.nodes)
 
     total_size, scratchpad_map = strategy.evaluate(
         key_to_node, node, tiled_shapes, bank_width, bank_size, unroll_dims[1]
     )
 
     # Skip if GEMM already has fused reshape op
-    is_gemm = is_gemm_op(first_node)
+    is_gemm = is_gemm_op(anchor_node)
     submod_nodes = list(module.graph.nodes) + [node]
     if is_gemm and any("reshape" in n.meta for n in submod_nodes):
         logger.info(f"Skip submodule {node} which is a GEMM fused with reshape")
         return total_size, scratchpad_map, None
 
     min_sizes = None
-    transposed = first_node.meta.get("transposed", False)
+    transposed = anchor_node.meta.get("transposed", False)
 
     output_shape = tiled_shapes[node]
     if isinstance(node.value, (list, tuple)):
@@ -971,7 +971,7 @@ def run_submod_l2_tiling(
         ShapeProp(module).propagate(*args)
 
         # We are not doing tiling on Y, X and C dimensions for conv layers here
-        if is_conv2d(first_node):
+        if is_conv2d(anchor_node):
             dim = 3 if transposed else 1
             min_sizes = output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1:]
         else:
@@ -984,8 +984,8 @@ def run_submod_l2_tiling(
         new_shapes = {}
 
         if is_gemm:
-            new_shapes = _build_conv2d_and_gemm_shape_map(first_node, tile_sizes)
-            propagate_tiled_shapes_upstream(first_node, new_shapes)
+            new_shapes = _build_conv2d_and_gemm_shape_map(anchor_node, tile_sizes)
+            propagate_tiled_shapes_upstream(anchor_node, new_shapes)
 
         for n in node.all_input_nodes:
             if n not in new_shapes and require_allocation(n):
@@ -1006,24 +1006,24 @@ def run_submod_l2_tiling(
 
         if total_size <= cache_size:
             # Tiling adjustment for linear and matmul layers
-            if is_gemm and not is_conv2d(first_node):
+            if is_gemm and not is_conv2d(anchor_node):
                 tiling = (math.prod(tiling[:-1]), tiling[-1])
 
-            tiling = _merge_tiling(tiling, first_node.meta.get("l2_tiling"))
+            tiling = _merge_tiling(tiling, anchor_node.meta.get("l2_tiling"))
 
             if math.prod(tiling) == 1:
                 new_shapes = None
-                first_node.meta.pop("l2_tiling", None)
+                anchor_node.meta.pop("l2_tiling", None)
             else:
-                first_node.meta["l2_tiling"] = tiling
+                anchor_node.meta["l2_tiling"] = tiling
 
-                if is_gemm and first_node.kwargs.get("A_indptr") is not None:
-                    input_node = first_node.args[0]
+                if is_gemm and anchor_node.kwargs.get("A_indptr") is not None:
+                    input_node = anchor_node.args[0]
                     input_node = input_node.meta.get("source_node", input_node)
-                    tile_strides = first_node.meta["tile_strides"]
+                    tile_strides = anchor_node.meta["tile_strides"]
                     tile_strides["A_indptr"] = new_shapes[input_node][:-1]
 
-            first_node.meta.pop("tiled_shapes", None)
+            anchor_node.meta.pop("tiled_shapes", None)
 
             return total_size, scratchpad_map, new_shapes
 
@@ -1221,17 +1221,17 @@ def adjust_tiling(
 
     if node.op == "call_module":
         mod = named_modules[node.target]
-        first_node = get_reference_node(mod.graph.nodes)
+        anchor_node = get_anchor_node(mod.graph.nodes)
 
         for n in list(mod.graph.nodes):
-            if n != first_node:
+            if n != anchor_node:
                 n.meta.pop("l2_tiling", None)
     else:
-        first_node = node
+        anchor_node = node
 
-    l2_tiling = first_node.meta.get("l2_tiling")
+    l2_tiling = anchor_node.meta.get("l2_tiling")
     tiled_shapes = normalize_shape(
-        first_node, first_node.meta.get("tiled_shapes", {})
+        anchor_node, anchor_node.meta.get("tiled_shapes", {})
     )
 
     if not tiled_shapes:
@@ -1244,7 +1244,7 @@ def adjust_tiling(
         # TODO Skip if GEMM does not have fused dequantize op
         args = map_arg(node.args, lambda n: get_tiled_tensor(n))
         ShapeProp(mod).propagate(*args)
-        propagate_tiled_shapes_upstream(first_node, tiled_shapes)
+        propagate_tiled_shapes_upstream(anchor_node, tiled_shapes)
 
         # Calculate tiled shape for other input/output nodes
         for n in node.all_input_nodes:
@@ -1258,11 +1258,11 @@ def adjust_tiling(
         if n in node.all_input_nodes and require_allocation(n) or n is node
     }
 
-    op_scope = _get_scope(first_node.target)
-    node_to_key = get_node_to_key_map(first_node)
+    op_scope = _get_scope(anchor_node.target)
+    node_to_key = get_node_to_key_map(anchor_node)
     key_to_node = {f"{op_scope}::{v}": k for k, v in node_to_key.items()}
 
-    strategies = get_banking_strategies_for_op(first_node.target)
+    strategies = get_banking_strategies_for_op(anchor_node.target)
 
     logger.debug(f"Allocating scratchpad for {node} with strategies:")
 
@@ -1302,9 +1302,9 @@ def adjust_tiling(
     for n, s in scratchpad_map.items():
         logger.debug(f"  {n}: {s}")
 
-    strides = first_node.meta.get("tile_strides")
+    strides = anchor_node.meta.get("tile_strides")
     if strides is not None:
-        node.meta["tile_strides"] = normalize_shape(first_node, strides)
+        node.meta["tile_strides"] = normalize_shape(anchor_node, strides)
 
     strategy.print_banking_info(key_to_node, node)
 
@@ -1318,10 +1318,10 @@ def adjust_tiling(
     if interstellar is not None:
         _interstellar_arch, _interstellar_schedule, _interstellar_cache, \
             double_buffered_accum_buffer = interstellar
-        if _interstellar_arch is not None and is_gemm_op(first_node):
+        if _interstellar_arch is not None and is_gemm_op(anchor_node):
             _run_interstellar_for_node(
                 node,
-                first_node,
+                anchor_node,
                 final_tiled_shapes,
                 _interstellar_arch,
                 _interstellar_schedule,

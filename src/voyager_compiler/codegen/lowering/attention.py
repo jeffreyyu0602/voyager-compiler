@@ -113,23 +113,20 @@ class TiledAttention(torch.nn.Module):
 
         O = voyager.alloc((B, H, N, d), query.dtype)
 
-        def cond_fn(b, h, i, O_buf):
+        # ``O`` is closed over (an additional input); ``store_tile`` writes it in place
+        # (a side effect), so the loop carries only the (b, h, i) tile index.
+        def cond_fn(b, h, i):
             return b < query.shape[0]
 
-        def body_fn(b, h, i, O_buf):
+        def body_fn(b, h, i):
             O_tile = self._outer_loop_body(b, h, i, query, key, value, Br, Bc)
-            O_buf = voyager.store_tile(
-                O_tile, O_buf, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2)
-            )
+            voyager.store_tile(O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2))
             # Advance the (b, h, i) grid (one fused increment op).
-            b_next, h_next, i_next = voyager.increment_indices(
-                (b, h, i), (B, H, Tr)
-            )
-            return (b_next, h_next, i_next, O_buf)
+            return tuple(voyager.increment_indices((b, h, i), (B, H, Tr)))
 
         # Loop counters are plain ints (0); no index tensors are materialized.
-        _, _, _, final_O = while_loop(cond_fn, body_fn, (0, 0, 0, O))
-        return final_O
+        while_loop(cond_fn, body_fn, (0, 0, 0))
+        return O
 
 
 class FlashAttentionPipelined(torch.nn.Module):
@@ -324,22 +321,18 @@ class FlashAttentionPipelined(torch.nn.Module):
 
         O = voyager.alloc((B, H, N, d), query.dtype)
 
-        def cond_fn(b, h, i, O_buf):
+        # ``O`` is closed over (an additional input); ``store_tile`` writes it in place.
+        def cond_fn(b, h, i):
             return b < query.shape[0]
 
-        def body_fn(b, h, i, O_buf):
+        def body_fn(b, h, i):
             O_tile = outer_body(b, h, i, query, key, value, Br, Bc)
-            O_buf = voyager.store_tile(
-                O_tile, O_buf, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2)
-            )
+            voyager.store_tile(O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2))
             # Advance the (b, h, i) grid (one fused increment op).
-            b_next, h_next, i_next = voyager.increment_indices(
-                (b, h, i), (B, H, Tr)
-            )
-            return (b_next, h_next, i_next, O_buf)
+            return tuple(voyager.increment_indices((b, h, i), (B, H, Tr)))
 
-        _, _, _, final_O = while_loop(cond_fn, body_fn, (0, 0, 0, O))
-        return final_O
+        while_loop(cond_fn, body_fn, (0, 0, 0))
+        return O
 
 
 def build_attention_buffers(

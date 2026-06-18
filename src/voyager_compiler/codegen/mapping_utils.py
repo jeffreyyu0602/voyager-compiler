@@ -112,6 +112,12 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
     if scratchpad_map is not None and node in scratchpad_map:
         _set_meminfo(field.scratchpad, scratchpad_map[node])
 
+    # Bufferized path: each tile node carries its own scratchpad ``Segment``
+    # directly (symmetric with ``memory`` below), rather than a per-consumer
+    # ``scratchpad_map`` dict.
+    elif (scratchpad := node.meta.get("scratchpad")) is not None:
+        _set_meminfo(field.scratchpad, scratchpad)
+
     # Tensor properties
     field.node = node.name
     field.shape.extend(node.shape or [1])
@@ -128,6 +134,17 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
         save_tensor(node.value, os.path.join(output_dir, f"{node.name}.bin"))
 
 
+def _is_tile_dma(node):
+    """True for a side-effecting tile-DMA node (``voyager.copy_tile`` / ``store_tile``):
+    returns ``None``, mutating its ``dst`` (``args[1]``) in place, so its emitted output
+    is described from that dest buffer."""
+    schema = getattr(getattr(node, "target", None), "_schema", None)
+    return schema is not None and schema.name in (
+        "voyager::copy_tile",
+        "voyager::store_tile",
+    )
+
+
 def set_output_field(param, node, output_dir):
     if isinstance(node.value, torch.Tensor):
         node.meta["_tiled_shapes"] = node.meta.get("tiled_shapes")
@@ -137,17 +154,32 @@ def set_output_field(param, node, output_dir):
 
         node.meta.pop("_tiled_shapes", None)
         node.meta.pop("_scratchpad_map", None)
+    elif isinstance(node.value, (tuple, list)) and node.value and all(
+        isinstance(v, int) for v in node.value
+    ):
+        # An integer index vector (``increment_indices`` / ``delinearize_index``): a
+        # named handle that the per-dimension component getitems index into — a tile
+        # block index — not a tensor list.
+        param.output.node = node.name
     elif isinstance(node.value, (tuple, list)):
         if (memory := node.meta.get("memory")) is not None:
             memory_copy = copy.copy(memory)
             output_sizes = node.meta["output_sizes"]
 
-        if (scratchpad_map := node.meta.get("scratchpad_map")) is not None:
+        scratchpad_map = node.meta.get("scratchpad_map")
+        if scratchpad_map is not None and node in scratchpad_map:
             scratchpad_copy = copy.copy(scratchpad_map[node])
             tiled_output_sizes = node.meta["tiled_output_sizes"]
+        else:
+            scratchpad_map = None
 
-        if (tiled_shape := node.meta.get("tiled_shapes")) is not None:
+        # The bufferized path may leave a stale ``tiled_shapes`` (keyed by the
+        # pre-bufferization nodes) on a copied op; only use it when it keys ``node``.
+        tiled_shape = node.meta.get("tiled_shapes")
+        if tiled_shape is not None and node in tiled_shape:
             shapes = tiled_shape[node]
+        else:
+            tiled_shape = None
 
         if (dtypes := node.meta.get("dtype")) is None:
             dtypes = [None] * len(node.value)
@@ -174,6 +206,17 @@ def set_output_field(param, node, output_dir):
                 save_tensor(t, os.path.join(output_dir, f"{node.name}_{i}.bin"))
 
             param.outputs.tensors.append(tensor)
+    elif isinstance(node.value, (int, bool)):
+        # A scalar-valued op is an integer tile-index computation (a pipelined
+        # prefetch's ``j + 1``); its result is a named scalar a load/store references,
+        # not a tensor — record the name so the reference resolves.
+        param.output.node = node.name
+    elif node.value is None and _is_tile_dma(node):
+        # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns ``None`` — its
+        # dest buffer is a closed-over additional input mutated in place).  Its result is
+        # the tile it writes, described from the dest buffer (``args[1]``), which carries
+        # the planned address; the source tile and block index travel in the op's args.
+        set_tensor_field(param.output, node.args[1], output_dir, is_output=True)
     else:
         logger.warning(f"Unsupported output type: {type(node.value)}")
 
@@ -226,6 +269,13 @@ def convert_arg(value, output_dir=None) -> Argument:
             arg.tensor_list.tensors.extend([
                 Tensor(node=f"{value.name}_{i}") for i in range(len(val))
             ])
+        else:
+            # Scalar-valued node: a tile block index — the loop induction variable, or
+            # a computed index such as a pipelined prefetch's ``j + 1`` (emitted as its
+            # own Operation by ``_emit_node``).  Reference it by name so the address is
+            # explicit (the loop's ``node`` names the induction variable), rather than
+            # an empty positional placeholder that can only mean the bare counter.
+            arg.tensor.node = value.name
     elif isinstance(value, bool):
         arg.bool_value = value
     elif isinstance(value, int):
