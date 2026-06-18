@@ -3,17 +3,18 @@ Bufferization builders for scaled-dot-product attention (flash attention).
 
 Replaces ``aten.scaled_dot_product_attention`` with an explicit, executable
 *bufferized FX graph*: an output buffer (``voyager.alloc``), an outer
-``while_loop`` over the ``(B, H, query-block)`` grid, and an inner ``while_loop``
-over key blocks implementing the online-softmax flash-attention recurrence, with
-``voyager.*`` tile loads/stores and plain integer loop counters.
+``while_loop`` over the ``(B, H, query-block)`` grid, and an inner
+``while_loop`` over key blocks implementing the online-softmax flash-attention
+recurrence, with ``voyager.*`` tile loads/stores and plain integer loop
+counters.
 
-Two variants, both in the same int-loop / static-addressing style as ``gemm.py``
-and ``pointwise.py`` (and reusing their shared helpers):
+Two variants, both in the int-loop / static-addressing style with the
+``voyager.*`` memory primitives:
 
   * ``TiledAttention``        — straightforward sequential flash attention.
   * ``FlashAttentionPipelined``  — software-pipelined (triple-buffered) kernel
-    that overlaps DMA load / QK-matmul / softmax+PV across key blocks; falls back
-    to the sequential kernel for fewer than four key blocks.
+    that overlaps DMA load / QK-matmul / softmax+PV across key blocks; falls
+    back to the sequential kernel for fewer than four key blocks.
 
 Both match ``scaled_dot_product_attention(query, key, value, scale=scale)``.
 """
@@ -25,7 +26,7 @@ import torch
 from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler import export_model
-from voyager_compiler.codegen.lowering.common import (
+from voyager_compiler.codegen.lowering.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
@@ -113,14 +114,17 @@ class TiledAttention(torch.nn.Module):
 
         O = voyager.alloc((B, H, N, d), query.dtype)
 
-        # ``O`` is closed over (an additional input); ``store_tile`` writes it in place
-        # (a side effect), so the loop carries only the (b, h, i) tile index.
+        # ``O`` is closed over (an additional input); ``store_tile`` writes it
+        # in place (a side effect), so the loop carries only the (b, h, i) tile
+        # index.
         def cond_fn(b, h, i):
             return b < query.shape[0]
 
         def body_fn(b, h, i):
             O_tile = self._outer_loop_body(b, h, i, query, key, value, Br, Bc)
-            voyager.store_tile(O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2))
+            voyager.store_tile(
+                O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2)
+            )
             # Advance the (b, h, i) grid (one fused increment op).
             return tuple(voyager.increment_indices((b, h, i), (B, H, Tr)))
 
@@ -131,8 +135,8 @@ class TiledAttention(torch.nn.Module):
 
 class FlashAttentionPipelined(torch.nn.Module):
     """
-    Software-pipelined flash attention (FlashAttention-V3-style triple buffering),
-    int-index / ``voyager.*`` refactor.
+    Software-pipelined flash attention (FlashAttention-V3-style triple
+    buffering), int-index / ``voyager.*`` refactor.
 
     Each key block flows through three pipeline stages — DMA load, QK matmul,
     softmax + PV matmul — kept in flight simultaneously so softmax latency is
@@ -160,7 +164,12 @@ class FlashAttentionPipelined(torch.nn.Module):
         # Fuse the K transpose into the DMA load: Kj is (1, 1, d, Bc).
         d = key.shape[-1]
         Kj = voyager.load_tile(
-            key, idx, (1, 1, Bc, d), dims=dims, static_indices=static, transposed=True
+            key,
+            idx,
+            (1, 1, Bc, d),
+            dims=dims,
+            static_indices=static,
+            transposed=True,
         )
         Vj = voyager.load_tile(
             value, idx, (1, 1, Bc, d), dims=dims, static_indices=static
@@ -168,16 +177,17 @@ class FlashAttentionPipelined(torch.nn.Module):
         return Kj, Vj
 
     def _dma_load(self, b, h, j, key, value, Bc):
-        # Dynamic key block (steady-state kernel): ``j`` is a loop-counter Node, so
-        # the whole (b, h, j) index is dynamic.
+        # Dynamic key block (steady-state kernel): ``j`` is a loop-counter Node,
+        # so the whole (b, h, j) index is dynamic.
         return self._load_kv(key, value, Bc, (b, h, j), (0, 1, 2), None)
 
     def _dma_load_const(self, b, h, j, key, value, Bc):
-        # Constant key block (prologue): ``j`` is a Python int, so pin that dim via
-        # static_indices and keep the dynamic index all loop counters (b, h).  A
-        # mixed [b, h, <int>] index list could not be serialized by the codegen,
-        # and a SymInt loop counter is indistinguishable from an int by type — so
-        # the constant-vs-dynamic split lives at the call site, not a type check.
+        # Constant key block (prologue): ``j`` is a Python int, so pin that dim
+        # via static_indices and keep the dynamic index all loop counters
+        # (b, h).  A mixed [b, h, <int>] index list could not be serialized by
+        # the codegen, and a SymInt loop counter is indistinguishable from an
+        # int by type — so the constant-vs-dynamic split lives at the call site,
+        # not a type check.
         return self._load_kv(key, value, Bc, (b, h), (0, 1), (0, 0, j, 0))
 
     def _qk_matmul(self, Qi, Kj):
@@ -216,12 +226,12 @@ class FlashAttentionPipelined(torch.nn.Module):
 
     def _kernel(self, b, h, j, state, Qi, key, value, Bc):
         O_i, l_i, m_i, P0, V0, scores1, V1, K2, V2 = state
-        O_i = self._pv_matmul(O_i, P0, V0)                      # drain tile (PV)
+        O_i = self._pv_matmul(O_i, P0, V0)  # drain tile (PV)
         P1, O_i, l_i, m_i = self._online_softmax(O_i, l_i, m_i, scores1)
-        K3, V3 = self._dma_load(b, h, j, key, value, Bc)        # prefetch tile j
-        scores2 = self._qk_matmul(Qi, K2)                       # QK next tile
-        # Clone the values shifted to a different pipeline slot so the while_loop
-        # body does not alias its carried inputs.
+        K3, V3 = self._dma_load(b, h, j, key, value, Bc)  # prefetch tile j
+        scores2 = self._qk_matmul(Qi, K2)  # QK next tile
+        # Clone the values shifted to a different pipeline slot so the
+        # while_loop body does not alias its carried inputs.
         return (O_i, l_i, m_i, P1, V1.clone(), scores2, V2.clone(), K3, V3)
 
     def _epilogue(self, state, Qi):
@@ -314,20 +324,23 @@ class FlashAttentionPipelined(torch.nn.Module):
         Tr = N // Br
         Tc = M // Bc
 
-        # The pipeline needs four key blocks to fill/drain; otherwise sequential.
+        # The pipeline needs four key blocks to fill/drain; else sequential.
         outer_body = (
             self._outer_loop_body_pipelined if Tc > 3 else self._outer_loop_body
         )
 
         O = voyager.alloc((B, H, N, d), query.dtype)
 
-        # ``O`` is closed over (an additional input); ``store_tile`` writes it in place.
+        # ``O`` is closed over (additional input); ``store_tile`` writes it in
+        # place.
         def cond_fn(b, h, i):
             return b < query.shape[0]
 
         def body_fn(b, h, i):
             O_tile = outer_body(b, h, i, query, key, value, Br, Bc)
-            voyager.store_tile(O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2))
+            voyager.store_tile(
+                O_tile, O, (b, h, i), (1, 1, Br, d), dims=(0, 1, 2)
+            )
             # Advance the (b, h, i) grid (one fused increment op).
             return tuple(voyager.increment_indices((b, h, i), (B, H, Tr)))
 
@@ -346,9 +359,9 @@ def build_attention_buffers(
     pipelined: bool = False,
 ) -> torch.fx.GraphModule:
     """
-    Build the bufferized FX graph (while_loop nest over voyager.* primitives) for
-    flash attention.  ``tile_sizes`` is ``[Br, Bc]`` (query-row / key-col blocks).
-    ``pipelined`` selects the software-pipelined kernel.
+    Build the bufferized FX graph (while_loop nest over voyager.* primitives)
+    for flash attention.  ``tile_sizes`` is ``[Br, Bc]`` (query-row / key-col
+    blocks).  ``pipelined`` selects the software-pipelined kernel.
     """
     Br, Bc = tile_sizes
     cls = FlashAttentionPipelined if pipelined else TiledAttention
@@ -365,7 +378,7 @@ def build_attention_buffers(
         gm,
         [
             [B, H, N // Br],  # outer (b, h, query-block) grid
-            inner,            # inner key-block reduction
+            inner,  # inner key-block reduction
         ],
     )
     return gm

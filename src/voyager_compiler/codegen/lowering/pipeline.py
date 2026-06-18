@@ -61,7 +61,7 @@ import torch
 from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler import export_model
-from voyager_compiler.codegen.lowering.common import (
+from voyager_compiler.codegen.lowering.utils import (
     _InputSpec,
     _OutputSpec,
     _compute_input_spec,
@@ -95,12 +95,12 @@ def write_out(bank: torch.Tensor, value: torch.Tensor, accumulate) -> None:
     functional ``torch.cond`` (fresh-tensor branches), then a single
     ``copy_tile`` writes the result back into the bank.
     """
-    newv = torch.cond(
+    new_value = torch.cond(
         accumulate,
         lambda b=bank, v=value: b + v,
         lambda v=value: v.clone(),
     )
-    voyager.copy_tile(newv, bank, [0] * bank.ndim, list(bank.shape))
+    voyager.copy_tile(new_value, bank, [0] * bank.ndim, list(bank.shape))
 
 
 class PipelinedKernel(torch.nn.Module):
@@ -650,7 +650,7 @@ def build_conv2d(node, *, num_banks: int = 2):
     (``meta["transposed"]`` selects NHWC input/output + HWIO weight), like
     gemm.py's TiledConv2d.  Returns the gm or ``None``.
     """
-    from voyager_compiler.codegen.lowering.gemm import (
+    from voyager_compiler.codegen.lowering.utils import (
         _HWIO,
         _NHWC,
         _phys_pos,
@@ -1067,7 +1067,7 @@ def build_pool(node, *, num_banks: int = 2):
     load (``copy_tile``'s ``pad`` / ``pad_value``), so the kernel pools each
     halo with ``padding=0``.  Returns the gm, or ``None``.
     """
-    from voyager_compiler.codegen.lowering.gemm import (
+    from voyager_compiler.codegen.lowering.utils import (
         _NHWC,
         _project,
         _unproject,

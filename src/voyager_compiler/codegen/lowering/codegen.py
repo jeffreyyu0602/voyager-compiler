@@ -1,11 +1,11 @@
 """
 Loop-aware output generation for bufferized FX graphs.
 
-Three consumers of the bufferized FX dialect (``while_loop`` + ``voyager.*`` nodes),
-grouped here because they share the same traversal concerns:
+Three consumers of the bufferized FX dialect (``while_loop`` + ``voyager.*``
+nodes), grouped here because they share the same traversal concerns:
 
   * ``gen_code_bufferized``          FX graph -> protobuf ``Model`` (Loop ops)
-  * ``gen_compute_graph_bufferized`` FX graph -> graphviz SVG (loops as clusters)
+  * ``gen_compute_graph_bufferized`` FX graph -> graphviz SVG (loop clusters)
   * ``print_bufferized_graph``       FX graph -> indented text
 
 Mirrors ``codegen/mapping.gen_code`` / ``gen_compute_graph`` but understands the
@@ -45,10 +45,10 @@ def _target_name(target, short: bool = False) -> str:
 # 1. Protobuf code generation
 # ===========================================================================
 
+
 def _is_lifted_index(node: torch.fx.Node) -> bool:
-    return (
-        node.op == "get_attr"
-        and str(node.target).startswith("lifted_tensor")
+    return node.op == "get_attr" and str(node.target).startswith(
+        "lifted_tensor"
     )
 
 
@@ -95,7 +95,9 @@ def _trip_str(node) -> str:
         return ""
     dims = []
     for start, end, step in (_norm_extent(e) for e in ext):
-        dims.append(str(end) if (start, step) == (0, 1) else f"{start}:{end}:{step}")
+        dims.append(
+            str(end) if (start, step) == (0, 1) else f"{start}:{end}:{step}"
+        )
     return f" trip=[{', '.join(dims)}]"
 
 
@@ -111,19 +113,27 @@ def _emit_body(
 
 
 def _emit_fused_op(node, named, output_dir) -> Operation:
-    """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a protobuf
-    ``fused_op`` — an ``OpOverloadList`` of the submodule's compute ops, mirroring the
-    default ``gen_code`` call_module path.  The body's ShapeProp gave the call_module
-    node + its ``load_tile`` args their ``value``, so we ShapeProp the submodule with
-    those to populate its inner nodes for ``map_node``."""
+    """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a
+    protobuf ``fused_op`` — an ``OpOverloadList`` of the submodule's compute
+    ops, mirroring the default ``gen_code`` call_module path.  The body's
+    ShapeProp gave the call_module node + its ``load_tile`` args their
+    ``value``, so we ShapeProp the submodule with those to populate its inner
+    nodes for ``map_node``."""
     sub = named[str(node.target)]
     ShapeProp(sub).propagate(
-        *(a.value.clone() if isinstance(a, torch.fx.Node) else a for a in node.args)
+        *(
+            a.value.clone() if isinstance(a, torch.fx.Node) else a
+            for a in node.args
+        )
     )
     op = Operation()
     op.fused_op.name = node.name
     for n in sub.graph.nodes:
-        if n.op == "call_function" and not n.meta.get("fused", False) and not is_nop(n):
+        if (
+            n.op == "call_function"
+            and not n.meta.get("fused", False)
+            and not is_nop(n)
+        ):
             op.fused_op.op_list.append(map_node(n, output_dir))
     set_output_field(op, node, output_dir)
     return op
@@ -135,11 +145,12 @@ _COPY_TILE = torch.ops.voyager.copy_tile.default
 
 
 def _feeds_tile_index(node, _seen=None) -> bool:
-    """True if ``node`` (transitively) computes a tile DMA block index — it reaches the
-    ``indices`` argument of a ``load_tile`` / ``store_tile`` / ``copy_tile`` through a
-    chain of scalar index arithmetic.  Such addressing (a pipelined prefetch's ``j+1``,
-    or a ``delinearize_index(i)`` of the linear counter) is real computation, not loop
-    control, so the whole cone must be emitted rather than dropped."""
+    """True if ``node`` (transitively) computes a tile DMA block index — it
+    reaches the ``indices`` argument of a ``load_tile`` / ``store_tile`` /
+    ``copy_tile`` through a chain of scalar index arithmetic.  Such addressing
+    (a pipelined prefetch's ``j+1``, or a ``delinearize_index(i)`` of the linear
+    counter) is real computation, not loop control, so the whole cone must be
+    emitted rather than dropped."""
     if _seen is None:
         _seen = set()
     for u in node.users:
@@ -147,11 +158,16 @@ def _feeds_tile_index(node, _seen=None) -> bool:
             continue
         _seen.add(u)
         if u.target in (_LOAD_TILE, _STORE_TILE, _COPY_TILE):
-            ix = 1 if u.target is _LOAD_TILE else 2  # position of the ``indices`` arg
+            ix = (
+                1 if u.target is _LOAD_TILE else 2
+            )  # position of the ``indices`` arg
             if len(u.args) > ix and node in (u.args[ix] or ()):
                 return True
-        elif not isinstance(getattr(u, "value", None), (torch.Tensor, list, tuple)):
-            # scalar index arithmetic (add / floordiv / mod / getitem) — recurse.
+        elif not isinstance(
+            getattr(u, "value", None), (torch.Tensor, list, tuple)
+        ):
+            # scalar index arithmetic (add / floordiv / mod / getitem) —
+            # recurse.
             if _feeds_tile_index(u, _seen):
                 return True
     return False
@@ -168,29 +184,33 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
         ops.append(_emit_loop(node, gm, named, output_dir))
         return
 
-    # getitem usually just unpacks loop results (no compute) — dropped, UNLESS it
-    # extracts a tile-index component (a ``delinearize_index`` output) that a tile DMA
-    # addresses by, which is genuine address-gen and must be emitted.
+    # getitem usually just unpacks loop results (no compute) — dropped, UNLESS
+    # it extracts a tile-index component (a ``delinearize_index`` output) that a
+    # tile DMA addresses by, which is genuine address-gen and must be emitted.
     if node.target is operator.getitem:
         if not _feeds_tile_index(node):
             return
     elif is_nop(node):
         return
-    # increment_indices is loop-counter bookkeeping; the nested Loop's start/end/step
-    # already encodes the iteration, so it is not a compute op.
+    # increment_indices is loop-counter bookkeeping; the nested Loop's
+    # start/end/step already encodes the iteration, so it is not a compute op.
     elif node.target is INCREMENT_INDICES:
         return
-    # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns ``None`` since
-    # the buffer is a closed-over additional input mutated in place) is a real
-    # instruction, always emitted despite its non-tensor value — its output is the tile
-    # it writes (set from the dest in ``set_output_field``).
+    # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns
+    # ``None`` since the buffer is a closed-over additional input mutated in
+    # place) is a real instruction, always emitted despite its non-tensor value
+    # — its output is the tile it writes (set from the dest in
+    # ``set_output_field``).
     elif node.target not in (_COPY_TILE, _STORE_TILE):
-        # A non-tensor call_function is usually integer loop-index carry arithmetic
-        # (k+1, k % num_k, ...) — loop control made explicit by the Loop structure, so not
-        # emitted.  The exception is a value that *indexes* a tile DMA (a prefetch's
-        # ``j+1``, or a ``delinearize_index`` vector): genuine addressing — emit it so the
-        # DMA can reference it by name (``map_node`` serialises it like any op).
-        if not isinstance(getattr(node, "value", None), (torch.Tensor, list, tuple)):
+        # A non-tensor call_function is usually integer loop-index carry
+        # arithmetic (k+1, k % num_k, ...) — loop control made explicit by the
+        # Loop structure, so not emitted.  The exception is a value that
+        # *indexes* a tile DMA (a prefetch's ``j+1``, or a ``delinearize_index``
+        # vector): genuine addressing — emit it so the DMA can reference it by
+        # name (``map_node`` serialises it like any op).
+        if not isinstance(
+            getattr(node, "value", None), (torch.Tensor, list, tuple)
+        ):
             if not _feeds_tile_index(node):
                 return
 
@@ -217,15 +237,18 @@ def _emit_loop(node, parent_gm, parent_named, output_dir) -> Operation:
     for i, (start, end, step) in enumerate(extents):
         lop = Operation()
         lop.loop.node = (
-            placeholders[i].name if i < len(placeholders) else f"{node.name}_d{i}"
+            placeholders[i].name
+            if i < len(placeholders)
+            else f"{node.name}_d{i}"
         )
         lop.loop.start = start
         lop.loop.end = end
         lop.loop.step = step
         loops.append(lop)
 
-    # Nest innermost-first: protobuf ``repeated.append`` copies by value, so each
-    # inner loop must be fully populated before it is appended into its outer.
+    # Nest innermost-first: protobuf ``repeated.append`` copies by value, so
+    # each inner loop must be fully populated before it is appended into its
+    # outer.
     loops[-1].loop.body.extend(body_ops)
     for outer, inner in zip(reversed(loops[:-1]), reversed(loops[1:])):
         outer.loop.body.append(inner)
@@ -235,8 +258,8 @@ def _emit_loop(node, parent_gm, parent_named, output_dir) -> Operation:
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     """
     Generate a protobuf ``Model`` from a bufferized FX graph, emitting ``Loop``
-    operations for ``while_loop`` nodes (recursively) and ``voyager.*`` / aten ops as
-    ordinary operations.
+    operations for ``while_loop`` nodes (recursively) and ``voyager.*`` / aten
+    ops as ordinary operations.
     """
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
@@ -271,6 +294,7 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
 # ===========================================================================
 # 2. Graphviz rendering (loops as clusters)
 # ===========================================================================
+
 
 def _label(node: torch.fx.Node) -> str:
     name = node.name
@@ -356,8 +380,8 @@ def gen_compute_graph_bufferized(
     args: Optional[tuple] = None,
 ) -> None:
     """
-    Render a bufferized FX graph to ``<output_file>.svg``; each ``while_loop`` is
-    a labelled cluster box containing its (possibly nested) body.
+    Render a bufferized FX graph to ``<output_file>.svg``; each ``while_loop``
+    is a labelled cluster box containing its (possibly nested) body.
     """
     if args is not None:
         ShapeProp(model).propagate(*args)
@@ -373,8 +397,9 @@ def gen_compute_graph_bufferized(
 # 3. Indented text printer
 # ===========================================================================
 
-# Short names for the builtin torch dtypes used in the ``<shape x dtype>`` annotation
-# (custom quantized dtypes carry their own string, e.g. ``nf4_6``, used verbatim).
+# Short names for the builtin torch dtypes used in the ``<shape x dtype>``
+# annotation (custom quantized dtypes carry their own string, e.g. ``nf4_6``,
+# used verbatim).
 _DTYPE_SHORT = {
     torch.float32: "f32",
     torch.float64: "f64",
@@ -390,14 +415,15 @@ _DTYPE_SHORT = {
 
 
 def _type_str(node) -> str:
-    """MLIR-like ``<DxDx...xdtype>`` (plus ``, space`` when known) for a node that
-    produces a single tensor; ``""`` otherwise (multi-output / scalar / unknown).
+    """MLIR-like ``<DxDx...xdtype>`` (plus ``, space`` when known) for a node
+    that produces a single tensor; ``""`` otherwise (multi-output / scalar /
+    unknown).
 
-    The dtype is the custom (quantized) ``meta['dtype']`` string (e.g. ``nf4_6``) used
-    verbatim when set, else a short name for the builtin torch dtype (``f32`` / ``bf16``
-    / ...).  ``space`` is ``meta['space']`` (``DRAM`` / ``Scratchpad``) from the bufferize
-    pass.  Shapes come from the node's ShapeProp ``value`` or, inside loop bodies, the
-    exported ``meta['val']``.
+    The dtype is the custom (quantized) ``meta['dtype']`` string (e.g.
+    ``nf4_6``) used verbatim when set, else a short name for the builtin torch
+    dtype (``f32`` / ``bf16`` / ...).  ``space`` is ``meta['space']`` (``DRAM``
+    / ``Scratchpad``) from the bufferize pass.  Shapes come from the node's
+    ShapeProp ``value`` or, inside loop bodies, the exported ``meta['val']``.
     """
     val = getattr(node, "value", None)
     if not isinstance(val, torch.Tensor):
@@ -405,27 +431,32 @@ def _type_str(node) -> str:
     if not isinstance(val, torch.Tensor):
         return ""
     custom = node.meta.get("dtype")
-    dtype = custom if isinstance(custom, str) else _DTYPE_SHORT.get(
-        val.dtype, str(val.dtype).replace("torch.", "")
+    dtype = (
+        custom
+        if isinstance(custom, str)
+        else _DTYPE_SHORT.get(val.dtype, str(val.dtype).replace("torch.", ""))
     )
     dims = "x".join(str(int(d)) for d in val.shape)
-    ty = f"{dims}x{dtype}" if dims else dtype       # 0-D scalar -> just the dtype
+    ty = f"{dims}x{dtype}" if dims else dtype  # 0-D scalar -> just the dtype
     space = node.meta.get("space")
     return f"<{ty}, {space}>" if space else f"<{ty}>"
 
 
 def _fmt_arg(a):
     if isinstance(a, torch.fx.Node):
-        # Annotate every tensor argument with its ``<shape×dtype, space>`` so a copy_tile's
-        # direction is legible inline (e.g. ``copy_tile(src<…,DRAM>, dst<…,Scratchpad>)`` =
-        # a load); scalar / index args (``_type_str`` empty) print as the bare name.
+        # Annotate every tensor argument with its ``<shape×dtype, space>`` so a
+        # copy_tile's direction is legible inline (e.g. ``copy_tile(src<…,DRAM>,
+        # dst<…,Scratchpad>)`` = a load); scalar / index args (``_type_str``
+        # empty) print as the bare name.
         return f"{a.name}{_type_str(a)}"
     if isinstance(a, (list, tuple)):
         return "[" + ", ".join(_fmt_arg(x) for x in a) + "]"
     return repr(a)
 
 
-def _print_loop(node, gm, named, lines: List[str], indent: int, pad: str) -> None:
+def _print_loop(
+    node, gm, named, lines: List[str], indent: int, pad: str
+) -> None:
     """
     Print a while_loop in scf.for-like form, binding each loop-body argument to
     the value it receives so the dataflow across the loop boundary is explicit:
@@ -441,18 +472,23 @@ def _print_loop(node, gm, named, lines: List[str], indent: int, pad: str) -> Non
     extra = list(node.args[3]) if len(node.args) > 3 else []
     phs = (
         [n for n in body_mod.graph.nodes if n.op == "placeholder"]
-        if isinstance(body_mod, GraphModule) else []
+        if isinstance(body_mod, GraphModule)
+        else []
     )
 
     def _bindings(ph_list, src_list):
-        # Annotate only the bound placeholder (LHS); the source (RHS) is a node already
-        # defined and annotated above, so printing it bare (just its name) avoids the noise.
+        # Annotate only the bound placeholder (LHS); the source (RHS) is a node
+        # already defined and annotated above, so printing it bare (just its
+        # name) avoids the noise.
         return ", ".join(
             f"{ph.name}{_type_str(ph)} = {src}"
             for ph, src in zip(ph_list, src_list)
         )
 
-    header = f"{pad}{node.name} = loop{_trip_str(node)} carried({_bindings(phs[:len(carried)], carried)})"
+    header = (
+        f"{pad}{node.name} = loop{_trip_str(node)} "
+        f"carried({_bindings(phs[:len(carried)], carried)})"
+    )
     if extra:
         header += f" extra({_bindings(phs[len(carried):], extra)})"
     lines.append(header + " {")
@@ -461,9 +497,12 @@ def _print_loop(node, gm, named, lines: List[str], indent: int, pad: str) -> Non
     lines.append(f"{pad}}}")
 
 
-def _print_cond(node, gm, named, lines: List[str], indent: int, pad: str) -> None:
-    """Print a ``torch.cond`` in MLIR ``scf.if`` form — both branch regions descended into,
-    operands bound to each branch's placeholders, the branch output rendered as ``yield``:
+def _print_cond(
+    node, gm, named, lines: List[str], indent: int, pad: str
+) -> None:
+    """Print a ``torch.cond`` in MLIR ``scf.if`` form — both branch regions
+    descended into, operands bound to each branch's placeholders, the branch
+    output rendered as ``yield``:
 
         cond = if pred (b_arg0 = src0, ...) {
           <true region>
@@ -477,28 +516,42 @@ def _print_cond(node, gm, named, lines: List[str], indent: int, pad: str) -> Non
     operands = list(node.args[3]) if len(node.args) > 3 else []
 
     def _branch(graph_arg):
-        mod = named.get(str(graph_arg.target)) or getattr(gm, str(graph_arg.target), None)
+        mod = named.get(str(graph_arg.target)) or getattr(
+            gm, str(graph_arg.target), None
+        )
         phs = (
             [n for n in mod.graph.nodes if n.op == "placeholder"]
-            if isinstance(mod, GraphModule) else []
+            if isinstance(mod, GraphModule)
+            else []
         )
         binds = ", ".join(
-            f"{ph.name}{_type_str(ph)} = {src}" for ph, src in zip(phs, operands)
+            f"{ph.name}{_type_str(ph)} = {src}"
+            for ph, src in zip(phs, operands)
         )
         return mod, binds
 
     true_mod, true_binds = _branch(node.args[1])
     false_mod, false_binds = _branch(node.args[2])
 
-    lines.append(f"{pad}{node.name}{_type_str(node)} = if {pred} ({true_binds}) {{")
+    lines.append(
+        f"{pad}{node.name}{_type_str(node)} = if {pred} ({true_binds}) {{"
+    )
     if isinstance(true_mod, GraphModule):
         _print_graph(
-            true_mod, lines, indent + 1, skip_placeholders=True, terminator="yield"
+            true_mod,
+            lines,
+            indent + 1,
+            skip_placeholders=True,
+            terminator="yield",
         )
     lines.append(f"{pad}}} else ({false_binds}) {{")
     if isinstance(false_mod, GraphModule):
         _print_graph(
-            false_mod, lines, indent + 1, skip_placeholders=True, terminator="yield"
+            false_mod,
+            lines,
+            indent + 1,
+            skip_placeholders=True,
+            terminator="yield",
         )
     lines.append(f"{pad}}}")
 
@@ -527,7 +580,9 @@ def _print_graph(
             sub = getattr(gm, str(node.target), None)
             if isinstance(sub, GraphModule):
                 continue  # printed at the while_loop use-site
-            lines.append(f"{pad}{node.name}{_type_str(node)} = get_attr {node.target}")
+            lines.append(
+                f"{pad}{node.name}{_type_str(node)} = get_attr {node.target}"
+            )
             continue
 
         if node.op == "call_function" and node.target is WHILE_LOOP:
@@ -539,10 +594,10 @@ def _print_graph(
             continue
 
         if node.op == "call_module":
-            # A fused submodule: just a braced block labelled by the node name (its
-            # placeholders reuse their source-node names, so the body ops read directly
-            # against the outer nodes — no ``arg`` lines, and the ``= fused <target>``
-            # tag only repeats the node name).
+            # A fused submodule: just a braced block labelled by the node name
+            # (its placeholders reuse their source-node names, so the body ops
+            # read directly against the outer nodes — no ``arg`` lines, and the
+            # ``= fused <target>`` tag only repeats the node name).
             sub = named.get(str(node.target))
             lines.append(f"{pad}{node.name}{_type_str(node)} = fused {{")
             if isinstance(sub, GraphModule):

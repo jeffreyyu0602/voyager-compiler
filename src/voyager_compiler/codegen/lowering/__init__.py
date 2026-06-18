@@ -7,9 +7,11 @@ primitives in the ``voyager`` torch.library namespace (``voyager.alloc``,
 ``voyager.zero_tile``, ``voyager.load_tile``, ``voyager.store_tile``), then
 generates protobuf / graphviz / text from that graph.
 
-Modules: ``ops`` (voyager.* primitives), ``common`` (shared builder helpers),
-``gemm`` / ``pointwise`` / ``attention`` (loop builders), ``bufferization`` (the
-rewrite pass), ``codegen`` (loop-aware output).
+Modules: ``ops`` (voyager.* primitives), ``utils`` (shared builder helpers +
+layout projections), ``pipeline`` (the unified Pallas-style software-pipelining
+scheduler and its GEMM / conv2d / pointwise / pool builders), ``attention``
+(flash-attention loop builder), ``bufferization`` (the rewrite pass),
+``codegen`` (loop-aware output).
 """
 
 from . import ops  # noqa: F401  (registers the voyager.* torch.library ops)
