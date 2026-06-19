@@ -25,6 +25,7 @@ from ..mapping_utils import (
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
+    is_nop,
     is_pooling,
 )
 from .ops import MemoryLevel
@@ -120,6 +121,14 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
                 if len(n.args) > 3:
                     operands += list(n.args[3])
                 _thread(operands, _subgraph(gm, n.args[1].target))
+            elif n.target is _COND:
+                # Both cond branches share the operand list (args[3]); thread
+                # codebook-ness into each, exactly like a while_loop body — a
+                # tail op (e.g. quantize_mx) inside a finalize cond consumes its
+                # codebook through a branch placeholder.
+                operands = list(n.args[3]) if len(n.args) > 3 else []
+                _thread(operands, _subgraph(gm, n.args[1].target))
+                _thread(operands, _subgraph(gm, n.args[2].target))
         elif n.op == "call_module":
             _thread(list(n.args), _subgraph(gm, n.target))
 
@@ -127,196 +136,157 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
     return {p for p in gm.graph.nodes if p.op == "placeholder" and p in local}
 
 
+_VOYAGER_WAIT = torch.ops.voyager.async_wait.default
+_VOYAGER_COPY = torch.ops.voyager.copy_tile.default
+
+# Control logic / addressing / DMA / store / buffer ops — *not* tile compute, so
+# they are exempt from the destination-passing check below.  The prefetch
+# semaphore (``where`` / ``eq`` / the DMA-guard's ``zeros`` dummy), the async
+# DMA + its token wait, the index ops, the bank-read ``select``, the
+# multi-output ``getitem``, the ``copy_tile`` store itself, and the ``alloc``
+# buffer all fall here.  (These become registers; not annotated yet.)
+_NON_COMPUTE = {
+    _VOYAGER_ALLOC,
+    _VOYAGER_ASYNC,
+    _VOYAGER_WAIT,
+    _VOYAGER_COPY,
+    _VOYAGER_INCR,
+    _VOYAGER_DELIN,
+    torch.ops.aten.select.int,
+    torch.ops.aten.where.self,
+    torch.ops.aten.eq.Scalar,
+    torch.ops.aten.eq.Tensor,
+    torch.ops.aten.zeros.default,
+    torch.ops.aten.arange.default,  # grid-index range (addressing)
+    operator.getitem,
+}
+
+
 def annotate_tensor_spaces(gm: GraphModule) -> None:
-    """
-    Annotate ``node.meta['space']`` with each tensor's memory space and
-    validate the bufferized memory model:
+    """Alloc-only memory model: mark the *buffers* and validate that every tile
+    computation lands in one.
 
-      * placeholder / get_attr param                  -> DRAM
-      * ``voyager.alloc`` buffer                      -> DRAM
-      * ``voyager.zero_tile`` accumulator             -> Scratchpad
-      * ``load_tile`` (source DRAM)                   -> Scratchpad
-      * ``store_tile`` (source Scratchpad, dest DRAM) -> DRAM
-      * any other op / fused ``call_module`` (inputs Scratchpad) -> Scratchpad
+      * **Buffers** carry ``node.meta['space']``: a ``voyager.alloc`` is
+        Scratchpad (``MemoryLevel.SRAM``) or DRAM (its level arg); a top-level
+        input placeholder and a weight ``get_attr`` are DRAM.  Codebooks /
+        qmaps are *params* (passed to the accelerator, not memory) — unmarked.
+      * **Compute** is *not* given a space.  Instead the destination-passing
+        invariant is checked: every tile-compute ``call_function`` /
+        ``call_module`` result must be written to a buffer via ``copy_tile``.
+        Control logic (``_NON_COMPUTE`` + NOPs) is exempt.
 
-    Spaces thread through ``while_loop`` / ``call_module`` boundaries: a body
-    placeholder inherits the space of the operand it is bound to and a loop
-    result inherits its carried value — so e.g. the carried ``zero_tile``
-    accumulator stays Scratchpad inside the reduction loop.  Codebook / qmap
-    operands are *unallocated*: left unmarked and skipped in the checks.
-    Asserts each rule, so a violation raises ``AssertionError``.
+    Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
+    when an op's result is the body's output, the check threads to the users of
+    the loop / cond node in the parent graph.  A violation raises.
     """
     codebooks: set = set()
     _collect_codebook_nodes(gm, codebooks)
-    _annotate_spaces(gm, {}, codebooks)
+    _annotate_and_validate(gm, codebooks, parent_hop=None, parent_ctx=None)
 
 
-def _annotate_spaces(gm: GraphModule, ph_space: dict, codebooks: set) -> list:
-    """Annotate ``gm`` given ``{placeholder: space}`` from its caller; return
-    the spaces of its output values (to thread a ``while_loop`` body's results
-    back to the loop's getitems)."""
-    space: dict = {}
-    loop_results: dict = {}  # while_loop node -> [result spaces]
-    out_spaces: list = []
+def _is_compute(node: Node, codebooks: set) -> bool:
+    """A tile-compute op subject to the destination-passing rule: it yields a
+    tensor and is not a codebook, a NOP, or a control / DMA / store / buffer
+    op.  A fused ``call_module`` is one L1 compute op."""
+    if node in codebooks or not _produces_tensor(node):
+        return False
+    if node.op == "call_module":
+        return True
+    if node.op != "call_function":
+        return False
+    return node.target not in _NON_COMPUTE and not is_nop(node)
 
-    def sp(x):
-        return space.get(x) if isinstance(x, Node) else None
 
-    def scratchpad_inputs(node):
-        for a in node.all_input_nodes:
-            if a in codebooks or sp(a) is None or _is_scalar_operand(a):
-                continue  # codebook / scalar (whole) or non-tensor
-            assert (
-                sp(a) == "Scratchpad"
-            ), f"{node.target} input '{a}' must be Scratchpad, got {sp(a)}"
+def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
+    """For ``node`` returned as ``gm``'s output, the parent-graph ``getitem``
+    handles of the loop / cond ``parent_hop`` at the matching output slot(s) —
+    used to thread the store check across the body boundary."""
+    out = next(x for x in gm.graph.nodes if x.op == "output")
+    outs = out.args[0]
+    outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+    handles = []
+    for i, o in enumerate(outs):
+        if o is node:
+            handles.append(
+                next(
+                    (
+                        u
+                        for u in parent_hop.users
+                        if u.target is operator.getitem and u.args[1] == i
+                    ),
+                    None,
+                )
+            )
+    return handles
 
+
+def _stored(node: Node, ctx: tuple) -> bool:
+    """True if every consumer of ``node``'s value — threading through NOP /
+    ``getitem`` wrappers and the body->parent boundary — is a ``copy_tile``."""
+    gm, parent_hop, parent_ctx = ctx
+    users = list(node.users)
+    if not users:
+        return False
+    for u in users:
+        if u.target is _VOYAGER_COPY:
+            continue
+        if u.op == "output":
+            if parent_hop is None:
+                return False  # a top-level graph output, not a store
+            for handle in _result_handles(node, gm, parent_hop):
+                if handle is None or not _stored(handle, parent_ctx):
+                    return False
+            continue
+        if (
+            u.target is operator.getitem
+            or u.target is torch.ops.aten.to.dtype
+            or is_nop(u)
+        ):
+            # ``getitem`` / NOP wrappers, and a ``to.dtype`` cast (a cast in the
+            # store path is fine — even a real dtype conversion), thread through.
+            if not _stored(u, ctx):
+                return False
+            continue
+        return False  # a real compute op consumes the tile -> not stored
+    return True
+
+
+def _annotate_and_validate(
+    gm: GraphModule, codebooks: set, parent_hop, parent_ctx
+) -> None:
+    ctx = (gm, parent_hop, parent_ctx)
     for node in gm.graph.nodes:
         if node in codebooks:
-            continue  # unallocated; not marked
-
+            continue  # a param (codebook / qmap), not memory
         if node.op == "placeholder":
-            if _produces_tensor(node):
-                space[node] = ph_space.get(node, "DRAM")
+            if parent_hop is None and _produces_tensor(node):
+                node.meta["space"] = "DRAM"  # a model input
         elif node.op == "get_attr":
             if _subgraph(gm, node.target) is None and _produces_tensor(node):
-                space[node] = "DRAM"  # a param tensor (sub-graph attrs skipped)
-        elif node.op == "output":
-            outs = node.args[0]
-            outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
-            out_spaces = [sp(o) for o in outs]
-        elif node.op == "call_module":
-            # A fused op: a re-fused nest op reads tiles (-> Scratchpad); a
-            # raw, non-bufferized fused op reads whole DRAM tensors (-> DRAM).
-            # Infer from its operands (codebooks excluded); recurse only into
-            # the tile-op form so its interior tiles are annotated without
-            # tripping the check on a raw DRAM op.
-            ins = {
-                sp(a)
-                for a in node.all_input_nodes
-                if a not in codebooks and sp(a) is not None
-            }
-            tile_op = "Scratchpad" in ins
-            space[node] = "Scratchpad" if tile_op else "DRAM"
-            sub = _subgraph(gm, node.target)
-            if sub is not None and tile_op:
-                sub_phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
-                bound = {
-                    p: sp(o)
-                    for p, o in zip(node.args, sub_phs)
-                    if isinstance(o, Node) and sp(o) is not None
-                }
-                _annotate_spaces(sub, bound, codebooks)
-        elif node.op == "call_function":
-            t = node.target
-            if t is _VOYAGER_ALLOC:
-                # alloc(size, dtype, space): the MemoryLevel arg selects the
-                # buffer's home — DRAM (default) or an on-chip SRAM tile bank
-                # (-> Scratchpad).
-                level = (
-                    node.args[2]
-                    if len(node.args) > 2
-                    else int(MemoryLevel.DRAM)
+                node.meta["space"] = "DRAM"  # a weight param
+        elif node.op == "call_function" and node.target is _VOYAGER_ALLOC:
+            level = (
+                node.args[2] if len(node.args) > 2 else int(MemoryLevel.DRAM)
+            )
+            node.meta["space"] = (
+                "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
+            )
+        elif node.op == "call_function" and node.target is _WHILE_LOOP:
+            body = _subgraph(gm, node.args[1].target)
+            if body is not None:
+                _annotate_and_validate(body, codebooks, node, ctx)
+        elif node.op == "call_function" and node.target is _COND:
+            for graph_arg in (node.args[1], node.args[2]):
+                branch = _subgraph(gm, graph_arg.target)
+                if branch is not None:
+                    _annotate_and_validate(branch, codebooks, node, ctx)
+        elif _is_compute(node, codebooks):
+            if not _stored(node, ctx):
+                raise Exception(
+                    f"destination-passing violation: result of {node.op} "
+                    f"'{node.name}' ({node.target}) is not stored to a buffer "
+                    f"via copy_tile (it feeds a non-store consumer)"
                 )
-                space[node] = (
-                    "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
-                )
-            elif t is _VOYAGER_ZERO:
-                space[node] = "Scratchpad"
-            elif t is _VOYAGER_LOAD:
-                assert sp(node.args[0]) == "DRAM", (
-                    f"load_tile source '{node.args[0]}' must be DRAM, "
-                    f"got {sp(node.args[0])}"
-                )
-                space[node] = "Scratchpad"
-            elif t is _VOYAGER_STORE:
-                assert sp(node.args[0]) == "Scratchpad", (
-                    f"store_tile source '{node.args[0]}' must be Scratchpad, "
-                    f"got {sp(node.args[0])}"
-                )
-                assert sp(node.args[1]) == "DRAM", (
-                    f"store_tile dest '{node.args[1]}' must be DRAM, "
-                    f"got {sp(node.args[1])}"
-                )
-                space[node] = "DRAM"
-            elif t is _WHILE_LOOP:
-                operands = list(node.args[2])
-                if len(node.args) > 3:
-                    operands += list(node.args[3])
-                body = _subgraph(gm, node.args[1].target)
-                if body is not None:
-                    body_phs = [
-                        p for p in body.graph.nodes if p.op == "placeholder"
-                    ]
-                    bound = {
-                        p: sp(o)
-                        for p, o in zip(body_phs, operands)
-                        if sp(o) is not None
-                    }
-                    loop_results[node] = _annotate_spaces(
-                        body, bound, codebooks
-                    )
-            elif t is _COND:
-                # torch.cond: annotate both branch regions (the shared operands
-                # bound to each branch's placeholders) and thread the branch
-                # result spaces to the cond's getitems, exactly like a
-                # while_loop.  Inputs may mix DRAM + Scratchpad (a guarded DMA
-                # reads a DRAM buffer and writes a Scratchpad bank), so the
-                # generic all-Scratchpad check must not apply here.
-                operands = list(node.args[3]) if len(node.args) > 3 else []
-                results = None
-                for graph_arg in (node.args[1], node.args[2]):
-                    branch = _subgraph(gm, graph_arg.target)
-                    if branch is None:
-                        continue
-                    phs = [
-                        p for p in branch.graph.nodes if p.op == "placeholder"
-                    ]
-                    bound = {
-                        p: sp(o)
-                        for p, o in zip(phs, operands)
-                        if sp(o) is not None
-                    }
-                    res = _annotate_spaces(branch, bound, codebooks)
-                    results = results if results is not None else res
-                if results is not None:
-                    loop_results[node] = results
-            elif t is _VOYAGER_ASYNC:
-                # Guarded async DMA: a DRAM<->Scratchpad tile move whose result
-                # is an on-chip token (not a data tile).  Its operands are a
-                # (DRAM, Scratchpad) pair, so the generic check doesn't apply;
-                # mark the token Scratchpad (on-chip, like zero_tile).
-                space[node] = "Scratchpad"
-            elif t is operator.getitem:
-                src, idx = node.args[0], node.args[1]
-                if (
-                    isinstance(src, Node)
-                    and src.target in (_WHILE_LOOP, _COND)
-                    and src in loop_results
-                    and isinstance(idx, int)
-                    and idx < len(loop_results[src])
-                ):
-                    if loop_results[src][idx] is not None:
-                        space[node] = loop_results[src][idx]
-                elif sp(src) is not None:  # getitem on a multi-output op tuple
-                    space[node] = sp(src)
-            elif t is _VOYAGER_INCR or t is _VOYAGER_DELIN:
-                pass  # loop indices, not a tensor
-            elif t in _DRAM_TRANSFORM:
-                # whole-tensor preprocessing in DRAM (the conv/pool halo pad)
-                # before tiling; space-preserving — the padded buffer is then
-                # load_tiled.
-                if sp(node.args[0]) is not None:
-                    space[node] = sp(node.args[0])
-            elif _produces_tensor(node):
-                scratchpad_inputs(node)
-                space[node] = "Scratchpad"
-            # else: index arithmetic (operator.add on counters, ...) — not a
-            # tensor
-
-        if node in space:
-            node.meta["space"] = space[node]
-
-    return out_spaces
 
 
 # ---------------------------------------------------------------------------
@@ -452,20 +422,34 @@ def bufferize_graph(model: GraphModule, pipelined: bool = False) -> GraphModule:
     specs = []
     for node in list(graph.nodes):
         if node.op == "call_module":
-            # Fused GEMM/conv + post-op tail.  The pipelined builders fold only
-            # a bias, not an arbitrary tail; tail fusion is being redesigned, so
-            # a fused submodule has no bufferization path yet.
+            # Fused GEMM/conv + post-op pointwise ops.  Dispatch to the pipeline
+            # builders, which parse the submodule's anchor + fused ops and apply
+            # them in the kernel (operands threaded through ``in_specs``).  They
+            # handle num_k == 1 (tail in ``compute``) and num_k > 1 (accumulate
+            # into a scratch ref, tail once on the last reduction step); an
+            # unsupported anchor returns ``None``.
             submod = getattr(model, str(node.target), None)
-            ref = (
-                get_anchor_node(submod.graph.nodes)
-                if isinstance(submod, GraphModule)
-                else None
-            )
-            if ref is not None and (is_conv2d(ref) or is_gemm_op(ref)):
+            if not isinstance(submod, GraphModule):
+                continue
+            node.meta.setdefault("submodule", submod)
+            anchor_node = get_anchor_node(submod.graph.nodes)
+            if anchor_node is None:
+                continue
+            if is_conv2d(anchor_node):
+                sub_gm = build_conv2d(node, num_banks=num_banks)
+            elif is_gemm_op(anchor_node):
+                sub_gm = build_gemm(node, num_banks=num_banks)
+            else:
+                # A pure-pointwise fused submodule (e.g. relu(x + residual)):
+                # run the whole submodule per output tile.
+                sub_gm = build_pointwise(node, num_banks=num_banks)
+            if sub_gm is None:
                 raise NotImplementedError(
-                    f"fused submodule {node.name!r}: pipelined tail fusion is "
-                    "not yet wired (the old gemm.py fused path was retired)"
+                    f"fused submodule {node.name!r}: no pipelined fusion path"
                 )
+            val = node.value
+            n_out = len(val) if isinstance(val, (list, tuple)) else 1
+            specs.append((node, sub_gm, n_out))
             continue
         if node.op != "call_function":
             continue

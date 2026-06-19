@@ -33,29 +33,34 @@ to DRAM.
     async DMA — and the counter then flips the slot, so a completed tile's store
     overlaps the next tile's compute (store / compute double buffering).  A
     reduction thus writes each output tile once instead of every step.
-  * The kernel writes an out bank via the ``write_out`` helper (or
-    ``voyager.copy_tile`` directly), choosing reset vs. accumulate per
-    ``grid_index`` (e.g. reset when the reduction coord is 0) — the scheduler
-    stays oblivious to which output is a reduction.
+  * The kernel writes an out bank via ``voyager.copy_tile``, choosing initialize vs.
+    accumulate per ``grid_index`` (e.g. initialize when the reduction coord is 0) —
+    the scheduler stays oblivious to which output is a reduction.
 
 Export-driven design notes (each verified against ``export_model``):
   * In-body bank writes go through the opaque ``voyager.copy_tile`` custom op,
     never raw aten in-place: ``while_loop`` (a HOP) rejects aten in-place
     mutation of captured tensors, but custom-op ``Tensor(a!)`` mutation of a
     *captured* (closed-over) bank is allowed and persists.
-  * Accumulate-vs-reset (``write_out``) uses ``torch.cond`` in its *functional*
-    form (each branch returns a fresh tensor) followed by a ``copy_tile`` write.
-  * A **guarded DMA** is ``torch.cond`` over ``voyager.async_copy``: the mutated
-    buffer is a cond *operand* (a captured/closed buffer mutated inside a branch
-    is silently dropped on export — the docstring's "no mutation of global
-    variables"), and the async *token* the copy returns is the cond's used
-    result (carried in loop state) so the op is not pruned.  Load counters
-    advance with ``torch.sym_ite(changed, count + 1, count)`` outside the cond.
-    See ``test/cond_capture_demo.py`` for the captured-vs-operand contrast.
+  * Accumulate-vs-initialize (a reduction) uses ``torch.cond`` in its *functional*
+    form (each branch returns a fresh tensor) followed by a ``copy_tile`` write;
+    a map overwrites directly (no cond).
+  * A **guarded DMA** is ``torch.cond`` over ``voyager.async_copy`` (or a guarded
+    ``async_wait``): the branch closes over the captured bank / semaphore and
+    mutates them in place, returning an unused ``int``.  The cond is kept by
+    ``has_side_effect(torch.ops.higher_order.cond)`` (registered in
+    ``lowering/__init__.py``); the in-place mutation of a captured buffer inside
+    a branch persists.  Load/store counters advance with
+    ``torch.sym_ite(changed, count + 1, count)`` outside the cond.
+  * DMA ordering uses **per-slot semaphores** (a captured ``[num_banks]`` int64
+    bank per input/output, not loop-carried): ``async_copy(sem)`` increments and
+    a once-per-block-guarded ``async_wait(sem)`` decrements, so the copy->wait
+    dependency is a write-after-write on the shared semaphore, and the eager
+    counting (``assert > 0``) is a runtime check that the schedule is balanced.
 """
 
 import math
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import torch
 from torch._higher_order_ops.while_loop import while_loop
@@ -64,51 +69,33 @@ from voyager_compiler import export_model
 from voyager_compiler.codegen.lowering.utils import (
     _InputSpec,
     _OutputSpec,
+    _ScratchSpec,
     _compute_input_spec,
     _finalize_exported_gm,
+    _fuse_tail_in_body,
     _lenient_verifier,
     _tag_loop_extents,
     voyager,
 )
 from voyager_compiler.codegen.lowering.ops import MemoryLevel
 
+# ``mapping`` / ``lowering.utils`` / ``lowering.bufferization`` do not import
+# this module at module scope (bufferization imports the builders function-
+# locally), so these are top-level.
+from voyager_compiler.codegen.mapping import get_anchor_node
+from voyager_compiler.codegen.lowering.bufferization import (
+    annotate_tensor_spaces,
+)
+
 _SRAM = int(MemoryLevel.SRAM)
-
-
-def _inert_token() -> torch.Tensor:
-    """A 0-dim int token matching ``voyager.async_copy``'s return — the value a
-    guard's *skip* branch returns so both ``torch.cond`` branches agree.  A
-    tensor, not a bare int: a ``torch.cond`` branch can't return a ``SymInt``
-    (it must be a tensor), which is the cost of the ``aten.zeros``.
-    """
-    return torch.zeros((), dtype=torch.int64)
-
-
-def write_out(bank: torch.Tensor, value: torch.Tensor, accumulate) -> None:
-    """Write ``value`` into the captured output SRAM ``bank`` (mutate-style
-    kernel helper).
-
-    ``value`` is pinned to the bank's tile shape (the kernel's result may carry
-    input-derived symbolic sizes, e.g. a pooled halo tile).  ``accumulate`` (a
-    bool / SymBool the kernel derives from ``grid_index`` — e.g.
-    ``reduction_coord != 0``) selects add-into-bank vs. overwrite, as a
-    functional ``torch.cond`` (fresh-tensor branches), then a single
-    ``copy_tile`` writes the result back into the bank.
-    """
-    new_value = torch.cond(
-        accumulate,
-        lambda b=bank, v=value: b + v,
-        lambda v=value: v.clone(),
-    )
-    voyager.copy_tile(new_value, bank, [0] * bank.ndim, list(bank.shape))
 
 
 class PipelinedKernel(torch.nn.Module):
     """Spec-driven, mutate-style kernel scheduler (see module docstring).
 
     ``kernel(grid_index, *in_tiles, *out_banks)`` is the per-tile compute; it
-    **writes** each output SRAM bank (via ``write_out`` / ``voyager.copy_tile``)
-    rather than returning a value. ``grid`` is the iteration space (tiles per
+    **writes** each output SRAM bank (via ``voyager.copy_tile``) rather than
+    returning a value. ``grid`` is the iteration space (tiles per
     dim); ``in_specs`` / ``out_specs`` are the per-operand block specs (a
     ``None`` input spec is a whole / scalar / codebook operand, passed through
     un-tiled).  ``num_banks`` is the software-pipeline depth (2 = double
@@ -123,6 +110,7 @@ class PipelinedKernel(torch.nn.Module):
         grid: Tuple[int, ...],
         in_specs: List[Optional[_InputSpec]],
         out_specs: List[_OutputSpec],
+        scratch_specs: Sequence[_ScratchSpec] = (),
         num_banks: int = 2,
     ):
         super().__init__()
@@ -132,6 +120,9 @@ class PipelinedKernel(torch.nn.Module):
         self.grid = grid
         self.in_specs = in_specs
         self.out_specs = out_specs
+        # Persistent, unbuffered, non-DMA SRAM refs (e.g. a reduction
+        # accumulator); appended after the input/output refs in the kernel call.
+        self.scratch_specs = tuple(scratch_specs)
         self.num_banks = num_banks
         self.ndim = len(self.grid)
         self.num_steps = math.prod(self.grid)
@@ -156,20 +147,24 @@ class PipelinedKernel(torch.nn.Module):
         # every dim dynamic -> copy_tile's "all dims" shorthand
         return None, indices
 
-    def _indices_differ(self, spec, cur, nxt):
+    def _indices_differ(self, spec, cur, next):
         """Whether the operand's tile block changes between grid points ``cur``
-        and ``nxt`` — the OR over its tiled (non-broadcast) dims of ``cur[g] !=
-        nxt[g]``.  A chained ``|`` of ``SymBool``s — no Python ``any`` short-
+        and ``next`` — the OR over its tiled (non-broadcast) dims of ``cur[g] !=
+        next[g]``.  A chained ``|`` of ``SymBool``s — no Python ``any`` short-
         circuit (which would data-dependent-guard inside the traced loop) and no
         mixed-radix arithmetic, just the per-dim comparisons.  This is the load
         / store change predicate.
         """
         bcast = getattr(spec, "is_broadcast", None)
-        differ = False
+        differ = None
         for d, g in enumerate(spec.index_map):
             if self.grid[g] > 1 and not (bcast is not None and bcast[d]):
-                differ = differ | (cur[g] != nxt[g])
-        return differ
+                term = cur[g] != next[g]
+                differ = term if differ is None else (differ | term)
+        # No tiled (non-broadcast) dim -> the block never changes.  Seeding the
+        # OR with the first term (not ``False``) avoids a redundant ``False |
+        # ...`` node in the traced loop.
+        return False if differ is None else differ
 
     def _innermost_tiled_dim(self):
         """The fastest-varying tiled grid dim — the last dim with extent > 1,
@@ -195,21 +190,19 @@ class PipelinedKernel(torch.nn.Module):
             for d, g in enumerate(spec.index_map)
         )
 
-    def _load_block(self, src, dst, spec, grid_idx):
+    def _load_block(self, src, dst, spec, grid_idx, sem):
         """Async-DMA ``src``'s tile at ``grid_idx`` into SRAM ``dst``, carrying
-        the input halo (``strides`` / ``pad`` / ``pad_value``); returns the
-        async token.  Used both by the prologue (token discarded) and inside a
-        guard's ``do`` branch (token is the cond's used result).
-        ``voyager.async_copy`` — not ``copy_tile`` — so the guarded form has a
-        tensor result that matches its ``skip`` branch and keeps the op from
-        being pruned.
+        the input halo (``strides`` / ``pad`` / ``pad_value``), and signal the
+        load semaphore ``sem`` (``sem[slot]``).  Used by the prologue and inside
+        a guard's ``do`` branch.
         """
         dims, indices = self._block_address(spec, grid_idx)
-        return voyager.async_copy(
+        voyager.async_copy(
             src,
             dst,
             indices,
             spec.tile_sizes,
+            sem,
             dims=dims,
             strides=spec.strides,
             pad=spec.pad,
@@ -227,57 +220,86 @@ class PipelinedKernel(torch.nn.Module):
             flat, out[d] = divmod(flat, self.grid[d])
         return tuple(out)
 
-    def _copy_in(self, dram_buf, slot, spec, fetch_idx, should_copy):
+    def _copy_in(self, dram_buf, slot, spec, fetch_idx, should_copy, sem):
         """Async-DMA ``fetch_idx``'s block of ``dram_buf`` into the SRAM bank
-        ``slot`` when ``should_copy``, else a no-op; return the async token (the
-        copy's when it fires, an inert token when skipped).  ``slot`` is a
-        ``torch.cond`` operand (a captured buffer mutated inside a branch is
-        dropped on export), and the token is the cond's used result, so the op
-        survives.  The caller advances the producer cursor (``sym_ite``) and
-        stamps the token vector (``where``) under the same ``should_copy``.
+        ``slot`` (signaling ``sem``) when ``should_copy``, else a no-op.  The
+        guarded copy is the store-in-cond pattern: the ``do`` branch closes over
+        the captured ``slot`` / ``sem`` and mutates them in place (via
+        ``async_copy``) and returns an ``int`` — the cond's output is unused but
+        kept alive by ``has_side_effect(cond)``.  The caller advances the
+        producer cursor (``sym_ite``) under the same ``should_copy``.
         """
 
-        def do(src, dst):
-            return self._load_block(src, dst, spec, fetch_idx)
+        def do():
+            self._load_block(dram_buf, slot, spec, fetch_idx, sem)
+            return 1
 
-        def skip(src, dst):
-            return _inert_token()
+        def skip():
+            return 0
 
-        return torch.cond(should_copy, do, skip, (dram_buf, slot))
+        torch.cond(should_copy, do, skip)
 
-    def _store_block(self, input_buffers, output_buffers, spec, grid_idx):
-        """Async-DMA SRAM tile ``bank`` -> ``out_buf``'s block at ``grid_idx``;
-        returns the token. Used unconditionally (an output that stores every
+    def _store_block(self, input_buffers, output_buffers, spec, grid_idx, sem):
+        """Async-DMA SRAM tile ``bank`` -> ``out_buf``'s block at ``grid_idx``,
+        signaling ``sem``.  Used unconditionally (an output that stores every
         step) or inside a guard's ``do``.
         """
         dims, indices = self._block_address(spec, grid_idx)
-        return voyager.async_copy(
-            input_buffers, output_buffers, indices, spec.tile_sizes, dims=dims
+        voyager.async_copy(
+            input_buffers,
+            output_buffers,
+            indices,
+            spec.tile_sizes,
+            sem,
+            dims=dims,
         )
 
-    def _guarded_store(self, sram_buf, dram_buf, sc, spec, cur, nxt, last):
-        """Store ``sram_buf`` -> ``dram_buf``'s block at ``cur`` and return
-        ``(token, next_count)``. Unconditional when the output advances every
-        step (build-time constant); otherwise guarded so a reduction writes once
-        per output tile — when its block completes (changes next) or on the last
-        step.  ``sram_buf`` / ``dram_buf`` are cond operands; the token is the
-        used result.
+    def _guarded_store(
+        self, sram_buf, dram_buf, sc, spec, cur, next, last, sem
+    ):
+        """Store ``sram_buf`` -> ``dram_buf``'s block at ``cur`` (signaling
+        ``sem``) and return ``next_count``.  Unconditional when the output
+        advances every step (build-time constant); otherwise guarded (store-in-
+        cond) so a reduction writes once per output tile — when its block
+        completes (changes next) or on the last step.
         """
         if self._advances_every_step(spec):
-            return self._store_block(sram_buf, dram_buf, spec, cur), sc + 1
+            self._store_block(sram_buf, dram_buf, spec, cur, sem)
+            return sc + 1
 
-        should_store = self._indices_differ(spec, cur, nxt) | last
+        should_store = self._indices_differ(spec, cur, next) | last
 
-        def do(src, dst):
-            return self._store_block(src, dst, spec, cur)
+        def do():
+            self._store_block(sram_buf, dram_buf, spec, cur, sem)
+            return 1
 
-        def skip(src, dst):
-            return _inert_token()
+        def skip():
+            return 0
 
-        return (
-            torch.cond(should_store, do, skip, (sram_buf, dram_buf)),
-            torch.sym_ite(should_store, sc + 1, sc),
-        )
+        torch.cond(should_store, do, skip)
+        return torch.sym_ite(should_store, sc + 1, sc)
+
+    def _guarded_wait(self, sem, pred=None):
+        """``async_wait(sem)`` guarded by ``pred``, so each slot's semaphore is
+        waited exactly once per signaling copy (a counting semaphore underflows
+        on a stray wait).  Pallas's scheduler predicate: wait only when a new
+        block is entered.  ``pred=None`` waits unconditionally — an operand whose
+        block changes every step is already once-per-block.  The wait is wrapped
+        in ``torch.cond`` (kept alive by ``has_side_effect``); the branch returns
+        an unused ``int``.
+        """
+        if pred is None:
+            voyager.async_wait(sem)
+            return
+
+        def do():
+            voyager.async_wait(sem)
+            return 1
+
+        def skip():
+            return 0
+
+        torch.cond(pred, do, skip)
 
     def _alloc_in_bank(self, tile_sizes, dtype):
         """One double-buffered SRAM input bank: ``num_banks`` slots, leading
@@ -298,38 +320,37 @@ class PipelinedKernel(torch.nn.Module):
         # *guarded* DMA + explicit semaphore waits.
         #
         # Each tiled input / output has a ``num_banks``-deep SRAM bank and a
-        # carried per-bank *token vector* (one async-DMA token per slot).  The
-        # input pipeline runs ``D = num_banks - 1`` blocks ahead: the prologue
-        # primes the first ``D`` distinct blocks (slots ``0..D-1``); each step
-        # prefetches the block ``D`` ahead while the kernel reads the current
-        # one.  A *guarded* input (block reused across some sweep) carries two
-        # cursors — a producer ``copy_in`` and a consumer ``wait_in`` — that
-        # advance on different events; an always-advance input needs neither
-        # (its read / copy slots are pure functions of ``step``).  Each step
-        # (Pallas ``copy_in, wait_in, kernel, copy_out, wait_out``):
+        # captured per-bank ``[num_banks]`` int64 *semaphore* bank (one per slot,
+        # NOT loop-carried).  The input pipeline runs ``D = num_banks - 1`` blocks
+        # ahead: the prologue primes the first ``D`` distinct blocks (slots
+        # ``0..D-1``); each step prefetches the block ``D`` ahead while the kernel
+        # reads the current one.  A *guarded* input (block reused across some
+        # sweep) carries two cursors — a producer ``copy_in`` and a consumer
+        # ``wait_in`` — that advance on different events; an always-advance input
+        # needs neither (its read / copy slots are pure functions of ``step``).
+        # Each step (Pallas ``copy_in, wait_in, kernel, copy_out, wait_out``):
         # * COPY-IN (guarded prefetch) — async-load the block ``D`` ahead into
         #   ``copy_slot`` (skipped when no new block enters the window edge or
-        #   the fetch is past the tail), recording the copy's token at that
-        #   slot.
-        # * WAIT-IN — before the kernel reads ``read_slot`` (``step % nb`` for
-        #   an always-advance input, the consumer cursor's slot for a guarded
-        #   one), ``async_wait`` on that slot's recorded token.
-        # * WAIT-OUT (reuse) — before the kernel reuses an output slot,
-        #   ``async_wait`` on that slot's previous store, so the store has
-        #   drained before the slot is overwritten.
+        #   the fetch is past the tail), signaling that slot's load semaphore.
+        # * WAIT-IN — before the kernel reads ``read_slot`` (``step % nb`` for an
+        #   always-advance input, the consumer cursor's slot for a guarded one),
+        #   ``async_wait`` that slot's load semaphore.  Guarded once-per-block
+        #   (Pallas ``has_changed | first_step``) so the counting semaphore is
+        #   balanced; an always-advance input changes block every step (no guard).
+        # * WAIT-OUT (reuse) — before the kernel reuses an output slot, wait on
+        #   that slot's previous store so it has drained.  Guarded once-per-tile
+        #   and only when the slot holds a prior store (``store_counts >= nb``).
         # * KERNEL — mutate-style, writes the captured output bank slots.
         # * COPY-OUT (guarded store) — async-store an output slot to DRAM when
-        #   its block completes (block changes next, or last step), recording
-        #   the store's token at that slot. After the loop a final WAIT-OUT
-        #   drains every output slot's last store before the result is returned.
-        #   Guards are ``torch.cond`` over ``voyager.async_copy`` (the token is
-        #   the cond's used result); the per-slot token vectors are updated with
-        #   ``torch.where`` and read with a symbolic ``[slot]`` select.  Slot
-        #   indices are runtime ``% num_banks`` — no unrolling.  At
-        #   ``num_banks == 2`` (``D == 1``) this reduces to one-step-ahead
-        #   double buffering; ``num_banks == 1`` (``D == 0``) is single
-        #   buffering — copy the current block, wait on it, read it (no
-        #   prefetch).
+        #   its block completes (block changes next, or last step), signaling its
+        #   store semaphore.  After the loop a guarded finalize drains every
+        #   output slot's last store before the result is returned.  Guards are
+        #   ``torch.cond`` (kept by ``has_side_effect``); ``async_copy`` signals
+        #   and ``async_wait`` waits the per-slot semaphore.  Slot indices are
+        #   runtime ``% num_banks`` — no unrolling.  At ``num_banks == 2``
+        #   (``D == 1``) this reduces to one-step-ahead double buffering;
+        #   ``num_banks == 1`` (``D == 0``) is single buffering — copy the current
+        #   block, wait on it, read it (no prefetch).
         #
         out_bufs = [voyager.alloc(s.shape, s.dtype) for s in self.out_specs]
         tiled = [
@@ -341,54 +362,61 @@ class PipelinedKernel(torch.nn.Module):
         out_banks = [
             self._alloc_out_bank(s.tile_sizes, s.dtype) for s in self.out_specs
         ]
-        nb = self.num_banks
+        # Per-slot async-DMA semaphores: one ``[num_banks]`` int64 bank per tiled
+        # input (load) and per output (store), initialized to zero.  ``async_copy
+        # (sem[slot])`` signals and ``async_wait(sem[slot])`` waits — the
+        # per-slot semaphore persists across iterations (captured, mutated in
+        # place like the SRAM banks), so it carries the copy->wait dependency the
+        # old returned token used to thread through the loop's token vectors.
+        sem_loads = [
+            torch.zeros(self.num_banks, dtype=torch.int64) for _ in tiled
+        ]
+        sem_stores = [
+            torch.zeros(self.num_banks, dtype=torch.int64)
+            for _ in self.out_specs
+        ]
+        # Scratch refs: allocate once here (single buffer, not
+        # ``num_banks``-deep — reused immediately for the next tile's reduction
+        # while the output bank stays buffered until its DMA drains), captured
+        # in the loop body like ``out_banks`` (not carried in the loop state).
+        scratch_refs = tuple(
+            voyager.alloc(s.shape, s.dtype, _SRAM) for s in self.scratch_specs
+        )
         num_outputs = len(self.out_specs)
+        nb = self.num_banks
         D = nb - 1  # prefetch distance (blocks ahead)
 
         # Prologue: prime the first ``D`` logical positions, deduplicating
         # reused blocks.  These positions are *static* (concrete grid coords),
         # so the dedup is a Python ``if`` — each distinct block is copied into
-        # the next ring slot and stamped into the input's token vector.  An
+        # the next ring slot, signaling that slot's load semaphore.  An
         # always-advance input makes ``D`` distinct copies (slots ``0..D-1``); a
         # guarded one's prologue copy count seeds its producer cursor.
-        init_load_tokens = []
         init_copy_in = []  # guarded inputs only: prologue copy count
         for i, (inp, spec) in enumerate(tiled):
-            vec = _inert_token()
             num_copies = 0
             prev_idx = None
             for p in range(min(D, self.num_steps)):
                 idx = self._unravel(p)
                 if p == 0 or self._indices_differ(spec, prev_idx, idx):
                     slot = num_copies % nb
-                    tok = self._load_block(inp, in_banks[i][slot], spec, idx)
-                    vec = torch.where(torch.arange(nb) == slot, tok, vec)
+                    self._load_block(
+                        inp, in_banks[i][slot], spec, idx, sem_loads[i][slot]
+                    )
                     num_copies += 1
                 prev_idx = idx
-            # Single buffering (nb == 1) waits on the freshly-issued token, so
-            # it carries no input token vector (see WAIT-IN) — nothing to seed.
-            if nb > 1:
-                init_load_tokens.append(vec)
             if not self._advances_every_step(spec):
                 init_copy_in.append(num_copies)
 
-        init_store_tokens = [
-            torch.zeros(nb, dtype=torch.int64) for _ in range(num_outputs)
-        ]
-
-        def cond_fn(
-            step, copy_counts, wait_counts, store_counts, in_toks, out_toks
-        ):
+        def cond_fn(step, load_counts, wait_counts, store_counts):
             return step < self.num_steps
 
-        def body_fn(
-            step, copy_counts, wait_counts, store_counts, in_toks, out_toks
-        ):
+        def body_fn(step, load_counts, wait_counts, store_counts):
             cur = voyager.delinearize_index(step, self.grid)
-            nxt = voyager.delinearize_index(step + 1, self.grid)
+            next = voyager.delinearize_index(step + 1, self.grid)
+            prev = voyager.delinearize_index(step - 1, self.grid)
             last = step + 1 >= self.num_steps
             cur_slot = step % nb
-            slots = torch.arange(nb)
 
             # The depth-``D`` prefetch window: fetch the block ``D`` steps
             # ahead, gated so no tail fetch runs past the grid end.
@@ -401,32 +429,29 @@ class PipelinedKernel(torch.nn.Module):
                 # *current* block.
                 first = step == 0
                 fetch_idx = cur
-                prev_edge = voyager.delinearize_index(step - 1, self.grid)
+                prev_edge = prev
             elif D == 1:
-                # one-step pipeline: the window edge is just ``nxt`` / ``cur``
-                fetch_idx, prev_edge = nxt, cur
+                # one-step pipeline: the window edge is just ``next`` / ``cur``
+                fetch_idx, prev_edge = next, cur
             else:
                 fetch_idx = voyager.delinearize_index(fetch_step, self.grid)
                 prev_edge = voyager.delinearize_index(fetch_step - 1, self.grid)
 
-            # 1. COPY-IN: prefetch into ``copy_slot`` and stamp the token
-            #    there.  An always-advance input has no cursor (``copy_slot =
+            # 1. COPY-IN: prefetch into ``copy_slot``, signaling its load
+            #    semaphore.  An always-advance input has no cursor (``copy_slot =
             #    (step + D) % nb``, ``should_copy = has_fetch``); a guarded one
-            #    advances its producer cursor only when a copy fires.  A skipped
-            #    copy stamps an inert token, but the depth invariant guarantees
-            #    ``copy_slot`` is then the next-to-fill slot (never a still-live
-            #    one): when ``should_copy`` is false the block repeats at the
-            #    window edge, so in-flight distinct blocks <= nb - 1 and
-            #    ``copy_slot`` differs from the read slot — it is overwritten by
-            #    a real copy before any read.
-            next_copy_counts, next_in_toks, issued_tokens = [], [], []
+            #    advances its producer cursor only when a copy fires.  When
+            #    ``should_copy`` is false the block repeats at the window edge,
+            #    so in-flight distinct blocks <= nb - 1 and ``copy_slot`` differs
+            #    from the read slot — overwritten by a real copy before any read.
+            next_load_counts = []
             g = 0
             for i, (inp, spec) in enumerate(tiled):
                 if self._advances_every_step(spec):
                     copy_slot = (step + D) % nb
                     should_copy = has_fetch
                 else:
-                    pc = copy_counts[g]
+                    pc = load_counts[g]
                     copy_slot = pc % nb
                     differ = self._indices_differ(spec, prev_edge, fetch_idx)
                     # D == 0 (single buffer): copy on the first step or when the
@@ -434,33 +459,27 @@ class PipelinedKernel(torch.nn.Module):
                     should_copy = (
                         (first | differ) if nb == 1 else (has_fetch & differ)
                     )
-                    next_copy_counts.append(
+                    next_load_counts.append(
                         torch.sym_ite(should_copy, pc + 1, pc)
                     )
                     g += 1
                 # ``_check`` against the bank's own size lets the select bound
                 # resolve on the unbacked step (needed for num_banks >= 3).
                 torch._check(copy_slot < in_banks[i].size(0))
-                token = self._copy_in(
+                self._copy_in(
                     inp,
                     in_banks[i][copy_slot],
                     spec,
                     fetch_idx,
                     should_copy,
+                    sem_loads[i][copy_slot],
                 )
-                # nb == 1 carries no input token vector (it is unused — WAIT-IN
-                # waits on ``issued_tokens``), so don't produce a next value.
-                if nb == 1:
-                    issued_tokens.append(token)
-                else:
-                    next_in_toks.append(
-                        torch.where(slots == copy_slot, token, in_toks[i])
-                    )
 
-            # 2. WAIT-IN: block on the token of each input's read slot, then
-            #    read it.  Always-advance reads ``step % nb``; a guarded input
-            #    reads its consumer cursor's slot.  ``None``-spec operands pass
-            #    through in kernel arg order.
+            # 2. WAIT-IN: wait on each input's read-slot load semaphore once per
+            #    consumed block (Pallas ``has_changed | first_step``), then read
+            #    it.  An always-advance input changes block every step, so its
+            #    wait is unconditional; a reused input waits only on entering a
+            #    new block.  ``None``-spec operands pass through in kernel order.
             in_args, i, g = [], 0, 0
             for inp, spec in zip(inputs, self.in_specs):
                 if spec is None:
@@ -468,20 +487,21 @@ class PipelinedKernel(torch.nn.Module):
                     continue
                 if self._advances_every_step(spec):
                     rs = cur_slot
+                    pred = None
                 else:
                     rs = wait_counts[g] % nb
                     g += 1
+                    pred = (step == 0) | self._indices_differ(spec, prev, cur)
                 torch._check(rs < in_banks[i].size(0))
-                # nb == 1 (single buffer): the copy issued this step is the
-                # *current* tile, so wait on that token — the carried token is a
-                # future tile only when nb >= 2.
-                wait_token = issued_tokens[i] if nb == 1 else in_toks[i][rs]
-                voyager.async_wait(wait_token)
+                self._guarded_wait(sem_loads[i][rs], pred)
                 in_args.append(in_banks[i][rs])
                 i += 1
 
-            # 3. WAIT-OUT (reuse): block on each output slot's previous store
-            #    before the kernel reuses (overwrites / re-accumulates into) it.
+            # 3. WAIT-OUT (reuse): before the kernel reuses an output slot, wait
+            #    on that slot's previous store — once per output tile (Pallas
+            #    ``has_changed(output) & ~first``) and only when the slot already
+            #    holds a prior store (``store_counts >= nb``); the first ``nb``
+            #    uses of each slot have nothing to drain.
             out_slots, out_slot_idx = [], []
             for i, spec in enumerate(self.out_specs):
                 if self._advances_every_step(spec):
@@ -490,29 +510,30 @@ class PipelinedKernel(torch.nn.Module):
                     slot = store_counts[i] % nb
                 torch._check(slot < out_banks[i].size(0))
                 out_slot_idx.append(slot)
-                # TODO: guard async_wait(0) using torch.cond?
-                voyager.async_wait(out_toks[i][slot])
+                pred = self._indices_differ(spec, prev, cur) & (
+                    store_counts[i] >= nb
+                )
+                self._guarded_wait(sem_stores[i][slot], pred)
                 out_slots.append(out_banks[i][slot])
 
-            # 4. KERNEL (mutate-style: writes the output bank slots).
-            self.kernel(cur, *in_args, *out_slots)
+            # 4. KERNEL (mutate-style: writes the output bank slots).  Scratch
+            #    refs follow the input/output args (Pallas's *index, *inputs,
+            #    *outputs, *scratch convention).
+            self.kernel(cur, *in_args, *out_slots, *scratch_refs)
 
-            # 5. COPY-OUT: store each completed output tile (guarded) and record
-            #    the store's token at its source slot; advance the store counter
-            #    (flip slot).
-            next_store_counts, next_out_toks = [], []
+            # 5. COPY-OUT: store each completed output tile (guarded), signaling
+            #    its store semaphore; advance the store counter (flip slot).
+            next_store_counts = []
             for i, spec in enumerate(self.out_specs):
-                token, new_sc = self._guarded_store(
+                new_sc = self._guarded_store(
                     out_slots[i],
                     out_bufs[i],
                     store_counts[i],
                     spec,
                     cur,
-                    nxt,
+                    next,
                     last,
-                )
-                next_out_toks.append(
-                    torch.where(slots == out_slot_idx[i], token, out_toks[i])
+                    sem_stores[i][out_slot_idx[i]],
                 )
                 next_store_counts.append(new_sc)
 
@@ -523,17 +544,15 @@ class PipelinedKernel(torch.nn.Module):
                 if self._advances_every_step(spec):
                     continue
                 wc = wait_counts[g]
-                finished = last | self._indices_differ(spec, cur, nxt)
+                finished = last | self._indices_differ(spec, cur, next)
                 next_wait_counts.append(torch.sym_ite(finished, wc + 1, wc))
                 g += 1
 
             return (
                 step + 1,
-                tuple(next_copy_counts),
+                tuple(next_load_counts),
                 tuple(next_wait_counts),
                 tuple(next_store_counts),
-                tuple(next_in_toks),
-                tuple(next_out_toks),
             )
 
         init = (
@@ -544,19 +563,17 @@ class PipelinedKernel(torch.nn.Module):
             (0,) * len(init_copy_in),
             # store counters
             (0,) * num_outputs,
-            # per-input [nb] token vectors (the prologue copies)
-            tuple(init_load_tokens),
-            # per-output [nb] token vectors (no store yet)
-            tuple(init_store_tokens),
         )
         final = while_loop(cond_fn, body_fn, init)
 
-        # Final WAIT-OUT: drain every output slot's last store so the DRAM
-        # result is complete.
-        final_store_tokens = final[5]
+        # Finalize: drain each output slot's last (un-reused) store so the DRAM
+        # result is complete.  ``store_counts`` is the total stores per output;
+        # slot ``j`` holds a pending store iff ``j < total`` (a small grid stores
+        # fewer than ``nb`` distinct slots, leaving the rest un-signaled).
+        final_store_counts = final[3]
         for i in range(num_outputs):
-            for slot in range(nb):
-                voyager.async_wait(final_store_tokens[i][slot])
+            for j in range(nb):
+                self._guarded_wait(sem_stores[i][j], j < final_store_counts[i])
 
         return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
 
@@ -568,6 +585,7 @@ def build_pipelined_buffers(
     out_specs: List[_OutputSpec],
     inputs: Tuple[torch.Tensor, ...],
     *,
+    scratch_specs: Sequence[_ScratchSpec] = (),
     num_banks: int = 2,
     kwargs: Optional[dict] = None,
 ) -> torch.fx.GraphModule:
@@ -576,20 +594,19 @@ def build_pipelined_buffers(
     ``build_pointwise_buffers``'s export / finalize / extent-tag flow.
     """
     pattern = PipelinedKernel(
-        kernel, grid, in_specs, out_specs, num_banks=num_banks
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        scratch_specs=scratch_specs,
+        num_banks=num_banks,
     )
     with _lenient_verifier():
         gm = export_model(pattern, inputs, kwargs=kwargs)
     gm = _finalize_exported_gm(gm)
     _tag_loop_extents(gm, [[(0, pattern.num_steps, 1)]])
-    # Annotate each tensor's memory space (DRAM vs Scratchpad) so the graph is
-    # fully bufferized (threads through the while_loop body and the guarded
-    # ``torch.cond`` regions).
-    from voyager_compiler.codegen.lowering.bufferization import (
-        annotate_tensor_spaces,
-    )
-
-    annotate_tensor_spaces(gm)
+    # Memory-space annotation is deferred to the builders, *after* fusion — the
+    # destination-passing validation needs the fused call_modules in place.
     return gm
 
 
@@ -604,21 +621,154 @@ def build_pipelined_buffers(
 # ``node.value`` — a tuple for a multi-output op — so it isn't returned.) They
 # mirror ``bufferization._build_for_*`` but target the pipelined scheduler: a
 # return-style per-tile ``compute`` is wrapped *mutate-style* by
-# ``_mutate_kernel`` (each result is written into its output bank), accumulating
+# ``_map_kernel`` (each result is written into its output bank), accumulating
 # across the reduction grid dim for a GEMM / conv and overwriting for a map
 # (pointwise / pool / layernorm·softmax).
 # ---------------------------------------------------------------------------
 
 
-def _mutate_kernel(
-    compute: Callable, num_outputs: int, reduction_dim: Optional[int] = None
-):
-    """Adapt a return-style ``compute(grid_index, *in_tiles) -> Tensor | tuple``
-    into the scheduler's mutate-style ``kernel(grid_index, *in_tiles,
-    *out_banks)``: run ``compute`` and write each result into its output bank
-    via ``write_out``.  ``reduction_dim`` (a grid dim) makes the write
-    *accumulate* over that sweep (reset when its coord is 0); ``None``
-    overwrites (a map).
+class _FusedInfo:
+    """Parsed pieces of a fused ``call_module`` (GEMM/conv + post-op fused
+    pointwise ops), for the GEMM / conv pipeline builders.
+
+    ``anchor_node`` is the GEMM/conv reference op (inside the submodule, so its
+    ``args`` are submodule placeholders whose ``meta['source_node']`` point back
+    to the outer graph; ``ShapeProp`` has populated their ``.value``).
+    ``fused_gm`` runs the post-op pointwise ops as ``[acc, *fused] ->
+    output(s)`` on the anchor's result tile.  ``fused_operands`` are the
+    tensors those ops consume (a residual, a scale, …); ``fused_tiles[i]`` is
+    that operand's per-dim tiled shape, or ``None`` for a whole operand.
+    ``output_specs`` is one ``(full_shape, tile_shape, dtype)`` per fused output
+    (a tuple ⇒ multi-output, e.g. ``quantize_mx``).
+    """
+
+    def __init__(
+        self,
+        anchor_node,
+        is_conv,
+        fused_gm,
+        fused_operands,
+        fused_tiles,
+        output_specs,
+    ):
+        self.anchor_node = anchor_node
+        self.is_conv = is_conv
+        self.fused_gm = fused_gm
+        self.fused_operands = fused_operands
+        self.fused_tiles = fused_tiles
+        self.output_specs = output_specs
+
+    def operand_specs(self, out_shape, out_index_map):
+        """Per fused operand, the ``(tensor, _InputSpec | None)`` for the GEMM /
+        conv builders to append to the kernel's ``inputs`` / ``in_specs``: the
+        operand tiled at the output block, each of its dims mapped to a grid dim
+        via ``out_index_map`` (a whole codebook / scalar operand -> ``None``).
+        The grid mapping is builder-specific (GEMM inserts the K reduction dim,
+        conv projects the NHWC layout), so it is passed in.
+        """
+        pairs = []
+        for operand, tile in zip(self.fused_operands, self.fused_tiles):
+            if tile is None:
+                pairs.append((operand, None))
+                continue
+            off = len(out_shape) - operand.ndim
+            imap, tiles, bcast = [], [], []
+            for d in range(operand.ndim):
+                b = operand.shape[d] == 1 and out_shape[off + d] > 1
+                imap.append(out_index_map[off + d])
+                bcast.append(b)
+                tiles.append(1 if b else int(tile[d]))
+            pairs.append(
+                (operand, _InputSpec(tuple(tiles), tuple(imap), tuple(bcast)))
+            )
+        return pairs
+
+
+def parse_fused_submodule(node) -> Optional["_FusedInfo"]:
+    """Parse a fused ``call_module`` ``node`` into a ``_FusedInfo``, or ``None``
+    if its anchor is not a GEMM/conv (adapted from the retired
+    ``_build_for_fused_submodule``).
+
+    The submodule (``node.meta['submodule']``) holds a GEMM/conv anchor followed
+    by post-op pointwise ops.  ``adjust_tiling`` node-keyed the SRAM-fit tiling
+    onto the outer ``node`` (``meta['tiled_shapes']``, keyed by outer input
+    nodes + ``node``); the fused operands tile at the output block, so their
+    tiles come from ``tiled_shapes`` keyed by the outer ``source_node``.
+    """
+    from voyager_compiler.codegen.lowering.bufferization import (
+        _codebook_arg_nodes,
+    )
+    from voyager_compiler.codegen.lowering.utils import _build_fused_gm
+    from voyager_compiler.codegen.mapping_utils import is_conv2d, is_gemm_op
+    from voyager_compiler.codegen.shape_prop import ShapeProp
+
+    submod = node.meta.get("submodule")
+    if not isinstance(submod, torch.fx.GraphModule):
+        return None
+    anchor = get_anchor_node(submod.graph.nodes)
+    if anchor is None:
+        return None
+    is_conv = is_conv2d(anchor)
+    if not is_conv and not is_gemm_op(anchor):
+        return None
+
+    # ShapeProp the submodule so its inner nodes (anchor + fused ops) carry
+    # ``.value``; the main-graph ShapeProp does not populate submodule
+    # internals.  Inputs come in ``all_input_nodes`` = placeholder order.
+    ShapeProp(submod).propagate(
+        *(n.value.clone() for n in node.all_input_nodes)
+    )
+
+    shapes = node.meta.get("tiled_shapes") or {}
+
+    # Walk the ops after the anchor (the fused pointwise chain).  Collect each
+    # op and, for every new placeholder it consumes, the operand tensor and its
+    # tiled shape (or ``None`` for a codebook / scalar passed whole).
+    reachable = {anchor}
+    fused_ops, fused_inputs, fused_operands, fused_tiles = [], [], [], []
+    for sn in submod.graph.nodes:
+        if sn is anchor or sn.op != "call_function":
+            continue
+        if not any(inp in reachable for inp in sn.all_input_nodes):
+            continue
+        reachable.add(sn)
+        fused_ops.append(sn)
+        codebooks = _codebook_arg_nodes(sn)
+        for inp in sn.all_input_nodes:
+            if inp.op != "placeholder" or inp in fused_inputs:
+                continue
+            fused_inputs.append(inp)
+            fused_operands.append(inp.value.clone())
+            src = inp.meta.get("source_node", inp)
+            if inp in codebooks or inp.value.numel() == 1:
+                fused_tiles.append(None)  # whole operand
+            else:
+                fused_tiles.append(shapes.get(src, tuple(inp.value.shape)))
+
+    fused_gm = _build_fused_gm(submod, anchor, fused_ops, fused_inputs)
+
+    multi = isinstance(node.value, (list, tuple))
+    vals = list(node.value) if multi else [node.value]
+    full_shapes = [tuple(v.shape) for v in vals]
+    keyed = shapes.get(node)  # None when the fused node is untiled
+    if keyed is None:
+        tile_shapes = full_shapes  # tile == full tensor (trip-1)
+    else:
+        tile_shapes = list(keyed) if multi else [keyed]
+    output_specs = list(zip(full_shapes, tile_shapes, [v.dtype for v in vals]))
+
+    return _FusedInfo(
+        anchor, is_conv, fused_gm, fused_operands, fused_tiles, output_specs
+    )
+
+
+def _map_kernel(compute: Callable, num_outputs: int):
+    """Map kernel (no cross-tile reduction): adapt a return-style
+    ``compute(grid_index, *in_tiles) -> Tensor | tuple`` into the scheduler's
+    mutate-style ``kernel(grid_index, *in_tiles, *out_banks)`` — run ``compute``
+    once per tile and write each result straight into its output bank.  Every
+    num_k == 1 op (gemm / conv / pointwise / pool) uses this; the cross-tile
+    reduction case uses ``_reduction_fused_kernel``.
     """
 
     def kernel(grid_index, *args):
@@ -627,25 +777,103 @@ def _mutate_kernel(
         results = compute(grid_index, *in_tiles)
         if not isinstance(results, (tuple, list)):
             results = (results,)
-        accumulate = (
-            reduction_dim is not None and grid_index[reduction_dim] != 0
-        )
         for bank, value in zip(out_banks, results):
-            write_out(bank, value, accumulate)
+            voyager.copy_tile(value, bank, (0,) * bank.ndim, bank.shape)
 
     return kernel
 
 
-def build_conv2d(node, *, num_banks: int = 2):
+def _dense_strides(shape) -> Tuple[int, ...]:
+    """Canonical (C-contiguous) strides for ``shape``."""
+    st = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        st[i] = st[i + 1] * shape[i + 1]
+    return tuple(st)
+
+
+def _reduction_fused_kernel(
+    compute: Callable,
+    reduction_dim: int,
+    last_idx: int,
+    op_dtype: Optional[torch.dtype],
+    out_specs: List[_OutputSpec],
+    fused_gm: Optional[Callable],
+    num_fused_operands: int,
+):
+    """Kernel for an op whose reduction needs > 1 tile (every num_k > 1 GEMM /
+    conv; the num_k == 1 map case uses ``_map_kernel``).
+
+    ``compute(grid_index, in_tiles, first)`` runs the bare op (GEMM / conv) on
+    the current tiles; on the ``first`` reduction step it folds the bias straight
+    into the op (the hardware does ``op + bias`` in one pass).  The bias rides
+    only the first reduction step — which is the same step that *initializes* the
+    accumulator — so the bias gate and the reduction init collapse into the
+    single reduction ``torch.cond`` (init = op-with-bias; accumulate =
+    op-without-bias + scratch), with **no** nested bias-gate cond.  The partial
+    accumulates into a scratch ref across the reduction sweep; on the last step
+    the completed accumulator is cast to ``op_dtype`` (it may accumulate in a
+    wider dtype, e.g. fp32) and mapped through the fused tail (if any) into the
+    output bank(s).
+    """
+    num_outputs = len(out_specs)
+
+    def kernel(grid_index, *args):
+        n_in = len(args) - num_outputs - 1  # one scratch accumulator
+        in_tiles = args[:n_in]
+        out_banks = args[n_in : n_in + num_outputs]
+        scratch = args[-1]  # the single scratch accumulator (Scratchpad)
+
+        def to_acc(result):
+            return result if op_dtype is None else result.to(scratch.dtype)
+
+        def init():
+            # First reduction step: op with the bias folded in, initializing
+            # the accumulator.
+            return to_acc(compute(grid_index, in_tiles, True))
+
+        def accumulate(prev=scratch):
+            # Later steps: bare op (no bias) added to the running accumulator.
+            return to_acc(compute(grid_index, in_tiles, False)) + prev
+
+        voyager.copy_tile(
+            torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
+            scratch,
+            (0,) * scratch.ndim,
+            scratch.shape,
+        )
+
+        # On the last reduction coord, cast the now-complete accumulator, apply
+        # the fused tail ONCE, and store each output; off the last step a no-op.
+        # ``torch.cond`` captures the closed-over ``scratch`` / fused operands
+        # automatically — no need to thread them through as branch operands.
+        def post_process():
+            outs = scratch if op_dtype is None else scratch.to(op_dtype)
+            if fused_gm is not None:
+                outs = fused_gm(outs, *in_tiles[n_in - num_fused_operands :])
+            if not isinstance(outs, (tuple, list)):
+                outs = (outs,)
+            for bank, out in zip(out_banks, outs):
+                voyager.copy_tile(out, bank, (0,) * bank.ndim, bank.shape)
+            return 1
+
+        def skip():
+            return 0
+
+        torch.cond(grid_index[reduction_dim] == last_idx, post_process, skip)
+
+    return kernel
+
+
+def build_conv2d(node, *, num_banks: int = 2, accumulate_fp32: bool = False):
     """Pipeline builder for a conv2d (groups=1) node — including the
     microscaling / codebook (``conv2d_mx``) variant, a fused bias, and the
     systolic NHWC layout — the input-channel (C) cross-tile reduction.  A map
     over the (N, K, oH, oW) output grid plus a reduction grid dim for C: the
     input is a strided receptive-field halo (pad-on-load, ``pad_value=0``), the
     weight is tiled on (K, C), and the kernel convolves each C-block and
-    accumulates (reset when the C coord is 0).  Grid ``(N, K, oH, oW, C, 1)`` —
+    accumulates (initialize when the C coord is 0).  Grid ``(N, K, oH, oW, C, 1)`` —
     the trailing extent-1 dim holds the whole ``kH``/``kW`` weight dims; for
-    ``num_c == 1`` the C dim is extent 1 (no reduction).  Specs are written in
+    ``num_k == 1`` the C dim is extent 1 (no reduction).  Specs are written in
     logical NCHW/OIHW terms and projected onto each operand's physical order
     (``meta["transposed"]`` selects NHWC input/output + HWIO weight), like
     gemm.py's TiledConv2d.  Returns the gm or ``None``.
@@ -659,13 +887,31 @@ def build_conv2d(node, *, num_banks: int = 2):
     )
     from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
 
-    shapes = node.meta.get("tiled_shapes", {})
-    inp = node.args[0].value.clone()
-    w = node.args[1].value.clone()
-    out = node.value
+    # ``or {}`` (not a ``{}`` default): ``adjust_tiling`` sets the key to
+    # ``None`` for an on-chip / untiled node, which a plain default wouldn't
+    # catch.
+    shapes = node.meta.get("tiled_shapes") or {}
+
+    # A fused ``call_module`` (conv + post-op pointwise ops): read the op /
+    # tiling off the conv anchor inside the submodule; ``anchor`` is the bare
+    # ``node`` for a non-fused op.  A num_k == 1 fused op (the C reduction fits
+    # one tile) applies the tail in ``compute``; num_k > 1 accumulates the conv
+    # partials into a scratch ref and applies the tail once on the last C step.
+    info = parse_fused_submodule(node) if node.op == "call_module" else None
+    if node.op == "call_module" and (info is None or not info.is_conv):
+        return None
+    # A non-fused untiled op is bufferized elsewhere; a fused untiled op falls
+    # back to whole-tensor tiles (trip-1 loops) below.
+    if info is None and not shapes:
+        return None
+    anchor = info.anchor_node if info is not None else node
+
+    inp = anchor.args[0].value.clone()
+    w = anchor.args[1].value.clone()
+    out = anchor.value  # the conv output (drives the N/K/oH/oW grid)
     if inp.ndim != 4 or w.ndim != 4:
         return None
-    groups = get_arg_value(node, 6, "groups", 1)
+    groups = get_arg_value(anchor, 6, "groups", 1)
     if groups != 1:
         return None  # doesn't support depthwise conv yet
 
@@ -673,30 +919,42 @@ def build_conv2d(node, *, num_banks: int = 2):
     # HWIO weight.  Specs are logical (NCHW/OIHW per-axis) and ``_project``-ed
     # onto each operand's physical order; the grid stays logical.  ``None`` dims
     # == logical NCHW (a plain identity projection).
-    nhwc = node.meta.get("transposed", False)
+    nhwc = anchor.meta.get("transposed", False)
     in_dims = _NHWC if nhwc else None
     w_dims = _HWIO if nhwc else None
     out_dims = _NHWC if nhwc else None
 
+    # ``tiled_shapes`` is keyed by outer graph nodes: the output by ``node``,
+    # the input by its outer ``source_node`` (== the node itself for a bare op).
+    # A fused node that fits on-chip has no ``tiled_shapes`` entry — falling
+    # back to the whole tensor makes every loop trip-1.
+    in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
+    out_keyed = shapes.get(node)
+    if out_keyed is None:
+        out_keyed = tuple(out.shape)  # untiled -> whole tensor (trip-1)
+    elif info is not None and isinstance(node.value, (list, tuple)):
+        out_keyed = out_keyed[
+            -1
+        ]  # the activation output's tile drives the grid
     # logical (tn, tk, toh, tow)
-    out_ts = _unproject(shapes.get(node), out_dims)
+    out_ts = _unproject(out_keyed, out_dims)
     # logical (tn, tc, ., .)
-    in_ts = _unproject(shapes.get(node.args[0]), in_dims)
+    in_ts = _unproject(shapes.get(in_node, tuple(inp.shape)), in_dims)
     tn, tk, toh, tow = (int(x) for x in out_ts)
     N, C, H, W = _unproject(inp.shape, in_dims)
     K, _, kH, kW = _unproject(w.shape, w_dims)
     tc = int(in_ts[1])
-    num_c = C // tc
+    num_k = C // tc
 
-    sh, sw = _pair(get_arg_value(node, 3, "stride", 1))
-    ph, pw = _pair(get_arg_value(node, 4, "padding", 0))
-    dh, dw = _pair(get_arg_value(node, 5, "dilation", 1))
+    sh, sw = _pair(get_arg_value(anchor, 3, "stride", 1))
+    ph, pw = _pair(get_arg_value(anchor, 4, "padding", 0))
+    dh, dw = _pair(get_arg_value(anchor, 5, "dilation", 1))
     oH, oW = _unproject(out.shape, out_dims)[2:]
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
 
     # grid dims (logical): 0=N 1=K 2=oH 3=oW 4=C(reduction) 5=whole(kH/kW).
-    grid = (N // tn, K // tk, oH // toh, oW // tow, num_c, 1)
+    grid = (N // tn, K // tk, oH // toh, oW // tow, num_k, 1)
     in_spec = _InputSpec(
         _project((tn, tc, ih, iw), in_dims),
         _project((0, 4, 2, 3), in_dims),  # N->0, C->4, H->oH(2), W->oW(3)
@@ -711,42 +969,45 @@ def build_conv2d(node, *, num_banks: int = 2):
         _project((1, 4, 5, 5), w_dims),
         (False,) * 4,
     )
-    out_spec = _OutputSpec(
-        _project((N, K, oH, oW), out_dims),
-        _project((tn, tk, toh, tow), out_dims),
-        _project((0, 1, 2, 3), out_dims),
-        inp.dtype,
-    )
+    # The output(s) tile onto the (N, K, oH, oW) grid dims (the C reduction dim
+    # 4 is dropped); a fused op may produce several (``quantize_mx``).
+    out_index_map = _project((0, 1, 2, 3), out_dims)
+    if info is None:
+        out_specs = [
+            _OutputSpec(
+                _project((N, K, oH, oW), out_dims),
+                _project((tn, tk, toh, tow), out_dims),
+                out_index_map,
+                inp.dtype,
+            )
+        ]
+    else:
+        out_specs = [
+            _OutputSpec(tuple(shape), tuple(tile), out_index_map, dtype)
+            for shape, tile, dtype in info.output_specs
+        ]
 
     inputs, in_specs = [inp, w], [in_spec, w_spec]
-    # Operand index into the kernel's ``*extra`` (the args after the input,
-    # weight tiles).
-    extra_index = lambda: len(in_specs) - 2
 
     # Bias [K] tiles along K (grid dim 1); folded once on the C==0 step (below),
-    # since later C blocks only accumulate partials into the bank.
-    bias_n = get_arg_value(node, 2, "bias")
+    # since later C blocks only accumulate partials into the bank.  It is the
+    # first extra (``extra[0]``) when present.
+    bias_n = get_arg_value(anchor, 2, "bias")
     if bias_n is not None:
-        bias_slot = extra_index()
         inputs.append(bias_n.value.clone())
         in_specs.append(_InputSpec((tk,), (1,), (False,)))
-
-    # Bias broadcasts over the output's channel (K) dim — its physical position
-    # depends on layout.
-    bias_shape = [1, 1, 1, 1]
-    bias_shape[_phys_pos(1, out_dims)] = -1
 
     # On the microscaling target (conv2d_mx) the per-block scales tile along C
     # (// block_size): input_scale shares the input halo's layout, weight_scale
     # the weight's; the codebook tables (only present on this target) load whole
     # (untiled, None spec).  Each threads to the op by kw.
-    target = node.target
-    bs = node.kwargs.get("block_size")
+    target = anchor.target
+    bs = anchor.kwargs.get("block_size")
 
     kw_slots = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
-        v = node.kwargs.get(name)
+        v = anchor.kwargs.get(name)
         if not isinstance(v, torch.fx.Node):
             return
 
@@ -755,7 +1016,7 @@ def build_conv2d(node, *, num_banks: int = 2):
                 f"Expected materialized value for FX node kwarg {name!r}"
             )
 
-        kw_slots[name] = extra_index()
+        kw_slots[name] = len(in_specs) - 2
         inputs.append(v.value.clone())
         in_specs.append(spec)
 
@@ -780,57 +1041,160 @@ def build_conv2d(node, *, num_banks: int = 2):
         for name in ("input_code", "weight_code"):
             add_kw_input(name, None)
 
-    def compute(grid_index, in_tile, w_tile, *extra):
+    # Fused post-op operands (a residual, …): append each through ``in_specs``,
+    # tiled at the output (N, K, oH, oW) block in the same physical layout as
+    # the output.  A ``None`` spec is a whole (codebook / scalar) operand.
+    if info is not None:
+        for operand, spec in info.operand_specs(out.shape, out_index_map):
+            inputs.append(operand)
+            in_specs.append(spec)
+    # The fused operands are the last inputs (appended above); the kernel /
+    # compute pick them off the tail of ``*extra`` by count.
+    num_fused = len(info.fused_operands) if info is not None else 0
+
+    def _conv(in_tile, w_tile, bias, kw):
+        return target(
+            in_tile, w_tile, bias, [sh, sw], [0, 0], [dh, dw], groups, **kw
+        )
+
+    def _fix_stride(t):
+        # ``torch.cond`` rejects a branch output whose stride it can't prove is a
+        # simple product of sizes; a *strided* conv tile's spatial extent is the
+        # symbolic ``(((H - kH)//stride) + 1)`` with a ``Max(1, .)`` clamp, whose
+        # stride the cond can't represent (``.to`` / ``.contiguous`` / reshape
+        # keep the ``Max(1, .)`` form).  Re-view with the **concrete** output tile
+        # shape the builder already knows (``tn, tk, toh, tow``) and its dense
+        # stride — no symbolic ``Max`` — via ``as_strided`` (a metadata-only NOP,
+        # in ``is_nop``).  Needed independently of the accumulator cast, which the
+        # reduction kernel drops when no dtype change is required.
+        # TODO why this doesn't work.
+        # n, c, h, w = t.shape
+        # return torch.as_strided(
+        #     t, size=(n, c, h, w), stride=(c * h * w, h * w, w, 1)
+        # )
+        d0, d1, d2, d3 = _project((tn, tk, toh, tow), out_dims)
+        return torch.as_strided(
+            t, size=(d0, d1, d2, d3), stride=(d1 * d2 * d3, d2 * d3, d3, 1)
+        )
+
+    def conv_partial(grid_index, in_tiles, first):
+        """The bare conv op on the current tiles, dense-strided (``_fix_stride``)
+        so it can feed a ``torch.cond`` branch.  On the ``first`` reduction step
+        the [K] bias folds straight into the op (the hardware does conv + bias in
+        one pass, taking the bias directly — no broadcast reshape); later steps
+        only accumulate partials, which must not re-add it.
+        """
+        in_tile, w_tile, *extra = in_tiles
         kw = {name: extra[i] for name, i in kw_slots.items()}
         if bs is not None:
             kw["block_size"] = bs
-        result = target(
-            in_tile, w_tile, None, [sh, sw], [0, 0], [dh, dw], groups, **kw
-        )
-        if bias_n is not None:
-            # Add bias once, on the first C-reduction step: gate the small
-            # contiguous bias addend through the cond, then add it (gating
-            # ``result`` trips cond's dense-output check on the conv tile's
-            # symbolic spatial stride).
-            bias_tile = extra[bias_slot].reshape(bias_shape)
-            addend = torch.cond(
-                grid_index[4] == 0,
-                # clone: a cond branch can't return its input
-                lambda: bias_tile.clone(),
-                lambda: torch.zeros_like(bias_tile),
-            )
-            result = result + addend
+        bias = extra[0] if (bias_n is not None and first) else None  # [K]
+        return _fix_stride(_conv(in_tile, w_tile, bias, kw))
+
+    def compute(grid_index, in_tile, w_tile, *extra):
+        # num_k == 1 map: the conv completes in one step (bias folds straight in,
+        # no reduction cond), then the fused tail (if any) is applied here.
+        in_tiles = (in_tile, w_tile, *extra)
+        result = conv_partial(grid_index, in_tiles, True)
+        if info is not None:
+            # The fused operands are the last ``num_fused`` extras.
+            fused_tiles = extra[len(extra) - num_fused :]
+            return info.fused_gm(result, *fused_tiles)
         return result
 
-    kernel = _mutate_kernel(compute, 1, reduction_dim=4 if num_c > 1 else None)
+    if num_k > 1:
+        # Tiled C reduction: accumulate the bare conv partials into a scratch
+        # ref (the conv output tile); on the last C step the accumulator reaches
+        # the output bank(s) — through the tail if fused, else stored directly.
+        acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
+        scratch_specs = [
+            _ScratchSpec(_project((tn, tk, toh, tow), out_dims), acc_dtype)
+        ]
+        kernel = _reduction_fused_kernel(
+            conv_partial,
+            reduction_dim=4,
+            last_idx=num_k - 1,
+            out_specs=out_specs,
+            op_dtype=(out.dtype if acc_dtype != out.dtype else None),
+            fused_gm=info.fused_gm if info is not None else None,
+            num_fused_operands=num_fused,
+        )
+    else:
+        scratch_specs = []
+        kernel = _map_kernel(compute, len(out_specs))
     gm = build_pipelined_buffers(
-        kernel, grid, in_specs, [out_spec], tuple(inputs), num_banks=num_banks
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        tuple(inputs),
+        scratch_specs=scratch_specs,
+        num_banks=num_banks,
     )
+    if num_k > 1 or info is not None:
+        # num_k > 1: the reduction splits work across ``torch.cond`` branches —
+        # fuse the accumulate branch (anchor + cast + accumulate add), and the
+        # finalize branch's tail when present (``fuse_anchor_with_tail=False``).
+        # Runs even without a tail so the bare anchor isn't flagged by the
+        # destination-passing check (its result feeds the add, not a store).
+        # num_k == 1: the anchor + fused tail share the output body — one cone
+        # (``fuse_anchor_with_tail=True``).
+        _fuse_tail_in_body(
+            gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
+        )
     return gm
 
 
-def build_gemm(node, *, num_banks: int = 2):
+def build_gemm(node, *, num_banks: int = 2, accumulate_fp32: bool = False):
     """Pipeline builder for a linear / matmul / batched-matmul node — including
     the microscaling / codebook (``*_mx``) variants and a fused bias — covering
     the cross-tile K reduction the old pointwise engine couldn't do.  Grid ``(M,
     N, K)`` (or ``(B, M, N, K)`` for a batched matmul) tiles with K innermost;
     the kernel accumulates ``act_tile @ weight_tile`` into the output bank,
-    reset on ``k == 0``.  Returns the gm, or ``None`` (unsupported).
+    initialize on ``k == 0``.  Returns the gm, or ``None`` (unsupported).
     """
     from voyager_compiler.codegen.mapping_utils import is_linear, is_matmul
     from voyager_compiler.codegen.passes.utils import get_arg_value
 
-    shapes = node.meta.get("tiled_shapes")
-    if not shapes or not (is_linear(node) or is_matmul(node)):
+    shapes = node.meta.get("tiled_shapes") or {}
+
+    # A fused ``call_module`` (GEMM + post-op pointwise ops): read the op /
+    # tiling off the GEMM anchor inside the submodule, append the fused operands
+    # through ``in_specs``, and apply the fused ops in ``compute``.  ``anchor``
+    # is the bare ``node`` for a non-fused op.  A num_k == 1 fused op (the K
+    # reduction fits one tile) applies the tail in ``compute``; num_k > 1
+    # accumulates the GEMM partials into a scratch ref and applies the tail once
+    # on the last K step.
+    info = parse_fused_submodule(node) if node.op == "call_module" else None
+    if node.op == "call_module" and info is None:
         return None
-    act = node.args[0].value.clone()
-    weight = node.args[1].value.clone()
-    out = node.value
+    # A non-fused untiled op is bufferized elsewhere (load / run / store whole);
+    # a fused untiled op falls back to whole-tensor tiles (trip-1 loops) below.
+    if info is None and not shapes:
+        return None
+    anchor = info.anchor_node if info is not None else node
+
+    if not (is_linear(anchor) or is_matmul(anchor)):
+        return None
+    act = anchor.args[0].value.clone()
+    weight = anchor.args[1].value.clone()
+    out = anchor.value  # the GEMM output (drives the M/N/K grid)
     if not isinstance(out, torch.Tensor) or act.ndim < 2 or weight.ndim < 2:
         return None
 
-    out_ts = shapes.get(node)  # (..batch.., tile_m, tile_n)
-    in_ts = shapes.get(node.args[0])  # (..batch.., tile_m, tile_k)
+    # ``tiled_shapes`` is keyed by outer graph nodes: the output by ``node``,
+    # the activation by its outer ``source_node`` (== the node itself for a bare
+    # op).  A fused node that fits on-chip has no entry — fall back to the whole
+    # tensor so every loop is trip-1.
+    in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
+    keyed_out = shapes.get(node)
+    if keyed_out is None:
+        out_ts = tuple(out.shape)  # untiled -> whole tensor (trip-1)
+    elif info is not None and isinstance(node.value, (list, tuple)):
+        out_ts = keyed_out[-1]  # the activation output's tile drives the grid
+    else:
+        out_ts = keyed_out
+    in_ts = shapes.get(in_node, tuple(act.shape))  # (..batch.., tile_m, tile_k)
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
     tk = int(in_ts[-1])
     M, K, N = act.shape[-2], act.shape[-1], out.shape[-1]
@@ -857,7 +1221,7 @@ def build_gemm(node, *, num_banks: int = 2):
     # flips it — matching gemm.py's ``weight_ck = is_matmul XOR transposed``.
     # ``_proj`` orders an (output N, reduction K) pair into that layout (like
     # gemm.py's ``_wkc``); the weight and its scale share it.
-    weight_ck = is_matmul(node) != bool(node.meta.get("transposed", False))
+    weight_ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))
     _proj = lambda n, k: (k, n) if weight_ck else (n, k)
 
     def _batch(shape):
@@ -890,24 +1254,29 @@ def build_gemm(node, *, num_banks: int = 2):
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
-    out_spec = _OutputSpec(
-        tuple(out.shape),
-        tuple(tb) + (tm, tn),
-        tuple(range(nb)) + (gm, gn),
-        out.dtype,
-    )
+    # The output(s) tile onto the M/N grid dims (the K reduction dim ``gk`` is
+    # dropped); a fused op may produce several (``quantize_mx``).
+    out_index_map = tuple(range(nb)) + (gm, gn)
+    if info is None:
+        out_specs = [
+            _OutputSpec(
+                tuple(out.shape), tuple(tb) + (tm, tn), out_index_map, out.dtype
+            )
+        ]
+    else:
+        out_specs = [
+            _OutputSpec(tuple(shape), tuple(tile), out_index_map, dtype)
+            for shape, tile, dtype in info.output_specs
+        ]
 
     inputs, in_specs = [act, weight], [act_spec, weight_spec]
-    # Operand index into the kernel's ``*extra`` (the args after activation,
-    # weight).
-    extra_index = lambda: len(in_specs) - 2
 
     # Bias [N] tiles along N (grid dim ``gn``); folded once on the k==0 step
     # (below), since later steps only accumulate partials into the bank — adding
-    # bias per-k would multiply-count it.
-    bias_n = get_arg_value(node, 2, "bias")
+    # bias per-k would multiply-count it.  It is the first extra (``extra[0]``)
+    # when present.
+    bias_n = get_arg_value(anchor, 2, "bias")
     if bias_n is not None:
-        bias_slot = extra_index()
         inputs.append(bias_n.value.clone())
         in_specs.append(_InputSpec((tn,), (gn,), (False,)))
 
@@ -916,12 +1285,12 @@ def build_gemm(node, *, num_banks: int = 2):
     # block layout) and the codebook tables (input_code / weight_code, only
     # present on these targets) load whole (untiled, None spec); each threads to
     # the op by keyword.
-    bs = node.kwargs.get("block_size")
+    bs = anchor.kwargs.get("block_size")
 
     kw_slots = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
-        v = node.kwargs.get(name)
+        v = anchor.kwargs.get(name)
         if not isinstance(v, torch.fx.Node):
             return
 
@@ -930,11 +1299,11 @@ def build_gemm(node, *, num_banks: int = 2):
                 f"Expected materialized value for FX node kwarg {name!r}"
             )
 
-        kw_slots[name] = extra_index()
+        kw_slots[name] = len(in_specs) - 2
         inputs.append(v.value.clone())
         in_specs.append(spec)
 
-    if node.target in (
+    if anchor.target in (
         torch.ops.quantized_ops.linear_mx.default,
         torch.ops.quantized_ops.matmul_mx.default,
     ):
@@ -947,33 +1316,87 @@ def build_gemm(node, *, num_banks: int = 2):
         for name in ("input_code", "weight_code"):
             add_kw_input(name, None)
 
-    op = node.target
+    op = anchor.target
 
-    def compute(grid_index, activation, weight_tile, *extra):
+    # Fused post-op operands (a residual, a scale, …): append each through
+    # ``in_specs`` so the scheduler pipelines it like any tiled input, tiled at
+    # the output (M/N) block.  A ``None`` tile is a whole (codebook / scalar)
+    # operand passed through.  ``compute`` then applies ``info.fused_gm`` to the
+    # GEMM result with these tiles.
+    if info is not None:
+        for operand, spec in info.operand_specs(out.shape, out_index_map):
+            inputs.append(operand)
+            in_specs.append(spec)
+    # The fused operands are the *last* inputs (appended above), so the kernel
+    # picks them off the tail of ``*extra`` by count.
+    num_fused = len(info.fused_operands) if info is not None else 0
+
+    num_k = K // tk  # reduction tiles (grid extent along ``gk``)
+
+    def gemm_partial(grid_index, in_tiles, first):
+        """The bare GEMM op on the current tiles.  On the ``first`` reduction
+        step the bias folds straight into the op (``w @ x + bias`` in one pass);
+        later steps only accumulate partials, which must not re-add it.
+        """
+        activation, weight_tile, *extra = in_tiles
         kw = {name: extra[i] for name, i in kw_slots.items()}
         if bs is not None:
             kw["block_size"] = bs
-        result = op(activation, weight_tile, **kw)
-        if bias_n is not None:
-            # Add bias once, on the first reduction step: gate the (small,
-            # contiguous) bias addend through the cond, then add it to the
-            # result — adding bias per-k would multiply-count it.  (Gating
-            # ``result`` itself trips cond's dense-output check on symbolic
-            # shapes.)
-            bias_tile = extra[bias_slot]  # [N]
-            addend = torch.cond(
-                grid_index[gk] == 0,
-                # clone: a cond branch can't return its input
-                lambda: bias_tile.clone(),
-                lambda: torch.zeros_like(bias_tile),
-            )
-            result = result + addend
+        if bias_n is None:
+            return op(activation, weight_tile, **kw)
+        bias = extra[0] if first else None  # bias [N] is the first extra
+        return op(activation, weight_tile, bias, **kw)
+
+    def compute(grid_index, activation, weight_tile, *extra):
+        # num_k == 1 map: the GEMM completes in one step (bias folds straight in,
+        # no reduction cond), then the fused tail (if any) is applied here.
+        in_tiles = (activation, weight_tile, *extra)
+        result = gemm_partial(grid_index, in_tiles, True)
+        if info is not None:
+            # The fused operands are the last ``num_fused`` extras.
+            fused_tiles = extra[len(extra) - num_fused :]
+            return info.fused_gm(result, *fused_tiles)
         return result
 
-    kernel = _mutate_kernel(compute, 1, reduction_dim=gk)
+    if num_k > 1:
+        # Tiled K reduction: accumulate the bare GEMM partials into a scratch
+        # ref (the op output tile); on the last K step the accumulator reaches
+        # the output bank(s) — through the tail if fused, else stored directly.
+        acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
+        scratch_specs = [_ScratchSpec(tuple(tb) + (tm, tn), acc_dtype)]
+        kernel = _reduction_fused_kernel(
+            gemm_partial,
+            reduction_dim=gk,
+            last_idx=num_k - 1,
+            out_specs=out_specs,
+            op_dtype=(out.dtype if acc_dtype != out.dtype else None),
+            fused_gm=info.fused_gm if info is not None else None,
+            num_fused_operands=num_fused,
+        )
+    else:
+        # num_k == 1: a map (the tail, if any, is applied inside ``compute``).
+        scratch_specs = []
+        kernel = _map_kernel(compute, len(out_specs))
     gm = build_pipelined_buffers(
-        kernel, grid, in_specs, [out_spec], tuple(inputs), num_banks=num_banks
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        tuple(inputs),
+        scratch_specs=scratch_specs,
+        num_banks=num_banks,
     )
+    if num_k > 1 or info is not None:
+        # num_k > 1: the reduction splits work across ``torch.cond`` branches —
+        # fuse the accumulate branch (anchor + cast + accumulate add), and the
+        # finalize branch's tail when present (``fuse_anchor_with_tail=False``).
+        # Runs even without a tail so the bare anchor isn't flagged by the
+        # destination-passing check (its result feeds the add, not a store).
+        # num_k == 1: the anchor + fused tail share the output body — one cone
+        # (``fuse_anchor_with_tail=True``).
+        _fuse_tail_in_body(
+            gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
+        )
     return gm
 
 
@@ -990,46 +1413,75 @@ def build_pointwise(node, *, num_banks: int = 2):
     val = getattr(node, "value", None)
     if not isinstance(val, (torch.Tensor, list, tuple)):
         return None
-    tiled_shapes = node.meta.get("tiled_shapes")
-    if not tiled_shapes:
+    tiled_shapes = node.meta.get("tiled_shapes") or {}
+    # A non-fused untiled op is bufferized elsewhere; a fused untiled submodule
+    # falls back to whole-tensor tiles (trip-1) below.
+    if node.op != "call_module" and not tiled_shapes:
         return None
 
     outputs = list(val) if isinstance(val, (list, tuple)) else [val]
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
 
-    # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
-    # constant *now* — the closure runs in the traced while_loop body, where
-    # dynamo rejects FX-Node lookups.
-    order = {n: i for i, n in enumerate(in_nodes)}
-    _plain = lambda a: list(a) if isinstance(a, list) else a
-    arg_slots = [
-        order[a] if isinstance(a, torch.fx.Node) else None for a in node.args
-    ]
-    kw_slots = {
-        k: order[v] if isinstance(v, torch.fx.Node) else None
-        for k, v in node.kwargs.items()
-    }
-    op_args = [_plain(a) for a in node.args]
-    op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
-    op = node.target
+    if node.op == "call_module":
+        # Fused pointwise submodule (e.g. ``relu(x + residual)``): there is no
+        # reduction, so the whole submodule is the per-tile compute — every
+        # input tiles at the output block (codebooks / scalars passed whole) and
+        # the submodule runs on the loaded tiles.  No anchor / fused-op split is
+        # needed (unlike the GEMM / conv builders, whose reduction sweep keeps
+        # the anchor separate).
+        submod = node.meta.get("submodule")
+        if not isinstance(submod, torch.fx.GraphModule):
+            return None
+        # Codebook operands (passed whole): map the submodule's codebook
+        # placeholders back to their outer input nodes.
+        codebooks = set()
+        for sn in submod.graph.nodes:
+            if sn.op != "call_function":
+                continue
+            for cb in _codebook_arg_nodes(sn):
+                codebooks.add(cb.meta.get("source_node", cb))
 
-    def compute(grid_index, *tiles):
-        args = [
-            tiles[i] if i is not None else a for i, a in zip(arg_slots, op_args)
+        def compute(grid_index, *tiles):
+            return submod(*tiles)
+
+    else:
+        # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
+        # constant *now* — the closure runs in the traced while_loop body, where
+        # dynamo rejects FX-Node lookups.
+        order = {n: i for i, n in enumerate(in_nodes)}
+        _plain = lambda a: list(a) if isinstance(a, list) else a
+        arg_slots = [
+            order[a] if isinstance(a, torch.fx.Node) else None
+            for a in node.args
         ]
-        kwargs = {
-            k: tiles[i] if i is not None else op_kwargs[k]
-            for k, i in kw_slots.items()
+        kw_slots = {
+            k: order[v] if isinstance(v, torch.fx.Node) else None
+            for k, v in node.kwargs.items()
         }
-        return op(*args, **kwargs)
+        op_args = [_plain(a) for a in node.args]
+        op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
+        op = node.target
+        codebooks = _codebook_arg_nodes(node)
+
+        def compute(grid_index, *tiles):
+            args = [
+                tiles[i] if i is not None else a
+                for i, a in zip(arg_slots, op_args)
+            ]
+            kwargs = {
+                k: tiles[i] if i is not None else op_kwargs[k]
+                for k, i in kw_slots.items()
+            }
+            return op(*args, **kwargs)
 
     output_ts = tiled_shapes.get(node)
-    if isinstance(val, (list, tuple)):
-        output_ts = output_ts[-1]
     output_shape = tuple(outputs[-1].shape)
+    if output_ts is None:
+        output_ts = output_shape  # untiled -> whole tensor (trip-1)
+    elif isinstance(val, (list, tuple)):
+        output_ts = output_ts[-1]
     grid = tuple(s // t for s, t in zip(output_shape, output_ts))
-    codebooks = _codebook_arg_nodes(node)
     in_specs = [
         (
             _compute_input_spec(output_shape, output_ts, tuple(n.shape))
@@ -1047,16 +1499,29 @@ def build_pointwise(node, *, num_banks: int = 2):
         )
         for o in outputs
     ]
-    kernel = _mutate_kernel(compute, len(outputs))
+    kernel = _map_kernel(compute, len(outputs))
     gm = build_pipelined_buffers(
         kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
     )
+
+    if node.op == "call_module":
+        # Group the fused pointwise ops into one nested call_module for
+        # codegen's ``fused_op``.  There is no reduction here, so (like the GEMM
+        # / conv num_k == 1 path) the anchor — the first pointwise op, per
+        # ``get_anchor_node`` — sits in the body with its tail, and the forward
+        # cone from it is the whole chain.
+        anchor = get_anchor_node(submod.graph.nodes)
+        if anchor is not None:
+            _fuse_tail_in_body(gm, anchor.target)
     return gm
 
 
 _POOL2D_SUPPORTED = {
     torch.ops.aten.max_pool2d.default,
     torch.ops.aten.avg_pool2d.default,
+    # NHWC variant after the data-layout transform (same schema as aten's);
+    # ``build_pool``'s ``"max_pool" in str(target)`` detection covers it.
+    torch.ops.quantized_ops.max_pool2d.default,
 }
 
 
@@ -1079,7 +1544,8 @@ def build_pool(node, *, num_banks: int = 2):
     nhwc = bool(node.meta.get("transposed", False))
     in_dims = _NHWC if nhwc else None
     input_t = node.args[0].value.clone()
-    shapes = node.meta.get("tiled_shapes", {})
+    # ``or {}``: ``adjust_tiling`` may set the key to ``None`` (on-chip op).
+    shapes = node.meta.get("tiled_shapes") or {}
     output_ts = shapes.get(node, tuple(node.value.shape))
     tn, tc, toh, tow = _unproject(output_ts, in_dims)
 
@@ -1132,7 +1598,7 @@ def build_pool(node, *, num_banks: int = 2):
     def compute(grid_index, tile):
         return node.target(tile, [kH, kW], [sh, sw], [0, 0], *extra_args)
 
-    kernel = _mutate_kernel(compute, 1)
+    kernel = _map_kernel(compute, 1)
     gm = build_pipelined_buffers(
         kernel, grid, [in_spec], out_specs, (input_t,), num_banks=num_banks
     )

@@ -323,40 +323,33 @@ def _copy_tile_fake(
 # ---------------------------------------------------------------------------
 # voyager.async_copy / voyager.async_wait — the asynchronous DMA pair.
 #
-# ``async_copy`` is ``copy_tile`` that *returns an integer token* identifying
-# the in-flight transfer; ``async_wait(token)`` blocks until that transfer
-# completes.  Modelling the DMA as a value-producing op (rather than a pure
-# side effect) is what lets it live inside a ``torch.cond`` branch: a guarded
-# copy returns its token, the token is threaded out through the branch / loop
-# carry, and so the op has an observed result and is kept (a captured-buffer
-# mutation whose only effect is the in-place write is invisible to ``cond``
-# and gets pruned — see ``test/cond_capture_demo.py``).
+# ``async_copy(..., semaphore)`` is ``copy_tile`` that "signals" a semaphore;
+# ``async_wait(semaphore)`` "waits on" it.  Both take an int64 ``semaphore``
+# scalar, **return nothing**, and declare it **mutable** (``Tensor(a!)`` /
+# ``Tensor(b!)``).  The eager impls emulate a counting semaphore: ``async_copy``
+# increments it (post / V), ``async_wait`` asserts ``> 0`` and decrements it
+# (wait / P) — so a *correct* pipeline keeps every wait matched by a prior copy
+# into the same slot (a stray wait trips the assert).  The transfer itself is
+# synchronous (already finished), and the ``register_fake`` impls are no-ops
+# (export traces through the fake, never the eager body).
 #
-# ``async_wait(token)`` declares its ``token`` argument **mutable**
-# (``Tensor(a!)``) even though the eager body is a no-op.  A no-output,
-# non-mutating op is functionalized away by ``torch.export`` — and that
-# pruning happens *inside* the ``while_loop`` body where the wait must live
-# (it survives at top level but is DCE'd in the HOP body; the effects system /
-# ``with_effects`` is not honored on this export path, verified empirically).
-# Marking the token mutable makes the op impure, so it is kept and stays
-# ordered.  The mutation is a pure keep-alive no-op: the synchronous semantics
-# (the copy is already finished, the token is inert, the wait does nothing)
-# are unchanged.
+# The ``(a!)`` / ``(b!)`` mutation does two jobs at the graph level:
+#
+#   * the shared-semaphore write-after-write (a copy writing ``sem[slot]`` then
+#     a later wait writing the same ``sem[slot]``) is the copy→wait ordering
+#     edge — the data dependency the old returned token used to carry through
+#     the loop's token vectors;
+#   * it makes both ops impure, so ``torch.export`` keeps them (a no-output,
+#     non-mutating op is functionalized away *inside* the ``while_loop`` body
+#     where the wait must live — verified empirically; the ``has_side_effect``
+#     registrations in ``lowering/__init__.py`` are belt-and-suspenders).
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
-    "SymInt[]? dims=None, SymInt[]? static_indices=None, "
+    "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? static_indices=None, "
     "SymInt[]? strides=None, bool transposed=False, "
-    "SymInt[]? pad=None, float? pad_value=None) -> Tensor"
+    "SymInt[]? pad=None, float? pad_value=None) -> ()"
 )
-
-
-def _token() -> torch.Tensor:
-    """An inert async-DMA token (a 0-dim int tensor).  A tensor — not a bare
-    int — so it can be a ``torch.cond`` branch output / ``while_loop`` carry (a
-    HOP branch can't return a SymInt).
-    """
-    return torch.zeros((), dtype=torch.int64)
 
 
 @impl(voyager_lib, "async_copy", "CompositeExplicitAutograd")
@@ -365,13 +358,14 @@ def async_copy(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
+    semaphore: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
     static_indices: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
-) -> torch.Tensor:
+) -> None:
     copy_tile(
         src,
         dst,
@@ -384,9 +378,9 @@ def async_copy(
         pad,
         pad_value,
     )
-    # Synchronous for now: the transfer is already complete; the token is
-    # inert.
-    return _token()
+    # Emulate a counting semaphore: the completed transfer signals its slot.
+    semaphore.add_(1)
+    return None
 
 
 @torch.library.register_fake("voyager::async_copy")
@@ -395,28 +389,34 @@ def _async_copy_fake(
     dst: torch.Tensor,
     indices: Tuple[int, ...],
     sizes: Tuple[int, ...],
+    semaphore: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
     static_indices: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
-) -> torch.Tensor:
-    return _token()
+) -> None:
+    return None
 
 
-voyager_lib.define("async_wait(Tensor(a!) token) -> ()")
+voyager_lib.define("async_wait(Tensor(a!) semaphore) -> ()")
 
 
 @impl(voyager_lib, "async_wait", "CompositeExplicitAutograd")
-def async_wait(token: torch.Tensor) -> None:
-    # Synchronous DMA: nothing to wait on (the token is inert; the (a!) is a
-    # keep-alive).
+def async_wait(semaphore: torch.Tensor) -> None:
+    # Emulate a counting semaphore: block until signaled, then consume.  The
+    # transfer is synchronous (already done), so this only checks the invariant
+    # that a matching ``async_copy`` ran first.
+    assert (
+        semaphore.item() > 0
+    ), "async_wait on a semaphore with no pending async_copy"
+    semaphore.sub_(1)
     return None
 
 
 @torch.library.register_fake("voyager::async_wait")
-def _async_wait_fake(token: torch.Tensor) -> None:
+def _async_wait_fake(semaphore: torch.Tensor) -> None:
     return None
 
 

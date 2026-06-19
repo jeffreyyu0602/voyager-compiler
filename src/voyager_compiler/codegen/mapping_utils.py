@@ -20,13 +20,14 @@ from .param_pb2 import (
     LoopBound,
     LevelAccessCount,
 )
-
+from .passes.utils import get_arg_value
 
 logger = logging.getLogger(__name__)
 
 
 # Global variable to store the custom save function
 _custom_save_function = None
+
 
 def register_save_function(custom_function):
     """
@@ -88,7 +89,7 @@ def _set_meminfo(field, segment):
 
 
 def set_tensor_field(field, node, output_dir=None, is_output=False):
-    if not isinstance(node, Node) or not hasattr(node, 'value'):
+    if not isinstance(node, Node) or not hasattr(node, "value"):
         raise TypeError(f"Expected node with value attribute, got {node!r}")
 
     tiled_shapes = node.meta.get("_tiled_shapes")
@@ -154,8 +155,10 @@ def set_output_field(param, node, output_dir):
 
         node.meta.pop("_tiled_shapes", None)
         node.meta.pop("_scratchpad_map", None)
-    elif isinstance(node.value, (tuple, list)) and node.value and all(
-        isinstance(v, int) for v in node.value
+    elif (
+        isinstance(node.value, (tuple, list))
+        and node.value
+        and all(isinstance(v, int) for v in node.value)
     ):
         # An integer index vector (``increment_indices`` / ``delinearize_index``): a
         # named handle that the per-dimension component getitems index into — a tile
@@ -234,21 +237,25 @@ def build_tiling_proto(node):
             matched = False
             for loop in range(interstellar.le.NUM):
                 if mapping.loop_orders[loop][level] == loop_index:
-                    lt.loop_bounds.append(LoopBound(
-                        loop=loop,
-                        bound=mapping.loop_blockings[loop][level],
-                    ))
+                    lt.loop_bounds.append(
+                        LoopBound(
+                            loop=loop,
+                            bound=mapping.loop_blockings[loop][level],
+                        )
+                    )
                     loop_index += 1
                     matched = True
                     break
             if not matched:
                 break
         tiling.level_tilings.append(lt)
-        tiling.level_access_counts.append(LevelAccessCount(
-            input_access_count=int(access_list[level][0]),
-            output_access_count=int(access_list[level][1]),
-            weight_access_count=int(access_list[level][2]),
-        ))
+        tiling.level_access_counts.append(
+            LevelAccessCount(
+                input_access_count=int(access_list[level][0]),
+                output_access_count=int(access_list[level][1]),
+                weight_access_count=int(access_list[level][2]),
+            )
+        )
 
     return tiling
 
@@ -261,14 +268,14 @@ def convert_arg(value, output_dir=None) -> Argument:
     arg = Argument()
 
     if isinstance(value, torch.fx.Node):
-        val = getattr(value, 'value', None)
+        val = getattr(value, "value", None)
 
         if isinstance(val, torch.Tensor):
             set_tensor_field(arg.tensor, value, output_dir)
         elif isinstance(val, (tuple, list)):
-            arg.tensor_list.tensors.extend([
-                Tensor(node=f"{value.name}_{i}") for i in range(len(val))
-            ])
+            arg.tensor_list.tensors.extend(
+                [Tensor(node=f"{value.name}_{i}") for i in range(len(val))]
+            )
         else:
             # Scalar-valued node: a tile block index — the loop induction variable, or
             # a computed index such as a pipelined prefetch's ``j + 1`` (emitted as its
@@ -284,16 +291,22 @@ def convert_arg(value, output_dir=None) -> Argument:
         arg.float_value = value
     elif isinstance(value, str):
         arg.str_value = value
-    elif isinstance(value, (
-        torch.dtype, torch.layout, torch.device, torch.memory_format
-    )):
+    elif isinstance(
+        value, (torch.dtype, torch.layout, torch.device, torch.memory_format)
+    ):
         arg.str_value = str(value).split(".")[-1]
     elif isinstance(value, (list, tuple)):
         if all(isinstance(x, torch.fx.Node) or x is None for x in value):
-            arg.tensor_list.tensors.extend([
-                convert_arg(x).tensor if x is not None else Tensor(is_none=True)
-                for x in value
-            ])
+            arg.tensor_list.tensors.extend(
+                [
+                    (
+                        convert_arg(x).tensor
+                        if x is not None
+                        else Tensor(is_none=True)
+                    )
+                    for x in value
+                ]
+            )
         elif all(isinstance(x, bool) for x in value):
             arg.bool_list.values.extend(value)
         elif all(isinstance(x, int) for x in value):
@@ -313,7 +326,7 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
     Converts a torch.fx.Node into an OpOverload protobuf message.
     """
     if hasattr(node.target, "_schema"):
-        target = node.target._schema.name.split('::')[1]
+        target = node.target._schema.name.split("::")[1]
     else:
         target = str(node.target)
 
@@ -323,7 +336,11 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
         target=target,
     )
 
-    if is_nop(node) or is_addressing_op(node) or node.target == operator.getitem:
+    if (
+        is_nop(node)
+        or is_addressing_op(node)
+        or node.target == operator.getitem
+    ):
         op_overload.op = "nop"
 
     if node.target == torch.ops.aten.pad.default:
@@ -359,7 +376,9 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
         n.meta.pop("_scratchpad_map", None)
 
     if "l2_tiling" in node.meta:
-        op_overload.kwargs["l2_tiling"].int_list.values.extend(node.meta["l2_tiling"])
+        op_overload.kwargs["l2_tiling"].int_list.values.extend(
+            node.meta["l2_tiling"]
+        )
 
     return op_overload
 
@@ -385,18 +404,19 @@ def is_conv2d(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.conv2d.default,
         torch.ops.quantized_ops.conv2d.default,
-        torch.ops.quantized_ops.conv2d_mx.default
+        torch.ops.quantized_ops.conv2d_mx.default,
     ]
 
 
 def is_depthwise_conv(node: Node) -> bool:
     return (
-        node.target in [
+        node.target
+        in [
             torch.ops.aten.conv2d.default,
-            torch.ops.quantized_ops.conv2d_mx.default
-        ] and
-        len(node.args) == 7 and
-        node.args[6] != 1
+            torch.ops.quantized_ops.conv2d_mx.default,
+        ]
+        and len(node.args) == 7
+        and node.args[6] != 1
     )
 
 
@@ -589,12 +609,14 @@ def is_prunable_op(node: Node) -> bool:
     # A slice from 0 to the end of the input tensor
     if node.target == torch.ops.aten.slice.Tensor:
         default_args = [0, None, None, 1]
-        dim, start, end, step = list(node.args[1:]) + default_args[len(node.args) - 1:]
+        dim, start, end, step = (
+            list(node.args[1:]) + default_args[len(node.args) - 1 :]
+        )
         if start is not None and start != 0 or step != 1:
             return False
         if end is not None and hasattr(node.args[0], "shape"):
             return end >= node.args[0].shape[dim]
-        return (start is None and end is None) or end == 0x7fffffffffffffff
+        return (start is None and end is None) or end == 0x7FFFFFFFFFFFFFFF
 
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])
@@ -620,16 +642,25 @@ def is_nop(node: Node) -> bool:
     # as a cast op, not silenced.
     if node.target == torch.ops.aten.to.dtype:
         input_node = node.args[0]
-        value = getattr(input_node, "value", None)
+
         src_dtype = getattr(input_node, "dtype", None)
-        if src_dtype is None and isinstance(value, torch.Tensor):
-            src_dtype = str(value.dtype).split(".")[1]
-        dst_dtype = node.args[1] if len(node.args) > 1 else node.kwargs.get("dtype")
+
+        if src_dtype is None:
+            value = getattr(input_node, "value", None)
+            if not isinstance(value, torch.Tensor):
+                value = getattr(input_node, "meta", {}).get("val")
+
+            if isinstance(value, torch.Tensor):
+                src_dtype = value.dtype
+
+        dst_dtype = get_arg_value(node, 1, "dtype")
         if isinstance(dst_dtype, torch.dtype):
             dst_dtype = str(dst_dtype).split(".")[1]
+
         return src_dtype == dst_dtype
 
     return node.target in [
+        torch.ops.aten.as_strided.default,
         torch.ops.aten.clone.default,
         torch.ops.aten.contiguous.default,
         torch.ops.aten.copy_.default,
@@ -651,9 +682,12 @@ def is_addressing_op(node: Node) -> bool:
     thus require no additional handling:
     """
     if node.target == torch.ops.aten.select.int:
-        return all(d == 1 for d in node.args[0].value.shape[:node.args[1]])
+        return all(d == 1 for d in node.args[0].value.shape[: node.args[1]])
 
-    if node.target in [torch.ops.aten.stack.default, torch.ops.aten.cat.default]:
+    if node.target in [
+        torch.ops.aten.stack.default,
+        torch.ops.aten.cat.default,
+    ]:
         return len(node.args) == 1 or node.args[1] == 0
 
     return False

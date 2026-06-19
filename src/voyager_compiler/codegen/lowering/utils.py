@@ -17,9 +17,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from voyager_compiler.codegen.lowering import (
-    ops,
-)  # noqa: F401  registers voyager.*
+from voyager_compiler.codegen.lowering import ops
 
 voyager = torch.ops.voyager
 
@@ -76,6 +74,21 @@ class _OutputSpec:
     dtype: torch.dtype
 
 
+@dataclass(frozen=True)
+class _ScratchSpec:
+    """A persistent on-chip SRAM scratch ref — a third class of SRAM object
+    next to input / output banks.  Unlike them it is *local state*: allocated
+    once and reused every grid step, not DMA-managed, not double-buffered, and
+    not carried in the loop state.  It has only a ``shape`` + ``dtype`` (no
+    ``index_map`` / DRAM shape / token / buffer count); the kernel mutates it
+    in place (e.g. a tiled-reduction accumulator).  Mirrors Pallas's
+    ``scratch_shapes`` appended after the normal input/output refs.
+    """
+
+    shape: Tuple[int, ...]
+    dtype: torch.dtype
+
+
 def _compute_input_spec(
     output_shape: tuple, tile_sizes: tuple, input_shape: tuple
 ) -> Optional[_InputSpec]:
@@ -102,6 +115,55 @@ def _compute_input_spec(
         ts_for_inp.append(1 if bcast else ts)
 
     return _InputSpec(tuple(ts_for_inp), tuple(index_map), tuple(is_broadcast))
+
+
+def _out_of_place(target):
+    """The out-of-place aten overload of an in-place one (``add_.Tensor`` ->
+    ``add.Tensor``), or ``target`` unchanged if it is not a convertible
+    in-place op.
+    """
+    if not isinstance(target, torch._ops.OpOverload):
+        return target
+    name = target._schema.name  # e.g. "aten::add_"
+    if "::" not in name or not name.endswith("_"):
+        return target
+    ns, op = name.split("::")
+    packet = getattr(getattr(torch.ops, ns, None), op[:-1], None)
+    if packet is None:
+        return target
+    return getattr(packet, target._overloadname, target)
+
+
+def _build_fused_gm(submod, anchor_node, fused_ops, fused_inputs):
+    """The post-anchor fused pointwise ops as a ``GraphModule``
+    ``[acc, *fused_inputs] -> submodule output(s)``.
+
+    ``anchor_node``'s output is rewired to the ``acc`` placeholder;
+    ``fused_inputs`` are the submodule placeholders the ``fused_ops`` consume
+    (e.g. a residual / scale).  Export inlines this, so the fused ops become
+    standalone nodes in the loop body, applied to the anchor's result tile.
+    """
+    g = torch.fx.Graph()
+    remap = {anchor_node: g.placeholder("acc")}
+    for n in fused_inputs:
+        remap[n] = g.placeholder(n.name)
+    inputs = set(remap.values())  # the [acc, *fused_inputs] placeholders
+    for n in fused_ops:
+        new = g.node_copy(n, lambda x: remap[x])
+        # An in-place fused op touching a fused input can mutate a while_loop
+        # input (a residual is passed whole when the node is untiled), which
+        # HOPs reject — so de-inplace it (add_ -> add); same result, no
+        # mutation.
+        if any(a in inputs for a in new.all_input_nodes):
+            new.target = _out_of_place(n.target)
+        remap[n] = new
+    out = next(n for n in submod.graph.nodes if n.op == "output").args[0]
+    if isinstance(out, (list, tuple)):
+        g.output(tuple(remap[o] for o in out))
+    else:
+        g.output(remap[out])
+    g.lint()
+    return torch.fx.GraphModule(torch.nn.Module(), g)
 
 
 @contextlib.contextmanager
@@ -132,36 +194,6 @@ def _lenient_verifier():
         yield
     finally:
         _verifier._check_val = orig
-
-
-def _apply_tail(tail_fn, acc, tail_operands, tail_input_specs, block):
-    """
-    Apply a fused pointwise tail to the accumulator tile.
-
-    Each tail operand is loaded per its precomputed ``_InputSpec`` — built once
-    by the bufferization pass, which has the whole submodule, rather than on
-    the fly here.  A ``None`` spec means *pass the operand whole*: a true
-    scalar, or a quantization codebook / qmap (only ever a quantization-op
-    arg).  Otherwise the operand's tile is loaded, pinning broadcast dims
-    (size 1 vs a >1 output dim) to block 0.  ``block`` is the output tile's
-    block index.  The loaded tiles are passed positionally after the
-    accumulator: ``tail_fn(acc, *operand_tiles)``.  ``tail_operands`` /
-    ``tail_input_specs`` may be ``None`` (a unary tail such as relu / silu with
-    no extra operands).
-    """
-    if tail_fn is None:
-        return acc
-    tiles = []
-    for op, spec in zip(tail_operands or (), tail_input_specs or ()):
-        if spec is None:  # whole (scalar / codebook) operand -> passed through
-            tiles.append(op)
-        else:
-            blk = tuple(
-                0 if bcast else block[i]
-                for i, bcast in zip(spec.index_map, spec.is_broadcast)
-            )
-            tiles.append(voyager.load_tile(op, blk, spec.tile_sizes))
-    return tail_fn(acc, *tiles)
 
 
 def _split_block_indices(gm: torch.fx.GraphModule) -> None:
@@ -222,109 +254,208 @@ def _split_block_indices(gm: torch.fx.GraphModule) -> None:
 
 
 def _fuse_tail_in_body(
-    gm: torch.fx.GraphModule, ref_target, tail_fn=None, fuse_ref_with_tail=True
+    gm: torch.fx.GraphModule,
+    target,
+    fuse_anchor_with_tail=True,
 ) -> None:
-    """Group a GEMM/conv op's post-op tail (inside the exported ``while_loop``
-    body) into a nested ``call_module`` so codegen emits it as one protobuf
-    ``fused_op``.
+    """Group a GEMM/conv anchor + its fused post-op pointwise ops (inside the
+    exported ``while_loop`` body) into a nested ``call_module``, so the proto
+    codegen emits them as one ``fused_op`` (L1: one accelerator pass).
 
-    Two cases, split by whether the reduction (C) dim is tiled:
+    The group is found by *forward reachability* from the anchor (like
+    mapping.py's ``find_sequential_nodes_``), not by op target: from the lone
+    anchor walk *down* through ``.users``, collecting the compute cone, and stop
+    at the output store (``copy_tile``) — excluding the write-out wrappers (a
+    ``clone`` / multi-output ``getitem`` that only feed that store).  The tail's
+    operand loads (residual / scale ``select`` reads) are *inputs* to the tail
+    ops, not descendants of the anchor, so they fall outside the cone and become
+    the call_module's args; the per-slot DMA / loop machinery is likewise never
+    reached.  A multi-output op (``quantize_mx``) ends the cone with its
+    ``getitem`` users left outside, rewired to the call_module.  Recurses into
+    nested ``while_loop`` / ``cond`` bodies.
 
-    * **num_c == 1** (``fuse_ref_with_tail``) — the reference op sits directly
-      in this body and produces the output tile, so the GEMM/conv *and* its
-      tail fuse into one call_module (L1: one accelerator pass, no SRAM
-      write-back).  The group is the ref plus every op reachable from it, which
-      includes the GEMM's own output-dtype cast (part of the op, not a separate
-      tail).
-    * **num_c > 1** — the reference op's partials are summed with an
-      accumulate-add and a bias/dtype epilogue the accelerator does in the GEMM
-      pass, so the GEMM stays separate.  Only the **pointwise tail** fuses,
-      located by matching ``tail_fn``'s op sequence against the body's trailing
-      compute ops — so the bias-add + cast epilogue is excluded *exactly*, not
-      by heuristics.  Needs ``tail_fn`` to be a ``GraphModule`` (the production
-      / bufferize path); a bare-callable tail (unit-test builders) is left
-      unfused.
+    Two modes, by ``fuse_anchor_with_tail``:
 
-    ``fuse_ref_with_tail`` is the caller's ``num_c == 1`` knowledge (the builder
-    knows the tile count).  It is needed because a single ``ref_target`` beside
-    the store does not uniquely mean num_c == 1: a double-buffered reduction
-    leaves its *epilogue* matmul in this body too (one ref when rolled, several
-    when unrolled).  Gating on the builder's flag keeps num_c > 1 tail-only
-    whether sequential or pipelined.
+      * ``True`` (num_k == 1): the anchor sits directly in this body and
+        produces the output tile, so the cone is anchor + bias + fused ops.
 
-    The ``load_tile`` / ``store_tile`` / loop-control nodes stay out of the
-    group and become the call_module's args; multi-output tails
-    (``quantize_mx``) keep their ``getitem`` users, rewired to the call_module.
-    Recurses into nested bodies.
+      * ``False`` (num_k > 1): the reduction splits the anchor and tail across
+        separate ``torch.cond`` branches — the anchor accumulates into a scratch
+        ref, and the tail runs in a *finalize* cond's true branch.  Group only
+        that tail branch's compute (``_fuse_tail_only``), leaving the GEMM/conv
+        anchor out.
     """
     from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
 
-    store = voyager.store_tile.default
-    skip = {
-        voyager.load_tile.default,
-        store,
-        voyager.increment_indices.default,
-        torch.ops.higher_order.while_loop,
-        operator.getitem,
-    }
     for node in list(gm.graph.nodes):
         if node.op == "get_attr":
             sub = getattr(gm, str(node.target), None)
             if isinstance(sub, torch.fx.GraphModule):
-                _fuse_tail_in_body(sub, ref_target, tail_fn, fuse_ref_with_tail)
+                _fuse_tail_in_body(sub, target, fuse_anchor_with_tail)
 
-    if not any(
-        n.op == "call_function" and n.target is store for n in gm.graph.nodes
-    ):
+    if not fuse_anchor_with_tail:
+        _fuse_tail_only(gm, target)
         return
 
-    # Only num_c == 1 (per the caller) fuses the ref op with the tail, and only
-    # when it is the lone ref in this body (the output-producing op).  num_c > 1
-    # — sequential (no ref here) or pipelined (the double-buffered epilogue
-    # leaves one/several refs here) — falls to the tail-only branch.
-    refs = [
+    # The anchor appears only in the output-producing body, exactly once for
+    # num_k == 1.  (A multi-anchor / no-anchor body is num_k > 1 or a non-output
+    # region — out of scope for fusion.)
+    anchors = [
         n
         for n in gm.graph.nodes
-        if n.op == "call_function" and n.target is ref_target
+        if n.op == "call_function" and n.target is target
     ]
-    ref = refs[0] if (fuse_ref_with_tail and len(refs) == 1) else None
-    if ref is not None:
-        # num_c == 1: GEMM + tail.  Group the ref and everything reachable
-        # from it.
-        reachable = {ref}
-        group = [ref]
-        for n in gm.graph.nodes:
-            if n is ref or n.op != "call_function" or n.target in skip:
-                continue
-            if any(inp in reachable for inp in n.all_input_nodes):
-                reachable.add(n)
-                group.append(n)
-        if len(group) < 2:
-            return  # bare reference op, no tail to fuse
-    else:
-        # num_c > 1: fuse the pointwise tail only.  ``tail_fn``'s ops are
-        # inlined as the body's trailing compute ops (after the bias-add + cast
-        # epilogue), so the tail is exactly the last ``len(tail_targets)`` of
-        # them.
-        if not isinstance(tail_fn, torch.fx.GraphModule):
-            return
-        tail_targets = [
-            n.target for n in tail_fn.graph.nodes if n.op == "call_function"
-        ]
-        body_compute = [
-            n
-            for n in gm.graph.nodes
-            if n.op == "call_function" and n.target not in skip
-        ]
-        if not tail_targets or len(tail_targets) > len(body_compute):
-            return
-        group = body_compute[-len(tail_targets) :]
-        if [n.target for n in group] != tail_targets:
-            return  # pattern mismatch — leave unfused rather than guess
+    if len(anchors) != 1:
+        return
+    anchor = anchors[0]
 
-    _create_and_insert_subgraph(group, gm, dict(gm.named_modules()))
+    copy_tile = voyager.copy_tile.default
+    clone = torch.ops.aten.clone.default
+
+    def _is_writeout_wrapper(n) -> bool:
+        # A ``clone`` / multi-output ``getitem`` that only feeds the output
+        # store — the boundary between real compute and the bank write.
+        return (
+            n.target in (clone, operator.getitem)
+            and bool(n.users)
+            and all(u.target is copy_tile for u in n.users)
+        )
+
+    # Forward cone from the anchor, halting at the store and its write-out
+    # wrappers — exactly the anchor + bias + fused compute ops.
+    group, stack = {anchor}, [anchor]
+    while stack:
+        for u in stack.pop().users:
+            if (
+                u in group
+                or u.op != "call_function"
+                or u.target is copy_tile
+                or _is_writeout_wrapper(u)
+            ):
+                continue
+            group.add(u)
+            stack.append(u)
+
+    if len(group) < 2:
+        return  # bare anchor — nothing fused into this body
+
+    _create_and_insert_subgraph(list(group), gm, dict(gm.named_modules()))
     gm.graph.lint()
     gm.recompile()
+
+
+def _subgraph_has(gm: torch.fx.GraphModule, target) -> bool:
+    """True if ``gm`` — or any nested cond / while_loop body — has a
+    ``call_function`` with ``target``.  The search recurses because a conv
+    bias-gate ``torch.cond`` nests the anchor a level inside the accumulate
+    branch."""
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.target is target:
+            return True
+        if n.op == "get_attr":
+            sub = getattr(gm, str(n.target), None)
+            if isinstance(sub, torch.fx.GraphModule) and _subgraph_has(
+                sub, target
+            ):
+                return True
+    return False
+
+
+def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
+    """num_k > 1: group the fused tail into a nested ``call_module``, leaving
+    the GEMM/conv anchor separate.  The reduction splits the work across
+    ``torch.cond``s: an *accumulate* cond (whose branch holds the anchor) sums
+    the op into a scratch ref, then a *finalize* cond maps the completed scratch
+    through the tail (``fused_gm``) into the output.
+
+    The finalize cond is found by the **scratch data dependency**: the
+    accumulate cond's result is ``copy_tile``'d into the scratch ref, and the
+    finalize cond is the other cond that reads that same scratch as an operand.
+    Its true branch is just ``fused_gm`` + NOP wrappers (the dense-view / cast /
+    multi-output ``getitem`` that match the skip branch's metadata), so the
+    group is its non-NOP ops; a single-op tail needs no fusing."""
+    from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
+    from voyager_compiler.codegen.mapping_utils import is_nop
+
+    cond = torch.ops.higher_order.cond
+    copy_tile = voyager.copy_tile.default
+
+    def true_branch(c):
+        a = c.args[1]
+        if isinstance(a, torch.fx.Node) and a.op == "get_attr":
+            b = getattr(gm, str(a.target), None)
+            return b if isinstance(b, torch.fx.GraphModule) else None
+        return None
+
+    # 1. The accumulate cond — its true branch holds the anchor.
+    anchor_cond = None
+    for n in gm.graph.nodes:
+        if n.op != "call_function" or n.target is not cond:
+            continue
+        branch = true_branch(n)
+        if branch is not None and _subgraph_has(branch, target):
+            anchor_cond = n
+            break
+    if anchor_cond is None:
+        return
+
+    # 1a. Fuse the accumulate branch (anchor + cast + the ``+ scratch`` add) into
+    #     one ``fused_op``.  The cond is ``torch.cond(coord == 0, init,
+    #     accumulate)``: the true branch (``args[1]``) is ``init`` — just the
+    #     anchor, whose result is stored directly (through at most a nop cast) —
+    #     so only the false branch (``args[2]``, ``accumulate``) has the add.
+    #     There the bare anchor result feeds the add, not a store, so the
+    #     destination-passing check would reject it; folding it into the fused op
+    #     makes the op's *result* the value that is ``copy_tile``'d into scratch.
+    accum_branch = getattr(gm, str(anchor_cond.args[2].target), None)
+    if isinstance(accum_branch, torch.fx.GraphModule):
+        _fuse_tail_in_body(accum_branch, target)
+
+    # 2. The scratch ref = the dest of the ``copy_tile`` fed by the accumulate
+    #    cond's result (through the cond's ``getitem`` unpacking).
+    scratch = None
+    for u in anchor_cond.users:
+        chain = list(u.users) if u.target is operator.getitem else [u]
+        copy_n = next((n for n in chain if n.target is copy_tile), None)
+        if copy_n is not None:
+            scratch = copy_n.args[1]
+            break
+    if scratch is None:
+        return
+
+    # 3. The finalize cond reads that scratch, so it is among the scratch's
+    #    users — the *other* cond there (the accumulate cond also reads it).
+    finalize_cond = next(
+        (u for u in scratch.users if u.target is cond and u is not anchor_cond),
+        None,
+    )
+    if finalize_cond is None:
+        return
+
+    # 4. The tail branch is ``fused_gm`` + the finalize wrappers (a multi-output
+    #    ``getitem``, a dense-view ``as_strided``, a dtype ``to`` — added so the
+    #    finalize and skip branches share output metadata).  Group ``fused_gm``:
+    #    the branch's non-NOP ops.  ``getitem`` and ``to`` aren't caught by
+    #    ``is_nop`` (getitem never is; ``to`` only when the dtype is unchanged —
+    #    under fp32 accumulation it is a real cast), so exclude them explicitly.
+    branch = true_branch(finalize_cond)
+    ops = [
+        n
+        for n in branch.graph.nodes
+        if (
+            n.op == "call_function"
+            and n.target is not operator.getitem
+            and n.target is not torch.ops.aten.to.dtype
+            and n.target is not copy_tile
+            and not is_nop(n)
+        )
+    ]
+    if len(ops) < 2:
+        return  # a lone op — nothing to fuse
+
+    _create_and_insert_subgraph(ops, branch, dict(branch.named_modules()))
+    branch.graph.lint()
+    branch.recompile()
 
 
 def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
