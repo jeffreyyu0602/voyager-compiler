@@ -435,19 +435,51 @@ def gen_compute_graph_bufferized(
     model: GraphModule,
     output_file: str = "bufferized_graph",
     args: Optional[tuple] = None,
+    timeout: Optional[float] = None,
 ) -> None:
     """
     Render a bufferized FX graph to ``<output_file>.svg``; each ``while_loop``
     is a labelled cluster box containing its (possibly nested) body.
+
+    ``timeout`` (seconds) bounds the build+render work: if it is exceeded the
+    rendering is abandoned and a warning is printed instead of raising.  The
+    graph is a debug visualization, so skipping it is non-fatal.  Implemented
+    with ``SIGALRM`` (main thread, POSIX only); ``None`` disables the guard.
     """
     if args is not None:
         ShapeProp(model).propagate(*args)
 
-    g = graphviz.Digraph()
-    g.attr(compound="true")
-    env: Dict[torch.fx.Node, str] = {}
-    _render_graph(model, g, env, counter=[0])
-    g.render(output_file, format="svg", cleanup=True)
+    def _render():
+        g = graphviz.Digraph()
+        g.attr(compound="true")
+        env: Dict[torch.fx.Node, str] = {}
+        _render_graph(model, g, env, counter=[0])
+        g.render(output_file, format="svg", cleanup=True)
+
+    if timeout is None:
+        _render()
+        return
+
+    import signal
+
+    class _RenderTimeout(Exception):
+        pass
+
+    def _on_timeout(signum, frame):
+        raise _RenderTimeout
+
+    old_handler = signal.signal(signal.SIGALRM, _on_timeout)
+    signal.setitimer(signal.ITIMER_REAL, timeout)
+    try:
+        _render()
+    except _RenderTimeout:
+        print(
+            f"WARNING: gen_compute_graph_bufferized exceeded {timeout:g}s; "
+            "skipping compute graph rendering."
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 # ===========================================================================

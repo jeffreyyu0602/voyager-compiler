@@ -35,7 +35,6 @@ from ..banking import (
     require_allocation,
     _get_scope,
 )
-from ..tiler import run_interstellar_dram
 from ...pt2e_utils import WrapperModule, fetch_attr, propagate_shape
 from ...quantize_pt2e import create_getattr_from_value, export_model
 
@@ -51,18 +50,22 @@ __all__ = [
 DEFAULT_CACHE_SIZE = 8 * 1024 * 1024  # 8 MiB
 
 
-def _get_tiling_context(node_to_fuse: torch.fx.Node) -> List[Tuple[int, int, int]]:
+def _get_tiling_context(
+    node_to_fuse: torch.fx.Node,
+) -> List[Tuple[int, int, int]]:
     """
     Backtracks from node_to_fuse to find slice/pad ops and calculates
     the equivalent output slice parameters.
     """
     conv_node = node_to_fuse
     if not is_conv2d(conv_node) and len(conv_node.args) > 1:
-         # Fallback for patterns like relu(conv) or add(conv, bias)
-         # Assuming conv is the second arg based on original logic, but safer to check
-         potential_conv = conv_node.args[1]
-         if isinstance(potential_conv, torch.fx.Node) and is_conv2d(potential_conv):
-             conv_node = potential_conv
+        # Fallback for patterns like relu(conv) or add(conv, bias)
+        # Assuming conv is the second arg based on original logic, but safer to check
+        potential_conv = conv_node.args[1]
+        if isinstance(potential_conv, torch.fx.Node) and is_conv2d(
+            potential_conv
+        ):
+            conv_node = potential_conv
 
     if "tiled_shapes" not in conv_node.meta:
         return []
@@ -75,7 +78,8 @@ def _get_tiling_context(node_to_fuse: torch.fx.Node) -> List[Tuple[int, int, int
     # Traverse backwards to find slicing details
     current_node = conv_node.args[0]
     while isinstance(current_node, torch.fx.Node) and current_node.target in [
-        torch.ops.aten.slice.Tensor, torch.ops.aten.pad.default
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.pad.default,
     ]:
         if current_node.target == torch.ops.aten.slice.Tensor:
             dim, start, end = current_node.args[1:]
@@ -99,7 +103,7 @@ def _clone_parameter(
     param = fetch_attr(model, arg.target)
     prefix = arg.name
 
-    if match := re.fullmatch(r'(code|qmap)(_\d+)?', arg.name):
+    if match := re.fullmatch(r"(code|qmap)(_\d+)?", arg.name):
         prefix = match.group(1)
 
     with model.graph.inserting_before(anchor):
@@ -158,9 +162,7 @@ def create_new_chain(model, node_to_fuse, cat_node, fusable):
                 )
 
         with model.graph.inserting_before(anchor):
-            new_node = model.graph.node_copy(
-                n, lambda n: value_remap.get(n, n)
-            )
+            new_node = model.graph.node_copy(n, lambda n: value_remap.get(n, n))
         propagate_shape(new_node, model)
         new_node.meta["dtype"] = n.meta.get("dtype")
 
@@ -203,7 +205,8 @@ def move_fusable_ops_after_conv2d(model, node):
     while stack:
         curr = stack.pop()
         if curr.target in [
-            torch.ops.aten.cat.default, torch.ops.aten.slice.Tensor,
+            torch.ops.aten.cat.default,
+            torch.ops.aten.slice.Tensor,
         ]:
             cat_and_slice_nodes.append(curr)
             stack.extend(curr.all_input_nodes)
@@ -227,8 +230,11 @@ def _make_conv2d_tiled_module(
     """
     Factory function to create a Conv2dTiled module class with captured parameters.
     """
+
     class Conv2dTiled(torch.nn.Module):
-        def __init__(self, stride=1, padding=0, dilation=1, groups=1, block_size=16):
+        def __init__(
+            self, stride=1, padding=0, dilation=1, groups=1, block_size=16
+        ):
             super().__init__()
             self.stride = _pair(stride)
             self.padding = _pair(padding)
@@ -309,7 +315,7 @@ def _make_conv2d_tiled_module(
 
             oy, ox = cfg["output_offset"]
             oh, ow = cfg["output_sizes"]
-            return out[:, :, oy:oy+oh, ox:ox+ow]
+            return out[:, :, oy : oy + oh, ox : ox + ow]
 
         def forward(
             self,
@@ -405,25 +411,33 @@ def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
 
     # Update metadata on new nodes in the graph
     for n in list(value_remap.values()):
-        if n.target == torch.ops.aten.slice.Tensor and n.args[0].op == "get_attr":
+        if (
+            n.target == torch.ops.aten.slice.Tensor
+            and n.args[0].op == "get_attr"
+        ):
             c_start, c_end = n.args[2], n.args[3]
             with model.graph.inserting_before(n):
-                sliced_param = _slice_tensor(n.args[0], 1, c_start, c_end, model)
+                sliced_param = _slice_tensor(
+                    n.args[0], 1, c_start, c_end, model
+                )
             n.replace_all_uses_with(sliced_param)
             model.graph.erase_node(n)
             continue
 
         if n.target in [
-            torch.ops.aten.slice.Tensor, torch.ops.aten.pad.default,
+            torch.ops.aten.slice.Tensor,
+            torch.ops.aten.pad.default,
         ]:
             n.meta["dtype"] = n.args[0].meta.get("dtype")
 
         if n.target == node.target:
-            n.meta.update({
-                "tiled_shapes": tiled_shapes.pop(0),
-                "l2_tiling": (1, K // tile_k, 1, 1),
-                "dtype": node.meta.get("dtype"),
-            })
+            n.meta.update(
+                {
+                    "tiled_shapes": tiled_shapes.pop(0),
+                    "l2_tiling": (1, K // tile_k, 1, 1),
+                    "dtype": node.meta.get("dtype"),
+                }
+            )
 
     if output[0].target == torch.ops.aten.cat.default:
         move_fusable_ops_after_conv2d(model, output[0])
@@ -450,7 +464,7 @@ def split_conv2d_node(model, node, tile_sizes):
         node: node (must be aten.conv2d or quantized conv2d)
         tile_sizes: (Y, X, C, K)
     """
-    stride  = _pair(get_arg_value(node, 3, "stride", 1))
+    stride = _pair(get_arg_value(node, 3, "stride", 1))
     padding = _pair(get_arg_value(node, 4, "padding", 0))
     dilation = _pair(get_arg_value(node, 5, "dilation", 1))
     bs = node.kwargs.get("block_size", 1)
@@ -471,7 +485,11 @@ def split_conv2d_node(model, node, tile_sizes):
         code = model.get_buffer(input_code.target)
         pad_value = (code == 0).nonzero()[0].item()
 
-    if (tile_x != X or tile_y != Y) and any(p for p in padding) and not is_conv1:
+    if (
+        (tile_x != X or tile_y != Y)
+        and any(p for p in padding)
+        and not is_conv1
+    ):
         pad_hw = (padding[1], padding[1], padding[0], padding[0])
         _pad_input(model, node, node.args[0], pad_hw, pad_value)
 
@@ -493,9 +511,13 @@ def split_conv2d_node(model, node, tile_sizes):
             }
 
         y_in_start = y * stride[0] - padding[0]
-        y_in_end = y_in_start + (oh - 1) * stride[0] + (kH - 1) * dilation[0] + 1
+        y_in_end = (
+            y_in_start + (oh - 1) * stride[0] + (kH - 1) * dilation[0] + 1
+        )
         x_in_start = x * stride[1] - padding[1]
-        x_in_end = x_in_start + (ow - 1) * stride[1] + (kW - 1) * dilation[1] + 1
+        x_in_end = (
+            x_in_start + (ow - 1) * stride[1] + (kW - 1) * dilation[1] + 1
+        )
 
         # Grab more input pixels so that after applying padding of three, the
         # new convolution still aligns with the original one, just with some
@@ -534,8 +556,8 @@ def split_conv2d_node(model, node, tile_sizes):
             x_offset, y_offset = 0, 0
         else:
             # conv1 hardware replication constraints
-            y_in_end += (16 - ((y_in_end - y_in_start_clamped) % 16))
-            x_in_end += (16 - ((x_in_end - x_in_start_clamped) % 16))
+            y_in_end += 16 - ((y_in_end - y_in_start_clamped) % 16)
+            x_in_end += 16 - ((x_in_end - x_in_start_clamped) % 16)
             y_in_end_clamped = min(y_in_end, IY)
             x_in_end_clamped = min(x_in_end, IX)
 
@@ -555,21 +577,21 @@ def split_conv2d_node(model, node, tile_sizes):
         }
 
     def _compute_per_tile_shapes(cfg):
-        (y0, y1) = cfg["y_tile"]
-        (x0, x1) = cfg["x_tile"]
-        (pad_left, pad_right, pad_top, pad_bottom) = cfg["input_padding"]
+        y0, y1 = cfg["y_tile"]
+        x0, x1 = cfg["x_tile"]
+        pad_left, pad_right, pad_top, pad_bottom = cfg["input_padding"]
         conv_padding = cfg["conv_padding"]
-        (oh, ow) = cfg["output_sizes"]
-        (c_start, c_end) = cfg["c_tile"]
+        oh, ow = cfg["output_sizes"]
+        c_start, c_end = cfg["c_tile"]
 
         h_in = (y1 - y0) + pad_top + pad_bottom
         w_in = (x1 - x0) + pad_left + pad_right
         h_out = (h_in + 2 * conv_padding[0] - kH) // stride[0] + 1
         w_out = (w_in + 2 * conv_padding[1] - kW) // stride[1] + 1
 
-        assert h_out >= oh and w_out >= ow, (
-            f"Output sizes mismatch: ({h_out}, {w_out}) vs ({oh}, {ow})"
-        )
+        assert (
+            h_out >= oh and w_out >= ow
+        ), f"Output sizes mismatch: ({h_out}, {w_out}) vs ({oh}, {ow})"
 
         c_tile = c_end - c_start
         tiled_shape = {}
@@ -699,7 +721,8 @@ def _slice_tensor(node, dim, start, end, model):
         )
     else:
         tiled_node = graph.call_function(
-            torch.ops.aten.slice.Tensor, (node, dim, start, end),
+            torch.ops.aten.slice.Tensor,
+            (node, dim, start, end),
         )
 
     propagate_shape(tiled_node, model)
@@ -709,10 +732,7 @@ def _slice_tensor(node, dim, start, end, model):
 
 def _get_node_attribute(node):
     args_and_kwargs = normalize_function(
-        node.target,
-        node.args,
-        node.kwargs,
-        normalize_to_only_use_kwargs=True
+        node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )
 
     def sanitize_value(v):
@@ -758,13 +778,15 @@ def _make_tiled_gemm_module(node, C, tile_c):
             op_kwargs = {}
             if bs is not None:
                 bc0, bc1 = c0 // bs, c1 // bs
-                op_kwargs.update({
-                    "input_scale": input_scale[..., bc0:bc1],
-                    "weight_scale": slice_wt(weight_scale, bc0, bc1),
-                    "block_size": bs,
-                    "input_code": input_code,
-                    "weight_code": weight_code,
-                })
+                op_kwargs.update(
+                    {
+                        "input_scale": input_scale[..., bc0:bc1],
+                        "weight_scale": slice_wt(weight_scale, bc0, bc1),
+                        "block_size": bs,
+                        "input_code": input_code,
+                        "weight_code": weight_code,
+                    }
+                )
 
             if not is_mat:
                 args += (bias if c1 == C else None,)
@@ -778,7 +800,10 @@ def _make_tiled_gemm_module(node, C, tile_c):
 
 
 def _make_tiled_linear_with_outlier_filter_module(
-    quantize_node, node, C, tile_c,
+    quantize_node,
+    node,
+    C,
+    tile_c,
 ):
     """
     Factory function to create a TiledGemm module class with
@@ -810,14 +835,14 @@ def _make_tiled_linear_with_outlier_filter_module(
         for c in range(0, C, tile_c):
             c0, c1 = c, min(c + tile_c, C)
 
-            (
-                data, indices, indptr, input_scale, inliers
-            ) = quantized_ops.quantize_mx_outlier(
-                input[..., c0:c1],
-                qmap=input_qmap,
-                scale_qmap=scale_qmap,
-                output_code=output_code,
-                **quantize_mx_outlier_kwargs,
+            data, indices, indptr, input_scale, inliers = (
+                quantized_ops.quantize_mx_outlier(
+                    input[..., c0:c1],
+                    qmap=input_qmap,
+                    scale_qmap=scale_qmap,
+                    output_code=output_code,
+                    **quantize_mx_outlier_kwargs,
+                )
             )
 
             args = (inliers, slice_wt(weight, c0, c1))
@@ -939,7 +964,9 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
                 c_start = get_arg_value(n, 2, "start", None)
                 c_end = get_arg_value(n, 3, "end", None)
                 with model.graph.inserting_before(n):
-                    sliced_param = _slice_tensor(n.args[0], 1, c_start, c_end, model)
+                    sliced_param = _slice_tensor(
+                        n.args[0], 1, c_start, c_end, model
+                    )
                 n.replace_all_uses_with(sliced_param)
                 model.graph.erase_node(n)
             else:
@@ -993,7 +1020,8 @@ def get_valid_tiling(
     # --- 1. Normalize Inputs ---
 
     # helper: resolving negative indices to positive
-    def resolve_idx(i): return i + ndim if i < 0 else i
+    def resolve_idx(i):
+        return i + ndim if i < 0 else i
 
     # Set up fixed dimensions set
     fixed_indices = set()
@@ -1029,7 +1057,7 @@ def get_valid_tiling(
     # Example: input 128, multiple_of=16 -> [128, 64, 32, 16]
     dim_factors = {}
     for i in range(ndim):
-        limit = max(1, targets[i]) # Ensure min_size is at least 1
+        limit = max(1, targets[i])  # Ensure min_size is at least 1
         size = input_shape[i]
         limit = min(limit, size)  # Cap limit to size
 
@@ -1038,7 +1066,11 @@ def get_valid_tiling(
         else:
             mult = multiples[i]
             # Generate factors in descending order, respecting divisibility and multiple_of
-            factors = [f for f in range(size, limit - 1, -1) if size % f == 0 and f % mult == 0]
+            factors = [
+                f
+                for f in range(size, limit - 1, -1)
+                if size % f == 0 and f % mult == 0
+            ]
             if not factors:
                 logger.warning(
                     f"No valid tiling found for dim {i} (size={size}, min={limit}, "
@@ -1056,7 +1088,9 @@ def get_valid_tiling(
 
     def get_current_state():
         """Constructs the shape and tiling tuple based on current indices."""
-        shape = tuple(dim_factors[i][current_factor_indices[i]] for i in range(ndim))
+        shape = tuple(
+            dim_factors[i][current_factor_indices[i]] for i in range(ndim)
+        )
         tiling = tuple(input_shape[i] // shape[i] for i in range(ndim))
         return shape, tiling
 
@@ -1125,12 +1159,10 @@ def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
     kH, kW, _, _ = _conv2d_layout(weight_shape, True, not transposed)
 
     iy_tile = (
-        (y_tile - 1) * stride[0] - 2 * padding[0]
-        + dilation[0] * (kH - 1) + 1
+        (y_tile - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kH - 1) + 1
     )
     ix_tile = (
-        (x_tile - 1) * stride[1] - 2 * padding[1]
-        + dilation[1] * (kW - 1) + 1
+        (x_tile - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kW - 1) + 1
     )
 
     def apply_layout(shape, is_weight):
@@ -1203,7 +1235,8 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
 
 def _log_tiling_details(node, tiled_shapes, strategy):
     def fmt(s):
-        if s is None: return "?"
+        if s is None:
+            return "?"
         return str(tuple(s)).replace(" ", "")
 
     logger.info(f"Selected tiling for {node} (Strategy: {strategy}):")
@@ -1316,7 +1349,7 @@ def search_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         shape_func=_build_conv2d_shape_map,
         cache_size=cache_size,
         bank_width=bank_width,
-        bank_size=bank_size
+        bank_size=bank_size,
     )
 
 
@@ -1338,7 +1371,9 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     if bank_size is not None:
         input_bytes = get_node_bytes(node.args[0])
         c_max_size = bank_size / input_bytes / x_min_size
-        for (c,), (num_c_tile,) in get_valid_tiling((C,), min_sizes=(unroll_dims[0],)):
+        for (c,), (num_c_tile,) in get_valid_tiling(
+            (C,), min_sizes=(unroll_dims[0],)
+        ):
             if c <= c_max_size:
                 break
         else:
@@ -1398,22 +1433,10 @@ def run_matrix_op_l2_tiling(
     cache_size=None,
     num_banks=None,
     bank_width=None,
-    interstellar_dram_arch=None,
-    interstellar_dram_schedule=None,
-    dram_bandwidth=0,
-    input_dtype_width=8,
-    weight_dtype_width=8,
-    output_dtype_width=8,
-    double_buffered_accum_buffer=False,
-    double_buffered_l2=True,
 ):
     """
-    Perform tiling on GEMM operations to fit intermediate data into cache.
-
-    When interstellar_dram_arch/schedule are provided, runs interstellar with a
-    4-level memory hierarchy before each node's L2 heuristic tiling and logs
-    the resulting tile sizes. The interstellar mapping is stored in
-    node.meta["interstellar_dram_tiling"] but does not yet replace the heuristic.
+    Perform heuristic L2 tiling on GEMM/conv operations to fit intermediate data
+    into cache, splitting each op along the reduction dimension when needed.
 
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
@@ -1421,12 +1444,6 @@ def run_matrix_op_l2_tiling(
         cache_size (int): Total cache size in bytes.
         num_banks (int, optional): Number of cache banks for bank-aligned tiling.
         bank_width (int, optional): Width of memory for bank-aligned tiling.
-        interstellar_dram_arch: 4-level Resource from build_architecture_and_schedule_with_dram.
-        interstellar_dram_schedule: Matching Schedule object.
-        dram_bandwidth (int): DRAM bandwidth in elements per cycle.
-        input_dtype_width (int): Input tensor element width in bits (default 8).
-        output_dtype_width (int): Output tensor element width in bits (default 8).
-        double_buffered_accum_buffer (bool): Whether the accumulator buffer is double-buffered.
     """
     graph = model.graph
 
@@ -1436,21 +1453,6 @@ def run_matrix_op_l2_tiling(
     bank_size = None if num_banks is None else cache_size // num_banks
 
     for node in list(graph.nodes):
-        if interstellar_dram_arch is not None and (
-            is_conv2d(node) or is_linear(node) or is_matmul(node)
-        ):
-            run_interstellar_dram(
-                node,
-                interstellar_dram_arch,
-                interstellar_dram_schedule,
-                dram_bandwidth,
-                input_dtype_width,
-                weight_dtype_width,
-                output_dtype_width,
-                double_buffered_accum_buffer,
-                double_buffered_l2=double_buffered_l2,
-            )
-
         if is_conv2d(node):
             tile_sizes, tiled_shape = search_conv2d_tiling(
                 node, unroll, cache_size, None, bank_size
@@ -1485,10 +1487,7 @@ def compute_tiled_shape(shape, divisor):
     elif m > ndim:
         divisor = divisor[-ndim:]
 
-    return tuple(
-        s // d if s > 1 else s
-        for s, d in zip(shape, divisor)
-    )
+    return tuple(s // d if s > 1 else s for s, d in zip(shape, divisor))
 
 
 def compute_output_tiled_shapes(node, tiling, override_shapes=None):
@@ -1560,7 +1559,9 @@ def run_vector_op_node_l2_tiling(
         last_dim = get_arg_value(node, 1, "dim", -1)
     elif node.target == torch.ops.aten.layer_norm.default:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
-        last_dim = -len(normalized_shape) if normalized_shape is not None else -1
+        last_dim = (
+            -len(normalized_shape) if normalized_shape is not None else -1
+        )
     elif node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
         axes = get_arg_value(node, 1, "axes", None)
         block_size = get_arg_value(node, 2, "block_size", None)
@@ -1569,9 +1570,11 @@ def run_vector_op_node_l2_tiling(
         last_dim = None
         axes = set(axes or ())
         min_sizes = tuple(
-            max(block_size, unroll) if i == ndim - 1
-            else block_size if i in axes
-            else 1
+            (
+                max(block_size, unroll)
+                if i == ndim - 1
+                else block_size if i in axes else 1
+            )
             for i in range(ndim)
         )
     elif node.target in [
@@ -1585,7 +1588,8 @@ def run_vector_op_node_l2_tiling(
         last_dim = next((i for i, d in enumerate(node.args[1]) if i != d), None)
 
     output_shape = (
-        node.value.shape if isinstance(node.value, torch.Tensor)
+        node.value.shape
+        if isinstance(node.value, torch.Tensor)
         else node.value[-1].shape
     )
 
@@ -1610,7 +1614,11 @@ def run_vector_op_node_l2_tiling(
 
 
 def run_vector_op_l2_tiling(
-    model, unroll, cache_size=None, num_banks=None, bank_width=None,
+    model,
+    unroll,
+    cache_size=None,
+    num_banks=None,
+    bank_width=None,
 ):
     """
     Perform tiling on vector operations in a model to fit intermediate data into cache.
@@ -1655,14 +1663,14 @@ _MAX_POOL_OPS = {
 # Non-adaptive: fixed kernel/stride/padding → full 4-D (N, H, W, C) tiling
 _NON_ADAPTIVE_POOL_OPS = {
     torch.ops.quantized_ops.max_pool2d.default,  # NHWC (after data_layout)
-    torch.ops.aten.max_pool2d.default,            # NCHW (before data_layout)
+    torch.ops.aten.max_pool2d.default,  # NCHW (before data_layout)
 }
 
 # Adaptive: input window is proportional to H_in/H_out → only (N, C) tiling
 _ADAPTIVE_POOL_OPS = {
     torch.ops.quantized_ops.adaptive_avg_pool2d.default,  # NHWC
-    torch.ops.aten.adaptive_avg_pool2d.default,            # NCHW
-    torch.ops.aten._adaptive_avg_pool2d,                   # NCHW (core aten)
+    torch.ops.aten.adaptive_avg_pool2d.default,  # NCHW
+    torch.ops.aten._adaptive_avg_pool2d,  # NCHW (core aten)
 }
 
 
@@ -1673,6 +1681,7 @@ _ADAPTIVE_POOL_OPS = {
 # tile maps to a deterministic input window.  Full 4-D (N, H, W, C) tiling is
 # possible; boundary tiles are handled with F.pad before the pool call.
 # ---------------------------------------------------------------------------
+
 
 def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     """
@@ -1696,8 +1705,12 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     dilation = _pair(get_arg_value(node, 4, "dilation", 1))
     kernel_size = _pair(get_arg_value(node, 1, "kernel_size"))
 
-    tile_H_in = (tile_H - 1) * stride[0] + dilation[0] * (kernel_size[0] - 1) + 1
-    tile_W_in = (tile_W - 1) * stride[1] + dilation[1] * (kernel_size[1] - 1) + 1
+    tile_H_in = (
+        (tile_H - 1) * stride[0] + dilation[0] * (kernel_size[0] - 1) + 1
+    )
+    tile_W_in = (
+        (tile_W - 1) * stride[1] + dilation[1] * (kernel_size[1] - 1) + 1
+    )
 
     if node.target in _NHWC_POOL_OPS:  # NHWC: (N, H, W, C)
         return {
@@ -1759,8 +1772,12 @@ def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
             N, C, H_in, W_in = input.shape
 
         if ceil_mode:
-            H_out = math.ceil((H_in + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1)
-            W_out = math.ceil((W_in + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1)
+            H_out = math.ceil(
+                (H_in + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
+            )
+            W_out = math.ceil(
+                (W_in + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
+            )
         else:
             H_out = (H_in + 2 * pad_h - dil_h * (kH - 1) - 1) // stride_h + 1
             W_out = (W_in + 2 * pad_w - dil_w * (kW - 1) - 1) // stride_w + 1
@@ -1782,7 +1799,9 @@ def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
                 for w0 in range(0, W_out, tile_W):
                     w1 = min(w0 + tile_W, W_out)
                     w_in_start = w0 * stride_w - pad_w
-                    w_in_end = (w1 - 1) * stride_w + dil_w * (kW - 1) + 1 - pad_w
+                    w_in_end = (
+                        (w1 - 1) * stride_w + dil_w * (kW - 1) + 1 - pad_w
+                    )
                     pleft = max(0, -w_in_start)
                     pright = max(0, w_in_end - W_in)
                     w_in_s = max(0, w_in_start)
@@ -1798,7 +1817,11 @@ def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
                             x = _slice_dim(x, 2, w_in_s, w_in_e, W_in)
                             x = _slice_dim(x, 3, c0, c1, C)
                             if ptop or pbot or pleft or pright:
-                                x = F.pad(x, (0, 0, pleft, pright, ptop, pbot), value=pad_value)
+                                x = F.pad(
+                                    x,
+                                    (0, 0, pleft, pright, ptop, pbot),
+                                    value=pad_value,
+                                )
                         else:
                             # dim order: N=0, C=1, H=2, W=3
                             x = _slice_dim(input, 0, n0, n1, N)
@@ -1806,8 +1829,16 @@ def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
                             x = _slice_dim(x, 2, h_in_s, h_in_e, H_in)
                             x = _slice_dim(x, 3, w_in_s, w_in_e, W_in)
                             if ptop or pbot or pleft or pright:
-                                x = F.pad(x, (pleft, pright, ptop, pbot), value=pad_value)
-                        c_parts.append(target(x, kernel_size, stride, 0, dilation, ceil_mode))
+                                x = F.pad(
+                                    x,
+                                    (pleft, pright, ptop, pbot),
+                                    value=pad_value,
+                                )
+                        c_parts.append(
+                            target(
+                                x, kernel_size, stride, 0, dilation, ceil_mode
+                            )
+                        )
                     cat_dim = -1 if is_nhwc else 1
                     w_parts.append(_cat_or_single(c_parts, cat_dim))
                 h_parts.append(_cat_or_single(w_parts, 2 if is_nhwc else 3))
@@ -1831,6 +1862,7 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
     tiled forward module, prunes no-op nodes, and splices it into the parent
     graph via replace_node_with_graph_module.  Validates at DEBUG log level.
     """
+
     def load_arg(a):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
 
@@ -1845,7 +1877,12 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
     # Uniform tiles: every dimension divides evenly → input window advances by a
     # constant number of pixels per tile step, so the hardware can drive tiled
     # loads without graph splitting.
-    if N % tile_N == 0 and H_out % tile_H == 0 and W_out % tile_W == 0 and C % tile_C == 0:
+    if (
+        N % tile_N == 0
+        and H_out % tile_H == 0
+        and W_out % tile_W == 0
+        and C % tile_C == 0
+    ):
         kernel_size = _pair(get_arg_value(node, 1, "kernel_size"))
         stride = _pair(get_arg_value(node, 2, "stride", kernel_size))
         h_in_stride = tile_H * stride[0]
@@ -1853,9 +1890,13 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
         node.meta["tiled_shapes"] = tiled_shapes
         node.meta["l2_tiling"] = tiling
         if is_nhwc:
-            node.meta["tile_strides"] = {"input": (tile_N, h_in_stride, w_in_stride, tile_C)}
+            node.meta["tile_strides"] = {
+                "input": (tile_N, h_in_stride, w_in_stride, tile_C)
+            }
         else:
-            node.meta["tile_strides"] = {"input": (tile_N, tile_C, h_in_stride, w_in_stride)}
+            node.meta["tile_strides"] = {
+                "input": (tile_N, tile_C, h_in_stride, w_in_stride)
+            }
         return
 
     module = _make_tiled_non_adaptive_pool_module(node, tile_sizes)
@@ -1865,7 +1906,9 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
         ref_out = node.target(*example_inputs, **load_arg(node.kwargs))
         tiled_out = module(*example_inputs)
         torch.testing.assert_close(tiled_out, ref_out, rtol=1e-4, atol=1e-4)
-        logger.debug(f"Validation passed for tiled non-adaptive pool node: {node}")
+        logger.debug(
+            f"Validation passed for tiled non-adaptive pool node: {node}"
+        )
 
     gm = export_model(module, example_inputs)
 
@@ -1883,11 +1926,13 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
 
     for n in value_remap.values():
         if n.target == node.target:
-            n.meta.update({
-                "tiled_shapes": copy.deepcopy(tiled_shapes),
-                "l2_tiling": tiling,
-                "dtype": node.meta.get("dtype"),
-            })
+            n.meta.update(
+                {
+                    "tiled_shapes": copy.deepcopy(tiled_shapes),
+                    "l2_tiling": tiling,
+                    "dtype": node.meta.get("dtype"),
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1898,6 +1943,7 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
 # windows, which is non-trivial.  In practice adaptive pooling almost always
 # reduces spatial dims to (1, 1), so tiling N and C is sufficient.
 # ---------------------------------------------------------------------------
+
 
 def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     """
@@ -1980,6 +2026,7 @@ def split_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
     and splices it into the parent graph via replace_node_with_graph_module.
     Validates output correctness at DEBUG log level.
     """
+
     def load_arg(a):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
 
@@ -2018,19 +2065,26 @@ def split_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
 
     for n in value_remap.values():
         if n.target == node.target:
-            n.meta.update({
-                "tiled_shapes": copy.deepcopy(tiled_shapes),
-                "l2_tiling": tiling,
-                "dtype": node.meta.get("dtype"),
-            })
+            n.meta.update(
+                {
+                    "tiled_shapes": copy.deepcopy(tiled_shapes),
+                    "l2_tiling": tiling,
+                    "dtype": node.meta.get("dtype"),
+                }
+            )
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+
 def run_pool_op_l2_tiling(
-    model, unroll, cache_size=None, num_banks=None, bank_width=None,
+    model,
+    unroll,
+    cache_size=None,
+    num_banks=None,
+    bank_width=None,
 ):
     """
     Perform tiling on pooling operations to fit intermediate data into Scratchpad.
@@ -2070,11 +2124,17 @@ def run_pool_op_l2_tiling(
                 bank_size=bank_size,
             )
             if tile_sizes is not None:
-                split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes)
+                split_non_adaptive_pool_node(
+                    model, node, tile_sizes, tiled_shapes
+                )
 
         elif node.target in _ADAPTIVE_POOL_OPS:
             N = node.shape[0]
-            C = node.shape[-1] if node.target in _NHWC_POOL_OPS else node.shape[1]
+            C = (
+                node.shape[-1]
+                if node.target in _NHWC_POOL_OPS
+                else node.shape[1]
+            )
             logger.info(f"Running L2 tiling for adaptive pool op: {node}")
             tile_sizes, tiled_shapes = _search_tiling(
                 node=node,

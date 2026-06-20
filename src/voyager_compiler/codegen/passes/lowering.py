@@ -18,7 +18,12 @@ from ..mapping import (
     _create_and_insert_subgraph,
 )
 from ..mapping_utils import is_elementwise_op, is_gemm_op, is_nop
-from ...pt2e_utils import WrapperModule, get_aten_graph_module, fetch_attr, propagate_shape
+from ...pt2e_utils import (
+    WrapperModule,
+    get_aten_graph_module,
+    fetch_attr,
+    propagate_shape,
+)
 from ...quantize_pt2e import create_getattr_from_value, export_model
 from ...quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
 
@@ -72,7 +77,7 @@ def _decompose_bmm(model: GraphModule, node: Node):
         if n.target in [
             node.target,
             torch.ops.aten.stack.default,
-            torch.ops.aten.view.default
+            torch.ops.aten.view.default,
         ]:
             n.meta["dtype"] = node.meta.get("dtype")
 
@@ -88,13 +93,22 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
     if input1_dims < 3 and input2_dims < 3:
         return None
 
-    block_size = node.kwargs['block_size']
+    block_size = node.kwargs["block_size"]
 
     class BMM(torch.nn.Module):
         def forward(
-                self, input: torch.Tensor, other: torch.Tensor, input_scale=None,
-                weight_scale=None, input_code=None, weight_code=None, A_data=None,
-                A_indices=None, A_indptr=None, weight_transposed=False):
+            self,
+            input: torch.Tensor,
+            other: torch.Tensor,
+            input_scale=None,
+            weight_scale=None,
+            input_code=None,
+            weight_code=None,
+            A_data=None,
+            A_indices=None,
+            A_indptr=None,
+            weight_transposed=False,
+        ):
             # Loop through each element in the batch dimensions
             batch_shape = input.shape[:-2]
             result = []
@@ -107,41 +121,47 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
                     "weight_code": weight_code,
                 }
                 if A_data is not None:
-                    kwargs.update({
-                        "A_data": A_data[idx],
-                        "A_indices": A_indices[idx],
-                        "A_indptr": A_indptr[idx],
-                        "weight_transposed": weight_transposed,
-                    })
-                result.append(torch.ops.quantized_ops.matmul_mx(
-                    input[idx], other[idx], **kwargs,
-                ))
+                    kwargs.update(
+                        {
+                            "A_data": A_data[idx],
+                            "A_indices": A_indices[idx],
+                            "A_indptr": A_indptr[idx],
+                            "weight_transposed": weight_transposed,
+                        }
+                    )
+                result.append(
+                    torch.ops.quantized_ops.matmul_mx(
+                        input[idx],
+                        other[idx],
+                        **kwargs,
+                    )
+                )
             result = torch.stack(result)
             result = result.view(*batch_shape, *result.shape[-2:])
             return result
 
-    input_code = node.kwargs.get('input_code', None)
-    weight_code = node.kwargs.get('weight_code', None)
-    A_data = node.kwargs.get('A_data', None)
-    A_indices = node.kwargs.get('A_indices', None)
-    A_indptr = node.kwargs.get('A_indptr', None)
+    input_code = node.kwargs.get("input_code", None)
+    weight_code = node.kwargs.get("weight_code", None)
+    A_data = node.kwargs.get("A_data", None)
+    A_indices = node.kwargs.get("A_indices", None)
+    A_indptr = node.kwargs.get("A_indptr", None)
 
     kwargs = {
-        'input_scale': node.kwargs['input_scale'].value,
-        'weight_scale': node.kwargs['weight_scale'].value,
-        'input_code': input_code.value if input_code is not None else None,
-        'weight_code': weight_code.value if weight_code is not None else None,
-        'A_data': A_data.value if A_data is not None else None,
-        'A_indices': A_indices.value if A_indices is not None else None,
-        'A_indptr': A_indptr.value if A_indptr is not None else None,
-        'weight_transposed': node.kwargs.get('weight_transposed', True),
+        "input_scale": node.kwargs["input_scale"].value,
+        "weight_scale": node.kwargs["weight_scale"].value,
+        "input_code": input_code.value if input_code is not None else None,
+        "weight_code": weight_code.value if weight_code is not None else None,
+        "A_data": A_data.value if A_data is not None else None,
+        "A_indices": A_indices.value if A_indices is not None else None,
+        "A_indptr": A_indptr.value if A_indptr is not None else None,
+        "weight_transposed": node.kwargs.get("weight_transposed", True),
     }
 
     gm = export_model(BMM(), (input1, input2), kwargs)
 
     # Remove unused placeholder nodes
     for n in gm.graph.nodes:
-        if n.op == 'placeholder' and len(n.users) == 0:
+        if n.op == "placeholder" and len(n.users) == 0:
             gm.graph.erase_node(n)
     gm.graph.lint()
 
@@ -156,7 +176,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
         if n.target in [
             node.target,
             torch.ops.aten.stack.default,
-            torch.ops.aten.view.default
+            torch.ops.aten.view.default,
         ]:
             n.meta["dtype"] = node.meta.get("dtype")
 
@@ -181,13 +201,13 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
 
     example_inputs = (
         quantize_node.args[0],
-        get_arg_value(quantize_node, 1, 'qmap'),
-        get_arg_value(quantize_node, 6, 'scale_qmap'),
-        get_arg_value(quantize_node, 7, 'output_code'),
+        get_arg_value(quantize_node, 1, "qmap"),
+        get_arg_value(quantize_node, 6, "scale_qmap"),
+        get_arg_value(quantize_node, 7, "output_code"),
         node.args[1],
-        node.kwargs.get('weight_scale'),
-        node.kwargs.get('input_code'),
-        node.kwargs.get('weight_code'),
+        node.kwargs.get("weight_scale"),
+        node.kwargs.get("input_code"),
+        node.kwargs.get("weight_code"),
     )
 
     quantize_mx_outlier_kwargs = _get_node_attribute(quantize_node)
@@ -206,14 +226,14 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
         batch_shape = input.shape[:-2]
         result = []
         for idx in itertools.product(*[range(dim) for dim in batch_shape]):
-            (
-                data, indices, indptr, input_scale, inliers
-            ) = quantized_ops.quantize_mx_outlier(
-                input[idx],
-                qmap=input_qmap,
-                scale_qmap=scale_qmap,
-                output_code=output_code,
-                **quantize_mx_outlier_kwargs,
+            data, indices, indptr, input_scale, inliers = (
+                quantized_ops.quantize_mx_outlier(
+                    input[idx],
+                    qmap=input_qmap,
+                    scale_qmap=scale_qmap,
+                    output_code=output_code,
+                    **quantize_mx_outlier_kwargs,
+                )
             )
             output = quantized_ops.matmul_mx(
                 inliers,
@@ -244,7 +264,7 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
 
     # Remove unused placeholder nodes
     for n in gm.graph.nodes:
-        if n.op == 'placeholder' and len(n.users) == 0:
+        if n.op == "placeholder" and len(n.users) == 0:
             gm.graph.erase_node(n)
     gm.graph.lint()
 
@@ -273,7 +293,7 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
 def _decompose_bmm_helper(model: GraphModule, node: Node):
     if node.target == torch.ops.aten.matmul.default:
         return _decompose_bmm(model, node)
-    elif node.kwargs.get('A_data', None) is None:
+    elif node.kwargs.get("A_data", None) is None:
         return _decompose_bmm_mx(model, node)
     else:
         return _decompose_bmm_mx_with_outlier_inputs(model, node)
@@ -290,7 +310,9 @@ def split_multi_head_attention(model: GraphModule):
         ]:
             continue
 
-        if (nn_module_stack := node.meta.get('nn_module_stack', None)) is not None:
+        if (
+            nn_module_stack := node.meta.get("nn_module_stack", None)
+        ) is not None:
             bt = list(nn_module_stack.values())[-1]
             grouped_nodes[bt[0]].append(node)
 
@@ -311,7 +333,9 @@ def split_multi_head_attention(model: GraphModule):
             paths = []
             for user in current_node.users:
                 if user not in visited:
-                    if (result := dfs(user, visited + [user], max_depth)) is None:
+                    if (
+                        result := dfs(user, visited + [user], max_depth)
+                    ) is None:
                         return None
                     paths.extend(result)
             return paths
@@ -367,14 +391,14 @@ def split_multi_head_attention(model: GraphModule):
                 pv_matmul.args[arg_idx], value_remap[nodes_between[-1]]
             )
 
-            arg_key = 'weight_scale' if has_spmm_arg else 'input_scale'
+            arg_key = "weight_scale" if has_spmm_arg else "input_scale"
             if (scale_node := pv_matmul.kwargs.get(arg_key)) is not None:
                 pv_matmul.replace_input_with(
                     scale_node, value_remap[nodes_between[-2]]
                 )
 
     def is_impure_node(n):
-        return n.op in ['placeholder', 'output']
+        return n.op in ["placeholder", "output"]
 
     graph.lint()
     graph.eliminate_dead_code(is_impure_node=is_impure_node)
@@ -399,13 +423,16 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
     graph = model.graph
     for node in list(graph.nodes):
         if node.target not in [
-            torch.ops.aten.cat.default, torch.ops.aten.stack.default
+            torch.ops.aten.cat.default,
+            torch.ops.aten.stack.default,
         ]:
             continue
         cat_node = node
 
         if not all(hasattr(n, "shape") for n in cat_node.args[0]):
-            logger.warning(f"Node {cat_node} does not have shape attributes for all inputs.")
+            logger.warning(
+                f"Node {cat_node} does not have shape attributes for all inputs."
+            )
             continue
 
         shapes = [n.shape for n in cat_node.args[0]]
@@ -414,7 +441,8 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
         if not all(list(s) == input_shape for s in shapes):
             logger.warning(
                 "Concatenated tensors have different shapes in node %s. Shapes: %s",
-                cat_node, shapes
+                cat_node,
+                shapes,
             )
             continue
 
@@ -440,11 +468,14 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
         dims = list(range(len(input_shape) + 1))[1:]
         dims = dims[:concat_dim] + [0] + dims[concat_dim:]
 
-        logger.info(f"Converting {cat_node} to stack on dim 0 with permute {dims}")
+        logger.info(
+            f"Converting {cat_node} to stack on dim 0 with permute {dims}"
+        )
 
         with graph.inserting_after(stack_node):
             permute_node = graph.call_function(
-                torch.ops.aten.permute.default, (stack_node, dims),
+                torch.ops.aten.permute.default,
+                (stack_node, dims),
             )
         propagate_shape(permute_node)
         output_node = permute_node
@@ -541,9 +572,9 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
         input_node = node.args[0]
         sizes = node.args[1]
         original_shape = input_node.meta["val"].shape
-        assert len(sizes) >= len(original_shape), (
-            "Sizes must have at least as many dimensions as the original tensor."
-        )
+        assert len(sizes) >= len(
+            original_shape
+        ), "Sizes must have at least as many dimensions as the original tensor."
 
         # Add singleton dimensions to match the size length
         while len(original_shape) < len(sizes):
@@ -555,7 +586,9 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
                 # Stack along the first dimension to create the expanded shape
                 for dim, size in enumerate(sizes):
                     if input.shape[dim] == 1 and size > 1:
-                        input = torch.stack([input.squeeze(dim)] * size, dim=dim)
+                        input = torch.stack(
+                            [input.squeeze(dim)] * size, dim=dim
+                        )
                     elif input.shape[dim] != size:
                         raise ValueError(
                             f"Cannot expand dimension {dim} from {input.shape[dim]} to {size}."
@@ -600,8 +633,7 @@ def replace_rmsnorm_with_layer_norm(
     example_input,
     convert_scalars_to_attrs=False,
 ):
-    """Replace LLaMA RMSNorm with ATen layer_norm
-    """
+    """Replace LLaMA RMSNorm with ATen layer_norm"""
     original_graph = model.graph
 
     pattern = get_aten_graph_module(layer_norm, example_input)
@@ -619,7 +651,9 @@ def replace_rmsnorm_with_layer_norm(
     _matches: List[InternalMatch] = matcher.match(original_graph)
     logger.info(f"Found {len(_matches)} matches")
 
-    weight_node = next(iter(n for n in pattern_graph.nodes if n.target == "weight"))
+    weight_node = next(
+        iter(n for n in pattern_graph.nodes if n.target == "weight")
+    )
 
     for match in _matches:
         input_node = match.placeholder_nodes[0]
@@ -630,9 +664,7 @@ def replace_rmsnorm_with_layer_norm(
 
         with original_graph.inserting_before(output_node):
             new_node = original_graph.call_function(
-                torch.ops.aten.layer_norm.default,
-                tuple(layer_norm_inputs),
-                {}
+                torch.ops.aten.layer_norm.default, tuple(layer_norm_inputs), {}
             )
 
         output_node.replace_all_uses_with(new_node)
@@ -726,7 +758,9 @@ def replace_conv2d_with_im2col(model: GraphModule):
         )
 
         val_maps = {}
-        output = replace_node_with_graph_module(model, node, match_pattern, val_maps)[0]
+        output = replace_node_with_graph_module(
+            model, node, match_pattern, val_maps
+        )[0]
         graph.erase_node(node)
 
         # Fold the view operation into the parameter
@@ -788,7 +822,9 @@ def extract_input_preprocessor(model: GraphModule):
     Returns:
         GraphModule: The transformed FX graph module with the input preprocessor extracted.
     """
-    placeholder = next(iter(n for n in model.graph.nodes if n.op == "placeholder"))
+    placeholder = next(
+        iter(n for n in model.graph.nodes if n.op == "placeholder")
+    )
     preprocess_nodes = [placeholder]
 
     user = next(iter(placeholder.users))
@@ -811,10 +847,12 @@ def extract_input_preprocessor(model: GraphModule):
     new_graph = torch.fx.Graph()
     value_remap = {}
     for node in preprocess_nodes:
-        if node.op == 'placeholder':
+        if node.op == "placeholder":
             value_remap[node] = new_graph.placeholder(node.name)
         else:
-            value_remap[node] = new_graph.node_copy(node, lambda n: value_remap[n])
+            value_remap[node] = new_graph.node_copy(
+                node, lambda n: value_remap[n]
+            )
 
             if node.op == "get_attr":
                 param = fetch_attr(model, node.target)
@@ -824,10 +862,12 @@ def extract_input_preprocessor(model: GraphModule):
     new_graph.print_tabular()
 
     with model.graph.inserting_before(placeholder):
-        new_placeholder = model.graph.placeholder(f"{placeholder.name}_preprocess")
+        new_placeholder = model.graph.placeholder(
+            f"{placeholder.name}_preprocess"
+        )
     preprocess_nodes[-1].replace_all_uses_with(new_placeholder)
 
-    new_placeholder.meta["dtype"] =  preprocess_nodes[-1].meta.get("dtype")
+    new_placeholder.meta["dtype"] = preprocess_nodes[-1].meta.get("dtype")
 
     model.graph.lint()
     model.graph.eliminate_dead_code()
@@ -927,7 +967,9 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     named_modules = dict(model.named_modules())
 
     for node in list(graph.nodes):
-        if isinstance(node.target, torch._higher_order_ops.wrap.WrapWithAutocast):
+        if isinstance(
+            node.target, torch._higher_order_ops.wrap.WrapWithAutocast
+        ):
             wrapped_func = node.args[4]
             mod = named_modules.get(wrapped_func.target, None)
 

@@ -612,6 +612,22 @@ def get_access(point, layer, resource):
     return [access_list, array_costs]
 
 
+def _output_dtype_bits(point, layer, level):
+    """
+    Width (in bits) of the output tensor stored at the given level.
+
+    The output holds wide partial sums (psum_dtype_bits) while IC accumulation
+    is still incomplete *above* this level, and the narrow final/quantized
+    output (of_dtype_bits) once IC is fully reduced at or below this level.
+    """
+    num_levels = len(point.loop_blocking(le.IC))
+    ic_above = 1
+    for lvl in range(level + 1, num_levels):
+        ic_above *= point.loop_blocking(le.IC)[lvl]
+        ic_above *= point.loop_partitioning(le.IC)[lvl]
+    return layer.psum_dtype_bits if ic_above > 1 else layer.of_dtype_bits
+
+
 def get_bank_size(point, layer, level):
 
     blocking_accum_list = []
@@ -622,7 +638,19 @@ def get_bank_size(point, layer, level):
     of_bank_size = get_of_bank_size(blocking_accum_list)
     fl_bank_size = get_fl_bank_size(blocking_accum_list)
 
-    return (if_bank_size, of_bank_size, fl_bank_size)
+    if level <= 1:
+        # L0/L1 are slot arrays: each element occupies a fixed-width slot (the max
+        # dtype in a mixed-precision design; narrower dtypes are padded), so the
+        # fit is checked in element counts, independent of the layer's dtype.
+        return (if_bank_size, of_bank_size, fl_bank_size)
+
+    # L2/L3 are flat byte pools where sub-byte operands pack -> compare in bytes.
+    of_bits = _output_dtype_bits(point, layer, level)
+    return (
+        if_bank_size * layer.if_dtype_bits / 8.0,
+        of_bank_size * of_bits / 8.0,
+        fl_bank_size * layer.fl_dtype_bits / 8.0,
+    )
 
 
 def get_block_size(point, layer, level):
@@ -650,7 +678,17 @@ def get_block_size(point, layer, level):
         blocking_accum_list, partitioning_accum_list, partitioning_list
     )
 
-    return (if_block_size, of_block_size, fl_block_size)
+    if level <= 1:
+        # L0/L1 are slot arrays (padded to a fixed width); fit is in element
+        # counts, independent of the layer's dtype.  L2/L3 (below) are byte pools.
+        return (if_block_size, of_block_size, fl_block_size)
+
+    of_bits = _output_dtype_bits(point, layer, level)
+    return (
+        if_block_size * layer.if_dtype_bits / 8.0,
+        of_block_size * of_bits / 8.0,
+        fl_block_size * layer.fl_dtype_bits / 8.0,
+    )
 
 
 def get_block_sizes(num_levels, point, layer):

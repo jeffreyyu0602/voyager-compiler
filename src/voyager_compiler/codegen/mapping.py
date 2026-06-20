@@ -13,7 +13,6 @@ from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
 from transformers.utils.import_utils import is_torch_greater_or_equal
 
-import interstellar
 from .banking import (
     _get_scope,
     get_banking_strategies_for_op,
@@ -39,10 +38,8 @@ from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
 from .tiler import (
-    RuntimeCalculator,
     build_architecture_and_schedule,
-    get_dtype_width,
-    _extract_layer_dims,
+    run_interstellar_for_tiled_op,
 )
 from ..pt2e_utils import (
     dtype_byte_size,
@@ -1071,124 +1068,6 @@ def propagate_tiled_shapes_upstream(start_node, tiled_shapes):
                 queue.append(n)
 
 
-def _run_interstellar_for_node(
-    output_node,
-    gemm_node,
-    tiled_shapes,
-    architecture,
-    schedule,
-    double_buffered_accum_buffer,
-    tiling_cache,
-    named_modules,
-):
-    node_to_key = get_node_to_key_map(gemm_node)
-    key_to_shape = {
-        v: tiled_shapes[k]
-        for k, v in node_to_key.items()
-        if k in tiled_shapes
-    }
-
-    output_shape = tiled_shapes.get(output_node)
-    if output_shape is None:
-        return
-    # multi-output (e.g. GEMM + sparse outputs): use the activation tensor shape
-    if isinstance(output_shape, tuple) and isinstance(output_shape[0], tuple):
-        output_shape = output_shape[-1]
-
-    layer = _extract_layer_dims(gemm_node, key_to_shape, output_shape)
-    if layer is None:
-        logger.debug(
-            f"Skipping interstellar tiling for {output_node.name} "
-            f"(FC, 3-channel, or depthwise)"
-        )
-        return
-
-    logger.info(
-        f"[interstellar] {output_node.name}: "
-        f"IC={layer.nifm} OC={layer.nofm} "
-        f"H={layer.hofm} W={layer.wofm} "
-        f"kH={layer.hfil} kW={layer.wfil} "
-        f"stride=({layer.hstd},{layer.wstd})"
-    )
-
-    # Get dtype widths from the outer graph node (not submodule placeholders)
-    input_node = output_node.args[0]
-    if (input_dtype := input_node.meta.get("dtype")) is None:
-        input_dtype = str(input_node.value.dtype).split(".")[-1]
-    input_width = get_dtype_width(input_dtype)
-
-    output_dtype = output_node.meta.get("dtype")
-    if isinstance(output_dtype, (list, tuple)):
-        output_dtype = output_dtype[-1]
-    if output_dtype is None:
-        val = output_node.value
-        out_val = val[-1] if isinstance(val, (list, tuple)) else val
-        output_dtype = str(out_val.dtype).split(".")[-1]
-    output_width = get_dtype_width(output_dtype)
-
-    # Check for high-precision operands in fused post-GEMM vector ops
-    has_hp_vector_input = False
-    if output_node.op == "call_module":
-        gm = named_modules[output_node.target]
-        for n in gm.graph.nodes:
-            if n.op != "placeholder" or gemm_node in n.users:
-                continue
-
-            n = n.meta.get("source_node", n)
-
-            if (dtype := n.meta.get("dtype")) is None:
-                dtype = str(n.value.dtype).split(".")[-1]
-
-            if get_dtype_width(dtype) > input_width:
-                has_hp_vector_input = True
-                break
-
-    has_sparse_op = gemm_node.kwargs.get("A_indptr") is not None
-
-    cache_key = (
-        layer.nifm, layer.nofm, layer.wofm, layer.hofm,
-        layer.wfil, layer.hfil, layer.wstd, layer.hstd,
-        input_width, output_width, has_hp_vector_input, has_sparse_op,
-    )
-
-    if cache_key in tiling_cache:
-        logger.info(
-            f"[interstellar] {output_node.name}: "
-            f"reusing cached tiling"
-        )
-        mapping, access_list = tiling_cache[cache_key]
-    else:
-        logger.info(
-            f"[interstellar] {output_node.name}: "
-            f"running optimizer"
-        )
-        rc = RuntimeCalculator(
-            input_width,
-            output_width,
-            double_buffered_accum_buffer,
-            has_hp_vector_input,
-            has_sparse_op,
-        )
-        _, runtime, mapping, _ = interstellar.optimizer.opt_optimizer(
-            architecture,
-            layer,
-            schedule,
-            rc.calculate_runtime,
-            True,
-        )
-        _, _, access_list = interstellar.cost_model.get_cost(
-            architecture, mapping, layer
-        )
-        tiling_cache[cache_key] = (mapping, access_list)
-        logger.info(
-            f"[interstellar] {output_node.name}: runtime={runtime}"
-        )
-        logger.info(interstellar.utils.format_tiling(mapping))
-
-    output_node.meta["interstellar_tiling"] = (mapping, access_list)
-    output_node.meta["interstellar_architecture"] = architecture
-
-
 def adjust_tiling(
     node: Node,
     named_modules: dict,
@@ -1316,17 +1195,17 @@ def adjust_tiling(
 
     # Run interstellar tiler for GEMM nodes if hardware config is provided
     if interstellar is not None:
-        _interstellar_arch, _interstellar_schedule, _interstellar_cache, \
+        interstellar_arch, interstellar_schedule, interstellar_cache, \
             double_buffered_accum_buffer = interstellar
-        if _interstellar_arch is not None and is_gemm_op(anchor_node):
-            _run_interstellar_for_node(
+        if interstellar_arch is not None and is_gemm_op(anchor_node):
+            run_interstellar_for_tiled_op(
                 node,
                 anchor_node,
                 final_tiled_shapes,
-                _interstellar_arch,
-                _interstellar_schedule,
+                interstellar_arch,
+                interstellar_schedule,
                 double_buffered_accum_buffer,
-                _interstellar_cache,
+                interstellar_cache,
                 named_modules,
             )
 
@@ -1352,20 +1231,18 @@ def run_memory_mapping(
         unroll_dims = (unroll_dims, unroll_dims)
 
     # Build interstellar arch/schedule once if hardware config is provided
-    _interstellar_arch = None
-    _interstellar_schedule = None
-    _interstellar_cache = {}
-    if unroll_dims and all(
-        x is not None
-        for x in (
-            input_buffer_size,
-            weight_buffer_size,
-            accum_buffer_size,
-        )
+    interstellar_arch = None
+    interstellar_schedule = None
+    interstellar_cache = {}
+    if (
+        unroll_dims
+        and input_buffer_size is not None
+        and weight_buffer_size is not None
+        and accum_buffer_size is not None
     ):
         (
-            _interstellar_arch,
-            _interstellar_schedule,
+            interstellar_arch,
+            interstellar_schedule,
         ) = build_architecture_and_schedule(
             unroll_dims[0],
             unroll_dims[1],
@@ -1429,9 +1306,9 @@ def run_memory_mapping(
         return nodes_to_delete
 
     interstellar = (
-        _interstellar_arch,
-        _interstellar_schedule,
-        _interstellar_cache,
+        interstellar_arch,
+        interstellar_schedule,
+        interstellar_cache,
         double_buffered_accum_buffer,
     )
 

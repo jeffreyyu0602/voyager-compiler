@@ -44,7 +44,6 @@ from voyager_compiler.codegen.mapping_utils import is_fully_connected
 from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
-from utils.models.utils import compute_interstellar_dram
 from utils.dataset import glue, imagenet
 
 logger = logging.getLogger()
@@ -52,7 +51,7 @@ logger = logging.getLogger()
 
 def _is_bf16_fc(node):
     # BF16 FC are ran on vector unit and thus cannot be fused
-    if hasattr(node, 'value') and is_fully_connected(node):
+    if hasattr(node, "value") and is_fully_connected(node):
         input_node = node.args[0]
         return input_node.meta.get("dtype") is None
     return False
@@ -75,6 +74,7 @@ def _is_constant_div(node):
         return divisor.value.numel() == 1
 
     return True
+
 
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
 QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
@@ -105,7 +105,7 @@ VECTOR_PIPELINE = [
     [
         OpMatcher("layer_norm", "softmax"),
         OpMatcher(*QUANT_OPS),
-    ]
+    ],
 ]
 
 
@@ -148,65 +148,70 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_name_or_path",
         default=None,
-        help="Path to pretrained model or model identifier from huggingface.co/models."
+        help=(
+            "Path to pretrained model or model identifier from "
+            "huggingface.co/models."
+        ),
     )
     parser.add_argument(
         "--task_name",
         default="sst2",
-        help="Name of the task to load the dataset"
+        help="Name of the task to load the dataset",
     )
     parser.add_argument(
         "--model_output_dir",
         required=True,
-        help="Output directory for generated tensor files"
+        help="Output directory for generated tensor files",
     )
     parser.add_argument(
         "--dump_dataset",
         action="store_true",
-        help="Whether to save the dataset for later use."
+        help="Whether to save the dataset for later use.",
     )
     parser.add_argument(
-        "--dataset_output_dir",
-        help="Output directory for dataset files"
+        "--dataset_output_dir", help="Output directory for dataset files"
     )
     parser.add_argument(
         "--dump_tensors",
         action="store_true",
-        help="Whether to save intermediate outputs for verification."
+        help="Whether to save intermediate outputs for verification.",
     )
     parser.add_argument(
         "--context_length",
         type=int,
         default=512,
-        help="Context length for the LLM decoding."
+        help="Context length for the LLM decoding.",
     )
     parser.add_argument(
         "--compile_single_layer",
         action="store_true",
-        help="Only compile for a single encoder/decoder layer in Transformer models."
+        help=(
+            "Only compile for a single encoder/decoder layer in Transformer "
+            "models."
+        ),
     )
     parser.add_argument(
         "--enable_mixed_precision",
         action="store_true",
-        help="Use mixed precision quantization scheme to quantize LLMs."
+        help="Use mixed precision quantization scheme to quantize LLMs.",
     )
     parser.add_argument(
         "--outlier_pct",
         type=float,
         default=None,
-        help="Percentage of outliers to filter when quantizing activations."
+        help="Percentage of outliers to filter when quantizing activations.",
     )
     parser.add_argument(
         "--cache_size",
         type=int,
         default=None,
-        help="Total L2 SRAM size in SoC."
+        help="Total L2 SRAM size in SoC.",
     )
     parser.add_argument(
         "--num_banks",
         type=int,
         default=None,
-        help="Number of banks in the accelerator."
+        help="Number of banks in the accelerator.",
     )
     parser.add_argument(
         "--input_buffer_size",
@@ -235,15 +240,18 @@ if __name__ == "__main__":
         "--double_buffered_l2",
         action="store_true",
         help=(
-            "Overlap DRAM I/O with compute (ping-pong). "
-            "Halves the effective L2 capacity seen by the tiling optimizer."
+            "Overlap DRAM I/O with compute (ping-pong). Halves the effective "
+            "L2 capacity seen by the tiling optimizer."
         ),
     )
     parser.add_argument(
         "--dram_size",
         type=int,
         default=None,
-        help="DRAM capacity in bytes. When set, runs interstellar with a 4-level memory hierarchy.",
+        help=(
+            "DRAM capacity in bytes. When set, runs interstellar with a "
+            "4-level memory hierarchy."
+        ),
     )
     parser.add_argument(
         "--dram_bandwidth",
@@ -255,7 +263,10 @@ if __name__ == "__main__":
         "--frequency",
         type=float,
         default=1.0,
-        help="Accelerator clock frequency in GHz. Used with --dram_bandwidth to compute bandwidth in input elements per cycle.",
+        help=(
+            "Accelerator clock frequency in GHz. Used with --dram_bandwidth to "
+            "compute bandwidth in input elements per cycle."
+        ),
     )
     parser.add_argument(
         "--transform_layout",
@@ -263,17 +274,17 @@ if __name__ == "__main__":
         help=(
             "Whether to transpose Conv2d inputs and weights and Linear weights "
             "to a systolic-array friendly layout."
-        )
+        ),
     )
     parser.add_argument(
         "--transpose_fc",
         action="store_true",
-        help="Whether to transpose the weights of fully connected layers."
+        help="Whether to transpose the weights of fully connected layers.",
     )
     parser.add_argument(
         "--use_maxpool_2x2",
         action="store_true",
-        help="Whether to use 2x2 maxpool for resnet18 and resnet50."
+        help="Whether to use 2x2 maxpool for resnet18 and resnet50.",
     )
     parser.add_argument(
         "--conv2d_im2col",
@@ -281,38 +292,44 @@ if __name__ == "__main__":
         help=(
             "Whether to transform Conv2d operations with small input channels "
             "into linear operations using im2col."
-        )
+        ),
     )
     parser.add_argument(
         "--hardware_unrolling",
-        type=lambda x: tuple(map(int, x.split(','))),
+        type=lambda x: tuple(map(int, x.split(","))),
         default=None,
-        help="Hardware unroll dimensions for the accelerator."
+        help="Hardware unroll dimensions for the accelerator.",
     )
     parser.add_argument(
         "--disable_reshape_fusion",
         action="store_true",
-        help="Whether to not fuse reshape operation with following GEMM in Transformer."
+        help=(
+            "Whether to not fuse reshape operation with following GEMM in "
+            "Transformer."
+        ),
     )
     parser.add_argument(
         "--evaluate",
         action="store_true",
-        help="Whether to run the pytorch evaluation during compilation"
+        help="Whether to run the pytorch evaluation during compilation",
     )
     parser.add_argument(
         "--quantize_attention_mask",
         action="store_true",
-        help="Whether to quantize Transformer attention mask to binary values."
+        help="Whether to quantize Transformer attention mask to binary values.",
     )
     parser.add_argument(
         "--quantize_fc",
         action="store_true",
-        help="Whether to quantize the fully connected layers."
+        help="Whether to quantize the fully connected layers.",
     )
     parser.add_argument(
         "--split_spmm",
         action="store_true",
-        help="Whether to split linear_mx with outliers into dense and SpMM operations.",
+        help=(
+            "Whether to split linear_mx with outliers into dense and SpMM "
+            "operations."
+        ),
     )
     parser.add_argument(
         "--attn_implementation",
@@ -338,7 +355,9 @@ if __name__ == "__main__":
 
     if not logger.hasHandlers():
         handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+        formatter = logging.Formatter(
+            "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+        )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
@@ -352,21 +371,9 @@ if __name__ == "__main__":
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    fuse_reshape = (
-        not args.disable_reshape_fusion
-        and (
-            args.hardware_unrolling is None
-            or max(args.hardware_unrolling) < 64
-        )
+    fuse_reshape = not args.disable_reshape_fusion and (
+        args.hardware_unrolling is None or max(args.hardware_unrolling) < 64
     )
-
-    # DRAM bandwidth (elem/cycle) + interstellar 4-level arch/schedule, shared
-    # with the model helpers' get_transform_args (utils.models.utils).
-    (
-        interstellar_dram_arch,
-        interstellar_dram_schedule,
-        dram_bandwidth_elem_per_cycle,
-    ) = compute_interstellar_dram(args)
 
     transform_args = {
         "patterns": VECTOR_PIPELINE,
@@ -377,13 +384,12 @@ if __name__ == "__main__":
         "unroll_dims": args.hardware_unrolling,
         "fuse_reshape": fuse_reshape,
         "split_spmm": args.split_spmm,
-        "interstellar_dram_arch": interstellar_dram_arch,
-        "interstellar_dram_schedule": interstellar_dram_schedule,
-        "dram_bandwidth": dram_bandwidth_elem_per_cycle,
-        "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
-        "double_buffered_l2": args.double_buffered_l2,
+        "bufferize": args.bufferize,
     }
 
+    # The bufferization lowering builds the interstellar architecture itself
+    # (``compile`` -> ``build_interstellar_tiler``); pass the raw hardware
+    # description rather than a prebuilt arch.
     compile_args = {
         "cache_size": args.cache_size,
         "num_banks": args.num_banks,
@@ -396,6 +402,10 @@ if __name__ == "__main__":
         "weight_buffer_size": args.weight_buffer_size,
         "accum_buffer_size": args.accum_buffer_size,
         "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
+        "double_buffered_l2": args.double_buffered_l2,
+        "dram_size": args.dram_size,
+        "dram_bandwidth": args.dram_bandwidth,
+        "frequency": args.frequency,
         "bufferize": args.bufferize,
     }
 
@@ -409,17 +419,23 @@ if __name__ == "__main__":
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "resnet")
 
-        gm, old_output, new_output, preprocess_fn = torchvision_models.quantize_and_dump_model(
-            model=model,
-            quantizer=quantizer,
-            calibration_data=imagenet_dataset,
-            vector_stages=VECTOR_PIPELINE,
-            args=args
+        gm, old_output, new_output, preprocess_fn = (
+            torchvision_models.quantize_and_dump_model(
+                model=model,
+                quantizer=quantizer,
+                calibration_data=imagenet_dataset,
+                vector_stages=VECTOR_PIPELINE,
+                args=args,
+            )
         )
 
         if args.dump_dataset:
             preprocessed_imagenet = imagenet.dump_imagenet(
-                args.dataset_output_dir, imagenet_dataset, "resnet", preprocess_fn, torch_dtype
+                args.dataset_output_dir,
+                imagenet_dataset,
+                "resnet",
+                preprocess_fn,
+                torch_dtype,
             )
 
         if args.evaluate:
@@ -427,7 +443,9 @@ if __name__ == "__main__":
     elif args.model == "mobilebert":
         model, tokenizer = mobilebert.load_model(args)
 
-        eval_dataset, train_dataset = glue.retrieve_dataset(model, tokenizer, args)
+        eval_dataset, train_dataset = glue.retrieve_dataset(
+            model, tokenizer, args
+        )
 
         if args.evaluate:
             mobilebert.evaluate(model, eval_dataset)
@@ -442,7 +460,7 @@ if __name__ == "__main__":
             quantizer=quantizer,
             calibration_data=train_dataset,
             vector_stages=VECTOR_PIPELINE,
-            args=args
+            args=args,
         )
 
         if args.evaluate:
@@ -451,7 +469,9 @@ if __name__ == "__main__":
     elif args.model == "bert":
         model, tokenizer = bert.load_model(args)
 
-        eval_dataset, train_dataset = glue.retrieve_dataset(model, tokenizer, args)
+        eval_dataset, train_dataset = glue.retrieve_dataset(
+            model, tokenizer, args
+        )
 
         if args.evaluate:
             bert.evaluate(model, eval_dataset)
@@ -466,7 +486,7 @@ if __name__ == "__main__":
             quantizer=quantizer,
             calibration_data=train_dataset,
             vector_stages=VECTOR_PIPELINE,
-            args=args
+            args=args,
         )
 
         if args.evaluate:
@@ -489,7 +509,7 @@ if __name__ == "__main__":
         test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
-        input_ids = encodings.input_ids[:,:args.context_length]
+        input_ids = encodings.input_ids[:, : args.context_length]
 
         past_key_values = None
 
@@ -498,20 +518,30 @@ if __name__ == "__main__":
                 config=model.config,
                 max_batch_size=1,
                 max_cache_len=input_ids.shape[1] + 128,
-                dtype=model.dtype
+                dtype=model.dtype,
             )
 
             with torch.no_grad():
-                outputs = model(input_ids, past_key_values=past_key_values, use_cache=True)
+                outputs = model(
+                    input_ids, past_key_values=past_key_values, use_cache=True
+                )
 
-            input_ids = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            input_ids = torch.argmax(
+                outputs.logits[:, -1, :], dim=-1, keepdim=True
+            )
             past_key_values = outputs.past_key_values
 
         inputs_embeds = model.model.embed_tokens(input_ids)
 
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        past_seen_tokens = (
+            past_key_values.get_seq_length()
+            if past_key_values is not None
+            else 0
+        )
         cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            past_seen_tokens,
+            past_seen_tokens + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
         )
 
         position_ids = cache_position.unsqueeze(0)
@@ -530,9 +560,16 @@ if __name__ == "__main__":
             causal_mask = causal_mask[:, :, :, : args.context_length]
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = model.model.rotary_emb(inputs_embeds, position_ids)
+        position_embeddings = model.model.rotary_emb(
+            inputs_embeds, position_ids
+        )
 
-        example_args = (inputs_embeds, causal_mask, position_embeddings, cache_position)
+        example_args = (
+            inputs_embeds,
+            causal_mask,
+            position_embeddings,
+            cache_position,
+        )
         example_kwargs = {}
 
         class LlamaWrapper(torch.nn.Module):
@@ -545,8 +582,16 @@ if __name__ == "__main__":
 
                 if self.static_cache is not None:
                     for i in range(len(self.static_cache.layers)):
-                        self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
-                        self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
+                        self.register_buffer(
+                            f"key_cache_{i}",
+                            self.static_cache.layers[i].keys,
+                            persistent=False,
+                        )
+                        self.register_buffer(
+                            f"value_cache_{i}",
+                            self.static_cache.layers[i].values,
+                            persistent=False,
+                        )
 
             def forward(
                 self,
@@ -577,26 +622,41 @@ if __name__ == "__main__":
 
         hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
         example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
-        replace_rmsnorm_with_layer_norm(gm, model.model.layers[0].input_layernorm, (example_input,))
+        replace_rmsnorm_with_layer_norm(
+            gm, model.model.layers[0].input_layernorm, (example_input,)
+        )
 
         if args.enable_mixed_precision:
-            qconfig = get_llama_qconfig(args.hardware_unrolling[0], args.outlier_pct)
+            qconfig = get_llama_qconfig(
+                args.hardware_unrolling[0], args.outlier_pct
+            )
 
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            target_path = os.path.join(script_dir, '../examples/language_modeling')
+            target_path = os.path.join(
+                script_dir, "../examples/language_modeling"
+            )
             sys.path.append(os.path.abspath(target_path))
 
             from quantization_configs import set_qconfig
+
             set_qconfig(quantizer, qconfig)
 
-            fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
+            fp8_qspec = QuantizationSpec.from_str(
+                "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
+            )
             qconfig = QuantizationConfig(fp8_qspec, None, None, None)
             quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-            quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
+            quantizer.set_object_type(
+                torch.ops.aten.layer_norm.default, qconfig
+            )
 
         if args.quantize_attention_mask:
-            qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
-            attention_mask = next(iter(n for n in gm.graph.nodes if n.target == "attention_mask"))
+            qspec = QuantizationSpec.from_str(
+                "int1,qs=per_tensor_symmetric,qmax=1"
+            )
+            attention_mask = next(
+                iter(n for n in gm.graph.nodes if n.target == "attention_mask")
+            )
             _annotate_output_qspec(attention_mask, qspec)
 
         gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
@@ -621,7 +681,7 @@ if __name__ == "__main__":
             example_args,
             example_kwargs=example_kwargs,
             use_fake_mode=(not has_outlier),
-            **transform_args
+            **transform_args,
         )
         compile(gm, example_args, **compile_args)
 
@@ -643,7 +703,7 @@ if __name__ == "__main__":
             layers_to_keep = model.model.layers[:1]
             model.model.layers = nn.ModuleList(layers_to_keep)
 
-            if hasattr(model, 'config'):
+            if hasattr(model, "config"):
                 model.config.num_hidden_layers = len(model.model.layers)
 
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -651,10 +711,14 @@ if __name__ == "__main__":
         test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
         encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
 
-        input_ids = encodings.input_ids[:,:args.context_length]
+        input_ids = encodings.input_ids[:, : args.context_length]
 
         max_length = args.context_length
-        bs = 64 if args.hardware_unrolling is None else args.hardware_unrolling[0]
+        bs = (
+            64
+            if args.hardware_unrolling is None
+            else args.hardware_unrolling[0]
+        )
 
         swap_llama_attention(model)
 
@@ -670,8 +734,11 @@ if __name__ == "__main__":
             model,
             prompt_token_ids=input_ids,
             max_new_tokens=bs,
-            min_length=max_length+1,
-            eos_token_id=[tokenizer.eos_token_id, tokenizer.encode("\n", add_special_tokens=False)[-1]],
+            min_length=max_length + 1,
+            eos_token_id=[
+                tokenizer.eos_token_id,
+                tokenizer.encode("\n", add_special_tokens=False)[-1],
+            ],
             model_decode=gm,
         )[0]
 
@@ -686,8 +753,12 @@ if __name__ == "__main__":
 
         quantizer.set_object_type(torch.ops.aten.matmul.default, None)
 
-        act0 = QuantizationSpec.from_str("int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3")
-        act1 = QuantizationSpec.from_str("int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3")
+        act0 = QuantizationSpec.from_str(
+            "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3"
+        )
+        act1 = QuantizationSpec.from_str(
+            "int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3"
+        )
         qconfig = QuantizationConfig(act0, None, act1, None)
 
         for layer_idx in range(model.config.num_hidden_layers):
@@ -699,13 +770,17 @@ if __name__ == "__main__":
                 module_name, torch.ops.aten.matmul.default, 2, qconfig
             )
 
-        fp8_qspec = QuantizationSpec.from_str("fp8_e4m3,qs=per_tensor_symmetric,qmax=240")
+        fp8_qspec = QuantizationSpec.from_str(
+            "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
+        )
         qconfig = QuantizationConfig(fp8_qspec, None, None, None)
         quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
         quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
         qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
-        attention_mask = next(iter(n for n in gm.graph.nodes if n.target == "attention_mask"))
+        attention_mask = next(
+            iter(n for n in gm.graph.nodes if n.target == "attention_mask")
+        )
         _annotate_output_qspec(attention_mask, qspec)
 
         # KV Cache shape: (N, H, S, D)
@@ -713,18 +788,26 @@ if __name__ == "__main__":
         #   H = number of heads
         #   S = sequence length
         #   D = head dimension
-        key_qspec = QuantizationSpec.from_str("uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3")
-        value_qspec = QuantizationSpec.from_str("uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3")
+        key_qspec = QuantizationSpec.from_str(
+            "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
+        )
+        value_qspec = QuantizationSpec.from_str(
+            "uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
+        )
 
         for node in gm.graph.nodes:
             match = re.match(r"^(key|value)_cache_(\d+)$", str(node.target))
             if node.op == "get_attr" and match is not None:
-                _annotate_output_qspec(node, key_qspec if match.group(1) == "key" else value_qspec)
+                _annotate_output_qspec(
+                    node, key_qspec if match.group(1) == "key" else value_qspec
+                )
 
         example_input_ids = torch.tensor([[1]], dtype=torch.long)
         example_cache_position = torch.tensor([0], dtype=torch.long)
         example_cache_position_residual = torch.tensor([0], dtype=torch.long)
-        example_attention_mask = torch.ones((1, max_length + bs), dtype=torch_dtype)[None, None, :, :]
+        example_attention_mask = torch.ones(
+            (1, max_length + bs), dtype=torch_dtype
+        )[None, None, :, :]
         example_args = ()
         example_kwargs = {
             "input_ids": example_input_ids,
@@ -765,23 +848,28 @@ if __name__ == "__main__":
             quantizer=quantizer,
             calibration_data=imagenet_dataset,
             vector_stages=VECTOR_PIPELINE,
-            args=args
+            args=args,
         )
 
         if args.dump_dataset:
             preprocessed_imagenet = imagenet.dump_imagenet(
-                args.dataset_output_dir, imagenet_dataset, "vit", preprocess_fn, torch_dtype
+                args.dataset_output_dir,
+                imagenet_dataset,
+                "vit",
+                preprocess_fn,
+                torch_dtype,
             )
 
         if args.evaluate:
             vit.evaluate(gm, preprocessed_imagenet)
     elif args.model == "yolo5":
         import sys
+
         sys.path.append("libraries/yolov5-face")
 
         # Clear any previously loaded modules to avoid conflicts
-        if 'utils' in sys.modules:
-            del sys.modules['utils']
+        if "utils" in sys.modules:
+            del sys.modules["utils"]
 
         from models.experimental import attempt_load
 
@@ -796,17 +884,20 @@ if __name__ == "__main__":
         gm = prepare_pt2e(model, quantizer, example_args)
 
         from voyager_compiler.codegen.mapping import eliminate_dead_code
+
         eliminate_dead_code(gm.graph)
 
         dataset = load_dataset("CUHK-CSE/wider_face")
 
-        pipeline = transforms.Compose([
-            transforms.Resize((640, 640)),  # Resize to 416x416
-            transforms.ToTensor()           # Convert to tensor and normalize to [0, 1]
-        ])
+        pipeline = transforms.Compose(
+            [
+                transforms.Resize((640, 640)),  # Resize to 416x416
+                transforms.ToTensor(),  # Convert to tensor and normalize to [0, 1]
+            ]
+        )
 
         for i in tqdm(range(10)):
-            inputs = pipeline(dataset['train'][i]["image"])
+            inputs = pipeline(dataset["train"][i]["image"])
             with torch.no_grad():
                 gm(inputs.unsqueeze(0).to(torch_dtype))
 
@@ -825,10 +916,14 @@ if __name__ == "__main__":
             import timm
             from timm.layers import set_fused_attn
         except ImportError as e:
-            raise ImportError("The 'timm' library is not installed. Please install it using 'pip install timm'.") from e
+            raise ImportError(
+                "The 'timm' library is not installed. Please install it using 'pip install timm'."
+            ) from e
 
         set_fused_attn(False)
-        model = timm.create_model("hf-hub:timm/mobilevit_xxs.cvnets_in1k", pretrained=True).eval()
+        model = timm.create_model(
+            "hf-hub:timm/mobilevit_xxs.cvnets_in1k", pretrained=True
+        ).eval()
 
         if args.bf16:
             model.bfloat16()
@@ -838,10 +933,14 @@ if __name__ == "__main__":
 
         dataset = load_dataset("zh-plus/tiny-imagenet")
 
-        image_processor = AutoImageProcessor.from_pretrained("microsoft/resnet-18")
+        image_processor = AutoImageProcessor.from_pretrained(
+            "microsoft/resnet-18"
+        )
 
         for i in tqdm(range(10)):
-            inputs = image_processor(dataset['train'][i]["image"], return_tensors="pt")
+            inputs = image_processor(
+                dataset["train"][i]["image"], return_tensors="pt"
+            )
             with torch.no_grad():
                 gm(inputs.pixel_values.to(torch_dtype))
 
@@ -875,21 +974,29 @@ if __name__ == "__main__":
         ).eval()
 
         context_length = args.context_length
-        input_ids = torch.randint(low=0, high=tokenizer.vocab_size, size=(1, context_length))
+        input_ids = torch.randint(
+            low=0, high=tokenizer.vocab_size, size=(1, context_length)
+        )
 
         if args.model == "mamba_decode":
             # Run prefill to populate SSM conv/ssm states
             with torch.no_grad():
                 prefill_out = model(input_ids, return_dict=True, use_cache=True)
                 cache = prefill_out.cache_params
-                decode_input = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
+                decode_input = torch.argmax(
+                    prefill_out.logits[:, -1, :], dim=-1, keepdim=True
+                )
 
             # Register each layer's conv and SSM states as model buffers so they
             # appear as constant tensors in the exported graph
             num_layers = model.config.num_hidden_layers
             for i in range(num_layers):
-                model.register_buffer(f"conv_state_{i}", cache.conv_states[i], persistent=False)
-                model.register_buffer(f"ssm_state_{i}", cache.ssm_states[i], persistent=False)
+                model.register_buffer(
+                    f"conv_state_{i}", cache.conv_states[i], persistent=False
+                )
+                model.register_buffer(
+                    f"ssm_state_{i}", cache.ssm_states[i], persistent=False
+                )
                 # Redirect the cache lists to the same underlying tensors
                 cache.conv_states[i] = getattr(model, f"conv_state_{i}")
                 cache.ssm_states[i] = getattr(model, f"ssm_state_{i}")
@@ -901,19 +1008,29 @@ if __name__ == "__main__":
             _orig_backbone_fwd = model.backbone.forward
 
             def _patched_backbone_fwd(
-                input_ids=None, inputs_embeds=None, cache_params=None, use_cache=None,
-                output_hidden_states=None, return_dict=None, cache_position=None,
-                attention_mask=None, **kwargs,
+                input_ids=None,
+                inputs_embeds=None,
+                cache_params=None,
+                use_cache=None,
+                output_hidden_states=None,
+                return_dict=None,
+                cache_position=None,
+                attention_mask=None,
+                **kwargs,
             ):
                 if use_cache and cache_params is None:
                     cache_params = model.backbone._static_cache
                 # Pass use_cache=False so MambaCache is not included in the output
                 # tuple (it is not a pytree-compatible type and would break export)
                 return _orig_backbone_fwd(
-                    input_ids=input_ids, inputs_embeds=inputs_embeds,
-                    cache_params=cache_params, use_cache=False,
-                    output_hidden_states=output_hidden_states, return_dict=False,
-                    cache_position=cache_position, attention_mask=attention_mask,
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    cache_params=cache_params,
+                    use_cache=False,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=False,
+                    cache_position=cache_position,
+                    attention_mask=attention_mask,
                     **kwargs,
                 )
 
@@ -921,7 +1038,11 @@ if __name__ == "__main__":
 
             cache_position = torch.tensor([context_length], dtype=torch.long)
             example_args = (decode_input,)
-            example_kwargs = {"cache_position": cache_position, "return_dict": False, "use_cache": True}
+            example_kwargs = {
+                "cache_position": cache_position,
+                "return_dict": False,
+                "use_cache": True,
+            }
         else:
             example_args = (input_ids,)
             example_kwargs = {"return_dict": False, "use_cache": False}

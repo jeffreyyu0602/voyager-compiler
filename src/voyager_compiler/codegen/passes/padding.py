@@ -47,11 +47,11 @@ def slicing_and_padding_cancel_out(shape, slice_dim, start, end, pad):
 
 def pad_input_node(model, node, input, pad, scale, scale_pad):
     pad_quantize_mx_input = (
-        scale is not None and
-        input.target == operator.getitem and
-        scale.target == operator.getitem and
-        input.args[0] == scale.args[0] and
-        input.args[0].target == torch.ops.quantized_ops.quantize_mx.default
+        scale is not None
+        and input.target == operator.getitem
+        and scale.target == operator.getitem
+        and input.args[0] == scale.args[0]
+        and input.args[0].target == torch.ops.quantized_ops.quantize_mx.default
     )
 
     node_to_pad = input.args[0].args[0] if pad_quantize_mx_input else input
@@ -68,7 +68,8 @@ def pad_input_node(model, node, input, pad, scale, scale_pad):
     else:
         with model.graph.inserting_after(node_to_pad):
             new_input = model.graph.call_function(
-                torch.ops.aten.pad.default, (node_to_pad, pad),
+                torch.ops.aten.pad.default,
+                (node_to_pad, pad),
             )
 
         propagate_shape(new_input)
@@ -85,7 +86,8 @@ def pad_input_node(model, node, input, pad, scale, scale_pad):
         if scale is not None and any(x for x in scale_pad):
             with model.graph.inserting_before(node):
                 padded_scale = model.graph.call_function(
-                    torch.ops.aten.pad.default, (scale, scale_pad),
+                    torch.ops.aten.pad.default,
+                    (scale, scale_pad),
                 )
 
             node.replace_input_with(scale, padded_scale)
@@ -118,8 +120,8 @@ def slice_output(model, output_node, slice_args):
             if all(
                 n == output_node
                 or (
-                    n.target == torch.ops.aten.slice.Tensor and
-                    n.args[1:] == slice_args
+                    n.target == torch.ops.aten.slice.Tensor
+                    and n.args[1:] == slice_args
                 )
                 for n in user.all_input_nodes
             ):
@@ -136,7 +138,8 @@ def slice_output(model, output_node, slice_args):
     if sliced_output_users:
         with model.graph.inserting_after(output_node):
             slice_node = model.graph.call_function(
-                torch.ops.aten.slice.Tensor, (output_node, *slice_args),
+                torch.ops.aten.slice.Tensor,
+                (output_node, *slice_args),
             )
 
         propagate_shape(slice_node)
@@ -291,7 +294,8 @@ def pad_layer_norm_to_hardware_unroll_size(
         else:
             with model.graph.inserting_after(attr_node):
                 new_attr = model.graph.call_function(
-                    torch.ops.aten.pad.default, (attr_node, [0, pad_k]),
+                    torch.ops.aten.pad.default,
+                    (attr_node, [0, pad_k]),
                 )
         propagate_shape(new_attr, model)
         return new_attr
@@ -301,14 +305,16 @@ def pad_layer_norm_to_hardware_unroll_size(
 
     with model.graph.inserting_before(node):
         new_input = model.graph.call_function(
-            torch.ops.aten.pad.default, (input, [0, pad_k]),
+            torch.ops.aten.pad.default,
+            (input, [0, pad_k]),
         )
         layer_norm = model.graph.call_function(
             torch.ops.quantized_ops.layer_norm.default,
-            (new_input, normalize_shape, new_weight, new_bias) + node.args[4:]
+            (new_input, normalize_shape, new_weight, new_bias) + node.args[4:],
         )
         slice_node = model.graph.call_function(
-            torch.ops.aten.slice.Tensor, (layer_norm, -1, 0, orig_k),
+            torch.ops.aten.slice.Tensor,
+            (layer_norm, -1, 0, orig_k),
         )
 
     propagate_shape(new_input)
@@ -362,7 +368,8 @@ def pad_calculate_mx_qparam(model, node, unroll):
         with model.graph.inserting_after(n.next):
             for dim in pad_dims.keys():
                 n = model.graph.call_function(
-                    torch.ops.aten.slice.Tensor, (n, dim, 0, input.shape[dim]),
+                    torch.ops.aten.slice.Tensor,
+                    (n, dim, 0, input.shape[dim]),
                 )
             propagate_shape(n)
             n.meta["dtype"] = node.meta.get("dtype")
@@ -430,7 +437,8 @@ def pad_vector_op_dimensions(
 
         with model.graph.inserting_after(node):
             slice_node = model.graph.call_function(
-                torch.ops.aten.slice.Tensor, (node, -1, 0, reduction_dim),
+                torch.ops.aten.slice.Tensor,
+                (node, -1, 0, reduction_dim),
             )
 
         node.replace_all_uses_with(slice_node)
@@ -450,7 +458,7 @@ def pad_vit_embeddings_output(
     embeddings,
     example_inputs,
     dynamic_shapes=None,
-    unroll=32
+    unroll=32,
 ):
     original_graph = model.graph
 
@@ -472,8 +480,7 @@ def pad_vit_embeddings_output(
     if not _matches:
         return model
 
-    vit_embed_out = _matches[0].returning_nodes[0]\
-
+    vit_embed_out = _matches[0].returning_nodes[0]
     orig_dim = vit_embed_out.meta["val"].shape[-2]
     pad = (unroll - (orig_dim % unroll)) % unroll
     logger.info(f"Padding {vit_embed_out} with {pad}")

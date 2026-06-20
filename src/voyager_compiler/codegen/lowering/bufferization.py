@@ -363,7 +363,9 @@ def _codebook_arg_nodes(node: Node) -> set:
 # ---------------------------------------------------------------------------
 
 
-def bufferize_graph(model: GraphModule, pipelined: bool = False) -> GraphModule:
+def bufferize_graph(
+    model: GraphModule, pipelined: bool = False, tiler=None
+) -> GraphModule:
     """
     Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
     Returns the same (mutated) model.
@@ -408,9 +410,9 @@ def bufferize_graph(model: GraphModule, pipelined: bool = False) -> GraphModule:
             if anchor_node is None:
                 continue
             if is_conv2d(anchor_node):
-                sub_gm = build_conv2d(node, num_banks=num_banks)
+                sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
             elif is_gemm_op(anchor_node):
-                sub_gm = build_gemm(node, num_banks=num_banks)
+                sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
             else:
                 # A pure-pointwise fused submodule (e.g. relu(x + residual)):
                 # run the whole submodule per output tile.
@@ -425,30 +427,32 @@ def bufferize_graph(model: GraphModule, pipelined: bool = False) -> GraphModule:
             continue
         if node.op != "call_function":
             continue
-        if not _is_tiled(node):
-            # Untiled op (operands/output fit on-chip): bufferize trivially —
-            # load every input whole, run the op, store the output(s) whole (no
-            # loop).
-            built = _build_for_untiled(node)
-            if built is not None:
-                specs.append((node, *built))
-            continue
+        # Try the matching tiled builder.  Each returns ``None`` when there is
+        # nothing to tile — interstellar skipped the layer (FC with batch 1,
+        # depthwise conv, ...), there is no ``tiled_shapes`` annotation, or no
+        # ``tiler`` — so untiled / skipped ops fall through to the whole-tensor
+        # path below.
+        sub_gm, n_out = None, 1
         if is_conv2d(node):
-            sub_gm, n_out = build_conv2d(node, num_banks=num_banks), 1
+            sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
         elif is_gemm_op(node):
-            sub_gm, n_out = build_gemm(node, num_banks=num_banks), 1
+            sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
         elif is_pooling(node):
-            sub_gm, n_out = build_pool(node, num_banks=num_banks), 1
+            sub_gm = build_pool(node, num_banks=num_banks)
         elif is_elementwise_op(node) or node.target in _REDUCTION_POINTWISE_OPS:
             sub_gm = build_pointwise(node, num_banks=num_banks)
             val = node.value
             n_out = len(val) if isinstance(val, (list, tuple)) else 1
-        else:
-            raise NotImplementedError(
-                f"Unsupported tiled op for bufferization: {node.target}"
-            )
-        if sub_gm is not None:
-            specs.append((node, sub_gm, n_out))
+        if sub_gm is None:
+            if _is_tiled(node):
+                raise NotImplementedError(
+                    f"tiled op {node.target} has no pipelined builder"
+                )
+            built = _build_for_untiled(node)
+            if built is None:
+                continue  # getitem / non-tensor: nothing to load/store
+            sub_gm, n_out = built
+        specs.append((node, sub_gm, n_out))
 
     for node, sub_gm, n_out in specs:
         results = replace_node_with_graph_module(model, node, sub_gm)

@@ -18,7 +18,6 @@ from .quantizer import *
 from .training_args import *
 from .utils import *
 
-
 __all__ = [
     "FusedAmaxObsFakeQuantize",
     "QConfig",
@@ -58,7 +57,9 @@ __all__ = [
     "with_execution_context",
 ]
 
+
 class qscheme: ...
+
 
 # Defined in voyager_compiler/quantizer.h
 per_tensor_symmetric: qscheme = QScheme.PER_TENSOR_SYMMETRIC
@@ -74,9 +75,9 @@ def _get_op_overload(op_name: str):
         for name in [op_name, f"{op_name}_"]:
             if (packet := getattr(lib, name, None)) is None:
                 continue
-            all_overloads.extend([
-                getattr(packet, name) for name in packet.overloads()
-            ])
+            all_overloads.extend(
+                [getattr(packet, name) for name in packet.overloads()]
+            )
     return all_overloads
 
 
@@ -108,7 +109,7 @@ def fuse(
     example_args,
     example_kwargs=None,
     fuse_reshape=True,
-    fake_mode=None
+    fake_mode=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -134,19 +135,14 @@ def transform(
     fuse_reshape=True,
     split_spmm=False,
     use_fake_mode=True,
-    interstellar_dram_arch=None,
-    interstellar_dram_schedule=None,
-    dram_bandwidth=0,
-    input_dtype_width=8,
-    weight_dtype_width=8,
-    output_dtype_width=8,
-    double_buffered_accum_buffer=False,
-    double_buffered_l2=False,
+    bufferize=False,
 ):
     if example_kwargs is None:
         example_kwargs = {}
 
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
+    fake_mode = (
+        FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
+    )
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
@@ -181,22 +177,11 @@ def transform(
     # 3. Matrix Operation Tiling
     # -------------------------------------------------------------------------
     # Apply L2 tiling logic specifically for matrix operations (GEMM/Conv) to
-    # optimize for the specific cache size and memory bank configuration.
-    if cache_size is not None:
-        run_matrix_op_l2_tiling(
-            model,
-            unroll_dims,
-            cache_size,
-            num_banks,
-            interstellar_dram_arch=interstellar_dram_arch,
-            interstellar_dram_schedule=interstellar_dram_schedule,
-            dram_bandwidth=dram_bandwidth,
-            input_dtype_width=input_dtype_width,
-            weight_dtype_width=weight_dtype_width,
-            output_dtype_width=output_dtype_width,
-            double_buffered_accum_buffer=double_buffered_accum_buffer,
-            double_buffered_l2=double_buffered_l2,
-        )
+    # optimize for the specific cache size and memory bank configuration.  Skipped
+    # under ``bufferize``: the bufferization lowering tiles each GEMM/conv on
+    # demand (interstellar) instead of splitting it here.
+    if cache_size is not None and not bufferize:
+        run_matrix_op_l2_tiling(model, unroll_dims, cache_size, num_banks)
 
     # -------------------------------------------------------------------------
     # 4. Data Layout Transformation
@@ -262,11 +247,14 @@ def compile(
     output_file="compute_graph",
     dump_tensors=True,
     dump_snapshot=False,
-    double_buffered_accum_buffer: bool = False,
-    double_buffered_l2: bool = False,
     input_buffer_size: int = None,
     weight_buffer_size: int = None,
     accum_buffer_size: int = None,
+    double_buffered_accum_buffer: bool = False,
+    double_buffered_l2: bool = False,
+    dram_size: int = None,
+    dram_bandwidth=200,
+    frequency=1.0,
     bufferize: bool = False,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -288,24 +276,36 @@ def compile(
             plan_memory,
             print_bufferized_graph,
         )
-        from .codegen.mapping import adjust_tiling
+        from .codegen.lowering.tiling import build_interstellar_tiler
 
-        # Fit each fused submodule's / tiled op's L2 tiling to the scratchpad and
-        # node-key its tiling meta BEFORE bufferizing, so the loop nests use the
-        # SRAM-fit tile sizes.  ``adjust_tiling`` parks the node-keyed result on each
-        # node; its returned scratchpad map is unused here (the bufferized path does
-        # no per-node memory allocation).  ``run_memory_mapping`` is skipped.
         ShapeProp(model).propagate(*flatten_args)
-        named = dict(model.named_modules(remove_duplicate=False))
-        for node in list(model.graph.nodes):
-            if node.op == "call_module" or "tiled_shapes" in node.meta:
-                adjust_tiling(
-                    node, named, cache_size, num_banks, bank_width, unroll_dims
-                )
+
+        # Build the interstellar tiler once; the bufferization builders tile each
+        # GEMM/conv on demand from it (no separate tiling pass / meta annotation).
+        # A caller may forward ``dram_size`` / ``unroll_dims`` as ``None``
+        # explicitly (e.g. the argparse defaults), so fall back here -> the tiler
+        # is always built under bufferize.  Per-node dtype widths are read off the
+        # nodes inside the tiler, so none are passed here.
+        if dram_size is None:
+            dram_size = 1 << 34
+        if unroll_dims is None:
+            unroll_dims = (16, 16)
+        tiler = build_interstellar_tiler(
+            unroll_dims,
+            input_buffer_size=input_buffer_size,
+            weight_buffer_size=weight_buffer_size,
+            accum_buffer_size=accum_buffer_size,
+            scratchpad_size=cache_size,
+            dram_size=dram_size,
+            dram_bandwidth=dram_bandwidth,
+            frequency=frequency,
+            double_buffered_accum_buffer=double_buffered_accum_buffer,
+            double_buffered_l2=double_buffered_l2,
+        )
 
         # Reuse the tiler's double-buffering decision: when L2 is double-buffered the
         # tiles already assume two-buffer occupancy, so emit software-pipelined loops.
-        bufferize_graph(model, pipelined=double_buffered_l2)
+        bufferize_graph(model, pipelined=double_buffered_l2, tiler=tiler)
 
         # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
         # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).  Writes
@@ -327,10 +327,11 @@ def compile(
             f.write(text_format.MessageToString(params))
         with open(os.path.join(output_dir, "bufferized_graph.txt"), "w") as f:
             f.write(print_bufferized_graph(model, to_string=True))
-        if len(model.graph.nodes) < 10000:
-            gen_compute_graph_bufferized(
-                model, os.path.join(output_dir, output_file)
-            )
+        gen_compute_graph_bufferized(
+            model,
+            os.path.join(output_dir, output_file),
+            timeout=5 * 60,
+        )
         return params
 
     allocator = MemoryAllocator(total_memory, bank_width=bank_width)
@@ -353,16 +354,17 @@ def compile(
     path = os.path.join(output_dir, "tensor_files")
     params = gen_code(model, flatten_args, path if dump_tensors else None)
 
-    with open(os.path.join(output_dir, 'model.txt'), "w") as f:
+    with open(os.path.join(output_dir, "model.txt"), "w") as f:
         f.write(text_format.MessageToString(params))
 
     operations = [
-        op.op.name if op.WhichOneof('op_type') == 'op' else op.fused_op.name
-        for op in params.ops if op.op.op != 'nop'
+        op.op.name if op.WhichOneof("op_type") == "op" else op.fused_op.name
+        for op in params.ops
+        if op.op.op != "nop"
     ]
 
-    with open(os.path.join(output_dir, 'layers.txt'), 'w') as f:
-        f.write('\n'.join(operations))
+    with open(os.path.join(output_dir, "layers.txt"), "w") as f:
+        f.write("\n".join(operations))
 
     if len(model.graph.nodes) < 10000:
         gen_compute_graph(model, os.path.join(output_dir, output_file))

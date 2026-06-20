@@ -175,8 +175,10 @@ def _get_path_to_conv2d(node: torch.fx.Node):
             return [node, user]
 
         if (
-            is_nop(user) or is_indexing_or_concatenation_op(user)
-            or user.target in [
+            is_nop(user)
+            or is_indexing_or_concatenation_op(user)
+            or user.target
+            in [
                 torch.ops.quantized_ops.quantize.default,
                 torch.ops.aten.pad.default,
             ]
@@ -197,7 +199,8 @@ def _process_conv2d_input_nodes(
     if node.op == "get_attr" and path is not None:
         conv2d_node = path[-1]
         if is_depthwise_conv(conv2d_node) or path[-2] not in (
-            conv2d_node.args[1], conv2d_node.kwargs.get("weight_scale")
+            conv2d_node.args[1],
+            conv2d_node.kwargs.get("weight_scale"),
         ):
             return
 
@@ -209,15 +212,16 @@ def _process_conv2d_input_nodes(
 
     # Case B: Input is a node flow from outside the island
     if node.op != "get_attr" and len(node.shape) == 4:
-        is_weight_node = (
-            path is not None and id(path[-2]) == id(path[-1].args[1])
+        is_weight_node = path is not None and id(path[-2]) == id(
+            path[-1].args[1]
         )
         dims = WEIGHT_NCHW_TO_HWIO if is_weight_node else NCHW_TO_NHWC
 
         logger.debug(f"Insert permute after {node} with dims {dims}")
         with graph.inserting_after(node):
             permute_node = graph.call_function(
-                torch.ops.aten.permute.default, (node, dims),
+                torch.ops.aten.permute.default,
+                (node, dims),
             )
 
         permute_node.meta["dims"] = dims
@@ -290,7 +294,9 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
                 if user in island_set or "dims" in user.meta:
                     continue
 
-                logger.debug(f"Insert permute before {user} with dims (0, 3, 1, 2)")
+                logger.debug(
+                    f"Insert permute before {user} with dims (0, 3, 1, 2)"
+                )
                 with graph.inserting_before(user):
                     permute_node = graph.call_function(
                         torch.ops.aten.permute.default,
@@ -306,8 +312,12 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
 
             tiled_shapes = node_to_treat.meta.get("tiled_shapes")
             if is_pooling(node_to_treat) and tiled_shapes is not None:
-                tiled_shapes["input"]  = permute(tiled_shapes["input"],  NCHW_TO_NHWC)
-                tiled_shapes["output"] = permute(tiled_shapes["output"], NCHW_TO_NHWC)
+                tiled_shapes["input"] = permute(
+                    tiled_shapes["input"], NCHW_TO_NHWC
+                )
+                tiled_shapes["output"] = permute(
+                    tiled_shapes["output"], NCHW_TO_NHWC
+                )
 
                 tiling = node_to_treat.meta["l2_tiling"]
                 node_to_treat.meta["l2_tiling"] = permute(tiling, NCHW_TO_NHWC)
@@ -319,7 +329,7 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
             elif is_conv2d(node_to_treat) and tiled_shapes is not None:
                 for key, arg in [
                     ("input", node_to_treat.args[0]),
-                    ("weight", node_to_treat.args[1])
+                    ("weight", node_to_treat.args[1]),
                 ]:
                     input_dims = arg.meta["dims"]
                     tiled_shapes[key] = permute(tiled_shapes[key], input_dims)
@@ -330,14 +340,18 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
                             tiled_shapes[scale_key], input_dims
                         )
 
-                tiled_shapes["output"] = permute(tiled_shapes["output"], NCHW_TO_NHWC)
+                tiled_shapes["output"] = permute(
+                    tiled_shapes["output"], NCHW_TO_NHWC
+                )
 
                 tiling = node_to_treat.meta["l2_tiling"]
                 node_to_treat.meta["l2_tiling"] = permute(tiling, NCHW_TO_NHWC)
 
                 if stride := node_to_treat.meta.get("tile_strides"):
                     stride["input"] = permute(stride["input"], NCHW_TO_NHWC)
-                    stride["input_scale"] = permute(stride["input_scale"], NCHW_TO_NHWC)
+                    stride["input_scale"] = permute(
+                        stride["input_scale"], NCHW_TO_NHWC
+                    )
                     node_to_treat.meta["tile_strides"] = stride
 
     graph.lint()
@@ -355,9 +369,8 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
         input_node = node.all_input_nodes[0]
 
         group = []
-        while (
-            len(curr_node.users) == 1
-            and (is_reshape_op(curr_node) or is_nop(curr_node))
+        while len(curr_node.users) == 1 and (
+            is_reshape_op(curr_node) or is_nop(curr_node)
         ):
             group.append(curr_node)
             curr_node = next(iter(curr_node.users))
@@ -376,7 +389,7 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
             if torch.equal(x.reshape(-1), orig_x):
                 last_valid_idx = i
 
-        del group[last_valid_idx + 1:]
+        del group[last_valid_idx + 1 :]
 
         if len(group) <= 1:
             continue
@@ -410,12 +423,14 @@ def make_linear_wrapper(transpose=False, skip_fc=False):
     Returns a function that wraps torch.nn.functional.linear with optional
     weight transposition.
     """
+
     def wrapped_linear(input, weight, bias=None):
         is_fc = all(dim == 1 for dim in input.shape[:-1])
         do_transpose = transpose and not (skip_fc and is_fc)
         return torch.ops.aten.linear.default(
             input, weight.T if do_transpose else weight, bias
         )
+
     return wrapped_linear
 
 
@@ -424,6 +439,7 @@ def make_matmul_wrapper(transpose=False, skip_fc=False):
     Returns a function that wraps torch.matmul with optional transposition of
     the second argument.
     """
+
     def wrapped_matmul(input, other):
         input_shape = input.shape
         other_shape = other.shape
@@ -439,6 +455,7 @@ def make_matmul_wrapper(transpose=False, skip_fc=False):
         return torch.ops.aten.matmul.default(
             input, other if do_transpose else other.transpose(-2, -1)
         )
+
     return wrapped_matmul
 
 
@@ -534,7 +551,7 @@ def _fix_axes_after_transpose(node: Node) -> List[int]:
 
     # Apply inverse permutation
     new_axes = tuple(inv_perm[a] for a in norm_axes)
-    node.args = node.args[:index] + (new_axes,) + node.args[index + 1:]
+    node.args = node.args[:index] + (new_axes,) + node.args[index + 1 :]
 
 
 def _fuse_quantize_mx_last_axis(model: GraphModule):
@@ -554,12 +571,17 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
 
         args = node.args[1:] + (None,) * (5 - len(node.args[1:]))
 
-        quantize_node = next(iter(
-            n for n in node.users
-            if n.target == torch.ops.quantized_ops.quantize.default
-        ))
+        quantize_node = next(
+            iter(
+                n
+                for n in node.users
+                if n.target == torch.ops.quantized_ops.quantize.default
+            )
+        )
 
-        assert quantize_node.args[0] == node.args[0], "Unexpected quantize input"
+        assert (
+            quantize_node.args[0] == node.args[0]
+        ), "Unexpected quantize input"
 
         qmap = quantize_node.args[5]
         output_code = get_arg_value(quantize_node, 6, "output_code")
@@ -571,7 +593,7 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
                 new_code = graph.node_copy(output_code)
             quantize_mx_node = graph.call_function(
                 torch.ops.quantized_ops.quantize_mx.default,
-                (node.args[0], new_qmap) + args + (new_code,)
+                (node.args[0], new_qmap) + args + (new_code,),
             )
             scale_node = graph.call_function(
                 operator.getitem, (quantize_mx_node, 0)
@@ -590,13 +612,16 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
         scale_node.meta["dtype"] = node.meta.get("dtype")
         output_node.meta["dtype"] = quantize_node.meta.get("dtype")
         quantize_mx_node.meta["dtype"] = (
-            scale_node.meta.get("dtype"), output_node.meta.get("dtype")
+            scale_node.meta.get("dtype"),
+            output_node.meta.get("dtype"),
         )
 
         node.replace_all_uses_with(scale_node)
         quantize_node.replace_all_uses_with(output_node)
 
-        logger.info(f"Replaced {node} and {quantize_node} with {quantize_mx_node}")
+        logger.info(
+            f"Replaced {node} and {quantize_node} with {quantize_mx_node}"
+        )
 
     graph.lint()
     model.recompile()
@@ -604,7 +629,9 @@ def _fuse_quantize_mx_last_axis(model: GraphModule):
 
 
 def eliminate_canceling_transposes(
-    model: GraphModule, chain: List[Node], transposed_nodes: Dict[Node, Node] = None
+    model: GraphModule,
+    chain: List[Node],
+    transposed_nodes: Dict[Node, Node] = None,
 ) -> bool:
     """
     Optimizes a chain like [select_3, select_2, quantize_default_1, transpose_3]
@@ -665,7 +692,9 @@ def eliminate_canceling_transposes(
 
 
 def move_transpose_before_dq(
-    model: GraphModule, chain: List[Node], transposed_nodes: Dict[Node, Node] = None
+    model: GraphModule,
+    chain: List[Node],
+    transposed_nodes: Dict[Node, Node] = None,
 ) -> bool:
     """
     Optimizes a chain like [dequantize_default, select_3, select_2, transpose_3].
@@ -704,10 +733,13 @@ def move_transpose_before_dq(
 
     # Insert transpose after dequantize input
     dq_input = dequantize_node.args[0]
-    up_t = next((
-        n for n in dq_input.users if n.target == torch.ops.aten.transpose.int
-    ), None)
-    if up_t is not None and up_t.meta.get("dtype") == dq_input.meta.get("dtype"):
+    up_t = next(
+        (n for n in dq_input.users if n.target == torch.ops.aten.transpose.int),
+        None,
+    )
+    if up_t is not None and up_t.meta.get("dtype") == dq_input.meta.get(
+        "dtype"
+    ):
         dequantize_node.replace_input_with(dq_input, up_t)
     else:
         with graph.inserting_after(dq_input):
@@ -736,7 +768,9 @@ def move_transpose_before_dq(
 
 
 def fold_transpose_into_constant(
-    model: GraphModule, chain: List[Node], transposed_nodes: Dict[Node, Node] = None
+    model: GraphModule,
+    chain: List[Node],
+    transposed_nodes: Dict[Node, Node] = None,
 ) -> bool:
     graph = model.graph
     if not chain or len(chain) < 2:
@@ -753,7 +787,9 @@ def fold_transpose_into_constant(
 
     # Ensure selects are on first dimension only
     selects = [n for n in chain if n.target == torch.ops.aten.select.int]
-    if _rank(attr_node) < len(selects) + 2 or any(n.args[1] != 0 for n in selects):
+    if _rank(attr_node) < len(selects) + 2 or any(
+        n.args[1] != 0 for n in selects
+    ):
         return False
 
     # We don't need to duplicate the transpose node
@@ -790,10 +826,7 @@ def _update_tiled_shapes(node: Node) -> None:
 
 
 def _insert_transpose_op(
-    model: GraphModule,
-    node: Node,
-    user: Node,
-    transposed_nodes: dict
+    model: GraphModule, node: Node, user: Node, transposed_nodes: dict
 ) -> Optional[List[Node]]:
     """Inserts a transpose operation before the user node."""
     with model.graph.inserting_before(user):
@@ -819,10 +852,7 @@ def _insert_transpose_op(
 
 
 def _process_linear_node(
-    model: GraphModule,
-    node: Node,
-    transpose_weight: bool,
-    skip_fc: bool
+    model: GraphModule, node: Node, transpose_weight: bool, skip_fc: bool
 ) -> None:
     """Handles weight mutation for Linear nodes."""
     is_fc = is_fully_connected(node)
@@ -859,7 +889,7 @@ def _process_matmul_node(
     node: Node,
     transpose_weight: bool,
     transpose_fc: bool,
-    transposed_nodes: dict
+    transposed_nodes: dict,
 ) -> None:
     """Handles graph transformation for MatMul nodes."""
     is_fc = is_fully_connected(node)
