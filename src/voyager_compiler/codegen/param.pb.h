@@ -62,6 +62,9 @@ extern ArgumentDefaultTypeInternal _Argument_default_instance_;
 class BoolList;
 struct BoolListDefaultTypeInternal;
 extern BoolListDefaultTypeInternal _BoolList_default_instance_;
+class Conditional;
+struct ConditionalDefaultTypeInternal;
+extern ConditionalDefaultTypeInternal _Conditional_default_instance_;
 class IntList;
 struct IntListDefaultTypeInternal;
 extern IntListDefaultTypeInternal _IntList_default_instance_;
@@ -617,7 +620,7 @@ class LoopBound final : public ::google::protobuf::Message
     return reinterpret_cast<const LoopBound*>(
         &_LoopBound_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 11;
+  static constexpr int kIndexInFileMessages = 12;
   friend void swap(LoopBound& a, LoopBound& b) { a.Swap(&b); }
   inline void Swap(LoopBound* other) {
     if (other == this) return;
@@ -819,7 +822,7 @@ class LevelAccessCount final : public ::google::protobuf::Message
     return reinterpret_cast<const LevelAccessCount*>(
         &_LevelAccessCount_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 13;
+  static constexpr int kIndexInFileMessages = 14;
   friend void swap(LevelAccessCount& a, LevelAccessCount& b) { a.Swap(&b); }
   inline void Swap(LevelAccessCount* other) {
     if (other == this) return;
@@ -1430,7 +1433,7 @@ class LevelTiling final : public ::google::protobuf::Message
     return reinterpret_cast<const LevelTiling*>(
         &_LevelTiling_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 12;
+  static constexpr int kIndexInFileMessages = 13;
   friend void swap(LevelTiling& a, LevelTiling& b) { a.Swap(&b); }
   inline void Swap(LevelTiling* other) {
     if (other == this) return;
@@ -2863,7 +2866,7 @@ class Tiling final : public ::google::protobuf::Message
     return reinterpret_cast<const Tiling*>(
         &_Tiling_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 14;
+  static constexpr int kIndexInFileMessages = 15;
   friend void swap(Tiling& a, Tiling& b) { a.Swap(&b); }
   inline void Swap(Tiling* other) {
     if (other == this) return;
@@ -3253,6 +3256,240 @@ class OpOverloadList final : public ::google::protobuf::Message
 };
 // -------------------------------------------------------------------
 
+class Conditional final : public ::google::protobuf::Message
+/* @@protoc_insertion_point(class_definition:codegen.Conditional) */ {
+ public:
+  inline Conditional() : Conditional(nullptr) {}
+  ~Conditional() PROTOBUF_FINAL;
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+  void operator delete(Conditional* msg, std::destroying_delete_t) {
+    SharedDtor(*msg);
+    ::google::protobuf::internal::SizedDelete(msg, sizeof(Conditional));
+  }
+#endif
+
+  template <typename = void>
+  explicit PROTOBUF_CONSTEXPR Conditional(
+      ::google::protobuf::internal::ConstantInitialized);
+
+  inline Conditional(const Conditional& from) : Conditional(nullptr, from) {}
+  inline Conditional(Conditional&& from) noexcept
+      : Conditional(nullptr, std::move(from)) {}
+  inline Conditional& operator=(const Conditional& from) {
+    CopyFrom(from);
+    return *this;
+  }
+  inline Conditional& operator=(Conditional&& from) noexcept {
+    if (this == &from) return *this;
+    if (::google::protobuf::internal::CanMoveWithInternalSwap(GetArena(), from.GetArena())) {
+      InternalSwap(&from);
+    } else {
+      CopyFrom(from);
+    }
+    return *this;
+  }
+
+  inline const ::google::protobuf::UnknownFieldSet& unknown_fields() const
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance);
+  }
+  inline ::google::protobuf::UnknownFieldSet* mutable_unknown_fields()
+      ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    return _internal_metadata_.mutable_unknown_fields<::google::protobuf::UnknownFieldSet>();
+  }
+
+  static const ::google::protobuf::Descriptor* descriptor() {
+    return GetDescriptor();
+  }
+  static const ::google::protobuf::Descriptor* GetDescriptor() {
+    return default_instance().GetMetadata().descriptor;
+  }
+  static const ::google::protobuf::Reflection* GetReflection() {
+    return default_instance().GetMetadata().reflection;
+  }
+  static const Conditional& default_instance() {
+    return *internal_default_instance();
+  }
+  static inline const Conditional* internal_default_instance() {
+    return reinterpret_cast<const Conditional*>(
+        &_Conditional_default_instance_);
+  }
+  static constexpr int kIndexInFileMessages = 11;
+  friend void swap(Conditional& a, Conditional& b) { a.Swap(&b); }
+  inline void Swap(Conditional* other) {
+    if (other == this) return;
+    if (::google::protobuf::internal::CanUseInternalSwap(GetArena(), other->GetArena())) {
+      InternalSwap(other);
+    } else {
+      ::google::protobuf::internal::GenericSwap(this, other);
+    }
+  }
+  void UnsafeArenaSwap(Conditional* other) {
+    if (other == this) return;
+    ABSL_DCHECK(GetArena() == other->GetArena());
+    InternalSwap(other);
+  }
+
+  // implements Message ----------------------------------------------
+
+  Conditional* New(::google::protobuf::Arena* arena = nullptr) const {
+    return ::google::protobuf::Message::DefaultConstruct<Conditional>(arena);
+  }
+  using ::google::protobuf::Message::CopyFrom;
+  void CopyFrom(const Conditional& from);
+  using ::google::protobuf::Message::MergeFrom;
+  void MergeFrom(const Conditional& from) { Conditional::MergeImpl(*this, from); }
+
+  private:
+  static void MergeImpl(
+      ::google::protobuf::MessageLite& to_msg,
+      const ::google::protobuf::MessageLite& from_msg);
+
+  public:
+  bool IsInitialized() const {
+    return true;
+  }
+  ABSL_ATTRIBUTE_REINITIALIZES void Clear() PROTOBUF_FINAL;
+  #if defined(PROTOBUF_CUSTOM_VTABLE)
+  private:
+  static ::size_t ByteSizeLong(const ::google::protobuf::MessageLite& msg);
+  static ::uint8_t* _InternalSerialize(
+      const MessageLite& msg, ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream);
+
+  public:
+  ::size_t ByteSizeLong() const { return ByteSizeLong(*this); }
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+    return _InternalSerialize(*this, target, stream);
+  }
+  #else   // PROTOBUF_CUSTOM_VTABLE
+  ::size_t ByteSizeLong() const final;
+  ::uint8_t* _InternalSerialize(
+      ::uint8_t* target,
+      ::google::protobuf::io::EpsCopyOutputStream* stream) const final;
+  #endif  // PROTOBUF_CUSTOM_VTABLE
+  int GetCachedSize() const { return _impl_._cached_size_.Get(); }
+
+  private:
+  void SharedCtor(::google::protobuf::Arena* arena);
+  static void SharedDtor(MessageLite& self);
+  void InternalSwap(Conditional* other);
+ private:
+  template <typename T>
+  friend ::absl::string_view(
+      ::google::protobuf::internal::GetAnyMessageName)();
+  static ::absl::string_view FullMessageName() { return "codegen.Conditional"; }
+
+ protected:
+  explicit Conditional(::google::protobuf::Arena* arena);
+  Conditional(::google::protobuf::Arena* arena, const Conditional& from);
+  Conditional(::google::protobuf::Arena* arena, Conditional&& from) noexcept
+      : Conditional(arena) {
+    *this = ::std::move(from);
+  }
+  const ::google::protobuf::internal::ClassData* GetClassData() const PROTOBUF_FINAL;
+  static void* PlacementNew_(const void*, void* mem,
+                             ::google::protobuf::Arena* arena);
+  static constexpr auto InternalNewImpl_();
+  static const ::google::protobuf::internal::ClassDataFull _class_data_;
+
+ public:
+  ::google::protobuf::Metadata GetMetadata() const;
+  // nested types ----------------------------------------------------
+
+  // accessors -------------------------------------------------------
+  enum : int {
+    kTrueBodyFieldNumber = 2,
+    kFalseBodyFieldNumber = 3,
+    kPredicateFieldNumber = 1,
+  };
+  // repeated .codegen.Operation true_body = 2;
+  int true_body_size() const;
+  private:
+  int _internal_true_body_size() const;
+
+  public:
+  void clear_true_body() ;
+  ::codegen::Operation* mutable_true_body(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* mutable_true_body();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& _internal_true_body() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* _internal_mutable_true_body();
+  public:
+  const ::codegen::Operation& true_body(int index) const;
+  ::codegen::Operation* add_true_body();
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& true_body() const;
+  // repeated .codegen.Operation false_body = 3;
+  int false_body_size() const;
+  private:
+  int _internal_false_body_size() const;
+
+  public:
+  void clear_false_body() ;
+  ::codegen::Operation* mutable_false_body(int index);
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* mutable_false_body();
+
+  private:
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& _internal_false_body() const;
+  ::google::protobuf::RepeatedPtrField<::codegen::Operation>* _internal_mutable_false_body();
+  public:
+  const ::codegen::Operation& false_body(int index) const;
+  ::codegen::Operation* add_false_body();
+  const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& false_body() const;
+  // .codegen.Argument predicate = 1;
+  bool has_predicate() const;
+  void clear_predicate() ;
+  const ::codegen::Argument& predicate() const;
+  PROTOBUF_NODISCARD ::codegen::Argument* release_predicate();
+  ::codegen::Argument* mutable_predicate();
+  void set_allocated_predicate(::codegen::Argument* value);
+  void unsafe_arena_set_allocated_predicate(::codegen::Argument* value);
+  ::codegen::Argument* unsafe_arena_release_predicate();
+
+  private:
+  const ::codegen::Argument& _internal_predicate() const;
+  ::codegen::Argument* _internal_mutable_predicate();
+
+  public:
+  // @@protoc_insertion_point(class_scope:codegen.Conditional)
+ private:
+  class _Internal;
+  friend class ::google::protobuf::internal::TcParser;
+  static const ::google::protobuf::internal::TcParseTable<
+      2, 3, 3,
+      0, 2>
+      _table_;
+
+  friend class ::google::protobuf::MessageLite;
+  friend class ::google::protobuf::Arena;
+  template <typename T>
+  friend class ::google::protobuf::Arena::InternalHelper;
+  using InternalArenaConstructable_ = void;
+  using DestructorSkippable_ = void;
+  struct Impl_ {
+    inline explicit constexpr Impl_(
+        ::google::protobuf::internal::ConstantInitialized) noexcept;
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena);
+    inline explicit Impl_(::google::protobuf::internal::InternalVisibility visibility,
+                          ::google::protobuf::Arena* arena, const Impl_& from,
+                          const Conditional& from_msg);
+    ::google::protobuf::internal::HasBits<1> _has_bits_;
+    ::google::protobuf::internal::CachedSize _cached_size_;
+    ::google::protobuf::RepeatedPtrField< ::codegen::Operation > true_body_;
+    ::google::protobuf::RepeatedPtrField< ::codegen::Operation > false_body_;
+    ::codegen::Argument* predicate_;
+    PROTOBUF_TSAN_DECLARE_MEMBER
+  };
+  union { Impl_ _impl_; };
+  friend struct ::TableStruct_param_2eproto;
+};
+// -------------------------------------------------------------------
+
 class Loop final : public ::google::protobuf::Message
 /* @@protoc_insertion_point(class_definition:codegen.Loop) */ {
  public:
@@ -3563,6 +3800,7 @@ class Operation final : public ::google::protobuf::Message
     kOp = 1,
     kFusedOp = 2,
     kLoop = 3,
+    kConditional = 7,
     OP_TYPE_NOT_SET = 0,
   };
   enum ReturnTypeCase {
@@ -3574,7 +3812,7 @@ class Operation final : public ::google::protobuf::Message
     return reinterpret_cast<const Operation*>(
         &_Operation_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 15;
+  static constexpr int kIndexInFileMessages = 16;
   friend void swap(Operation& a, Operation& b) { a.Swap(&b); }
   inline void Swap(Operation* other) {
     if (other == this) return;
@@ -3665,6 +3903,7 @@ class Operation final : public ::google::protobuf::Message
     kOpFieldNumber = 1,
     kFusedOpFieldNumber = 2,
     kLoopFieldNumber = 3,
+    kConditionalFieldNumber = 7,
     kOutputFieldNumber = 4,
     kOutputsFieldNumber = 5,
   };
@@ -3740,6 +3979,25 @@ class Operation final : public ::google::protobuf::Message
   ::codegen::Loop* _internal_mutable_loop();
 
   public:
+  // .codegen.Conditional conditional = 7;
+  bool has_conditional() const;
+  private:
+  bool _internal_has_conditional() const;
+
+  public:
+  void clear_conditional() ;
+  const ::codegen::Conditional& conditional() const;
+  PROTOBUF_NODISCARD ::codegen::Conditional* release_conditional();
+  ::codegen::Conditional* mutable_conditional();
+  void set_allocated_conditional(::codegen::Conditional* value);
+  void unsafe_arena_set_allocated_conditional(::codegen::Conditional* value);
+  ::codegen::Conditional* unsafe_arena_release_conditional();
+
+  private:
+  const ::codegen::Conditional& _internal_conditional() const;
+  ::codegen::Conditional* _internal_mutable_conditional();
+
+  public:
   // .codegen.Tensor output = 4;
   bool has_output() const;
   private:
@@ -3788,6 +4046,7 @@ class Operation final : public ::google::protobuf::Message
   void set_has_op();
   void set_has_fused_op();
   void set_has_loop();
+  void set_has_conditional();
   void set_has_output();
   void set_has_outputs();
   inline bool has_op_type() const;
@@ -3796,7 +4055,7 @@ class Operation final : public ::google::protobuf::Message
   inline void clear_has_return_type();
   friend class ::google::protobuf::internal::TcParser;
   static const ::google::protobuf::internal::TcParseTable<
-      0, 6, 6,
+      0, 7, 7,
       0, 2>
       _table_;
 
@@ -3823,6 +4082,7 @@ class Operation final : public ::google::protobuf::Message
       ::codegen::OpOverload* op_;
       ::codegen::OpOverloadList* fused_op_;
       ::codegen::Loop* loop_;
+      ::codegen::Conditional* conditional_;
     } op_type_;
     union ReturnTypeUnion {
       constexpr ReturnTypeUnion() : _constinit_{} {}
@@ -3897,7 +4157,7 @@ class Model final : public ::google::protobuf::Message
     return reinterpret_cast<const Model*>(
         &_Model_default_instance_);
   }
-  static constexpr int kIndexInFileMessages = 16;
+  static constexpr int kIndexInFileMessages = 17;
   friend void swap(Model& a, Model& b) { a.Swap(&b); }
   inline void Swap(Model* other) {
     if (other == this) return;
@@ -6062,6 +6322,204 @@ Loop::_internal_mutable_body() {
 
 // -------------------------------------------------------------------
 
+// Conditional
+
+// .codegen.Argument predicate = 1;
+inline bool Conditional::has_predicate() const {
+  bool value = (_impl_._has_bits_[0] & 0x00000001u) != 0;
+  PROTOBUF_ASSUME(!value || _impl_.predicate_ != nullptr);
+  return value;
+}
+inline void Conditional::clear_predicate() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.predicate_ != nullptr) _impl_.predicate_->Clear();
+  _impl_._has_bits_[0] &= ~0x00000001u;
+}
+inline const ::codegen::Argument& Conditional::_internal_predicate() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  const ::codegen::Argument* p = _impl_.predicate_;
+  return p != nullptr ? *p : reinterpret_cast<const ::codegen::Argument&>(::codegen::_Argument_default_instance_);
+}
+inline const ::codegen::Argument& Conditional::predicate() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Conditional.predicate)
+  return _internal_predicate();
+}
+inline void Conditional::unsafe_arena_set_allocated_predicate(::codegen::Argument* value) {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (GetArena() == nullptr) {
+    delete reinterpret_cast<::google::protobuf::MessageLite*>(_impl_.predicate_);
+  }
+  _impl_.predicate_ = reinterpret_cast<::codegen::Argument*>(value);
+  if (value != nullptr) {
+    _impl_._has_bits_[0] |= 0x00000001u;
+  } else {
+    _impl_._has_bits_[0] &= ~0x00000001u;
+  }
+  // @@protoc_insertion_point(field_unsafe_arena_set_allocated:codegen.Conditional.predicate)
+}
+inline ::codegen::Argument* Conditional::release_predicate() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+
+  _impl_._has_bits_[0] &= ~0x00000001u;
+  ::codegen::Argument* released = _impl_.predicate_;
+  _impl_.predicate_ = nullptr;
+  if (::google::protobuf::internal::DebugHardenForceCopyInRelease()) {
+    auto* old = reinterpret_cast<::google::protobuf::MessageLite*>(released);
+    released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    if (GetArena() == nullptr) {
+      delete old;
+    }
+  } else {
+    if (GetArena() != nullptr) {
+      released = ::google::protobuf::internal::DuplicateIfNonNull(released);
+    }
+  }
+  return released;
+}
+inline ::codegen::Argument* Conditional::unsafe_arena_release_predicate() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  // @@protoc_insertion_point(field_release:codegen.Conditional.predicate)
+
+  _impl_._has_bits_[0] &= ~0x00000001u;
+  ::codegen::Argument* temp = _impl_.predicate_;
+  _impl_.predicate_ = nullptr;
+  return temp;
+}
+inline ::codegen::Argument* Conditional::_internal_mutable_predicate() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (_impl_.predicate_ == nullptr) {
+    auto* p = ::google::protobuf::Message::DefaultConstruct<::codegen::Argument>(GetArena());
+    _impl_.predicate_ = reinterpret_cast<::codegen::Argument*>(p);
+  }
+  return _impl_.predicate_;
+}
+inline ::codegen::Argument* Conditional::mutable_predicate() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  _impl_._has_bits_[0] |= 0x00000001u;
+  ::codegen::Argument* _msg = _internal_mutable_predicate();
+  // @@protoc_insertion_point(field_mutable:codegen.Conditional.predicate)
+  return _msg;
+}
+inline void Conditional::set_allocated_predicate(::codegen::Argument* value) {
+  ::google::protobuf::Arena* message_arena = GetArena();
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (message_arena == nullptr) {
+    delete (_impl_.predicate_);
+  }
+
+  if (value != nullptr) {
+    ::google::protobuf::Arena* submessage_arena = (value)->GetArena();
+    if (message_arena != submessage_arena) {
+      value = ::google::protobuf::internal::GetOwnedMessage(message_arena, value, submessage_arena);
+    }
+    _impl_._has_bits_[0] |= 0x00000001u;
+  } else {
+    _impl_._has_bits_[0] &= ~0x00000001u;
+  }
+
+  _impl_.predicate_ = reinterpret_cast<::codegen::Argument*>(value);
+  // @@protoc_insertion_point(field_set_allocated:codegen.Conditional.predicate)
+}
+
+// repeated .codegen.Operation true_body = 2;
+inline int Conditional::_internal_true_body_size() const {
+  return _internal_true_body().size();
+}
+inline int Conditional::true_body_size() const {
+  return _internal_true_body_size();
+}
+inline void Conditional::clear_true_body() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.true_body_.Clear();
+}
+inline ::codegen::Operation* Conditional::mutable_true_body(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.Conditional.true_body)
+  return _internal_mutable_true_body()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>* Conditional::mutable_true_body()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.Conditional.true_body)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_true_body();
+}
+inline const ::codegen::Operation& Conditional::true_body(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Conditional.true_body)
+  return _internal_true_body().Get(index);
+}
+inline ::codegen::Operation* Conditional::add_true_body() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::Operation* _add = _internal_mutable_true_body()->Add();
+  // @@protoc_insertion_point(field_add:codegen.Conditional.true_body)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& Conditional::true_body() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.Conditional.true_body)
+  return _internal_true_body();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>&
+Conditional::_internal_true_body() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.true_body_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>*
+Conditional::_internal_mutable_true_body() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.true_body_;
+}
+
+// repeated .codegen.Operation false_body = 3;
+inline int Conditional::_internal_false_body_size() const {
+  return _internal_false_body().size();
+}
+inline int Conditional::false_body_size() const {
+  return _internal_false_body_size();
+}
+inline void Conditional::clear_false_body() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  _impl_.false_body_.Clear();
+}
+inline ::codegen::Operation* Conditional::mutable_false_body(int index)
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable:codegen.Conditional.false_body)
+  return _internal_mutable_false_body()->Mutable(index);
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>* Conditional::mutable_false_body()
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_mutable_list:codegen.Conditional.false_body)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  return _internal_mutable_false_body();
+}
+inline const ::codegen::Operation& Conditional::false_body(int index) const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Conditional.false_body)
+  return _internal_false_body().Get(index);
+}
+inline ::codegen::Operation* Conditional::add_false_body() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::codegen::Operation* _add = _internal_mutable_false_body()->Add();
+  // @@protoc_insertion_point(field_add:codegen.Conditional.false_body)
+  return _add;
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>& Conditional::false_body() const
+    ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_list:codegen.Conditional.false_body)
+  return _internal_false_body();
+}
+inline const ::google::protobuf::RepeatedPtrField<::codegen::Operation>&
+Conditional::_internal_false_body() const {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return _impl_.false_body_;
+}
+inline ::google::protobuf::RepeatedPtrField<::codegen::Operation>*
+Conditional::_internal_mutable_false_body() {
+  ::google::protobuf::internal::TSanRead(&_impl_);
+  return &_impl_.false_body_;
+}
+
+// -------------------------------------------------------------------
+
 // LoopBound
 
 // .codegen.LoopIndex loop = 1;
@@ -6619,6 +7077,85 @@ inline ::codegen::Loop* Operation::_internal_mutable_loop() {
 inline ::codegen::Loop* Operation::mutable_loop() ABSL_ATTRIBUTE_LIFETIME_BOUND {
   ::codegen::Loop* _msg = _internal_mutable_loop();
   // @@protoc_insertion_point(field_mutable:codegen.Operation.loop)
+  return _msg;
+}
+
+// .codegen.Conditional conditional = 7;
+inline bool Operation::has_conditional() const {
+  return op_type_case() == kConditional;
+}
+inline bool Operation::_internal_has_conditional() const {
+  return op_type_case() == kConditional;
+}
+inline void Operation::set_has_conditional() {
+  _impl_._oneof_case_[0] = kConditional;
+}
+inline void Operation::clear_conditional() {
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  if (op_type_case() == kConditional) {
+    if (GetArena() == nullptr) {
+      delete _impl_.op_type_.conditional_;
+    } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
+      ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.conditional_);
+    }
+    clear_has_op_type();
+  }
+}
+inline ::codegen::Conditional* Operation::release_conditional() {
+  // @@protoc_insertion_point(field_release:codegen.Operation.conditional)
+  if (op_type_case() == kConditional) {
+    clear_has_op_type();
+    auto* temp = _impl_.op_type_.conditional_;
+    if (GetArena() != nullptr) {
+      temp = ::google::protobuf::internal::DuplicateIfNonNull(temp);
+    }
+    _impl_.op_type_.conditional_ = nullptr;
+    return temp;
+  } else {
+    return nullptr;
+  }
+}
+inline const ::codegen::Conditional& Operation::_internal_conditional() const {
+  return op_type_case() == kConditional ? *_impl_.op_type_.conditional_ : reinterpret_cast<::codegen::Conditional&>(::codegen::_Conditional_default_instance_);
+}
+inline const ::codegen::Conditional& Operation::conditional() const ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  // @@protoc_insertion_point(field_get:codegen.Operation.conditional)
+  return _internal_conditional();
+}
+inline ::codegen::Conditional* Operation::unsafe_arena_release_conditional() {
+  // @@protoc_insertion_point(field_unsafe_arena_release:codegen.Operation.conditional)
+  if (op_type_case() == kConditional) {
+    clear_has_op_type();
+    auto* temp = _impl_.op_type_.conditional_;
+    _impl_.op_type_.conditional_ = nullptr;
+    return temp;
+  } else {
+    return nullptr;
+  }
+}
+inline void Operation::unsafe_arena_set_allocated_conditional(::codegen::Conditional* value) {
+  // We rely on the oneof clear method to free the earlier contents
+  // of this oneof. We can directly use the pointer we're given to
+  // set the new value.
+  clear_op_type();
+  if (value) {
+    set_has_conditional();
+    _impl_.op_type_.conditional_ = value;
+  }
+  // @@protoc_insertion_point(field_unsafe_arena_set_allocated:codegen.Operation.conditional)
+}
+inline ::codegen::Conditional* Operation::_internal_mutable_conditional() {
+  if (op_type_case() != kConditional) {
+    clear_op_type();
+    set_has_conditional();
+    _impl_.op_type_.conditional_ =
+        ::google::protobuf::Message::DefaultConstruct<::codegen::Conditional>(GetArena());
+  }
+  return _impl_.op_type_.conditional_;
+}
+inline ::codegen::Conditional* Operation::mutable_conditional() ABSL_ATTRIBUTE_LIFETIME_BOUND {
+  ::codegen::Conditional* _msg = _internal_mutable_conditional();
+  // @@protoc_insertion_point(field_mutable:codegen.Operation.conditional)
   return _msg;
 }
 

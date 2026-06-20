@@ -263,6 +263,7 @@ def compile(
     dump_tensors=True,
     dump_snapshot=False,
     double_buffered_accum_buffer: bool = False,
+    double_buffered_l2: bool = False,
     input_buffer_size: int = None,
     weight_buffer_size: int = None,
     accum_buffer_size: int = None,
@@ -284,6 +285,7 @@ def compile(
             bufferize_graph,
             gen_code_bufferized,
             gen_compute_graph_bufferized,
+            plan_memory,
             print_bufferized_graph,
         )
         from .codegen.mapping import adjust_tiling
@@ -301,7 +303,20 @@ def compile(
                     node, named, cache_size, num_banks, bank_width, unroll_dims
                 )
 
-        bufferize_graph(model)
+        # Reuse the tiler's double-buffering decision: when L2 is double-buffered the
+        # tiles already assume two-buffer occupancy, so emit software-pipelined loops.
+        bufferize_graph(model, pipelined=double_buffered_l2)
+
+        # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
+        # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).  Writes
+        # meta['memory'] / meta['scratchpad'] that the proto emitter reads.
+        plan_memory(
+            model,
+            cache_size,
+            num_banks=num_banks,
+            bank_width=bank_width,
+            unroll_dims=unroll_dims,
+        )
         print_bufferized_graph(model)
 
         path = os.path.join(output_dir, "tensor_files")

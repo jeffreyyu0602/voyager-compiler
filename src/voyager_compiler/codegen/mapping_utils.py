@@ -135,17 +135,6 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
         save_tensor(node.value, os.path.join(output_dir, f"{node.name}.bin"))
 
 
-def _is_tile_dma(node):
-    """True for a side-effecting tile-DMA node (``voyager.copy_tile`` / ``store_tile``):
-    returns ``None``, mutating its ``dst`` (``args[1]``) in place, so its emitted output
-    is described from that dest buffer."""
-    schema = getattr(getattr(node, "target", None), "_schema", None)
-    return schema is not None and schema.name in (
-        "voyager::copy_tile",
-        "voyager::store_tile",
-    )
-
-
 def set_output_field(param, node, output_dir):
     if isinstance(node.value, torch.Tensor):
         node.meta["_tiled_shapes"] = node.meta.get("tiled_shapes")
@@ -214,12 +203,21 @@ def set_output_field(param, node, output_dir):
         # prefetch's ``j + 1``); its result is a named scalar a load/store references,
         # not a tensor — record the name so the reference resolves.
         param.output.node = node.name
-    elif node.value is None and _is_tile_dma(node):
-        # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns ``None`` — its
+    elif node.value is None and node.target in (
+        torch.ops.voyager.copy_tile.default,
+        torch.ops.voyager.async_copy.default,
+    ):
+        # A side-effecting tile DMA (``copy_tile`` / ``async_copy``; returns ``None`` — its
         # dest buffer is a closed-over additional input mutated in place).  Its result is
         # the tile it writes, described from the dest buffer (``args[1]``), which carries
         # the planned address; the source tile and block index travel in the op's args.
         set_tensor_field(param.output, node.args[1], output_dir, is_output=True)
+    elif node.value is None and node.target is (
+        torch.ops.voyager.async_wait.default
+    ):
+        # ``async_wait`` synchronizes a semaphore and produces no tensor — leave
+        # the Operation's return field unset.
+        pass
     else:
         logger.warning(f"Unsupported output type: {type(node.value)}")
 

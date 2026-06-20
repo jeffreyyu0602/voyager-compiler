@@ -408,6 +408,33 @@ struct OpOverloadListDefaultTypeInternal {
 PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
     PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 OpOverloadListDefaultTypeInternal _OpOverloadList_default_instance_;
 
+inline constexpr Conditional::Impl_::Impl_(
+    ::_pbi::ConstantInitialized) noexcept
+      : _cached_size_{0},
+        true_body_{},
+        false_body_{},
+        predicate_{nullptr} {}
+
+template <typename>
+PROTOBUF_CONSTEXPR Conditional::Conditional(::_pbi::ConstantInitialized)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(_class_data_.base()),
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(),
+#endif  // PROTOBUF_CUSTOM_VTABLE
+      _impl_(::_pbi::ConstantInitialized()) {
+}
+struct ConditionalDefaultTypeInternal {
+  PROTOBUF_CONSTEXPR ConditionalDefaultTypeInternal() : _instance(::_pbi::ConstantInitialized{}) {}
+  ~ConditionalDefaultTypeInternal() {}
+  union {
+    Conditional _instance;
+  };
+};
+
+PROTOBUF_ATTRIBUTE_NO_DESTROY PROTOBUF_CONSTINIT
+    PROTOBUF_ATTRIBUTE_INIT_PRIORITY1 ConditionalDefaultTypeInternal _Conditional_default_instance_;
+
 inline constexpr Loop::Impl_::Impl_(
     ::_pbi::ConstantInitialized) noexcept
       : body_{},
@@ -640,6 +667,20 @@ const ::uint32_t
         PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.end_),
         PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.step_),
         PROTOBUF_FIELD_OFFSET(::codegen::Loop, _impl_.body_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Conditional, _impl_._has_bits_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Conditional, _internal_metadata_),
+        ~0u,  // no _extensions_
+        ~0u,  // no _oneof_case_
+        ~0u,  // no _weak_field_map_
+        ~0u,  // no _inlined_string_donated_
+        ~0u,  // no _split_
+        ~0u,  // no sizeof(Split)
+        PROTOBUF_FIELD_OFFSET(::codegen::Conditional, _impl_.predicate_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Conditional, _impl_.true_body_),
+        PROTOBUF_FIELD_OFFSET(::codegen::Conditional, _impl_.false_body_),
+        0,
+        ~0u,
+        ~0u,
         ~0u,  // no _has_bits_
         PROTOBUF_FIELD_OFFSET(::codegen::LoopBound, _internal_metadata_),
         ~0u,  // no _extensions_
@@ -694,9 +735,11 @@ const ::uint32_t
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
         ::_pbi::kInvalidFieldOffsetTag,
+        ::_pbi::kInvalidFieldOffsetTag,
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.tiling_),
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.op_type_),
         PROTOBUF_FIELD_OFFSET(::codegen::Operation, _impl_.return_type_),
+        ~0u,
         ~0u,
         ~0u,
         ~0u,
@@ -729,12 +772,13 @@ static const ::_pbi::MigrationSchema
         {104, -1, -1, sizeof(::codegen::OpOverload)},
         {117, -1, -1, sizeof(::codegen::OpOverloadList)},
         {127, -1, -1, sizeof(::codegen::Loop)},
-        {140, -1, -1, sizeof(::codegen::LoopBound)},
-        {150, -1, -1, sizeof(::codegen::LevelTiling)},
-        {159, -1, -1, sizeof(::codegen::LevelAccessCount)},
-        {170, -1, -1, sizeof(::codegen::Tiling)},
-        {181, 197, -1, sizeof(::codegen::Operation)},
-        {203, -1, -1, sizeof(::codegen::Model)},
+        {140, 151, -1, sizeof(::codegen::Conditional)},
+        {154, -1, -1, sizeof(::codegen::LoopBound)},
+        {164, -1, -1, sizeof(::codegen::LevelTiling)},
+        {173, -1, -1, sizeof(::codegen::LevelAccessCount)},
+        {184, -1, -1, sizeof(::codegen::Tiling)},
+        {195, 212, -1, sizeof(::codegen::Operation)},
+        {219, -1, -1, sizeof(::codegen::Model)},
 };
 static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_Memory_default_instance_._instance,
@@ -748,6 +792,7 @@ static const ::_pb::Message* const file_default_instances[] = {
     &::codegen::_OpOverload_default_instance_._instance,
     &::codegen::_OpOverloadList_default_instance_._instance,
     &::codegen::_Loop_default_instance_._instance,
+    &::codegen::_Conditional_default_instance_._instance,
     &::codegen::_LoopBound_default_instance_._instance,
     &::codegen::_LevelTiling_default_instance_._instance,
     &::codegen::_LevelAccessCount_default_instance_._instance,
@@ -787,39 +832,44 @@ const char descriptor_table_protodef_param_2eproto[] ABSL_ATTRIBUTE_SECTION_VARI
     "(\t\022$\n\007op_list\030\002 \003(\0132\023.codegen.OpOverload"
     "\"`\n\004Loop\022\014\n\004node\030\001 \001(\t\022\r\n\005start\030\002 \001(\005\022\013\n"
     "\003end\030\003 \001(\005\022\014\n\004step\030\004 \001(\005\022 \n\004body\030\005 \003(\0132\022"
-    ".codegen.Operation\"<\n\tLoopBound\022 \n\004loop\030"
-    "\001 \001(\0162\022.codegen.LoopIndex\022\r\n\005bound\030\002 \001(\005"
-    "\"6\n\013LevelTiling\022\'\n\013loop_bounds\030\001 \003(\0132\022.c"
-    "odegen.LoopBound\"h\n\020LevelAccessCount\022\032\n\022"
-    "input_access_count\030\001 \001(\004\022\033\n\023output_acces"
-    "s_count\030\002 \001(\004\022\033\n\023weight_access_count\030\003 \001"
-    "(\004\"{\n\006Tiling\022\014\n\004name\030\001 \001(\t\022+\n\rlevel_tili"
-    "ngs\030\002 \003(\0132\024.codegen.LevelTiling\0226\n\023level"
-    "_access_counts\030\003 \003(\0132\031.codegen.LevelAcce"
-    "ssCount\"\220\002\n\tOperation\022!\n\002op\030\001 \001(\0132\023.code"
-    "gen.OpOverloadH\000\022+\n\010fused_op\030\002 \001(\0132\027.cod"
-    "egen.OpOverloadListH\000\022\035\n\004loop\030\003 \001(\0132\r.co"
-    "degen.LoopH\000\022!\n\006output\030\004 \001(\0132\017.codegen.T"
-    "ensorH\001\022&\n\007outputs\030\005 \001(\0132\023.codegen.Tenso"
-    "rListH\001\022$\n\006tiling\030\006 \001(\0132\017.codegen.Tiling"
-    "H\002\210\001\001B\t\n\007op_typeB\r\n\013return_typeB\t\n\007_tili"
-    "ng\"n\n\005Model\022\037\n\006inputs\030\001 \003(\0132\017.codegen.Te"
-    "nsor\022#\n\nparameters\030\002 \003(\0132\017.codegen.Tenso"
-    "r\022\037\n\003ops\030\003 \003(\0132\022.codegen.Operation*C\n\tLo"
-    "opIndex\022\006\n\002FX\020\000\022\006\n\002FY\020\001\022\006\n\002OX\020\002\022\006\n\002OY\020\003\022"
-    "\006\n\002OC\020\004\022\006\n\002IC\020\005\022\006\n\002ON\020\006b\006proto3"
+    ".codegen.Operation\"\202\001\n\013Conditional\022$\n\tpr"
+    "edicate\030\001 \001(\0132\021.codegen.Argument\022%\n\ttrue"
+    "_body\030\002 \003(\0132\022.codegen.Operation\022&\n\nfalse"
+    "_body\030\003 \003(\0132\022.codegen.Operation\"<\n\tLoopB"
+    "ound\022 \n\004loop\030\001 \001(\0162\022.codegen.LoopIndex\022\r"
+    "\n\005bound\030\002 \001(\005\"6\n\013LevelTiling\022\'\n\013loop_bou"
+    "nds\030\001 \003(\0132\022.codegen.LoopBound\"h\n\020LevelAc"
+    "cessCount\022\032\n\022input_access_count\030\001 \001(\004\022\033\n"
+    "\023output_access_count\030\002 \001(\004\022\033\n\023weight_acc"
+    "ess_count\030\003 \001(\004\"{\n\006Tiling\022\014\n\004name\030\001 \001(\t\022"
+    "+\n\rlevel_tilings\030\002 \003(\0132\024.codegen.LevelTi"
+    "ling\0226\n\023level_access_counts\030\003 \003(\0132\031.code"
+    "gen.LevelAccessCount\"\275\002\n\tOperation\022!\n\002op"
+    "\030\001 \001(\0132\023.codegen.OpOverloadH\000\022+\n\010fused_o"
+    "p\030\002 \001(\0132\027.codegen.OpOverloadListH\000\022\035\n\004lo"
+    "op\030\003 \001(\0132\r.codegen.LoopH\000\022+\n\013conditional"
+    "\030\007 \001(\0132\024.codegen.ConditionalH\000\022!\n\006output"
+    "\030\004 \001(\0132\017.codegen.TensorH\001\022&\n\007outputs\030\005 \001"
+    "(\0132\023.codegen.TensorListH\001\022$\n\006tiling\030\006 \001("
+    "\0132\017.codegen.TilingH\002\210\001\001B\t\n\007op_typeB\r\n\013re"
+    "turn_typeB\t\n\007_tiling\"n\n\005Model\022\037\n\006inputs\030"
+    "\001 \003(\0132\017.codegen.Tensor\022#\n\nparameters\030\002 \003"
+    "(\0132\017.codegen.Tensor\022\037\n\003ops\030\003 \003(\0132\022.codeg"
+    "en.Operation*C\n\tLoopIndex\022\006\n\002FX\020\000\022\006\n\002FY\020"
+    "\001\022\006\n\002OX\020\002\022\006\n\002OY\020\003\022\006\n\002OC\020\004\022\006\n\002IC\020\005\022\006\n\002ON\020"
+    "\006b\006proto3"
 };
 static ::absl::once_flag descriptor_table_param_2eproto_once;
 PROTOBUF_CONSTINIT const ::_pbi::DescriptorTable descriptor_table_param_2eproto = {
     false,
     false,
-    2031,
+    2209,
     descriptor_table_protodef_param_2eproto,
     "param.proto",
     &descriptor_table_param_2eproto_once,
     nullptr,
     0,
-    17,
+    18,
     schemas,
     file_default_instances,
     TableStruct_param_2eproto::offsets,
@@ -4337,6 +4387,338 @@ void Loop::InternalSwap(Loop* PROTOBUF_RESTRICT other) {
 }
 // ===================================================================
 
+class Conditional::_Internal {
+ public:
+  using HasBits =
+      decltype(std::declval<Conditional>()._impl_._has_bits_);
+  static constexpr ::int32_t kHasBitsOffset =
+      8 * PROTOBUF_FIELD_OFFSET(Conditional, _impl_._has_bits_);
+};
+
+Conditional::Conditional(::google::protobuf::Arena* arena)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  SharedCtor(arena);
+  // @@protoc_insertion_point(arena_constructor:codegen.Conditional)
+}
+inline PROTOBUF_NDEBUG_INLINE Conditional::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility, ::google::protobuf::Arena* arena,
+    const Impl_& from, const ::codegen::Conditional& from_msg)
+      : _has_bits_{from._has_bits_},
+        _cached_size_{0},
+        true_body_{visibility, arena, from.true_body_},
+        false_body_{visibility, arena, from.false_body_} {}
+
+Conditional::Conditional(
+    ::google::protobuf::Arena* arena,
+    const Conditional& from)
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+    : ::google::protobuf::Message(arena, _class_data_.base()) {
+#else   // PROTOBUF_CUSTOM_VTABLE
+    : ::google::protobuf::Message(arena) {
+#endif  // PROTOBUF_CUSTOM_VTABLE
+  Conditional* const _this = this;
+  (void)_this;
+  _internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(
+      from._internal_metadata_);
+  new (&_impl_) Impl_(internal_visibility(), arena, from._impl_, from);
+  ::uint32_t cached_has_bits = _impl_._has_bits_[0];
+  _impl_.predicate_ = (cached_has_bits & 0x00000001u) ? ::google::protobuf::Message::CopyConstruct<::codegen::Argument>(
+                              arena, *from._impl_.predicate_)
+                        : nullptr;
+
+  // @@protoc_insertion_point(copy_constructor:codegen.Conditional)
+}
+inline PROTOBUF_NDEBUG_INLINE Conditional::Impl_::Impl_(
+    ::google::protobuf::internal::InternalVisibility visibility,
+    ::google::protobuf::Arena* arena)
+      : _cached_size_{0},
+        true_body_{visibility, arena},
+        false_body_{visibility, arena} {}
+
+inline void Conditional::SharedCtor(::_pb::Arena* arena) {
+  new (&_impl_) Impl_(internal_visibility(), arena);
+  _impl_.predicate_ = {};
+}
+Conditional::~Conditional() {
+  // @@protoc_insertion_point(destructor:codegen.Conditional)
+  SharedDtor(*this);
+}
+inline void Conditional::SharedDtor(MessageLite& self) {
+  Conditional& this_ = static_cast<Conditional&>(self);
+  this_._internal_metadata_.Delete<::google::protobuf::UnknownFieldSet>();
+  ABSL_DCHECK(this_.GetArena() == nullptr);
+  delete this_._impl_.predicate_;
+  this_._impl_.~Impl_();
+}
+
+inline void* Conditional::PlacementNew_(const void*, void* mem,
+                                        ::google::protobuf::Arena* arena) {
+  return ::new (mem) Conditional(arena);
+}
+constexpr auto Conditional::InternalNewImpl_() {
+  constexpr auto arena_bits = ::google::protobuf::internal::EncodePlacementArenaOffsets({
+      PROTOBUF_FIELD_OFFSET(Conditional, _impl_.true_body_) +
+          decltype(Conditional::_impl_.true_body_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+      PROTOBUF_FIELD_OFFSET(Conditional, _impl_.false_body_) +
+          decltype(Conditional::_impl_.false_body_)::
+              InternalGetArenaOffset(
+                  ::google::protobuf::Message::internal_visibility()),
+  });
+  if (arena_bits.has_value()) {
+    return ::google::protobuf::internal::MessageCreator::ZeroInit(
+        sizeof(Conditional), alignof(Conditional), *arena_bits);
+  } else {
+    return ::google::protobuf::internal::MessageCreator(&Conditional::PlacementNew_,
+                                 sizeof(Conditional),
+                                 alignof(Conditional));
+  }
+}
+PROTOBUF_CONSTINIT
+PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::google::protobuf::internal::ClassDataFull Conditional::_class_data_ = {
+    ::google::protobuf::internal::ClassData{
+        &_Conditional_default_instance_._instance,
+        &_table_.header,
+        nullptr,  // OnDemandRegisterArenaDtor
+        nullptr,  // IsInitialized
+        &Conditional::MergeImpl,
+        ::google::protobuf::Message::GetNewImpl<Conditional>(),
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        &Conditional::SharedDtor,
+        ::google::protobuf::Message::GetClearImpl<Conditional>(), &Conditional::ByteSizeLong,
+            &Conditional::_InternalSerialize,
+#endif  // PROTOBUF_CUSTOM_VTABLE
+        PROTOBUF_FIELD_OFFSET(Conditional, _impl_._cached_size_),
+        false,
+    },
+    &Conditional::kDescriptorMethods,
+    &descriptor_table_param_2eproto,
+    nullptr,  // tracker
+};
+const ::google::protobuf::internal::ClassData* Conditional::GetClassData() const {
+  ::google::protobuf::internal::PrefetchToLocalCache(&_class_data_);
+  ::google::protobuf::internal::PrefetchToLocalCache(_class_data_.tc_table);
+  return _class_data_.base();
+}
+PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
+const ::_pbi::TcParseTable<2, 3, 3, 0, 2> Conditional::_table_ = {
+  {
+    PROTOBUF_FIELD_OFFSET(Conditional, _impl_._has_bits_),
+    0, // no _extensions_
+    3, 24,  // max_field_number, fast_idx_mask
+    offsetof(decltype(_table_), field_lookup_table),
+    4294967288,  // skipmap
+    offsetof(decltype(_table_), field_entries),
+    3,  // num_field_entries
+    3,  // num_aux_entries
+    offsetof(decltype(_table_), aux_entries),
+    _class_data_.base(),
+    nullptr,  // post_loop_handler
+    ::_pbi::TcParser::GenericFallback,  // fallback
+    #ifdef PROTOBUF_PREFETCH_PARSE_TABLE
+    ::_pbi::TcParser::GetTable<::codegen::Conditional>(),  // to_prefetch
+    #endif  // PROTOBUF_PREFETCH_PARSE_TABLE
+  }, {{
+    {::_pbi::TcParser::MiniParse, {}},
+    // .codegen.Argument predicate = 1;
+    {::_pbi::TcParser::FastMtS1,
+     {10, 0, 0, PROTOBUF_FIELD_OFFSET(Conditional, _impl_.predicate_)}},
+    // repeated .codegen.Operation true_body = 2;
+    {::_pbi::TcParser::FastMtR1,
+     {18, 63, 1, PROTOBUF_FIELD_OFFSET(Conditional, _impl_.true_body_)}},
+    // repeated .codegen.Operation false_body = 3;
+    {::_pbi::TcParser::FastMtR1,
+     {26, 63, 2, PROTOBUF_FIELD_OFFSET(Conditional, _impl_.false_body_)}},
+  }}, {{
+    65535, 65535
+  }}, {{
+    // .codegen.Argument predicate = 1;
+    {PROTOBUF_FIELD_OFFSET(Conditional, _impl_.predicate_), _Internal::kHasBitsOffset + 0, 0,
+    (0 | ::_fl::kFcOptional | ::_fl::kMessage | ::_fl::kTvTable)},
+    // repeated .codegen.Operation true_body = 2;
+    {PROTOBUF_FIELD_OFFSET(Conditional, _impl_.true_body_), -1, 1,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+    // repeated .codegen.Operation false_body = 3;
+    {PROTOBUF_FIELD_OFFSET(Conditional, _impl_.false_body_), -1, 2,
+    (0 | ::_fl::kFcRepeated | ::_fl::kMessage | ::_fl::kTvTable)},
+  }}, {{
+    {::_pbi::TcParser::GetTable<::codegen::Argument>()},
+    {::_pbi::TcParser::GetTable<::codegen::Operation>()},
+    {::_pbi::TcParser::GetTable<::codegen::Operation>()},
+  }}, {{
+  }},
+};
+
+PROTOBUF_NOINLINE void Conditional::Clear() {
+// @@protoc_insertion_point(message_clear_start:codegen.Conditional)
+  ::google::protobuf::internal::TSanWrite(&_impl_);
+  ::uint32_t cached_has_bits = 0;
+  // Prevent compiler warnings about cached_has_bits being unused
+  (void) cached_has_bits;
+
+  _impl_.true_body_.Clear();
+  _impl_.false_body_.Clear();
+  cached_has_bits = _impl_._has_bits_[0];
+  if (cached_has_bits & 0x00000001u) {
+    ABSL_DCHECK(_impl_.predicate_ != nullptr);
+    _impl_.predicate_->Clear();
+  }
+  _impl_._has_bits_.Clear();
+  _internal_metadata_.Clear<::google::protobuf::UnknownFieldSet>();
+}
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::uint8_t* Conditional::_InternalSerialize(
+            const MessageLite& base, ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) {
+          const Conditional& this_ = static_cast<const Conditional&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::uint8_t* Conditional::_InternalSerialize(
+            ::uint8_t* target,
+            ::google::protobuf::io::EpsCopyOutputStream* stream) const {
+          const Conditional& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(serialize_to_array_start:codegen.Conditional)
+          ::uint32_t cached_has_bits = 0;
+          (void)cached_has_bits;
+
+          cached_has_bits = this_._impl_._has_bits_[0];
+          // .codegen.Argument predicate = 1;
+          if (cached_has_bits & 0x00000001u) {
+            target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                1, *this_._impl_.predicate_, this_._impl_.predicate_->GetCachedSize(), target,
+                stream);
+          }
+
+          // repeated .codegen.Operation true_body = 2;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_true_body_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_true_body().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    2, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          // repeated .codegen.Operation false_body = 3;
+          for (unsigned i = 0, n = static_cast<unsigned>(
+                                   this_._internal_false_body_size());
+               i < n; i++) {
+            const auto& repfield = this_._internal_false_body().Get(i);
+            target =
+                ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                    3, repfield, repfield.GetCachedSize(),
+                    target, stream);
+          }
+
+          if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
+            target =
+                ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
+                    this_._internal_metadata_.unknown_fields<::google::protobuf::UnknownFieldSet>(::google::protobuf::UnknownFieldSet::default_instance), target, stream);
+          }
+          // @@protoc_insertion_point(serialize_to_array_end:codegen.Conditional)
+          return target;
+        }
+
+#if defined(PROTOBUF_CUSTOM_VTABLE)
+        ::size_t Conditional::ByteSizeLong(const MessageLite& base) {
+          const Conditional& this_ = static_cast<const Conditional&>(base);
+#else   // PROTOBUF_CUSTOM_VTABLE
+        ::size_t Conditional::ByteSizeLong() const {
+          const Conditional& this_ = *this;
+#endif  // PROTOBUF_CUSTOM_VTABLE
+          // @@protoc_insertion_point(message_byte_size_start:codegen.Conditional)
+          ::size_t total_size = 0;
+
+          ::uint32_t cached_has_bits = 0;
+          // Prevent compiler warnings about cached_has_bits being unused
+          (void)cached_has_bits;
+
+          ::_pbi::Prefetch5LinesFrom7Lines(&this_);
+           {
+            // repeated .codegen.Operation true_body = 2;
+            {
+              total_size += 1UL * this_._internal_true_body_size();
+              for (const auto& msg : this_._internal_true_body()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+            // repeated .codegen.Operation false_body = 3;
+            {
+              total_size += 1UL * this_._internal_false_body_size();
+              for (const auto& msg : this_._internal_false_body()) {
+                total_size += ::google::protobuf::internal::WireFormatLite::MessageSize(msg);
+              }
+            }
+          }
+           {
+            // .codegen.Argument predicate = 1;
+            cached_has_bits = this_._impl_._has_bits_[0];
+            if (cached_has_bits & 0x00000001u) {
+              total_size += 1 +
+                            ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.predicate_);
+            }
+          }
+          return this_.MaybeComputeUnknownFieldsSize(total_size,
+                                                     &this_._impl_._cached_size_);
+        }
+
+void Conditional::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::google::protobuf::MessageLite& from_msg) {
+  auto* const _this = static_cast<Conditional*>(&to_msg);
+  auto& from = static_cast<const Conditional&>(from_msg);
+  ::google::protobuf::Arena* arena = _this->GetArena();
+  // @@protoc_insertion_point(class_specific_merge_from_start:codegen.Conditional)
+  ABSL_DCHECK_NE(&from, _this);
+  ::uint32_t cached_has_bits = 0;
+  (void) cached_has_bits;
+
+  _this->_internal_mutable_true_body()->MergeFrom(
+      from._internal_true_body());
+  _this->_internal_mutable_false_body()->MergeFrom(
+      from._internal_false_body());
+  cached_has_bits = from._impl_._has_bits_[0];
+  if (cached_has_bits & 0x00000001u) {
+    ABSL_DCHECK(from._impl_.predicate_ != nullptr);
+    if (_this->_impl_.predicate_ == nullptr) {
+      _this->_impl_.predicate_ =
+          ::google::protobuf::Message::CopyConstruct<::codegen::Argument>(arena, *from._impl_.predicate_);
+    } else {
+      _this->_impl_.predicate_->MergeFrom(*from._impl_.predicate_);
+    }
+  }
+  _this->_impl_._has_bits_[0] |= cached_has_bits;
+  _this->_internal_metadata_.MergeFrom<::google::protobuf::UnknownFieldSet>(from._internal_metadata_);
+}
+
+void Conditional::CopyFrom(const Conditional& from) {
+// @@protoc_insertion_point(class_specific_copy_from_start:codegen.Conditional)
+  if (&from == this) return;
+  Clear();
+  MergeFrom(from);
+}
+
+
+void Conditional::InternalSwap(Conditional* PROTOBUF_RESTRICT other) {
+  using std::swap;
+  _internal_metadata_.InternalSwap(&other->_internal_metadata_);
+  swap(_impl_._has_bits_[0], other->_impl_._has_bits_[0]);
+  _impl_.true_body_.InternalSwap(&other->_impl_.true_body_);
+  _impl_.false_body_.InternalSwap(&other->_impl_.false_body_);
+  swap(_impl_.predicate_, other->_impl_.predicate_);
+}
+
+::google::protobuf::Metadata Conditional::GetMetadata() const {
+  return ::google::protobuf::Message::GetMetadataImpl(GetClassData()->full());
+}
+// ===================================================================
+
 class LoopBound::_Internal {
  public:
 };
@@ -5444,6 +5826,19 @@ void Operation::set_allocated_loop(::codegen::Loop* loop) {
   }
   // @@protoc_insertion_point(field_set_allocated:codegen.Operation.loop)
 }
+void Operation::set_allocated_conditional(::codegen::Conditional* conditional) {
+  ::google::protobuf::Arena* message_arena = GetArena();
+  clear_op_type();
+  if (conditional) {
+    ::google::protobuf::Arena* submessage_arena = conditional->GetArena();
+    if (message_arena != submessage_arena) {
+      conditional = ::google::protobuf::internal::GetOwnedMessage(message_arena, conditional, submessage_arena);
+    }
+    set_has_conditional();
+    _impl_.op_type_.conditional_ = conditional;
+  }
+  // @@protoc_insertion_point(field_set_allocated:codegen.Operation.conditional)
+}
 void Operation::set_allocated_output(::codegen::Tensor* output) {
   ::google::protobuf::Arena* message_arena = GetArena();
   clear_return_type();
@@ -5517,6 +5912,9 @@ Operation::Operation(
       case kLoop:
         _impl_.op_type_.loop_ = ::google::protobuf::Message::CopyConstruct<::codegen::Loop>(arena, *from._impl_.op_type_.loop_);
         break;
+      case kConditional:
+        _impl_.op_type_.conditional_ = ::google::protobuf::Message::CopyConstruct<::codegen::Conditional>(arena, *from._impl_.op_type_.conditional_);
+        break;
   }
   switch (return_type_case()) {
     case RETURN_TYPE_NOT_SET:
@@ -5586,6 +5984,14 @@ void Operation::clear_op_type() {
         delete _impl_.op_type_.loop_;
       } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
         ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.loop_);
+      }
+      break;
+    }
+    case kConditional: {
+      if (GetArena() == nullptr) {
+        delete _impl_.op_type_.conditional_;
+      } else if (::google::protobuf::internal::DebugHardenClearOneofMessageOnArena()) {
+        ::google::protobuf::internal::MaybePoisonAfterClear(_impl_.op_type_.conditional_);
       }
       break;
     }
@@ -5660,16 +6066,16 @@ const ::google::protobuf::internal::ClassData* Operation::GetClassData() const {
   return _class_data_.base();
 }
 PROTOBUF_CONSTINIT PROTOBUF_ATTRIBUTE_INIT_PRIORITY1
-const ::_pbi::TcParseTable<0, 6, 6, 0, 2> Operation::_table_ = {
+const ::_pbi::TcParseTable<0, 7, 7, 0, 2> Operation::_table_ = {
   {
     PROTOBUF_FIELD_OFFSET(Operation, _impl_._has_bits_),
     0, // no _extensions_
-    6, 0,  // max_field_number, fast_idx_mask
+    7, 0,  // max_field_number, fast_idx_mask
     offsetof(decltype(_table_), field_lookup_table),
-    4294967232,  // skipmap
+    4294967168,  // skipmap
     offsetof(decltype(_table_), field_entries),
-    6,  // num_field_entries
-    6,  // num_aux_entries
+    7,  // num_field_entries
+    7,  // num_aux_entries
     offsetof(decltype(_table_), aux_entries),
     _class_data_.base(),
     nullptr,  // post_loop_handler
@@ -5702,6 +6108,9 @@ const ::_pbi::TcParseTable<0, 6, 6, 0, 2> Operation::_table_ = {
     // optional .codegen.Tiling tiling = 6;
     {PROTOBUF_FIELD_OFFSET(Operation, _impl_.tiling_), _Internal::kHasBitsOffset + 0, 5,
     (0 | ::_fl::kFcOptional | ::_fl::kMessage | ::_fl::kTvTable)},
+    // .codegen.Conditional conditional = 7;
+    {PROTOBUF_FIELD_OFFSET(Operation, _impl_.op_type_.conditional_), _Internal::kOneofCaseOffset + 0, 6,
+    (0 | ::_fl::kFcOneof | ::_fl::kMessage | ::_fl::kTvTable)},
   }}, {{
     {::_pbi::TcParser::GetTable<::codegen::OpOverload>()},
     {::_pbi::TcParser::GetTable<::codegen::OpOverloadList>()},
@@ -5709,6 +6118,7 @@ const ::_pbi::TcParseTable<0, 6, 6, 0, 2> Operation::_table_ = {
     {::_pbi::TcParser::GetTable<::codegen::Tensor>()},
     {::_pbi::TcParser::GetTable<::codegen::TensorList>()},
     {::_pbi::TcParser::GetTable<::codegen::Tiling>()},
+    {::_pbi::TcParser::GetTable<::codegen::Conditional>()},
   }}, {{
   }},
 };
@@ -5792,6 +6202,13 @@ PROTOBUF_NOINLINE void Operation::Clear() {
                 stream);
           }
 
+          // .codegen.Conditional conditional = 7;
+          if (this_.op_type_case() == kConditional) {
+            target = ::google::protobuf::internal::WireFormatLite::InternalWriteMessage(
+                7, *this_._impl_.op_type_.conditional_, this_._impl_.op_type_.conditional_->GetCachedSize(), target,
+                stream);
+          }
+
           if (PROTOBUF_PREDICT_FALSE(this_._internal_metadata_.have_unknown_fields())) {
             target =
                 ::_pbi::WireFormat::InternalSerializeUnknownFieldsToArray(
@@ -5840,6 +6257,12 @@ PROTOBUF_NOINLINE void Operation::Clear() {
             case kLoop: {
               total_size += 1 +
                             ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.op_type_.loop_);
+              break;
+            }
+            // .codegen.Conditional conditional = 7;
+            case kConditional: {
+              total_size += 1 +
+                            ::google::protobuf::internal::WireFormatLite::MessageSize(*this_._impl_.op_type_.conditional_);
               break;
             }
             case OP_TYPE_NOT_SET: {
@@ -5922,6 +6345,15 @@ void Operation::MergeImpl(::google::protobuf::MessageLite& to_msg, const ::googl
               ::google::protobuf::Message::CopyConstruct<::codegen::Loop>(arena, *from._impl_.op_type_.loop_);
         } else {
           _this->_impl_.op_type_.loop_->MergeFrom(from._internal_loop());
+        }
+        break;
+      }
+      case kConditional: {
+        if (oneof_needs_init) {
+          _this->_impl_.op_type_.conditional_ =
+              ::google::protobuf::Message::CopyConstruct<::codegen::Conditional>(arena, *from._impl_.op_type_.conditional_);
+        } else {
+          _this->_impl_.op_type_.conditional_->MergeFrom(from._internal_conditional());
         }
         break;
       }

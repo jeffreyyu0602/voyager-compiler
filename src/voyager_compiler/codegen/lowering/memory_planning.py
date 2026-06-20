@@ -9,13 +9,14 @@ those space-annotated buffers/tiles into a concrete map:
     the intermediate ``voyager.alloc`` activation buffers are packed with a
     greedy best-fit, shared-object allocator that reuses a slot whose lifetime
     is disjoint and whose size is closest (least fragmentation).
-  * **Scratchpad** — a single fixed ``cache_size`` pool, structured as
-    ``num_banks`` banks.  Each top-level compute region (a ``while_loop`` nest
-    or an untiled load/compute/store group) is laid out with the existing
-    banking strategies (``codegen/banking.py``), which place an op's inputs /
-    weight / output in *separate banks* for crossbar bandwidth.  Regions run
-    sequentially, so each resets to offset 0 and the pool size is the max region
-    footprint.
+  * **Scratchpad** — every on-chip buffer is likewise an explicit
+    ``voyager.alloc(SRAM)`` (the input / output banks — each a ``[num_banks,
+    tile...]`` alloc — and the reduction scratch), so it is packed with the same
+    greedy best-fit allocator as DRAM: a buffer reuses the slot of one whose
+    lifetime is already dead, across region boundaries.  Bank separation is
+    *structural* — distinct banks are distinct allocs, so simultaneously-live
+    banks get distinct addresses automatically; no per-op banking strategy is
+    needed.
 
 The planner does not move values between DRAM and Scratchpad (that is fixed by
 bufferization); it only decides addresses, reuse, and pool sizes.  Results are
@@ -35,13 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..banking import (
-    get_banking_strategies_for_op,
-    require_allocation,
-    _get_scope,
-)
-from ..mapping import get_node_to_key_map
-from ..mapping_utils import is_conv2d, is_gemm_op, is_nop
+from ..banking import require_allocation
 from ..memory import MemorySpace, Segment, _align_size
 from ...pt2e_utils import dtype_byte_size
 
@@ -49,9 +44,7 @@ logger = logging.getLogger(__name__)
 
 voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
-_ZERO = voyager.zero_tile.default
-_LOAD = voyager.load_tile.default
-_STORE = voyager.store_tile.default
+_ZERO = voyager.zeros.default
 _INCR = voyager.increment_indices.default
 _WHILE = torch.ops.higher_order.while_loop
 _GETITEM = operator.getitem
@@ -164,7 +157,7 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
     #   reusable   -- alloc activation buffers, recycled once dead
     # ``buffer_of`` maps each DRAM node to the node owning its buffer.  Several
     # nodes can name the same physical buffer: an ``alloc`` owns itself, while a
-    # ``getitem``/``store_tile`` is just another handle to the buffer it pulls
+    # ``getitem``/``copy_tile`` is just another handle to the buffer it pulls
     # out of a loop / writes to, so it resolves back to that owner.
     buffer_of: Dict[Node, Node] = {}
     persistent: List[Node] = []
@@ -190,8 +183,6 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
                     carried = list(src.args[2])
                     if idx < len(carried) and isinstance(carried[idx], Node):
                         buffer_of[n] = buffer_of.get(carried[idx])
-            elif n.target is _STORE:  # alias: store -> its dest buffer
-                buffer_of[n] = buffer_of.get(n.args[1])
 
     # Lifetime of each buffer: from its def to the last top-level node consuming
     # it (or an alias).  A while_loop consuming a buffer keeps it live for the
@@ -224,142 +215,8 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Scratchpad planning (bank-aware, region-scoped)
+# Scratchpad planning (alloc-based, packed like DRAM)
 # ---------------------------------------------------------------------------
-
-
-def _bodies(model: GraphModule, loop: Node) -> List[GraphModule]:
-    """The body GraphModule of ``loop`` plus all nested loop / fused-module
-    bodies."""
-    out: List[GraphModule] = []
-    body = _submodule(model, loop.args[1].target)
-    if body is None:
-        return out
-    out.append(body)
-    for n in body.graph.nodes:
-        if n.op == "call_function" and n.target is _WHILE:
-            out += _bodies(body, n)
-        elif n.op == "call_module":
-            sub = _submodule(body, n.target)
-            if sub is not None:
-                out.append(sub)
-    return out
-
-
-def _resolve_tile(n: Node, arg_map: Dict[Node, Node]) -> Optional[Node]:
-    """Map a reference-op operand to the body ``load_tile`` that produces it: it
-    is the operand itself for an in-body ref, or the call_module arg bound to it
-    for a tail-fused submodule placeholder."""
-    if isinstance(n, Node) and n.op == "call_function" and n.target is _LOAD:
-        return n
-    return arg_map.get(n)
-
-
-def _region_nodes(bodies: List[GraphModule]) -> List[Node]:
-    """All nodes across a region's bodies (and fused submodules), flattened."""
-    return [n for g in bodies for n in g.graph.nodes]
-
-
-def _region_roles(nodes: List[Node]):
-    """Locate a region's reference compute op and its role -> tile map.
-
-    Returns ``(ref, output_node, key_to_node, tile_shapes)`` or ``None``.
-    ``ref`` is the GEMM/conv op (preferred) or the first scratchpad-producing
-    op; ``output_node`` is the node that carries its output tile (the ref, or
-    the call_module that wraps it); ``key_to_node`` maps ``f"{scope}::{role}"``
-    to the ``load_tile`` for each operand; ``tile_shapes`` maps each of those
-    tiles and the output node to its tile shape.
-    """
-    ref = next(
-        (
-            n
-            for n in nodes
-            if n.op == "call_function" and (is_gemm_op(n) or is_conv2d(n))
-        ),
-        None,
-    )
-    if ref is None:
-        ref = next(
-            (
-                n
-                for n in nodes
-                if n.op == "call_function"
-                and n.meta.get("space") == "Scratchpad"
-                and n.target not in (_LOAD, _ZERO)
-            ),
-            None,
-        )
-    if ref is None:
-        return None
-
-    # If ref lives inside a fused call_module, the tiles feed that module; map
-    # its placeholders back to the call_module args.
-    host = None
-    arg_map: Dict[Node, Node] = {}
-    for n in nodes:
-        if n.op != "call_module":
-            continue
-        sub = _owning_submodule(n)
-        if sub is not None and any(x is ref for x in sub.graph.nodes):
-            phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
-            arg_map = {
-                ph: a for ph, a in zip(phs, n.args) if isinstance(a, Node)
-            }
-            host = n
-            break
-
-    output_node = host if host is not None else ref
-    scope = _get_scope(ref.target)
-    try:
-        node_to_key = get_node_to_key_map(ref)
-    except (AttributeError, TypeError):
-        # ``normalize_function`` can't resolve some custom-op schemas; without a
-        # role map the region falls back to bump allocation (still correct).
-        return None
-    key_to_node: Dict[str, Node] = {}
-    tile_shapes: Dict[Node, tuple] = {}
-    for n, role in node_to_key.items():
-        if role == "output":
-            continue
-        tile = _resolve_tile(n, arg_map)
-        if tile is not None and _val(tile) is not None:
-            key_to_node[f"{scope}::{role}"] = tile
-            tile_shapes[tile] = tuple(_val(tile).shape)
-    if _val(output_node) is not None:
-        tile_shapes[output_node] = tuple(_val(output_node).shape)
-    return ref, output_node, key_to_node, tile_shapes
-
-
-def _owning_submodule(call_module_node: Node) -> Optional[GraphModule]:
-    gm = call_module_node.graph.owning_module
-    if gm is None:
-        return None
-    return _submodule(gm, call_module_node.target)
-
-
-def _scratch_regions(model: GraphModule) -> List[List[Node]]:
-    """The compute regions whose tiles share the pad while the region runs: one
-    per top-level ``while_loop`` nest, plus one per top-level untiled op (the
-    scratchpad cone behind its ``store_tile``).  A cone whose only compute is a
-    view / nop (reshape, flatten, ...) is DRAM-resident addressing, not a pad
-    occupant, so it is dropped — otherwise it would size the pad by a whole
-    untiled tensor."""
-    regions: List[List[Node]] = []
-    for n in model.graph.nodes:
-        if n.op == "call_function" and n.target is _WHILE:
-            regions.append(_region_nodes(_bodies(model, n)))
-    for store in model.graph.nodes:
-        if store.op == "call_function" and store.target is _STORE:
-            cone = _untiled_cone(store)
-            compute = [
-                x
-                for x in cone
-                if x.op == "call_function" and x.target not in (_LOAD, _ZERO)
-            ]
-            if compute and all(is_nop(x) for x in compute):
-                continue
-            regions.append(cone)
-    return regions
 
 
 # --- global schedule + per-buffer lifetimes (scratchpad allocated like DRAM) -
@@ -409,8 +266,8 @@ def _buffer_identity(model: GraphModule) -> _UnionFind:
     """Merge the FX nodes that name the *same* physical buffer.  A value carried
     through a ``while_loop`` is one buffer — its carried operand, the body
     placeholder it binds, the body's returned value for that slot, and the
-    loop-result ``getitem`` all collapse together.  So a ``zero_tile``
-    accumulator threaded through the reduction loop (zero_tile -> body arg ->
+    loop-result ``getitem`` all collapse together.  So a scratch ``alloc``
+    accumulator threaded through the reduction loop (alloc -> body arg ->
     accumulate-add -> getitem) becomes one buffer with one lifetime, instead of
     several co-live aliases."""
     uf = _UnionFind()
@@ -474,31 +331,11 @@ class _Buf:
     members: List[Node]
 
 
-def _nop_view_tiles(model: GraphModule) -> set:
-    """Scratchpad nodes whose only compute is a view / nop (reshape, flatten,
-    ...) bufferized as load-whole/store-whole.  These are DRAM-resident
-    addressing, not real pad occupants, so they are excluded from scratchpad
-    allocation (otherwise a whole untiled tensor would size the pad)."""
-    skip: set = set()
-    for store in model.graph.nodes:
-        if store.op == "call_function" and store.target is _STORE:
-            cone = _untiled_cone(store)
-            compute = [
-                x
-                for x in cone
-                if x.op == "call_function" and x.target not in (_LOAD, _ZERO)
-            ]
-            if compute and all(is_nop(x) for x in compute):
-                skip.update(cone)
-    return skip
-
-
 def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
     """Per scratchpad buffer (a union-find root): byte size, birth, and last
     use.  Death follows the alias chain — a use of *any* member (e.g. the
     getitem of a carried accumulator, or the bias-add that reads it) extends the
     lifetime."""
-    skip = _nop_view_tiles(model)
     members: Dict[Node, List[Node]] = {}
     for n in _walk(model):
         members.setdefault(uf.find(n), []).append(n)
@@ -508,9 +345,7 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
         tiles = [
             m
             for m in mem
-            if m.meta.get("space") == "Scratchpad"
-            and _val(m) is not None
-            and m not in skip
+            if m.meta.get("space") == "Scratchpad" and _val(m) is not None
         ]
         if not tiles:
             continue
@@ -525,121 +360,6 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
     return bufs
 
 
-# --- bank-aware placement: group an op's operands by bank, best-fit by time --
-
-
-@dataclass(eq=False)
-class _Group:
-    """A bank-aligned scratchpad allocation: one or more buffers an op's banking
-    strategy packs into the same bank, with a combined size / lifetime."""
-
-    size: int
-    def_t: int
-    last_t: int
-    members: List[
-        Tuple[Node, int]
-    ]  # (buffer root, byte offset within the group)
-    region: int
-
-
-def _build_groups(
-    region_info, strat_idx, bufs, uf, bank_size, bank_width, unroll_dim
-):
-    """Turn each region's tiles into bank-aligned ``_Group``s under the
-    region's currently-selected banking strategy: the ref op's operands are
-    grouped by the bank ``evaluate`` assigns them (same bank -> packed together,
-    different banks -> separate groups), and every other scratchpad buffer
-    (accumulator / residual / bias) becomes its own group."""
-    groups: List[_Group] = []
-    placed: set = set()
-
-    def _add(members, region):
-        if not members:
-            return
-        size = max(off + bufs[r].size for r, off in members)
-        if bank_size:
-            size = int(_align_size(size, bank_size))
-        groups.append(
-            _Group(
-                size,
-                min(bufs[r].def_t for r, _ in members),
-                max(bufs[r].last_t for r, _ in members),
-                members,
-                region,
-            )
-        )
-
-    for rid, (nodes, roles) in enumerate(region_info):
-        if roles is not None:
-            ref, output_node, key_to_node, tile_shapes = roles
-            # ``evaluate`` / ``compute_tensor_size`` read ``node.value``, which
-            # body tiles lack (only ``meta['val']``); mirror it across
-            # (codegen's later ShapeProp overwrites it).
-            for n in tile_shapes:
-                if not isinstance(getattr(n, "value", None), torch.Tensor):
-                    v = n.meta.get("val")
-                    if isinstance(v, torch.Tensor):
-                        n.value = v
-            strat_list = get_banking_strategies_for_op(ref.target)
-            strategy = strat_list[min(strat_idx[rid], len(strat_list) - 1)]
-            _total, node_to_seg = strategy.evaluate(
-                key_to_node,
-                output_node,
-                tile_shapes,
-                bank_width,
-                bank_size,
-                unroll_dim,
-            )
-            by_bank: Dict[int, List[Tuple[Node, int]]] = {}
-            for tile, seg in node_to_seg.items():
-                root = uf.find(tile)
-                if root not in bufs or root in placed:
-                    continue
-                placed.add(root)
-                bank = seg.start // bank_size if bank_size else 0
-                off = seg.start % bank_size if bank_size else 0
-                by_bank.setdefault(bank, []).append((root, off))
-            for members in by_bank.values():
-                _add(members, rid)
-
-        # Every remaining scratchpad buffer in the region (accumulator,
-        # residual, bias, or the whole region when no banking role was found) ->
-        # its own bank.
-        for n in nodes:
-            if n.meta.get("space") != "Scratchpad":
-                continue
-            root = uf.find(n)
-            if root in placed or root not in bufs:
-                continue
-            placed.add(root)
-            _add([(root, 0)], rid)
-
-    for root in bufs:  # defensive: anything outside a region
-        if root not in placed:
-            placed.add(root)
-            _add([(root, 0)], -1)
-    return groups
-
-
-def _peak_live(groups: List[_Group]) -> Tuple[int, int, List[_Group]]:
-    """The timestamp of maximum concurrent scratchpad demand and the groups
-    live then.  Used to decide which ops to repack when the plan overflows
-    ``cache_size``.
-    """
-    events = []
-    for g in groups:
-        events.append((g.def_t, 1, g.size))  # birth
-        events.append((g.last_t + 1, 0, g.size))  # death (exclusive)
-    cur = best = 0
-    best_t = 0
-    for t, birth, size in sorted(events):
-        cur += size if birth else -size
-        if cur > best:
-            best, best_t = cur, t
-    live = [g for g in groups if g.def_t <= best_t <= g.last_t]
-    return best, best_t, live
-
-
 def _plan_scratchpad(
     model: GraphModule,
     uf: "_UnionFind",
@@ -649,79 +369,29 @@ def _plan_scratchpad(
     bank_width: Optional[int],
     unroll_dim: Optional[int],
 ):
-    """Allocate the scratchpad like DRAM: every tile is a buffer with a
-    lifetime, and buffers are packed with greedy best-fit so a tile reuses a
-    bank whose occupant is already dead — across region boundaries, not reset
-    per region.  Bank separation comes from each op's banking strategy (operands
-    grouped into bank-aligned ``_Group``s).  If the plan exceeds ``cache_size``,
-    the ops live at the peak are repacked with a more-grouped strategy (fewer
-    banks) and the placement is redone.
+    """Pack every Scratchpad buffer with greedy best-fit, exactly like DRAM.
+
+    With the alloc-only model each on-chip buffer is an explicit
+    ``voyager.alloc(SRAM)`` — the input / output banks (a ``[num_banks,
+    tile...]`` alloc each) and the reduction scratch — so ``bufs`` already lists
+    them with sizes and lifetimes.  A buffer reuses the address of one whose
+    lifetime is already dead (across region boundaries).  Bank separation is
+    *structural*: distinct banks are distinct allocs, so simultaneously-live
+    banks land at distinct addresses automatically — no per-op banking strategy
+    or region grouping is needed.
     """
-    bank_size = cache_size // num_banks if num_banks else None
-
-    region_info = [
-        (nodes, _region_roles(nodes)) for nodes in _scratch_regions(model)
+    items = [
+        (root, buf.size, buf.def_t, buf.last_t) for root, buf in bufs.items()
     ]
-    strat_idx = [0] * len(region_info)  # most-separated strategy per region
-
-    groups: List[_Group] = []
-    bases: Dict[_Group, int] = {}
-    total = 0
-    for _ in range(64):
-        groups = _build_groups(
-            region_info, strat_idx, bufs, uf, bank_size, bank_width, unroll_dim
+    bases, total = _greedy_best_fit(items)
+    for root, base in bases.items():
+        seg = Segment(
+            base, base + bufs[root].size, MemorySpace.SCRATCHPAD, root
         )
-        bases, total = _greedy_best_fit(
-            [(g, g.size, g.def_t, g.last_t) for g in groups]
-        )
-        if total <= cache_size:
-            break
-        # Repack the ops contributing to the peak with a more-grouped strategy.
-        _peak, _t, live = _peak_live(groups)
-        changed = False
-        for rid in {g.region for g in live if g.region >= 0}:
-            _nodes, roles = region_info[rid]
-            if roles is None:
-                continue
-            n_strat = len(get_banking_strategies_for_op(roles[0].target))
-            if strat_idx[rid] < n_strat - 1:
-                strat_idx[rid] += 1
-                changed = True
-        if not changed:
-            break
+        for m in bufs[root].members:
+            m.meta.setdefault("scratchpad", seg)
 
-    for g in groups:
-        base = bases[g]
-        for root, off in g.members:
-            seg = Segment(
-                base + off,
-                base + off + bufs[root].size,
-                MemorySpace.SCRATCHPAD,
-                root,
-            )
-            for m in bufs[root].members:
-                m.meta.setdefault("scratchpad", seg)
-
-    return int(total), {"groups": len(groups), "downgrades": sum(strat_idx)}
-
-
-def _untiled_cone(store: Node) -> List[Node]:
-    """Scratchpad nodes feeding a top-level ``store_tile`` (its load/compute
-    group); the backward walk stops at DRAM operands, isolating this op's
-    region."""
-    cone: List[Node] = []
-    seen = set()
-    stack = [store.args[0]]
-    while stack:
-        x = stack.pop()
-        if not isinstance(x, Node) or x in seen:
-            continue
-        seen.add(x)
-        if x.meta.get("space") != "Scratchpad":
-            continue
-        cone.append(x)
-        stack.extend(x.all_input_nodes)
-    return cone
+    return int(total), {"buffers": len(items)}
 
 
 # ---------------------------------------------------------------------------
@@ -732,7 +402,7 @@ def _untiled_cone(store: Node) -> List[Node]:
 def _thread_segments(model: GraphModule) -> None:
     """Propagate ``meta['memory']`` / ``meta['scratchpad']`` from buffer roots
     onto the body placeholders bound to them and onto in-place compute tiles, so
-    every ``load_tile`` source / ``store_tile`` dest / op tile resolves to an
+    every ``copy_tile`` / ``async_copy`` tile and op tile resolves to an
     address.
     Mirrors the space-threading recursion of ``annotate_tensor_spaces``.
     """
@@ -788,7 +458,7 @@ def _thread_segments(model: GraphModule) -> None:
                         carried = list(src.args[2])
                         if idx < len(carried) and get(carried[idx]) is not None:
                             _set(node, get(carried[idx]), local)
-                elif node.target not in (_LOAD, _ZERO, _STORE, _INCR, _ALLOC):
+                elif node.target not in (_ZERO, _INCR, _ALLOC):
                     # In-place compute tile: inherit the segment of its first
                     # scratchpad input (e.g. accumulate-add reuses the
                     # accumulator).

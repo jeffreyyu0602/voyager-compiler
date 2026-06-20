@@ -21,6 +21,7 @@ import torch
 from torch.fx import GraphModule
 
 from ..mapping_utils import (
+    convert_arg,
     is_nop,
     map_node,
     set_output_field,
@@ -28,6 +29,7 @@ from ..mapping_utils import (
 )
 from ..param_pb2 import Model, Operation, Tensor
 from ..shape_prop import ShapeProp
+from .ops import oracle_disabled
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
@@ -44,12 +46,6 @@ def _target_name(target, short: bool = False) -> str:
 # ===========================================================================
 # 1. Protobuf code generation
 # ===========================================================================
-
-
-def _is_lifted_index(node: torch.fx.Node) -> bool:
-    return node.op == "get_attr" and str(node.target).startswith(
-        "lifted_tensor"
-    )
 
 
 def _loop_input_value(n):
@@ -106,7 +102,12 @@ def _emit_body(
 ) -> None:
     """ShapeProp a (sub)graph with given input values and append Operations."""
     # Pass one value per placeholder, in order (tensors and scalar constants).
-    ShapeProp(gm).propagate(*body_args)
+    # This re-runs a loop / cond body in isolation (a single iteration), where a
+    # wait legitimately precedes its matching copy from an earlier iteration, so
+    # ``async_wait``'s counting-semaphore oracle is suspended — codegen needs
+    # only shapes/values, not the balance invariant.
+    with oracle_disabled():
+        ShapeProp(gm).propagate(*body_args)
     named = dict(gm.named_modules(remove_duplicate=False))
     for node in gm.graph.nodes:
         _emit_node(node, gm, named, ops, output_dir)
@@ -116,7 +117,7 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
     """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a
     protobuf ``fused_op`` — an ``OpOverloadList`` of the submodule's compute
     ops, mirroring the default ``gen_code`` call_module path.  The body's
-    ShapeProp gave the call_module node + its ``load_tile`` args their
+    ShapeProp gave the call_module node + its loaded-tile args their
     ``value``, so we ShapeProp the submodule with those to populate its inner
     nodes for ``map_node``."""
     sub = named[str(node.target)]
@@ -139,28 +140,26 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
     return op
 
 
-_LOAD_TILE = torch.ops.voyager.load_tile.default
-_STORE_TILE = torch.ops.voyager.store_tile.default
 _COPY_TILE = torch.ops.voyager.copy_tile.default
+_ASYNC_COPY = torch.ops.voyager.async_copy.default
+_ASYNC_WAIT = torch.ops.voyager.async_wait.default
 
 
 def _feeds_tile_index(node, _seen=None) -> bool:
     """True if ``node`` (transitively) computes a tile DMA block index — it
-    reaches the ``indices`` argument of a ``load_tile`` / ``store_tile`` /
-    ``copy_tile`` through a chain of scalar index arithmetic.  Such addressing
-    (a pipelined prefetch's ``j+1``, or a ``delinearize_index(i)`` of the linear
-    counter) is real computation, not loop control, so the whole cone must be
-    emitted rather than dropped."""
+    reaches the ``indices`` argument of a ``copy_tile`` / ``async_copy`` through
+    a chain of scalar index arithmetic.  Such addressing (a pipelined prefetch's
+    ``j+1``, or a ``delinearize_index(i)`` of the linear counter) is real
+    computation, not loop control, so the whole cone must be emitted rather than
+    dropped."""
     if _seen is None:
         _seen = set()
     for u in node.users:
         if u in _seen or u.op != "call_function":
             continue
         _seen.add(u)
-        if u.target in (_LOAD_TILE, _STORE_TILE, _COPY_TILE):
-            ix = (
-                1 if u.target is _LOAD_TILE else 2
-            )  # position of the ``indices`` arg
+        if u.target in (_COPY_TILE, _ASYNC_COPY):
+            ix = 2  # position of the ``indices`` arg
             if len(u.args) > ix and node in (u.args[ix] or ()):
                 return True
         elif not isinstance(
@@ -169,6 +168,31 @@ def _feeds_tile_index(node, _seen=None) -> bool:
             # scalar index arithmetic (add / floordiv / mod / getitem) —
             # recurse.
             if _feeds_tile_index(u, _seen):
+                return True
+    return False
+
+
+def _feeds_cond_predicate(node, _seen=None) -> bool:
+    """True if ``node`` (transitively) computes a ``torch.cond`` predicate — it
+    reaches the predicate (``args[0]``) of a ``cond`` through a chain of scalar
+    bool / int arithmetic (``eq`` / ``lt`` / ``bitwise_or`` / ``bitwise_and``,
+    or a ``delinearize_index`` component getitem the comparison reads).  Such a
+    predicate cone is real computation the ``Conditional`` references by name, so
+    it must be emitted rather than dropped as loop control."""
+    if _seen is None:
+        _seen = set()
+    for u in node.users:
+        if u in _seen or u.op != "call_function":
+            continue
+        _seen.add(u)
+        if u.target is COND:
+            if u.args and node is u.args[0]:
+                return True
+        elif not isinstance(
+            getattr(u, "value", None), (torch.Tensor, list, tuple)
+        ):
+            # scalar predicate arithmetic (eq / or / and / getitem) — recurse.
+            if _feeds_cond_predicate(u, _seen):
                 return True
     return False
 
@@ -184,11 +208,15 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
         ops.append(_emit_loop(node, gm, named, output_dir))
         return
 
+    if node.target is COND:
+        ops.append(_emit_cond(node, gm, named, output_dir))
+        return
+
     # getitem usually just unpacks loop results (no compute) — dropped, UNLESS
     # it extracts a tile-index component (a ``delinearize_index`` output) that a
     # tile DMA addresses by, which is genuine address-gen and must be emitted.
     if node.target is operator.getitem:
-        if not _feeds_tile_index(node):
+        if not (_feeds_tile_index(node) or _feeds_cond_predicate(node)):
             return
     elif is_nop(node):
         return
@@ -196,12 +224,13 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
     # start/end/step already encodes the iteration, so it is not a compute op.
     elif node.target is INCREMENT_INDICES:
         return
-    # A side-effecting tile DMA (``copy_tile`` / ``store_tile``; returns
-    # ``None`` since the buffer is a closed-over additional input mutated in
-    # place) is a real instruction, always emitted despite its non-tensor value
-    # — its output is the tile it writes (set from the dest in
-    # ``set_output_field``).
-    elif node.target not in (_COPY_TILE, _STORE_TILE):
+    # A side-effecting DMA op (``copy_tile`` / ``async_copy`` write a tile;
+    # ``async_wait`` synchronizes a semaphore) returns ``None`` — the buffer /
+    # semaphore is a closed-over additional input mutated in place — yet each is
+    # a real instruction, always emitted despite its non-tensor value.  A tile
+    # DMA's output is the tile it writes (set from the dest in
+    # ``set_output_field``); ``async_wait`` has no output.
+    elif node.target not in (_COPY_TILE, _ASYNC_COPY, _ASYNC_WAIT):
         # A non-tensor call_function is usually integer loop-index carry
         # arithmetic (k+1, k % num_k, ...) — loop control made explicit by the
         # Loop structure, so not emitted.  The exception is a value that
@@ -211,7 +240,7 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
         if not isinstance(
             getattr(node, "value", None), (torch.Tensor, list, tuple)
         ):
-            if not _feeds_tile_index(node):
+            if not (_feeds_tile_index(node) or _feeds_cond_predicate(node)):
                 return
 
     op = Operation()
@@ -255,6 +284,36 @@ def _emit_loop(node, parent_gm, parent_named, output_dir) -> Operation:
     return loops[0]
 
 
+def _emit_cond(node, parent_gm, parent_named, output_dir) -> Operation:
+    """Emit a ``torch.cond`` as a ``Conditional`` proto (MLIR ``scf.if``).
+
+    ``node.args`` is ``(pred, true_graph, false_graph, operands)`` (the layout
+    the text printer's ``_print_cond`` also reads).  Each branch is ShapeProp'd
+    with the captured ``operands`` and emitted into its own op list, mirroring
+    ``_emit_loop``'s body emission.  The predicate is referenced by name (a
+    bool-valued node) via ``convert_arg``.  A *dummy* false branch (``return 0``)
+    has no compute ops, so ``_emit_body`` appends nothing and ``false_body`` is
+    left empty — the optional ``else`` is simply omitted.
+    """
+    true_gm = parent_named[str(node.args[1].target)]
+    false_gm = parent_named[str(node.args[2].target)]
+    operands = list(node.args[3]) if len(node.args) > 3 else []
+    body_args = [_loop_input_value(n) for n in operands]
+
+    op = Operation()
+    op.conditional.predicate.CopyFrom(convert_arg(node.args[0], output_dir))
+
+    true_ops: List[Operation] = []
+    _emit_body(true_gm, body_args, true_ops, output_dir)
+    op.conditional.true_body.extend(true_ops)
+
+    false_ops: List[Operation] = []
+    _emit_body(false_gm, body_args, false_ops, output_dir)
+    if false_ops:
+        op.conditional.false_body.extend(false_ops)
+    return op
+
+
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     """
     Generate a protobuf ``Model`` from a bufferized FX graph, emitting ``Loop``
@@ -275,8 +334,6 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
             model_params.inputs.append(tensor)
             continue
         if node.op == "get_attr":
-            if _is_lifted_index(node):
-                continue
             mod = getattr(model, str(node.target), None)
             if isinstance(mod, GraphModule):
                 continue  # cond/body subgraphs are emitted inside their loop

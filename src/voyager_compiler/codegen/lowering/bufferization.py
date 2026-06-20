@@ -37,10 +37,8 @@ voyager = torch.ops.voyager
 # Memory-location annotation (self-contained; does NOT reuse _should_use_dram)
 # ---------------------------------------------------------------------------
 
-_VOYAGER_LOAD = torch.ops.voyager.load_tile.default
-_VOYAGER_STORE = torch.ops.voyager.store_tile.default
 _VOYAGER_ALLOC = torch.ops.voyager.alloc.default  # DRAM output buffer
-_VOYAGER_ZERO = torch.ops.voyager.zero_tile.default  # Scratchpad accumulator
+_VOYAGER_ZEROS = torch.ops.voyager.zeros.default  # accumulator / semaphore bank
 _VOYAGER_INCR = torch.ops.voyager.increment_indices.default
 _VOYAGER_DELIN = torch.ops.voyager.delinearize_index.default
 _VOYAGER_ASYNC = (
@@ -48,14 +46,6 @@ _VOYAGER_ASYNC = (
 )  # guarded DRAM<->Scratchpad DMA
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
-
-# Whole-tensor preprocessing done in DRAM before tiling (the conv / pool halo
-# pad); its padded output is then load_tiled, so it stays in DRAM rather than
-# being a tile compute.
-_DRAM_TRANSFORM = {
-    torch.ops.aten.pad.default,
-    torch.ops.aten.constant_pad_nd.default,
-}
 
 
 def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
@@ -79,16 +69,6 @@ def _produces_tensor(node: Node) -> bool:
     if isinstance(val, (tuple, list)):
         return any(isinstance(e, torch.Tensor) for e in val)
     return False
-
-
-def _is_scalar_operand(node: Node) -> bool:
-    """A 0-D or single-element operand — passed *whole* into an op (like a
-    codebook), not tiled, so it may legitimately be a DRAM input to a compute
-    op."""
-    val = node.meta.get("val", getattr(node, "value", None))
-    return isinstance(val, torch.Tensor) and (
-        val.ndim == 0 or list(val.shape) == [1]
-    )
 
 
 def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
@@ -139,25 +119,23 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
 _VOYAGER_WAIT = torch.ops.voyager.async_wait.default
 _VOYAGER_COPY = torch.ops.voyager.copy_tile.default
 
-# Control logic / addressing / DMA / store / buffer ops — *not* tile compute, so
-# they are exempt from the destination-passing check below.  The prefetch
-# semaphore (``where`` / ``eq`` / the DMA-guard's ``zeros`` dummy), the async
-# DMA + its token wait, the index ops, the bank-read ``select``, the
-# multi-output ``getitem``, the ``copy_tile`` store itself, and the ``alloc``
-# buffer all fall here.  (These become registers; not annotated yet.)
+# Memory / control-flow / semaphore ops — *not* tile compute, so they are exempt
+# from the destination-passing check below: the buffer producers (``alloc`` /
+# ``zeros``) and the ``copy_tile`` store, the async DMA + its semaphore
+# ``async_wait``, the index / counter ops (``increment_indices`` /
+# ``delinearize_index``), the bank- and semaphore-read ``select``, and the
+# multi-output / cond-unpack ``getitem``.  (These become registers; not
+# annotated yet.)  ``voyager.zeros`` (the accumulator / per-slot semaphore bank
+# init) is exempt — but a genuine ``aten.zeros`` *is* a compute op and is not.
 _NON_COMPUTE = {
     _VOYAGER_ALLOC,
+    _VOYAGER_ZEROS,
     _VOYAGER_ASYNC,
     _VOYAGER_WAIT,
     _VOYAGER_COPY,
     _VOYAGER_INCR,
     _VOYAGER_DELIN,
     torch.ops.aten.select.int,
-    torch.ops.aten.where.self,
-    torch.ops.aten.eq.Scalar,
-    torch.ops.aten.eq.Tensor,
-    torch.ops.aten.zeros.default,
-    torch.ops.aten.arange.default,  # grid-index range (addressing)
     operator.getitem,
 }
 
@@ -301,13 +279,15 @@ def propagate_logical_dtypes(
 
     The quantizer leaves ``meta['dtype']`` (a string like ``'nf4_6'`` /
     ``'fp8_e5m3'``) on input / weight / scale nodes, and the pass tags each
-    output buffer (``voyager.alloc``) with the output's logical dtype.  A
-    ``load_tile`` then inherits its source's dtype and the tile feeding a
-    ``store_tile`` inherits the destination buffer's, so codegen emits the
-    logical dtype rather than the physical storage dtype.  Threads through
-    ``while_loop`` bodies via their carried / additional inputs.  Ops whose
-    output is genuinely physical (the fp32 accumulator from a GEMM/conv) keep
-    no logical dtype.
+    output buffer (``voyager.alloc``) with the output's logical dtype, so
+    codegen emits the logical dtype rather than the physical storage dtype.
+    Threads through ``while_loop`` bodies via their carried / additional inputs.
+    Ops whose output is genuinely physical (the fp32 accumulator from a
+    GEMM/conv) keep no logical dtype.
+
+    TODO: per-*tile* logical-dtype inheritance previously rode ``load_tile`` /
+    ``store_tile`` (now retired); the equivalent for ``copy_tile`` /
+    ``async_copy`` is not yet wired (needed by the quantized end-to-end path).
     """
     for ph, d in (ph_dtypes or {}).items():
         if isinstance(d, str):
@@ -320,15 +300,7 @@ def propagate_logical_dtypes(
     for node in gm.graph.nodes:
         if node.op != "call_function":
             continue
-        if node.target is _VOYAGER_LOAD:
-            if (d := _dt(node.args[0])) is not None:
-                node.meta["dtype"] = d
-        elif node.target is _VOYAGER_STORE:
-            if (d := _dt(node.args[1])) is not None:  # destination buffer
-                node.meta["dtype"] = d
-                if isinstance(node.args[0], Node):
-                    node.args[0].meta.setdefault("dtype", d)
-        elif node.target is while_loop:
+        if node.target is while_loop:
             body = getattr(gm, str(node.args[1].target), None)
             if isinstance(body, GraphModule):
                 inputs = list(node.args[2])
@@ -532,65 +504,82 @@ _REDUCTION_POINTWISE_OPS = _MULTI_OUTPUT_POINTWISE | {
 
 
 def _build_for_untiled(node: Node):
-    """Bufferize an untiled op trivially: load each tiled tensor input whole
-    (codebooks and scalars passed through, not loaded), run the op, store each
-    output whole — no loop, since the operands and output(s) fit on-chip.
+    """Bufferize an untiled op through the pipeline scheduler with *whole-tensor*
+    tiles: a single-step ``PipelinedKernel`` (grid ``(1,)``) that DMA-loads each
+    tiled input whole, runs the op, and stores each output whole — no tiling
+    loop, since the operands and output(s) fit on-chip.  Codebooks and scalars
+    (0-D / single-element) are passed whole, not loaded.
+
+    Every tensor dim maps to the lone (extent-1) grid dim, so the spec is
+    op-agnostic — it works for shape-changing ops (``reshape`` / ``slice``)
+    where the elementwise-alignment spec of ``build_pointwise`` would not.
 
     Returns ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to
-    load/store (``getitem``, a non-tensor output, or no tensor inputs).
+    load/store (``getitem``, a non-tensor output).
     """
+    from .pipeline import _map_kernel, build_pipelined_buffers
+    from .utils import _InputSpec, _OutputSpec
+
     if node.target is operator.getitem:
         return None
     val = getattr(node, "value", None)
     if not isinstance(val, (torch.Tensor, list, tuple)):
         return None
 
-    g = fx.Graph()
-    # Placeholders in ``all_input_nodes`` order, so the splice wires them
-    # uniformly.  Codebook / qmap operands and scalars (0-D or single-element)
-    # are passed *whole* — the op indexes / broadcasts them directly, they are
-    # not tiled DMA loads — as in the tiled pointwise path.  Every other input
-    # is DMA'd in whole via a single load_tile.
+    in_nodes = node.all_input_nodes
+    inputs = [n.value.clone() for n in in_nodes]
+    outputs = list(val) if isinstance(val, (list, tuple)) else [val]
     codebooks = _codebook_arg_nodes(node)
-    remap = {}
-    for inp in node.all_input_nodes:
-        shape = list(inp.value.shape)
-        placeholder = g.placeholder(inp.name)
-        if inp in codebooks or len(shape) == 0 or shape == [1]:
-            remap[inp] = placeholder  # whole operand, not a tiled load
-        else:
-            remap[inp] = g.call_function(
-                voyager.load_tile.default,
-                (placeholder, [0] * len(shape), shape),
-            )
-    # The op itself, with its tensor args now the loaded tiles (scalar /
-    # codebook args pass through unchanged).
-    op = g.node_copy(node, lambda n: remap[n])
 
-    multi = isinstance(val, (list, tuple))
-    vals = list(val) if multi else [val]
-    dtype_meta = node.meta.get("dtype")
-    # ``dtype`` is per-output for a multi-output op, but absent (None) for a
-    # non-quantized one — so key off whether it's actually a sequence, not off
-    # ``multi`` (list(None)!).
-    dtypes = (
-        list(dtype_meta)
-        if isinstance(dtype_meta, (list, tuple))
-        else [dtype_meta]
-    )
-    outputs = []
-    for idx, v in enumerate(vals):
-        shape = list(v.shape)
-        buf = g.call_function(voyager.alloc.default, (shape, v.dtype))
-        if idx < len(dtypes) and isinstance(dtypes[idx], str):
-            buf.meta["dtype"] = dtypes[idx]  # emit the dtypes (quantized) dtype
-        src = g.call_function(operator.getitem, (op, idx)) if multi else op
-        # ``store_tile`` writes ``buf`` in place (a side effect, returns
-        # nothing); the op's output is the buffer itself, not the store.
-        g.call_function(
-            voyager.store_tile.default, (src, buf, [0] * len(shape), shape)
+    # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
+    # constant *now* — the closure runs in the traced while_loop body, where
+    # dynamo rejects FX-Node lookups (mirrors ``build_pointwise``).
+    order = {n: i for i, n in enumerate(in_nodes)}
+    _plain = lambda a: list(a) if isinstance(a, list) else a
+    arg_slots = [
+        order[a] if isinstance(a, fx.Node) else None for a in node.args
+    ]
+    kw_slots = {
+        k: order[v] if isinstance(v, fx.Node) else None
+        for k, v in node.kwargs.items()
+    }
+    op_args = [_plain(a) for a in node.args]
+    op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
+    op = node.target
+
+    def compute(grid_index, *tiles):
+        args = [
+            tiles[i] if i is not None else a for i, a in zip(arg_slots, op_args)
+        ]
+        kwargs = {
+            k: tiles[i] if i is not None else op_kwargs[k]
+            for k, i in kw_slots.items()
+        }
+        return op(*args, **kwargs)
+
+    grid = (1,)
+    in_specs = [
+        (
+            None
+            if (
+                n in codebooks
+                or n.value.ndim == 0
+                or list(n.value.shape) == [1]
+            )
+            else _InputSpec(
+                tuple(n.value.shape),
+                (0,) * n.value.ndim,
+                (False,) * n.value.ndim,
+            )
         )
-        outputs.append(buf)
-    g.output(tuple(outputs))
-    g.lint()
-    return fx.GraphModule(torch.nn.Module(), g), len(vals)
+        for n in in_nodes
+    ]
+    out_specs = [
+        _OutputSpec(tuple(o.shape), tuple(o.shape), (0,) * o.ndim, o.dtype)
+        for o in outputs
+    ]
+    kernel = _map_kernel(compute, len(outputs))
+    gm = build_pipelined_buffers(
+        kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=1
+    )
+    return gm, len(outputs)

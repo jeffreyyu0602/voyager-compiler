@@ -369,11 +369,10 @@ class PipelinedKernel(torch.nn.Module):
         # place like the SRAM banks), so it carries the copy->wait dependency the
         # old returned token used to thread through the loop's token vectors.
         sem_loads = [
-            torch.zeros(self.num_banks, dtype=torch.int64) for _ in tiled
+            voyager.zeros([self.num_banks], torch.int64) for _ in tiled
         ]
         sem_stores = [
-            torch.zeros(self.num_banks, dtype=torch.int64)
-            for _ in self.out_specs
+            voyager.zeros([self.num_banks], torch.int64) for _ in self.out_specs
         ]
         # Scratch refs: allocate once here (single buffer, not
         # ``num_banks``-deep — reused immediately for the next tile's reduction
@@ -781,14 +780,6 @@ def _map_kernel(compute: Callable, num_outputs: int):
             voyager.copy_tile(value, bank, (0,) * bank.ndim, bank.shape)
 
     return kernel
-
-
-def _dense_strides(shape) -> Tuple[int, ...]:
-    """Canonical (C-contiguous) strides for ``shape``."""
-    st = [1] * len(shape)
-    for i in range(len(shape) - 2, -1, -1):
-        st[i] = st[i + 1] * shape[i + 1]
-    return tuple(st)
 
 
 def _reduction_fused_kernel(

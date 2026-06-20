@@ -66,6 +66,15 @@ message Loop {
   repeated Operation body = 5; // The recursive body
 }
 
+// A two-way branch modeled on MLIR scf::if: run true_body when the bool
+// predicate holds, else false_body.  false_body is optional — omitted for the
+// common "dummy skip" guard whose else branch does nothing.
+message Conditional {
+  Argument predicate = 1;            // bool: node reference or literal
+  repeated Operation true_body = 2;  // "then" region
+  repeated Operation false_body = 3; // optional "else" region
+}
+
 enum LoopIndex {
   FX = 0;
   FY = 1;
@@ -102,6 +111,7 @@ message Operation {
     OpOverload op = 1;
     OpOverloadList fused_op = 2;
     Loop loop = 3;
+    Conditional conditional = 7;
   }
 
   oneof return_type {

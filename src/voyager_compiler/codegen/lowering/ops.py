@@ -9,12 +9,15 @@ lowering pass and consumed by the loop-aware code generator.
 Primitives
 ----------
 ``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
-``voyager.zero_tile(size, dtype)``   zero-initialised accumulator tile.
-``voyager.load_tile(...)``           DMA load of a tile into on-chip SRAM.
-``voyager.store_tile(src, dest...)`` side-effecting DMA store of a tile.
+``voyager.zeros(size, dtype)``       zero-initialised tile / bank (accumulator, semaphore).
+``voyager.copy_tile(src, dst, ...)`` side-effecting tile DMA (load or store).
+``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
+``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
+``voyager.delinearize_index(...)``   linear loop counter -> multi-dim index.
 """
 
+from contextlib import contextmanager
 from enum import IntEnum
 from typing import List, Optional, Tuple
 
@@ -67,23 +70,26 @@ def _alloc_fake(
 
 
 # ---------------------------------------------------------------------------
-# voyager.zero_tile — zero-initialised accumulator tile.
+# voyager.zeros — zero-initialised on-chip tile / bank (e.g. a reduction
+# accumulator or a per-slot DMA-semaphore bank).  A ``voyager`` op (not
+# ``aten.zeros``) so the bufferizer can tell a control/semaphore zero-init from
+# a genuine ``aten.zeros`` compute op.
 # ---------------------------------------------------------------------------
-voyager_lib.define("zero_tile(SymInt[] size, ScalarType dtype) -> Tensor")
+voyager_lib.define("zeros(SymInt[] size, ScalarType dtype) -> Tensor")
 
 
-@impl(voyager_lib, "zero_tile", "CompositeExplicitAutograd")
-def zero_tile(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+@impl(voyager_lib, "zeros", "CompositeExplicitAutograd")
+def zeros(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return torch.zeros(size, dtype=dtype)
 
 
-@torch.library.register_fake("voyager::zero_tile")
-def _zero_tile_fake(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+@torch.library.register_fake("voyager::zeros")
+def _zeros_fake(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return torch.zeros(size, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
-# Per-dim block-index assembly shared by load_tile / store_tile.
+# Per-dim block-index assembly for ``copy_tile``.
 # ---------------------------------------------------------------------------
 def _full_indices(
     rank: int,
@@ -111,125 +117,10 @@ def _full_indices(
 
 
 # ---------------------------------------------------------------------------
-# voyager.load_tile — emulate a DMA load of a tile from ``input``.
-#
-# ``indices`` is the per-dim block index: the tile start along dim d is
-# ``indices[d] * tile_strides[d]`` and the tile spans ``tile_sizes[d]``.  When
-# only some dims are tiled, pass those dims' block indices in ``indices`` and
-# name them in ``dims`` (one per ``indices`` entry); the untiled dims take
-# their block index from ``static_indices`` (constant, default 0).
-# ``dims=None`` (default) means ``indices`` covers every dim.  ``tile_strides``
-# defaults to ``tile_sizes`` (contiguous tiling); a smaller step yields
-# *overlapping* tiles (the conv input halo).  ``transposed`` applies ``.mT`` to
-# the loaded tile.
-# ---------------------------------------------------------------------------
-voyager_lib.define(
-    "load_tile(Tensor input, SymInt[] indices, SymInt[] tile_sizes, "
-    "SymInt[]? dims=None, SymInt[]? static_indices=None, "
-    "SymInt[]? tile_strides=None, bool transposed=False) -> Tensor"
-)
-
-
-@impl(voyager_lib, "load_tile", "CompositeExplicitAutograd")
-def load_tile(
-    input: torch.Tensor,
-    indices: Tuple[int, ...],
-    tile_sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-    tile_strides: Optional[Tuple[int, ...]] = None,
-    transposed: bool = False,
-) -> torch.Tensor:
-    if tile_strides is None:
-        tile_strides = tile_sizes
-
-    rank = input.dim()
-    full = _full_indices(rank, indices, dims, static_indices)
-    assert rank == len(tile_sizes) == len(tile_strides) == len(full)
-
-    start = [full[d] * tile_strides[d] for d in range(rank)]
-    slices = tuple(
-        slice(start[d], start[d] + tile_sizes[d]) for d in range(rank)
-    )
-    # A DMA load is a *copy* into on-chip SRAM (contiguous), not a view of
-    # DRAM.  Clone the slice (before any transpose) so the layout matches the
-    # fake impl (``new_empty(tile_sizes)`` then ``.mT``): a contiguous copy,
-    # with the transpose as a view on top.  The copy also keeps a
-    # software-pipelined ``while_loop`` legal — a prefetched tile carried as
-    # loop state must not alias the input operand (HOPs forbid that) — and the
-    # matching layout keeps the carried tile's metadata stable across the loop
-    # boundary (plain ``.clone()`` would keep the DRAM strides).
-    tile = input[slices].clone(memory_format=torch.contiguous_format)
-    return tile.mT if transposed else tile
-
-
-@torch.library.register_fake("voyager::load_tile")
-def _load_tile_fake(
-    input: torch.Tensor,
-    indices: Tuple[int, ...],
-    tile_sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-    tile_strides: Optional[Tuple[int, ...]] = None,
-    transposed: bool = False,
-) -> torch.Tensor:
-    output = input.new_empty(tile_sizes)
-    return output.mT if transposed else output
-
-
-# ---------------------------------------------------------------------------
-# voyager.store_tile — side-effecting DMA store of a tile into ``dest`` (a DRAM
-# buffer), mutated in place; returns nothing.  ``dest`` is declared mutable
-# (``Tensor(a!)``) so the write is a real side effect: the buffer can be a plain
-# *additional* (closed-over) input of a ``while_loop`` instead of being threaded
-# through carried_inputs just to keep the write alive.  ``indices`` / ``dims``
-# / ``static_indices`` give the per-dim block index exactly as in
-# ``load_tile``; the tile is written at ``index[d] * tile_sizes[d]``.
-# ---------------------------------------------------------------------------
-voyager_lib.define(
-    "store_tile(Tensor src, Tensor(a!) dest, SymInt[] indices, "
-    "SymInt[] tile_sizes, SymInt[]? dims=None, "
-    "SymInt[]? static_indices=None) -> ()"
-)
-
-
-@impl(voyager_lib, "store_tile", "CompositeExplicitAutograd")
-def store_tile(
-    src: torch.Tensor,
-    dest: torch.Tensor,
-    indices: Tuple[int, ...],
-    tile_sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-) -> None:
-    rank = dest.dim()
-    full = _full_indices(rank, indices, dims, static_indices)
-    assert rank == len(tile_sizes) == len(full)
-
-    start = [full[d] * tile_sizes[d] for d in range(rank)]
-    slices = tuple(
-        slice(start[d], start[d] + tile_sizes[d]) for d in range(rank)
-    )
-    dest[slices] = src
-
-
-@torch.library.register_fake("voyager::store_tile")
-def _store_tile_fake(
-    src: torch.Tensor,
-    dest: torch.Tensor,
-    indices: Tuple[int, ...],
-    tile_sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-) -> None:
-    return None
-
-
-# ---------------------------------------------------------------------------
-# voyager.copy_tile — the unified tile DMA: copy one tile between ``src`` and
-# ``dst``, subsuming both ``load_tile`` (DRAM buffer -> SRAM tile) and
-# ``store_tile`` (SRAM tile -> DRAM buffer); the two are the same move in
-# opposite directions.  The *buffer* operand (more than one tile of storage)
+# voyager.copy_tile — the tile DMA: copy one tile between ``src`` and ``dst``,
+# covering both a DRAM buffer -> SRAM tile load and an SRAM tile -> DRAM buffer
+# store; the two are the same move in opposite directions.  The *buffer* operand
+# (more than one tile of storage)
 # is addressed at block ``indices`` (start ``indices[d] * strides[d]``, span
 # ``sizes[d]``); the other operand is the whole ``sizes`` tile.  ``dims`` /
 # ``static_indices`` give a partial block index; ``strides`` defaults to
@@ -403,11 +294,36 @@ def _async_copy_fake(
 voyager_lib.define("async_wait(Tensor(a!) semaphore) -> ()")
 
 
+# The counting-semaphore check in ``async_wait`` is a runtime *oracle*: it
+# verifies that a real pipeline run keeps every wait matched by a prior copy
+# into the same slot.  It is only meaningful when the whole loop executes in
+# sequence.  Codegen's ShapeProp re-runs a single loop-body iteration in
+# isolation — where a wait legitimately precedes its matching copy (which lives
+# in an earlier iteration) — so it disables the oracle via ``oracle_disabled()``
+# (it needs only shapes/values, not the balance invariant).
+_oracle_enabled = True
+
+
+@contextmanager
+def oracle_disabled():
+    """Suspend the ``async_wait`` counting-semaphore oracle in this scope."""
+    global _oracle_enabled
+    prev = _oracle_enabled
+    _oracle_enabled = False
+    try:
+        yield
+    finally:
+        _oracle_enabled = prev
+
+
 @impl(voyager_lib, "async_wait", "CompositeExplicitAutograd")
 def async_wait(semaphore: torch.Tensor) -> None:
     # Emulate a counting semaphore: block until signaled, then consume.  The
     # transfer is synchronous (already done), so this only checks the invariant
-    # that a matching ``async_copy`` ran first.
+    # that a matching ``async_copy`` ran first.  Skipped when the oracle is
+    # disabled (codegen ShapeProp — see ``oracle_disabled``).
+    if not _oracle_enabled:
+        return None
     assert (
         semaphore.item() > 0
     ), "async_wait on a semaphore with no pending async_copy"

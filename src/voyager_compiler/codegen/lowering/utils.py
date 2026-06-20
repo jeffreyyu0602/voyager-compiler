@@ -2,12 +2,11 @@
 Shared helpers for the bufferization builders (``gemm`` / ``pointwise`` /
 ``attention``).
 
-Tile loads/stores go directly through ``voyager.load_tile`` /
-``voyager.store_tile`` (addressed by integer ``indices`` block indices); the
-helpers here are the remaining shared pieces: the fused pointwise tail, the
-lenient export verifier, exported-graph cleanup, and tagging each
-``while_loop`` with its per-dimension tile-grid extents (consumed by the
-loop-aware code generator).
+Tile DMA goes through ``voyager.async_copy`` (the guarded prefetch / store) and
+``voyager.copy_tile`` (the in-kernel whole-slot writes); the helpers here are
+the remaining shared pieces: the fused pointwise tail, the lenient export
+verifier, exported-graph cleanup, and tagging each ``while_loop`` with its
+per-dimension tile-grid extents (consumed by the loop-aware code generator).
 """
 
 import contextlib
@@ -194,63 +193,6 @@ def _lenient_verifier():
         yield
     finally:
         _verifier._check_val = orig
-
-
-def _split_block_indices(gm: torch.fx.GraphModule) -> None:
-    """Post-export: split each ``voyager.load_tile`` / ``store_tile`` /
-    ``copy_tile`` block index so its ``indices`` arg holds only loop-counter
-    Node refs — any constant ``int`` entry (a whole / broadcast dim, or a fixed
-    reduction tile) moves into ``static_indices``.  The proto codegen can't
-    serialize a list mixing FX Nodes with ints; the tile op rebuilds the same
-    full index from ``indices`` + ``dims`` + ``static_indices``, so this is
-    numerically transparent.  Recurses into ``while_loop`` body subgraphs.
-
-    Done here, not in the builder's ``forward``: at export-trace time loop
-    counters and constants are *both* plain ints (so they can't be told apart,
-    and a custom marker trips dynamo inside ``while_loop``); only after export
-    are the counters FX Nodes and the constants int literals.  ``copy_tile``
-    needs this on the double-buffered path: ``delinearize_index`` constant-folds
-    a unit loop dim (``i % 1`` -> 0), so its ``indices`` mixes those literal 0s
-    with the genuine counter getitems.
-    """
-    load = torch.ops.voyager.load_tile.default
-    store = torch.ops.voyager.store_tile.default
-    copy = torch.ops.voyager.copy_tile.default
-    changed = False
-    for node in gm.graph.nodes:
-        if node.op == "get_attr":
-            sub = getattr(gm, str(node.target), None)
-            if isinstance(sub, torch.fx.GraphModule):
-                _split_block_indices(sub)
-            continue
-        if node.op != "call_function" or node.target not in (load, store, copy):
-            continue
-        # ``indices`` is arg 1 for load_tile, arg 2 for store_tile / copy_tile.
-        ix = 1 if node.target is load else 2
-        a = list(node.args)
-        indices = a[ix]
-        if not any(isinstance(i, int) for i in indices):
-            continue  # all loop-counter nodes already
-        rank = len(a[ix + 1])  # tile_sizes
-        dims = a[ix + 2] if len(a) > ix + 2 else None
-        static = a[ix + 3] if len(a) > ix + 3 else None
-        pos = list(dims) if dims else list(range(len(indices)))
-        new_static = list(static) if static else [0] * rank
-        dyn, dyn_dims = [], []
-        for idx, d in zip(indices, pos):
-            if isinstance(idx, int):
-                new_static[d] = idx
-            else:
-                dyn.append(idx)
-                dyn_dims.append(d)
-        while len(a) <= ix + 3:  # ensure the dims / static_indices slots exist
-            a.append(None)
-        a[ix], a[ix + 2], a[ix + 3] = dyn, dyn_dims, new_static
-        node.args = tuple(a)
-        changed = True
-    if changed:
-        gm.graph.lint()
-        gm.recompile()
 
 
 def _fuse_tail_in_body(
@@ -458,6 +400,40 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     branch.recompile()
 
 
+def _strip_assert_scalars(gm: torch.fx.GraphModule) -> None:
+    """Drop export's deferred ``aten._assert_scalar`` range-checks — and the
+    ``getitem`` / ``ge`` / ``le`` nodes that feed only them — recursing into
+    ``while_loop`` / ``cond`` body subgraphs.
+
+    A guarded ``torch.cond`` (the async-DMA wait guards) returns an ``int``
+    (1 / 0) to stay alive; export materializes that as an unbacked symint and
+    emits ``u >= 0`` / ``u <= 1`` deferred assertions on it.  They are provably
+    true no-ops and only clutter codegen.  The cond itself stays (it carries the
+    wait's side effect); only its dead int-output scaffolding is removed.
+    """
+    assert_op = torch.ops.aten._assert_scalar.default
+    for n in list(gm.graph.nodes):
+        if n.op == "call_function" and n.target is assert_op:
+            gm.graph.erase_node(n)
+    # Reverse sweep: the bool (``ge`` / ``le``) feeds only the now-gone assert,
+    # then the cond's ``getitem`` feeds only those bools — erase once userless.
+    sweep = {operator.ge, operator.le, operator.getitem}
+    changed = True
+    while changed:
+        changed = False
+        for n in reversed(list(gm.graph.nodes)):
+            if n.op == "call_function" and n.target in sweep and not n.users:
+                gm.graph.erase_node(n)
+                changed = True
+    for n in gm.graph.nodes:
+        if n.op == "get_attr":
+            sub = getattr(gm, str(n.target), None)
+            if isinstance(sub, torch.fx.GraphModule):
+                _strip_assert_scalars(sub)
+    gm.graph.lint()
+    gm.recompile()
+
+
 def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     """
     Erase the unused tile-size int placeholders left by exporting with the tile
@@ -468,11 +444,11 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         if n.op == "placeholder" and not n.users:
             gm.graph.erase_node(n)
     # Only ``aten`` ops are safe to drop as dead code.  The ``voyager.*``
-    # primitives (notably the side-effecting ``store_tile``) and the
-    # ``while_loop`` / ``cond`` HOPs carry side effects that DCE can't see — a
-    # bufferized loop writes its output through ``store_tile`` into an
-    # *additional-input* buffer, so the loop has no FX users and default DCE
-    # would delete it.  Treating every non-``aten`` node as impure keeps the
+    # primitives (notably the side-effecting ``async_copy`` / ``copy_tile``) and
+    # the ``while_loop`` / ``cond`` HOPs carry side effects that DCE can't see — a
+    # bufferized loop writes its output through ``copy_tile`` / ``async_copy``
+    # into an *additional-input* buffer, so the loop has no FX users and default
+    # DCE would delete it.  Treating every non-``aten`` node as impure keeps the
     # loop machinery while still cleaning up dead ``aten`` compute.
     gm.graph.eliminate_dead_code(
         is_impure_node=lambda n: n.is_impure()
@@ -483,10 +459,9 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     )
     gm.graph.lint()
     gm.recompile()
-    # Route constant block-index entries into static_indices so codegen never
-    # sees a mixed Node/int index list (recurses into the while_loop body
-    # subgraphs).
-    _split_block_indices(gm)
+    # Drop export's deferred ``_assert_scalar`` range-checks on the guarded-wait
+    # conds' int outputs (no-ops for codegen; the impure-aware DCE keeps them).
+    _strip_assert_scalars(gm)
     return gm
 
 
