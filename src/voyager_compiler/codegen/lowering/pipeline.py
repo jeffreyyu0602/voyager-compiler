@@ -12,9 +12,11 @@ current block into its SRAM bank, then calls ``kernel(grid_index, *in_tiles,
 to DRAM.
 
   * An operand's *block index* at a grid point is the tuple of grid coords its
-    ``index_map`` selects (dropping whole / broadcast dims); that is how the DMA
-    tile is addressed.  An output whose ``index_map`` omits a grid dim does not
-    move along it, so its bank stays live across that (reduction) sweep.
+    ``index_map`` selects (dropping whole / broadcast dims, and dims whose
+    ``index_map`` entry is ``None`` — an axis loaded whole, mapped to no grid
+    dim); that is how the DMA tile is addressed.  An output whose ``index_map``
+    omits a grid dim does not move along it, so its bank stays live across that
+    (reduction) sweep.
   * Each tiled input has a ``num_banks``-deep SRAM bank and runs a depth-``N``
     (``N = num_banks``) software pipeline ``D = N - 1`` blocks ahead: the
     prologue primes the first ``D`` distinct blocks (slots ``0..D-1``); each
@@ -82,9 +84,9 @@ from voyager_compiler.codegen.lowering.ops import MemoryLevel
 # ``mapping`` / ``lowering.utils`` / ``lowering.bufferization`` do not import
 # this module at module scope (bufferization imports the builders function-
 # locally), so these are top-level.
-from voyager_compiler.codegen.mapping import get_anchor_node
-from voyager_compiler.codegen.lowering.bufferization import (
-    annotate_tensor_spaces,
+from voyager_compiler.codegen.mapping import (
+    get_anchor_node,
+    is_mha_qkv_permute,
 )
 
 _SRAM = int(MemoryLevel.SRAM)
@@ -131,14 +133,20 @@ class PipelinedKernel(torch.nn.Module):
         """The ``(dims, indices)`` addressing an operand's tile for
         ``copy_tile`` at ``grid_idx``: a spec dim is dynamically indexed iff the
         grid dim it maps to is tiled (``grid > 1``) and isn't broadcast — those
-        dims and their indices are returned.  Whole / broadcast dims stay at
-        block 0 (omitted; ``copy_tile`` defaults them).  ``dims`` is ``None``
-        when *every* dim is dynamic (``copy_tile``'s "all dims" shorthand).
+        dims and their indices are returned.  Whole / broadcast dims (and dims
+        whose ``index_map`` entry is ``None`` — an axis loaded whole, mapped to
+        no grid dim) stay at block 0 (omitted; ``copy_tile`` defaults them).
+        ``dims`` is ``None`` when *every* dim is dynamic (``copy_tile``'s "all
+        dims" shorthand).
         """
         bcast = getattr(spec, "is_broadcast", None)
         dims, indices = [], []
         for d, g in enumerate(spec.index_map):
-            if self.grid[g] > 1 and not (bcast is not None and bcast[d]):
+            if (
+                g is not None
+                and self.grid[g] > 1
+                and not (bcast is not None and bcast[d])
+            ):
                 dims.append(d)
                 indices.append(grid_idx[g])
         # some whole / broadcast dims -> explicit dim list
@@ -158,7 +166,11 @@ class PipelinedKernel(torch.nn.Module):
         bcast = getattr(spec, "is_broadcast", None)
         differ = None
         for d, g in enumerate(spec.index_map):
-            if self.grid[g] > 1 and not (bcast is not None and bcast[d]):
+            if (
+                g is not None
+                and self.grid[g] > 1
+                and not (bcast is not None and bcast[d])
+            ):
                 term = cur[g] != next[g]
                 differ = term if differ is None else (differ | term)
         # No tiled (non-broadcast) dim -> the block never changes.  Seeding the
@@ -186,7 +198,9 @@ class PipelinedKernel(torch.nn.Module):
             return False
         bcast = getattr(spec, "is_broadcast", None)
         return any(
-            g == inner and not (bcast is not None and bcast[d])
+            g is not None
+            and g == inner
+            and not (bcast is not None and bcast[d])
             for d, g in enumerate(spec.index_map)
         )
 
@@ -634,11 +648,13 @@ class _FusedInfo:
     ``args`` are submodule placeholders whose ``meta['source_node']`` point back
     to the outer graph; ``ShapeProp`` has populated their ``.value``).
     ``fused_gm`` runs the post-op pointwise ops as ``[acc, *fused] ->
-    output(s)`` on the anchor's result tile.  ``fused_operands`` are the
-    tensors those ops consume (a residual, a scale, …); ``fused_tiles[i]`` is
-    that operand's per-dim tiled shape, or ``None`` for a whole operand.
-    ``output_specs`` is one ``(full_shape, tile_shape, dtype)`` per fused output
-    (a tuple ⇒ multi-output, e.g. ``quantize_mx``).
+    output(s)`` on the anchor's result tile.  ``input_values`` are the tensors
+    those ops consume (a residual, a scale, …); ``in_specs[i]`` is that input's
+    tile ``_InputSpec`` (tiled at the output block, mapped to the grid), or
+    ``None`` for a whole input.  The GEMM / conv builders append these straight
+    onto the kernel's ``inputs`` / ``in_specs``.  ``output_specs`` is one
+    ``(full_shape, tile_shape, dtype, index_map)`` per fused output (a tuple ⇒
+    multi-output, e.g. ``quantize_mx``).
     """
 
     def __init__(
@@ -646,45 +662,61 @@ class _FusedInfo:
         anchor_node,
         is_conv,
         fused_gm,
-        fused_operands,
-        fused_tiles,
+        input_values,
+        in_specs,
         output_specs,
-        tile_sizes=None,
+        tiling=None,
     ):
         self.anchor_node = anchor_node
         self.is_conv = is_conv
         self.fused_gm = fused_gm
-        self.fused_operands = fused_operands
-        self.fused_tiles = fused_tiles
+        self.input_values = input_values
+        self.in_specs = in_specs
         self.output_specs = output_specs
-        # The anchor's on-chip tile sizes (``conv2d_tiling`` / ``gemm_tiling``
-        # result) so the builder reuses them instead of re-running the tiler.
-        self.tile_sizes = tile_sizes
+        self.tiling = tiling
 
-    def operand_specs(self, out_shape, out_index_map):
-        """Per fused operand, the ``(tensor, _InputSpec | None)`` for the GEMM /
-        conv builders to append to the kernel's ``inputs`` / ``in_specs``: the
-        operand tiled at the output block, each of its dims mapped to a grid dim
-        via ``out_index_map`` (a whole codebook / scalar operand -> ``None``).
-        The grid mapping is builder-specific (GEMM inserts the K reduction dim,
-        conv projects the NHWC layout), so it is passed in.
-        """
-        pairs = []
-        for operand, tile in zip(self.fused_operands, self.fused_tiles):
-            if tile is None:
-                pairs.append((operand, None))
-                continue
-            off = len(out_shape) - operand.ndim
-            imap, tiles, bcast = [], [], []
-            for d in range(operand.ndim):
-                b = operand.shape[d] == 1 and out_shape[off + d] > 1
-                imap.append(out_index_map[off + d])
-                bcast.append(b)
-                tiles.append(1 if b else int(tile[d]))
-            pairs.append(
-                (operand, _InputSpec(tuple(tiles), tuple(imap), tuple(bcast)))
-            )
-        return pairs
+
+def _detect_mha_relayout(fused_ops):
+    """If the fused tail ends with the MHA output relayout — a ``view`` /
+    ``reshape`` that splits the gemm's ``N`` into ``(H, head_dim)`` followed by
+    an MHA ``transpose(1,2)`` / ``permute([0,2,1,3])`` to ``[B, H, S, head_dim]``
+    (``is_mha_qkv_permute``) — return ``head_dim``; else ``None``.  (The relayout
+    is always the last op, per the QKV-projection fusion.)
+    """
+    if not fused_ops:
+        return None
+    perm = fused_ops[-1]
+    if not is_mha_qkv_permute(perm):
+        return None
+    view = perm.args[0]
+    if view.target not in (
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+    ):
+        return None
+    return perm.value.shape[-1]  # head_dim (last dim, unchanged by the perm)
+
+
+def _retile_mha_view(fused_gm, nb, tm) -> None:
+    """Rewrite the MHA relayout ``view`` in the fused body to tile-relative dims:
+    the original view's ``M`` dim is the *full* (untiled) M, so on a tile it
+    scrambles the data — replace it with the tile's ``tm`` and let the split
+    outer (heads) auto-size via ``-1``.  ``nb`` is the gemm's batch-dim count, so
+    the view dims are ``[*batch, M, H, head_dim]`` (M at index ``nb``).  The body
+    is ``... -> view -> perm -> output``, so navigate the output's perm to its
+    view (the body isn't ShapeProp'd, so match by structure, not shape).
+    """
+    out = next(n for n in fused_gm.graph.nodes if n.op == "output")
+    perm = out.args[0]
+    if isinstance(perm, (list, tuple)):
+        perm = perm[0]
+    view = perm.args[0]
+    dims = list(view.args[1])
+    dims[nb] = tm  # M -> tile M
+    dims[nb + 1] = -1  # split outer (heads) -> tn // head_dim
+    view.update_arg(1, dims)
+    fused_gm.graph.lint()
+    fused_gm.recompile()
 
 
 def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
@@ -693,36 +725,32 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     ``_build_for_fused_submodule``).
 
     The submodule (``node.meta['submodule']``) holds a GEMM/conv anchor followed
-    by post-op pointwise ops.  The anchor's on-chip tile comes from the tiler
-    (``conv2d_tiling`` / ``gemm_tiling`` — ``node.meta['tiled_shapes']`` or
-    interstellar via ``tiler``).  The fused operands / outputs tile at the output
-    block, diced from that tile's output ``tiling`` (per-dim counts) via
-    ``compute_tiled_shape`` / ``compute_output_tiled_shapes``.  The anchor tile is
-    stashed on ``_FusedInfo.tile_sizes`` so the builder reuses it (no second
-    tiler run).
+    by post-op pointwise ops.  The anchor's per-dim tile factors come from
+    ``get_tiling`` (the anchor's ``l2_tiling`` or interstellar via ``tiler``).
+    The fused operands / outputs tile at the output block, diced from those
+    factors (projected to the output's physical layout) via
+    ``_compute_input_spec`` / ``compute_output_tiled_shapes``.  The anchor
+    factors are stashed on ``_FusedInfo.tiling`` so the builder reuses them (no
+    second tiler run).
     """
     from voyager_compiler.codegen.lowering.bufferization import (
         _codebook_arg_nodes,
     )
-    from voyager_compiler.codegen.lowering.tiling import (
-        conv2d_tiling,
-        gemm_tiling,
-        output_tiling,
+    from voyager_compiler.codegen.lowering.tiling import get_tiling
+    from voyager_compiler.codegen.lowering.utils import (
+        _NHWC,
+        _build_fused_gm,
+        _compute_input_spec,
+        _project,
     )
-    from voyager_compiler.codegen.lowering.utils import _build_fused_gm
     from voyager_compiler.codegen.mapping_utils import is_conv2d, is_gemm_op
     from voyager_compiler.codegen.passes.tiling import (
         compute_output_tiled_shapes,
-        compute_tiled_shape,
     )
     from voyager_compiler.codegen.shape_prop import ShapeProp
 
     submod = node.meta.get("submodule")
-    if not isinstance(submod, torch.fx.GraphModule):
-        return None
-    anchor = get_anchor_node(submod.graph.nodes)
-    if anchor is None:
-        return None
+    anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
     if not is_conv and not is_gemm_op(anchor):
         return None
@@ -734,54 +762,104 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         *(n.value.clone() for n in node.all_input_nodes)
     )
 
-    # The anchor's on-chip tile, then the output-block tile counts the fused
-    # operands / outputs are diced by.  ``None`` => untiled (whole tensor).
-    tile_sizes = (conv2d_tiling if is_conv else gemm_tiling)(node, tiler)
-    tiling = output_tiling(node, tile_sizes)
+    # ``tiling`` = the anchor's per-dim tile counts (logical, builder-facing);
+    # ``out_tiling`` = those counts in the output's physical layout with the
+    # reduction dim dropped, the divisor that dices the fused operands / outputs
+    # at the output block.  ``out_index_map`` = output dim -> grid dim (the
+    # fused operands map through it): conv projects the physical layout (a
+    # transposed NHWC permutation), gemm is identity (its K reduction is the
+    # last grid dim, so output dims keep their position).  ``None`` => untiled
+    # (whole tensor).
+    tiling = get_tiling(node, tiler)
+    if tiling is None:
+        out_tiling = None
+        out_index_map = None
+    elif is_conv:
+        ny, nx, _, nk = tiling  # logical (Y, X, C, K) counts
+        odims = _NHWC if anchor.meta.get("transposed", False) else None
+        out_tiling = _project((1, nk, ny, nx), odims)  # physical output counts
+        out_index_map = _project((0, 1, 2, 3), odims)
+    else:
+        out_tiling = tiling[:-1]  # gemm (batch.., n_m, n_n, n_k) -> drop K
+        out_index_map = tuple(range(len(out_tiling)))
 
     # Walk the ops after the anchor (the fused pointwise chain).  Collect each
-    # op and, for every new placeholder it consumes, the operand tensor and its
-    # tiled shape (``None`` for a codebook / scalar passed whole, or untiled).
-    reachable = {anchor}
-    fused_ops, fused_inputs, fused_operands, fused_tiles = [], [], [], []
+    # op and, for every new placeholder it consumes, the placeholder node, its
+    # cloned tensor value, and its tile ``_InputSpec`` (tiled at the output
+    # block, mapped to the grid via ``out_index_map``); ``None`` for a codebook
+    # / scalar passed whole, or an untiled op.
+    fused_ops = []
+    input_nodes, input_values, in_specs = [], [], []
     for sn in submod.graph.nodes:
         if sn is anchor or sn.op != "call_function":
             continue
-        if not any(inp in reachable for inp in sn.all_input_nodes):
-            continue
-        reachable.add(sn)
         fused_ops.append(sn)
         codebooks = _codebook_arg_nodes(sn)
         for inp in sn.all_input_nodes:
-            if inp.op != "placeholder" or inp in fused_inputs:
+            if inp.op != "placeholder" or inp in input_nodes:
                 continue
-            fused_inputs.append(inp)
-            fused_operands.append(inp.value.clone())
-            if inp in codebooks or inp.value.numel() == 1 or tiling is None:
-                fused_tiles.append(None)  # whole operand
+            input_nodes.append(inp)
+            input_values.append(inp.value.clone())
+            if inp in codebooks or inp.value.numel() == 1 or out_tiling is None:
+                in_specs.append(None)  # whole operand
             else:
-                fused_tiles.append(compute_tiled_shape(inp.value.shape, tiling))
+                in_specs.append(
+                    _compute_input_spec(
+                        out_tiling, tuple(inp.shape), out_index_map
+                    )
+                )
 
-    fused_gm = _build_fused_gm(submod, anchor, fused_ops, fused_inputs)
+    fused_gm = _build_fused_gm(submod, anchor, fused_ops, input_nodes)
 
-    multi = isinstance(node.value, (list, tuple))
-    vals = list(node.value) if multi else [node.value]
+    multi_outputs = isinstance(node.value, (list, tuple))
+    vals = list(node.value) if multi_outputs else [node.value]
     full_shapes = [tuple(v.shape) for v in vals]
-    if tiling is None:
-        tile_shapes = full_shapes  # untiled -> tile == full tensor (trip-1)
+    if out_tiling is None:
+        tiled_shape = full_shapes  # untiled -> tile == full tensor (trip-1)
     else:
-        out_tiles = compute_output_tiled_shapes(node, tiling)
-        tile_shapes = list(out_tiles) if multi else [out_tiles]
-    output_specs = list(zip(full_shapes, tile_shapes, [v.dtype for v in vals]))
+        tiled_shape = compute_output_tiled_shapes(node, out_tiling)
+        tiled_shape = list(tiled_shape) if multi_outputs else [tiled_shape]
+    # Each output is ``(full_shape, tile_shape, dtype, index_map)``; ``index_map``
+    # is ``None`` (the builder uses its default M/N mapping) except for the MHA
+    # relayout handled below.
+    output_specs = [
+        (s, t, v.dtype, None) for s, t, v in zip(full_shapes, tiled_shape, vals)
+    ]
+
+    # MHA QKV projection fused with the output relayout (view-split-N +
+    # transpose/permute -> ``[B, H, S, head_dim]``).  The kernel computes and
+    # transposes the gemm tile, but it must be stored to the *transposed* block:
+    # M -> the S dim, N -> the head dim (outer = heads, tiled by the N grid;
+    # inner = head_dim, whole).  This is the fixed split-and-swap-middle pattern,
+    # so the override is spelled out directly.  Override the (single) output's
+    # tile + index_map and retile the body's view to tile-relative dims.
+    head_dim = None if is_conv else _detect_mha_relayout(fused_ops)
+    if head_dim is not None and tiling is not None and not multi_outputs:
+        g_out = anchor.value  # gemm output [*batch, M, N]
+        nb = g_out.ndim - 2
+        gm, gn = nb, nb + 1
+        M, N = g_out.shape[-2], g_out.shape[-1]
+        nm, nn = tiling[nb], tiling[nb + 1]
+        tm, tn = M // nm, N // nn
+        if tn % head_dim != 0:
+            raise NotImplementedError(
+                f"MHA output relayout: N tile {tn} is not a multiple of "
+                f"head_dim {head_dim} (would split a head across tiles)"
+            )
+        tb = tuple(g_out.shape[:nb])
+        out_tile = tb + (tn // head_dim, tm, head_dim)  # [*b, H_t, S_t, hd]
+        out_imap = tuple(range(nb)) + (gn, gm, None)  # H<-N, S<-M, hd whole
+        output_specs = [(full_shapes[0], out_tile, vals[0].dtype, out_imap)]
+        _retile_mha_view(fused_gm, nb, tm)
 
     return _FusedInfo(
         anchor,
         is_conv,
         fused_gm,
-        fused_operands,
-        fused_tiles,
+        input_values,
+        in_specs,
         output_specs,
-        tile_sizes,
+        tiling,
     )
 
 
@@ -895,11 +973,10 @@ def build_conv2d(
     (``meta["transposed"]`` selects NHWC input/output + HWIO weight), like
     gemm.py's TiledConv2d.  Returns the gm or ``None``.
     """
-    from voyager_compiler.codegen.lowering.tiling import conv2d_tiling
+    from voyager_compiler.codegen.lowering.tiling import get_tiling
     from voyager_compiler.codegen.lowering.utils import (
         _HWIO,
         _NHWC,
-        _phys_pos,
         _project,
         _unproject,
     )
@@ -919,8 +996,8 @@ def build_conv2d(
     # via ``tiler``); ``None`` => untiled.  A fused op reuses the tile the
     # submodule parse already computed; a non-fused untiled op is bufferized
     # elsewhere, a fused untiled op falls back to whole-tensor tiles below.
-    ts = info.tile_sizes if info is not None else conv2d_tiling(node, tiler)
-    if info is None and ts is None:
+    tiling = info.tiling if info is not None else get_tiling(node, tiler)
+    if info is None and tiling is None:
         return None
     anchor = info.anchor_node if info is not None else node
 
@@ -946,15 +1023,15 @@ def build_conv2d(
     K, _, kH, kW = _unproject(w.shape, w_dims)
     oH, oW = _unproject(out.shape, out_dims)[2:]
 
-    # ``ts`` is the logical output/reduction tile ``(toh, tow, tc, tk)``; ``None``
-    # => untiled (whole tensor, every loop trip-1).  Batch ``tn`` is never tiled;
-    # ``tc < C`` drives the C-reduction (``num_k``).
-    if ts is None:
-        toh, tow, tc, tk = oH, oW, C, K
-    else:
-        toh, tow, tc, tk = ts
-    tn = N
-    num_k = C // tc
+    # ``tiling`` is the logical output/reduction tile *factors*
+    # ``(n_y, n_x, n_c, n_k)`` (``None`` => untiled, every dim whole / trip-1);
+    # the tile sizes are ``full // factor``.  Batch ``tn`` is never tiled;
+    # ``n_c`` (the C reduction) is the kernel's ``num_k``.
+    if tiling is None:
+        tiling = (1, 1, 1, 1)
+    ny, nx, nc, nk = tiling
+    tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
+    num_k = nc
 
     sh, sw = _pair(get_arg_value(anchor, 3, "stride", 1))
     ph, pw = _pair(get_arg_value(anchor, 4, "padding", 0))
@@ -962,8 +1039,11 @@ def build_conv2d(
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
 
-    # grid dims (logical): 0=N 1=K 2=oH 3=oW 4=C(reduction) 5=whole(kH/kW).
-    grid = (N // tn, K // tk, oH // toh, oW // tow, num_k, 1)
+    # grid dims (logical): 0=N 1=K 2=oH 3=oW 4=C(reduction).  The batch is never
+    # tiled (dim 0 == 1); the others are the tile factors.  The weight's kH/kW
+    # axes are never tiled (loaded whole) and map to no grid dim (index_map
+    # ``None``), so there is no kernel-window grid dim.
+    grid = (1, nk, ny, nx, nc)
     in_spec = _InputSpec(
         _project((tn, tc, ih, iw), in_dims),
         _project((0, 4, 2, 3), in_dims),  # N->0, C->4, H->oH(2), W->oW(3)
@@ -974,8 +1054,8 @@ def build_conv2d(
     )
     w_spec = _InputSpec(
         _project((tk, tc, kH, kW), w_dims),
-        # K->1, C->4, kH/kW->5 (whole, extent 1)
-        _project((1, 4, 5, 5), w_dims),
+        # K->1, C->4, kH/kW->None (loaded whole, mapped to no grid dim)
+        _project((1, 4, None, None), w_dims),
         (False,) * 4,
     )
     # The output(s) tile onto the (N, K, oH, oW) grid dims (the C reduction dim
@@ -992,8 +1072,8 @@ def build_conv2d(
         ]
     else:
         out_specs = [
-            _OutputSpec(tuple(shape), tuple(tile), out_index_map, dtype)
-            for shape, tile, dtype in info.output_specs
+            _OutputSpec(tuple(shape), tuple(tile), imap or out_index_map, dtype)
+            for shape, tile, dtype, imap in info.output_specs
         ]
 
     inputs, in_specs = [inp, w], [in_spec, w_spec]
@@ -1040,7 +1120,7 @@ def build_conv2d(
         )
         wt_scale_qspec = _InputSpec(
             _project((tk, tc // bs, kH, kW), w_dims),
-            _project((1, 4, 5, 5), w_dims),
+            _project((1, 4, None, None), w_dims),  # kH/kW whole -> None
             (False,) * 4,
         )
 
@@ -1052,14 +1132,14 @@ def build_conv2d(
 
     # Fused post-op operands (a residual, …): append each through ``in_specs``,
     # tiled at the output (N, K, oH, oW) block in the same physical layout as
-    # the output.  A ``None`` spec is a whole (codebook / scalar) operand.
+    # the output (specs built by ``parse_fused_submodule``).  A ``None`` spec is
+    # a whole (codebook / scalar) operand.
     if info is not None:
-        for operand, spec in info.operand_specs(out.shape, out_index_map):
-            inputs.append(operand)
-            in_specs.append(spec)
+        inputs += info.input_values
+        in_specs += info.in_specs
     # The fused operands are the last inputs (appended above); the kernel /
     # compute pick them off the tail of ``*extra`` by count.
-    num_fused = len(info.fused_operands) if info is not None else 0
+    num_fused = len(info.input_values) if info is not None else 0
 
     def _conv(in_tile, w_tile, bias, kw):
         return target(
@@ -1076,11 +1156,6 @@ def build_conv2d(
         # stride — no symbolic ``Max`` — via ``as_strided`` (a metadata-only NOP,
         # in ``is_nop``).  Needed independently of the accumulator cast, which the
         # reduction kernel drops when no dtype change is required.
-        # TODO why this doesn't work.
-        # n, c, h, w = t.shape
-        # return torch.as_strided(
-        #     t, size=(n, c, h, w), stride=(c * h * w, h * w, w, 1)
-        # )
         d0, d1, d2, d3 = _project((tn, tk, toh, tow), out_dims)
         return torch.as_strided(
             t, size=(d0, d1, d2, d3), stride=(d1 * d2 * d3, d2 * d3, d3, 1)
@@ -1141,13 +1216,6 @@ def build_conv2d(
         num_banks=num_banks,
     )
     if num_k > 1 or info is not None:
-        # num_k > 1: the reduction splits work across ``torch.cond`` branches —
-        # fuse the accumulate branch (anchor + cast + accumulate add), and the
-        # finalize branch's tail when present (``fuse_anchor_with_tail=False``).
-        # Runs even without a tail so the bare anchor isn't flagged by the
-        # destination-passing check (its result feeds the add, not a store).
-        # num_k == 1: the anchor + fused tail share the output body — one cone
-        # (``fuse_anchor_with_tail=True``).
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
         )
@@ -1164,7 +1232,7 @@ def build_gemm(
     the kernel accumulates ``act_tile @ weight_tile`` into the output bank,
     initialize on ``k == 0``.  Returns the gm, or ``None`` (unsupported).
     """
-    from voyager_compiler.codegen.lowering.tiling import gemm_tiling
+    from voyager_compiler.codegen.lowering.tiling import get_tiling
     from voyager_compiler.codegen.mapping_utils import is_linear, is_matmul
     from voyager_compiler.codegen.passes.utils import get_arg_value
 
@@ -1190,19 +1258,22 @@ def build_gemm(
     if not isinstance(out, torch.Tensor) or act.ndim < 2 or weight.ndim < 2:
         return None
 
-    # On-chip tile from the tiler (``node.meta['tiled_shapes']`` or interstellar
-    # via ``tiler``); flat ``(batch.., tile_m, tile_n, tile_k)``, or ``None`` =>
-    # untiled.  A fused op reuses the tile the submodule parse already computed; a
-    # non-fused untiled op is bufferized elsewhere, a fused untiled op falls back
-    # to whole-tensor tiles (trip-1) below.
-    res = info.tile_sizes if info is not None else gemm_tiling(node, tiler)
-    if info is None and res is None:
+    # Per-dim tile factors from the tiler (the anchor's ``l2_tiling`` or
+    # interstellar via ``tiler``); ``(batch.., n_m, n_n, n_k)``, or ``None`` =>
+    # untiled.  A fused op reuses the factors the submodule parse already
+    # computed; a non-fused untiled op is bufferized elsewhere, a fused untiled
+    # op falls back to whole-tensor tiles (trip-1) below.  Tile sizes are the
+    # full dim divided by its factor.
+    tiling = info.tiling if info is not None else get_tiling(node, tiler)
+    if info is None and tiling is None:
         return None
     M, K, N = act.shape[-2], act.shape[-1], out.shape[-1]
-    if res is None:
+    if tiling is None:
         out_ts, tk = tuple(out.shape), K  # untiled -> whole tensor (trip-1)
     else:
-        out_ts, tk = res[:-1], int(res[-1])
+        out_tiling, nk = tiling[:-1], tiling[-1]  # batch.. + (n_m, n_n) , n_k
+        out_ts = tuple(s // t for s, t in zip(out.shape, out_tiling))
+        tk = K // nk
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
 
     # torch matmul broadcasts the leading ``N - 2`` batch dims: each output
@@ -1271,8 +1342,8 @@ def build_gemm(
         ]
     else:
         out_specs = [
-            _OutputSpec(tuple(shape), tuple(tile), out_index_map, dtype)
-            for shape, tile, dtype in info.output_specs
+            _OutputSpec(tuple(shape), tuple(tile), imap or out_index_map, dtype)
+            for shape, tile, dtype, imap in info.output_specs
         ]
 
     inputs, in_specs = [act, weight], [act_spec, weight_spec]
@@ -1326,16 +1397,16 @@ def build_gemm(
 
     # Fused post-op operands (a residual, a scale, …): append each through
     # ``in_specs`` so the scheduler pipelines it like any tiled input, tiled at
-    # the output (M/N) block.  A ``None`` tile is a whole (codebook / scalar)
-    # operand passed through.  ``compute`` then applies ``info.fused_gm`` to the
-    # GEMM result with these tiles.
+    # the output (M/N) block (specs built by ``parse_fused_submodule``).  A
+    # ``None`` spec is a whole (codebook / scalar) operand passed through.
+    # ``compute`` then applies ``info.fused_gm`` to the GEMM result with these
+    # tiles.
     if info is not None:
-        for operand, spec in info.operand_specs(out.shape, out_index_map):
-            inputs.append(operand)
-            in_specs.append(spec)
+        inputs += info.input_values
+        in_specs += info.in_specs
     # The fused operands are the *last* inputs (appended above), so the kernel
     # picks them off the tail of ``*extra`` by count.
-    num_fused = len(info.fused_operands) if info is not None else 0
+    num_fused = len(info.input_values) if info is not None else 0
 
     num_k = K // tk  # reduction tiles (grid extent along ``gk``)
 
@@ -1393,41 +1464,70 @@ def build_gemm(
         num_banks=num_banks,
     )
     if num_k > 1 or info is not None:
-        # num_k > 1: the reduction splits work across ``torch.cond`` branches —
-        # fuse the accumulate branch (anchor + cast + accumulate add), and the
-        # finalize branch's tail when present (``fuse_anchor_with_tail=False``).
-        # Runs even without a tail so the bare anchor isn't flagged by the
-        # destination-passing check (its result feeds the add, not a store).
-        # num_k == 1: the anchor + fused tail share the output body — one cone
-        # (``fuse_anchor_with_tail=True``).
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
         )
     return gm
 
 
+def _apply_relayout(node, *seqs, invert=False):
+    """Permute each per-dim sequence (an ``index_map``, a tile shape, …) by a
+    ``transpose`` / ``permute`` node's dim mapping, returning the relocated
+    sequences in order.
+
+    For ``out = in.permute(...)`` the forward perm gathers a *destination*
+    sequence from the source (``dst[k] = src[perm[k]]``); ``invert=True`` gathers
+    a *source* sequence from the destination.  ``build_pointwise`` uses
+    ``invert=True`` to turn a standalone relayout's output specs (tile shape,
+    ``index_map``) into its input (load) specs.  Handles transpose (``dim0`` /
+    ``dim1``) and permute (``dims``), args or kwargs, negative dims.
+    """
+    from voyager_compiler.codegen.passes.utils import get_arg_value
+
+    ndim = len(seqs[0])
+    if node.target is torch.ops.aten.permute.default:
+        perm = [d % ndim for d in get_arg_value(node, 1, "dims")]
+    else:  # aten.transpose.int
+        d0 = get_arg_value(node, 1, "dim0") % ndim
+        d1 = get_arg_value(node, 2, "dim1") % ndim
+        perm = list(range(ndim))
+        perm[d0], perm[d1] = perm[d1], perm[d0]
+    if invert:
+        inv = [0] * ndim
+        for k, p in enumerate(perm):
+            inv[p] = k
+        perm = inv
+    return tuple(tuple(s[p] for p in perm) for s in seqs)
+
+
 def build_pointwise(node, *, num_banks: int = 2):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
-    ops, and layernorm·softmax whose reduction dim is kept whole in the tile).
-    Tiles the output grid and writes each output tile once (no cross-tile
-    reduction).  Returns the gm, or ``None``.
+    ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
+    standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
+    writes each output tile once (no cross-tile reduction).  Returns the gm, or
+    ``None``.
     """
     from voyager_compiler.codegen.lowering.bufferization import (
         _codebook_arg_nodes,
     )
+    from voyager_compiler.codegen.passes.tiling import (
+        compute_output_tiled_shapes,
+    )
 
-    val = getattr(node, "value", None)
-    if not isinstance(val, (torch.Tensor, list, tuple)):
-        return None
-    tiled_shapes = node.meta.get("tiled_shapes") or {}
-    # A non-fused untiled op is bufferized elsewhere; a fused untiled submodule
-    # falls back to whole-tensor tiles (trip-1) below.
-    if node.op != "call_module" and not tiled_shapes:
+    # Tiling comes from the anchor's ``l2_tiling`` — per-output-dim tile counts
+    # set by the vector L2 tiling pass (pointwise has no reduction).  A non-fused
+    # op with no ``l2_tiling`` is untiled -> bufferized whole-tensor elsewhere; a
+    # fused untiled submodule falls back to whole tensor (trip-1) below.
+    anchor = get_anchor_node(node)
+    tiling = anchor.meta.get("l2_tiling") if anchor is not None else None
+    if node.op != "call_module" and tiling is None:
         return None
 
-    outputs = list(val) if isinstance(val, (list, tuple)) else [val]
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
+
+    val = node.value
+    outputs = val if isinstance(val, (list, tuple)) else (val,)
 
     if node.op == "call_module":
         # Fused pointwise submodule (e.g. ``relu(x + residual)``): there is no
@@ -1481,44 +1581,54 @@ def build_pointwise(node, *, num_banks: int = 2):
             }
             return op(*args, **kwargs)
 
-    output_ts = tiled_shapes.get(node)
     output_shape = tuple(outputs[-1].shape)
-    if output_ts is None:
-        output_ts = output_shape  # untiled -> whole tensor (trip-1)
-    elif isinstance(val, (list, tuple)):
-        output_ts = output_ts[-1]
-    grid = tuple(s // t for s, t in zip(output_shape, output_ts))
-    in_specs = [
-        (
-            _compute_input_spec(output_shape, output_ts, tuple(n.shape))
-            if n not in codebooks
-            else None
+    if tiling is None:
+        tiling = (1,) * len(output_shape)
+    grid = tuple(tiling)
+    # ``compute_output_tiled_shapes`` dices each output by ``tiling`` (the
+    # output-dim factors), with the sparse-output handling a per-output
+    # ``compute_tiled_shape`` would miss.
+    tiled_shape = compute_output_tiled_shapes(node, tiling)
+    tiled_shape = (
+        list(tiled_shape)
+        if isinstance(node.value, (list, tuple))
+        else [tiled_shape]
+    )
+
+    if node.target in (
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.permute.default,
+    ):
+        # Standalone transpose / permute: store each output tile identity, but
+        # load the single input from the transposed source — input dim ``j``
+        # tiles along the grid dim its output image occupies (the inverse perm).
+        # ``compute = op(tile)`` does the actual transpose.  (Same relocate-via-
+        # permuted-``index_map`` trick as the MHA relayout, on the load side.)
+        ndim = len(output_shape)
+        in_tile, in_imap = _apply_relayout(
+            node, tiled_shape[0], tuple(range(ndim)), invert=True
         )
-        for n in in_nodes
-    ]
+        in_specs = [_InputSpec(in_tile, in_imap, (False,) * ndim)]
+    else:
+        in_specs = [
+            (
+                _compute_input_spec(tiling, tuple(n.shape))
+                if n not in codebooks
+                else None
+            )
+            for n in in_nodes
+        ]
     out_specs = [
-        _OutputSpec(
-            tuple(o.shape),
-            tuple(min(t, s) for t, s in zip(output_ts, o.shape)),
-            tuple(range(o.ndim)),
-            o.dtype,
-        )
-        for o in outputs
+        _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
+        for o, ts in zip(outputs, tiled_shape)
     ]
     kernel = _map_kernel(compute, len(outputs))
     gm = build_pipelined_buffers(
         kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
     )
 
-    if node.op == "call_module":
-        # Group the fused pointwise ops into one nested call_module for
-        # codegen's ``fused_op``.  There is no reduction here, so (like the GEMM
-        # / conv num_k == 1 path) the anchor — the first pointwise op, per
-        # ``get_anchor_node`` — sits in the body with its tail, and the forward
-        # cone from it is the whole chain.
-        anchor = get_anchor_node(submod.graph.nodes)
-        if anchor is not None:
-            _fuse_tail_in_body(gm, anchor.target)
+    if node.op == "call_module" and anchor is not None:
+        _fuse_tail_in_body(gm, anchor.target)
     return gm
 
 
@@ -1532,63 +1642,84 @@ _POOL2D_SUPPORTED = {
 
 
 def build_pool(node, *, num_banks: int = 2):
-    """Pipeline builder for a 2-D max/avg pool node: a map over the (N, C, oH,
-    oW) output grid whose input tile is a strided receptive-field *halo*
-    (overlap = the kernel footprint) with the boundary padding folded into the
-    load (``copy_tile``'s ``pad`` / ``pad_value``), so the kernel pools each
-    halo with ``padding=0``.  Returns the gm, or ``None``.
+    """Pipeline builder for a 2-D max/avg pool node, bare or fused with post-op
+    pointwise ops: a map over the (N, C, oH, oW) output grid whose input tile is
+    a strided receptive-field *halo* (overlap = the kernel footprint) with the
+    boundary padding folded into the load (``copy_tile``'s ``pad`` /
+    ``pad_value``), so the kernel pools each halo with ``padding=0``.
+
+    Pool has no cross-tile reduction, so a fused submodule needs no anchor /
+    tail split (unlike conv / gemm): the whole submodule is the per-tile
+    compute (as in ``build_pointwise``), the *only* difference being the pool's
+    own input loads the halo while the tail operands tile at the output block.
+    Returns the gm, or ``None``.
     """
+    from voyager_compiler.codegen.lowering.bufferization import (
+        _codebook_arg_nodes,
+    )
     from voyager_compiler.codegen.lowering.utils import (
         _NHWC,
+        _compute_input_spec,
         _project,
         _unproject,
     )
+    from voyager_compiler.codegen.passes.tiling import (
+        compute_output_tiled_shapes,
+    )
     from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
 
-    if node.target not in _POOL2D_SUPPORTED:
+    anchor = get_anchor_node(node)
+    if anchor.target not in _POOL2D_SUPPORTED:
         return None
-    nhwc = bool(node.meta.get("transposed", False))
-    in_dims = _NHWC if nhwc else None
-    input_t = node.args[0].value.clone()
-    # ``or {}``: ``adjust_tiling`` may set the key to ``None`` (on-chip op).
-    shapes = node.meta.get("tiled_shapes") or {}
-    output_ts = shapes.get(node, tuple(node.value.shape))
-    tn, tc, toh, tow = _unproject(output_ts, in_dims)
 
-    kernel_size = get_arg_value(node, 1, "kernel_size")
-    stride = get_arg_value(node, 2, "stride", [])
-    padding = get_arg_value(node, 3, "padding", 0)
-    if "max_pool" in str(node.target):
-        dilation = get_arg_value(node, 4, "dilation", 1)
-        ceil_mode = get_arg_value(node, 5, "ceil_mode", False)
-        extra_args = (dilation, ceil_mode)
-        pad_value = float("-inf")
+    # Tiling comes from the anchor's ``l2_tiling`` — logical ``(n_N, n_H, n_W,
+    # n_C)`` tile *factors* set by the pool L2 tiling pass (pool has no
+    # cross-tile reduction).  A non-fused op with no ``l2_tiling`` is untiled ->
+    # bufferized whole-tensor elsewhere; a fused untiled submodule falls back to
+    # whole tensor (trip-1) below.
+    tiling = anchor.meta.get("l2_tiling")
+    if node.op != "call_module" and tiling is None:
+        return None
+
+    in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
+    input_t = in_node.value.clone()
+
+    val = node.value
+    outputs = val if isinstance(val, (list, tuple)) else (val,)
+    output_shape = tuple(outputs[-1].shape)
+
+    in_dims = _NHWC if anchor.meta.get("transposed", False) else None
+    # ``_unproject`` gives the logical ``(N, C, H, W)`` output; the tile sizes
+    # are each dim // its factor.  ``l2_tiling`` is logical ``(n_N, n_H, n_W,
+    # n_C)`` (``None`` => untiled, every factor 1).
+    N, C, H, W = _unproject(output_shape, in_dims)
+    if tiling is None:
+        nN, nH, nW, nC = 1, 1, 1, 1
     else:
-        ceil_mode = get_arg_value(node, 4, "ceil_mode", False)
-        count_include_pad = get_arg_value(node, 5, "count_include_pad") is None
-        dilation = 1
-        extra_args = (
-            ceil_mode,
-            count_include_pad,
-            get_arg_value(node, 6, "divisor_override"),
-        )
-        pad_value = 0.0
+        nN, nH, nW, nC = tiling
+    tn, tc, toh, tow = N // nN, C // nC, H // nH, W // nW
+    output_ts = _project((tn, tc, toh, tow), in_dims)
+    out_tiling = _project((nN, nC, nH, nW), in_dims)
 
-    N, C, H, W = _unproject(input_t.shape, in_dims)
+    # Geometry params, to size the halo / output / strides. Only ``max_pool``
+    # has a dilation arg; ``avg_pool``'s is implicitly 1.
+    is_max = "max_pool" in str(anchor.target)
+    kernel_size = get_arg_value(anchor, 1, "kernel_size")
+    stride = get_arg_value(anchor, 2, "stride", [])
+    padding = get_arg_value(anchor, 3, "padding", 0)
+    dilation = get_arg_value(anchor, 4, "dilation", 1) if is_max else 1
+    pad_value = float("-inf") if is_max else 0.0
+
     kH, kW = _pair(kernel_size)
     sh, sw = _pair(stride) if stride else (kH, kW)
     ph, pw = _pair(padding)
     dh, dw = _pair(dilation)
-    oH = (H + 2 * ph - dh * (kH - 1) - 1) // sh + 1
-    oW = (W + 2 * pw - dw * (kW - 1) - 1) // sw + 1
 
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
     step_h, step_w = toh * sh, tow * sw
 
-    out_tile = _project((tn, tc, toh, tow), in_dims)
-    out_shape = _project((N, C, oH, oW), in_dims)
-    grid = tuple(s // t for s, t in zip(out_shape, out_tile))
+    grid = out_tiling
     in_spec = _InputSpec(
         tile_sizes=_project((tn, tc, ih, iw), in_dims),
         index_map=(0, 1, 2, 3),
@@ -1597,15 +1728,72 @@ def build_pool(node, *, num_banks: int = 2):
         pad=_project((0, 0, ph, pw), in_dims),
         pad_value=pad_value,
     )
+
+    if node.op != "call_module":
+        out_specs = [
+            _OutputSpec(
+                output_shape, output_ts, tuple(range(4)), outputs[-1].dtype
+            )
+        ]
+
+        # Reuse the op's trailing args (max: dilation, ceil_mode; avg:
+        # ceil_mode, count_include_pad, divisor_override) verbatim; bound here,
+        # not inside ``compute`` — dynamo can't trace an FX-node attribute read.
+        extra = tuple(anchor.args[4:])
+
+        def compute(grid_index, tile):
+            # Only the input becomes the halo tile, padding is zeroed (folded
+            # into the halo load).
+            return anchor.target(tile, [kH, kW], [sh, sw], [0, 0], *extra)
+
+        kernel = _map_kernel(compute, 1)
+        return build_pipelined_buffers(
+            kernel,
+            grid,
+            [in_spec],
+            out_specs,
+            (input_t,),
+            num_banks=num_banks,
+        )
+
+    # Fused: run the whole submodule per tile.  The pool's input loads the halo;
+    # every other operand tiles at the output block (codebooks / scalars whole).
+    submod = node.meta["submodule"]
+    codebooks = set()
+    for sn in submod.graph.nodes:
+        if sn.op == "call_function":
+            for cb in _codebook_arg_nodes(sn):
+                codebooks.add(cb.meta.get("source_node", cb))
+
+    inputs, in_specs = [], []
+    for n in node.all_input_nodes:
+        inputs.append(n.value.clone())
+        if n is in_node:
+            in_specs.append(in_spec)
+        elif n in codebooks or n.value.ndim == 0 or list(n.shape) == [1]:
+            in_specs.append(None)
+        else:
+            in_specs.append(_compute_input_spec(out_tiling, tuple(n.shape)))
+
+    # Dice each output via the canonical helper (multi / sparse outputs handled
+    # right), using the physical-order ``out_divisor``.
+    tiled_shape = compute_output_tiled_shapes(node, out_tiling)
+    tiled_shape = (
+        list(tiled_shape)
+        if isinstance(node.value, (list, tuple))
+        else [tiled_shape]
+    )
     out_specs = [
-        _OutputSpec(out_shape, out_tile, tuple(range(4)), input_t.dtype)
+        _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
+        for o, ts in zip(outputs, tiled_shape)
     ]
 
-    def compute(grid_index, tile):
-        return node.target(tile, [kH, kW], [sh, sw], [0, 0], *extra_args)
+    def compute(grid_index, *tiles):
+        return submod(*tiles)
 
-    kernel = _map_kernel(compute, 1)
+    kernel = _map_kernel(compute, len(outputs))
     gm = build_pipelined_buffers(
-        kernel, grid, [in_spec], out_specs, (input_t,), num_banks=num_banks
+        kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
     )
+    _fuse_tail_in_body(gm, anchor.target)
     return gm

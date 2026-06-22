@@ -5,8 +5,8 @@ For each *tiled* GEMM / conv2d / pointwise / pool ``call_function``, the pass
 builds a ``while_loop`` nest over ``voyager.*`` primitives (via the ``pipeline``
 software-pipelining builders) and splices it into the graph in place of the
 node.  Untiled nodes (operands/outputs fit on-chip) are bufferized trivially;
-fused ``call_module`` submodules have no pipelined path yet (tail fusion is
-being redesigned) and raise.
+fused ``call_module`` submodules dispatch on their anchor op and apply the
+post-op tail in the kernel.
 
 Runs after operator fusion and before memory allocation.
 """
@@ -28,7 +28,7 @@ from ..mapping_utils import (
     is_nop,
     is_pooling,
 )
-from .ops import MemoryLevel
+from .ops import MemoryLevel, oracle_disabled
 
 voyager = torch.ops.voyager
 
@@ -370,9 +370,8 @@ def bufferize_graph(
     Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
     Returns the same (mutated) model.
 
-    Assumes shapes are already populated (``node.value``).  Build specs are
-    snapshotted up front (only shapes/dtypes are needed for export), so splicing
-    one node does not invalidate the build of a later node whose inputs change.
+    Assumes shapes are already populated (``node.value``); each node is built
+    from its (and its inputs') shapes/dtypes and spliced in place.
 
     ``pipelined`` reuses the tiler's double-buffering decision (it already
     sizes tiles so two L2 tiles fit) to emit software-pipelined loop nests:
@@ -391,71 +390,53 @@ def bufferize_graph(
     # software-pipeline depth: 2 banks (double buffer) vs 1 (single buffer).
     num_banks = 2 if pipelined else 1
 
-    # Snapshot which nodes to bufferize (and their built nests) before mutating
-    # the graph: each entry is ``(node, sub_gm, n_outputs)``.
-    specs = []
     for node in list(graph.nodes):
-        if node.op == "call_module":
-            # Fused GEMM/conv + post-op pointwise ops.  Dispatch to the pipeline
-            # builders, which parse the submodule's anchor + fused ops and apply
-            # them in the kernel (operands threaded through ``in_specs``).  They
-            # handle num_k == 1 (tail in ``compute``) and num_k > 1 (accumulate
-            # into a scratch ref, tail once on the last reduction step); an
-            # unsupported anchor returns ``None``.
-            submod = getattr(model, str(node.target), None)
-            if not isinstance(submod, GraphModule):
-                continue
-            node.meta.setdefault("submodule", submod)
-            anchor_node = get_anchor_node(submod.graph.nodes)
-            if anchor_node is None:
-                continue
-            if is_conv2d(anchor_node):
-                sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
-            elif is_gemm_op(anchor_node):
-                sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
-            else:
-                # A pure-pointwise fused submodule (e.g. relu(x + residual)):
-                # run the whole submodule per output tile.
-                sub_gm = build_pointwise(node, num_banks=num_banks)
-            if sub_gm is None:
-                raise NotImplementedError(
-                    f"fused submodule {node.name!r}: no pipelined fusion path"
-                )
-            val = node.value
-            n_out = len(val) if isinstance(val, (list, tuple)) else 1
-            specs.append((node, sub_gm, n_out))
+        # Dispatch is driven by an *anchor* op: for a fused ``call_module`` it is
+        # the submodule's matrix/pointwise anchor (the builders parse the rest of
+        # the submodule and apply the fused tail in the kernel — num_k == 1 folds
+        # the tail into ``compute``, num_k > 1 accumulates into a scratch ref and
+        # applies it once on the last reduction step); for a bare
+        # ``call_function`` it is the node itself.
+        if node.op not in ("call_module", "call_function"):
             continue
-        if node.op != "call_function":
-            continue
-        # Try the matching tiled builder.  Each returns ``None`` when there is
-        # nothing to tile — interstellar skipped the layer (FC with batch 1,
-        # depthwise conv, ...), there is no ``tiled_shapes`` annotation, or no
-        # ``tiler`` — so untiled / skipped ops fall through to the whole-tensor
-        # path below.
-        sub_gm, n_out = None, 1
-        if is_conv2d(node):
+        anchor = get_anchor_node(node)
+
+        # A fused submodule with no matrix/pool anchor runs whole through the
+        # pointwise builder; a bare op only when it is elementwise / a
+        # kept-reduction op (pool only when bare — a fused pool is pointwise).
+        if is_conv2d(anchor):
             sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
-        elif is_gemm_op(node):
+        elif is_gemm_op(anchor):
             sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
-        elif is_pooling(node):
+        elif is_pooling(anchor):
             sub_gm = build_pool(node, num_banks=num_banks)
-        elif is_elementwise_op(node) or node.target in _REDUCTION_POINTWISE_OPS:
+        elif (
+            is_elementwise_op(anchor)
+            or anchor.target in _REDUCTION_POINTWISE_OPS
+            or anchor.target in _RELAYOUT_POINTWISE_OPS
+        ):
             sub_gm = build_pointwise(node, num_banks=num_banks)
+        else:
+            sub_gm = None
+
+        if sub_gm is not None:
             val = node.value
             n_out = len(val) if isinstance(val, (list, tuple)) else 1
-        if sub_gm is None:
-            if _is_tiled(node):
-                raise NotImplementedError(
-                    f"tiled op {node.target} has no pipelined builder"
-                )
+        elif not _is_tiled(node):
+            # Untiled / interstellar-skipped op (FC batch-1, depthwise conv, a
+            # shape-changing reshape/slice): bufferize whole-tensor (trip-1).
             built = _build_for_untiled(node)
             if built is None:
                 continue  # getitem / non-tensor: nothing to load/store
             sub_gm, n_out = built
-        specs.append((node, sub_gm, n_out))
+        else:
+            raise Exception(
+                f"bufferization: no builder for tiled node {node.op} "
+                f"'{node.name}' ({node.target})"
+            )
 
-    for node, sub_gm, n_out in specs:
-        results = replace_node_with_graph_module(model, node, sub_gm)
+        with oracle_disabled():
+            results = replace_node_with_graph_module(model, node, sub_gm)
 
         if n_out == 1:
             if "dtype" in node.meta:
@@ -501,9 +482,17 @@ _MULTI_OUTPUT_POINTWISE = {
 }
 _REDUCTION_POINTWISE_OPS = _MULTI_OUTPUT_POINTWISE | {
     torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.calculate_mx_qparam.default,
+    torch.ops.quantized_ops.layer_norm.default,
     torch.ops.aten.layer_norm.default,
     torch.ops.aten.softmax.int,
-    torch.ops.aten._softmax.default,
+}
+# A standalone transpose / permute relayout — build_pointwise stores each tile
+# identity and loads the input from the transposed source.  (Untiled ones fall
+# to ``_build_for_untiled``; build_pointwise returns ``None`` when untiled.)
+_RELAYOUT_POINTWISE_OPS = {
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.permute.default,
 }
 
 
@@ -535,49 +524,49 @@ def _build_for_untiled(node: Node):
     outputs = list(val) if isinstance(val, (list, tuple)) else [val]
     codebooks = _codebook_arg_nodes(node)
 
-    # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
-    # constant *now* — the closure runs in the traced while_loop body, where
-    # dynamo rejects FX-Node lookups (mirrors ``build_pointwise``).
+    # Resolve each arg *now* into a ``(value, is_index)`` template: an input Node
+    # -> ``(tile_slot, True)`` (the loaded tile at that slot is substituted when
+    # the body is traced — dynamo rejects FX-Node lookups there; mirrors
+    # ``build_pointwise``), a constant -> ``(value, False)``; a list/tuple
+    # recurses, so a Node nested in a list arg (``stack([t0, t1], dim)``) is
+    # resolved instead of leaking an FX Node into the export.
     order = {n: i for i, n in enumerate(in_nodes)}
-    _plain = lambda a: list(a) if isinstance(a, list) else a
-    arg_slots = [
-        order[a] if isinstance(a, fx.Node) else None for a in node.args
-    ]
-    kw_slots = {
-        k: order[v] if isinstance(v, fx.Node) else None
-        for k, v in node.kwargs.items()
-    }
-    op_args = [_plain(a) for a in node.args]
-    op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
+
+    def _resolve(a):
+        if isinstance(a, fx.Node):
+            return (order[a], True)
+        if isinstance(a, (list, tuple)):
+            return [_resolve(x) for x in a]
+        return (a, False)
+
+    arg_tmpl = [_resolve(a) for a in node.args]
+    kw_tmpl = {k: _resolve(v) for k, v in node.kwargs.items()}
     op = node.target
 
+    def _fill(t, tiles):
+        if isinstance(t, list):
+            return [_fill(x, tiles) for x in t]
+        value, is_index = t
+        return tiles[value] if is_index else value
+
     def compute(grid_index, *tiles):
-        args = [
-            tiles[i] if i is not None else a for i, a in zip(arg_slots, op_args)
-        ]
-        kwargs = {
-            k: tiles[i] if i is not None else op_kwargs[k]
-            for k, i in kw_slots.items()
-        }
+        args = [_fill(t, tiles) for t in arg_tmpl]
+        kwargs = {k: _fill(t, tiles) for k, t in kw_tmpl.items()}
         return op(*args, **kwargs)
 
     grid = (1,)
-    in_specs = [
-        (
-            None
-            if (
-                n in codebooks
-                or n.value.ndim == 0
-                or list(n.value.shape) == [1]
+    in_specs = []
+    for n in in_nodes:
+        if n in codebooks or n.value.ndim == 0 or list(n.value.shape) == [1]:
+            in_specs.append(None)
+        else:
+            in_specs.append(
+                _InputSpec(
+                    tuple(n.value.shape),
+                    (0,) * n.value.ndim,
+                    (False,) * n.value.ndim,
+                )
             )
-            else _InputSpec(
-                tuple(n.value.shape),
-                (0,) * n.value.ndim,
-                (False,) * n.value.ndim,
-            )
-        )
-        for n in in_nodes
-    ]
     out_specs = [
         _OutputSpec(tuple(o.shape), tuple(o.shape), (0,) * o.ndim, o.dtype)
         for o in outputs

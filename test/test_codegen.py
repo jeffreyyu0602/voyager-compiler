@@ -44,6 +44,7 @@ from voyager_compiler.codegen.mapping_utils import is_fully_connected
 from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
+from utils.models.utils import get_compile_args, get_transform_args
 from utils.dataset import glue, imagenet
 
 logger = logging.getLogger()
@@ -345,7 +346,17 @@ if __name__ == "__main__":
             "voyager.* primitives and emit model.txt / bufferized_graph.txt / "
             "compute_graph from that graph, instead of run_memory_mapping + "
             "gen_code.  Requires --cache_size (the L2 tiling pass sets the "
-            "l2_tiling/tiled_shapes meta the bufferizer consumes)."
+            "l2_tiling meta the bufferizer consumes)."
+        ),
+    )
+    parser.add_argument(
+        "--use_interstellar_tiling",
+        action="store_true",
+        help=(
+            "Tile GEMM/conv on demand via interstellar in the bufferization "
+            "lowering, instead of the run_matrix_op_l2_tiling pass.  When set, "
+            "that pass is skipped (no l2_tiling meta) and each GEMM/conv is "
+            "tiled by interstellar at build time."
         ),
     )
     add_qspec_args(parser)
@@ -371,43 +382,8 @@ if __name__ == "__main__":
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    fuse_reshape = not args.disable_reshape_fusion and (
-        args.hardware_unrolling is None or max(args.hardware_unrolling) < 64
-    )
-
-    transform_args = {
-        "patterns": VECTOR_PIPELINE,
-        "transform_layout": args.transform_layout,
-        "transpose_fc": args.transpose_fc,
-        "cache_size": args.cache_size,
-        "num_banks": args.num_banks,
-        "unroll_dims": args.hardware_unrolling,
-        "fuse_reshape": fuse_reshape,
-        "split_spmm": args.split_spmm,
-        "bufferize": args.bufferize,
-    }
-
-    # The bufferization lowering builds the interstellar architecture itself
-    # (``compile`` -> ``build_interstellar_tiler``); pass the raw hardware
-    # description rather than a prebuilt arch.
-    compile_args = {
-        "cache_size": args.cache_size,
-        "num_banks": args.num_banks,
-        "bank_width": args.bank_width,
-        "unroll_dims": args.hardware_unrolling,
-        "output_dir": args.model_output_dir,
-        "output_file": args.model,
-        "dump_tensors": args.dump_tensors,
-        "input_buffer_size": args.input_buffer_size,
-        "weight_buffer_size": args.weight_buffer_size,
-        "accum_buffer_size": args.accum_buffer_size,
-        "double_buffered_accum_buffer": args.double_buffered_accum_buffer,
-        "double_buffered_l2": args.double_buffered_l2,
-        "dram_size": args.dram_size,
-        "dram_bandwidth": args.dram_bandwidth,
-        "frequency": args.frequency,
-        "bufferize": args.bufferize,
-    }
+    transform_args = get_transform_args(args, VECTOR_PIPELINE)
+    compile_args = get_compile_args(args)
 
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)

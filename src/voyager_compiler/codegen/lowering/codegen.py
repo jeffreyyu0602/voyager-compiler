@@ -406,10 +406,9 @@ def _render_loop(
     body_inputs = carried + extra
 
     body_args = [_loop_input_value(n) for n in body_inputs]
-    try:
+
+    with oracle_disabled():
         ShapeProp(body_gm).propagate(*body_args)
-    except Exception:
-        pass
 
     placeholders = [n for n in body_gm.graph.nodes if n.op == "placeholder"]
     for ph, src in zip(placeholders, body_inputs):
@@ -714,8 +713,4 @@ def print_bufferized_graph(model: GraphModule, to_string: bool = False):
     if to_string:
         return text
     print(text)
-
-    for m in model.modules():
-        if isinstance(m, torch.fx.GraphModule):
-            m.graph.print_tabular()
     return text

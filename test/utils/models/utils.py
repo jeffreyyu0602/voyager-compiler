@@ -12,7 +12,7 @@ def get_transform_args(args, vector_stages):
         "num_banks": args.num_banks,
         "fuse_reshape": fuse_reshape,
         "split_spmm": args.split_spmm,
-        "bufferize": args.bufferize,
+        "use_interstellar_tiling": args.use_interstellar_tiling,
     }
 
 

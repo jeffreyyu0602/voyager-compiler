@@ -32,7 +32,9 @@ class _InputSpec:
 
     Fields:
       ``tile_sizes``   per-dim tile sizes for this operand.
-      ``index_map``    output/grid dim each operand dim maps to.
+      ``index_map``    output/grid dim each operand dim maps to, or ``None`` for
+                       an axis loaded whole / mapped to no grid dim (e.g. a conv
+                       weight's kH/kW, never tiled).
       ``is_broadcast`` dim is size 1 in operand, >1 in output.
       ``strides``      step between tiles (``None`` => == ``tile_sizes``).
       ``pad``          per-dim low padding (start -= pad).
@@ -89,31 +91,41 @@ class _ScratchSpec:
 
 
 def _compute_input_spec(
-    output_shape: tuple, tile_sizes: tuple, input_shape: tuple
+    tiling: tuple, input_shape: tuple, grid_map: Optional[tuple] = None
 ) -> Optional[_InputSpec]:
     """Derive the tile spec for one operand (NumPy/PyTorch right-align rules),
     or ``None`` for a 0-D / single-element operand that is passed whole (not
     tiled / loaded).
+
+    ``tiling`` is the per-output-dim tile-factor vector; the operand's tile is
+    ``compute_tiled_shape(input_shape, tiling)`` — the same helper used
+    everywhere else — so a block/reduction axis (input larger than its output,
+    e.g. ``calculate_mx_qparam``) keeps its full per-tile block, and broadcast /
+    unit dims (``s == 1``) stay at 1.
+
+    ``grid_map`` maps each output dim to the grid dim it tiles along; ``None``
+    means the grid *is* the output (pointwise / pool), so the operand's dim
+    ``offset + d`` is its grid dim directly.  GEMM / conv pass their
+    output->grid map (e.g. a transposed-conv NHWC permutation), since their grid
+    carries a reduction dim the output doesn't span.
     """
-    ndim_out = len(output_shape)
+    from voyager_compiler.codegen.passes.tiling import compute_tiled_shape
 
     # 0-D or single-element tensors are passed through (no spec).
     if len(input_shape) == 0 or (len(input_shape) == 1 and input_shape[0] == 1):
         return None
 
     ndim_in = len(input_shape)
-    offset = ndim_out - ndim_in
+    offset = len(tiling) - ndim_in
 
-    index_map, ts_for_inp, is_broadcast = [], [], []
-    for d_in, (s_in, s_out, ts) in enumerate(
-        zip(input_shape, output_shape[offset:], tile_sizes[offset:])
-    ):
-        index_map.append(offset + d_in)
-        bcast = s_in == 1 and s_out > 1
-        is_broadcast.append(bcast)
-        ts_for_inp.append(1 if bcast else ts)
+    ts_for_inp = compute_tiled_shape(input_shape, tiling)
+    index_map = tuple(
+        (offset + d) if grid_map is None else grid_map[offset + d]
+        for d in range(ndim_in)
+    )
+    is_broadcast = tuple(s == 1 for s in input_shape)
 
-    return _InputSpec(tuple(ts_for_inp), tuple(index_map), tuple(is_broadcast))
+    return _InputSpec(ts_for_inp, index_map, is_broadcast)
 
 
 def _out_of_place(target):
@@ -525,8 +537,3 @@ def _unproject(physical: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
     if dims is None:
         return tuple(physical)
     return tuple(physical[dims.index(a)] for a in range(len(physical)))
-
-
-def _phys_pos(axis: int, dims: Optional[Tuple[int, ...]]) -> int:
-    """Physical position of logical ``axis`` under permutation ``dims``."""
-    return axis if dims is None else dims.index(axis)

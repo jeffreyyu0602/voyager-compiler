@@ -59,7 +59,9 @@ voyager_lib.define(
 def alloc(
     size: Tuple[int, ...], dtype: torch.dtype, space: int = MemoryLevel.DRAM
 ) -> torch.Tensor:
-    return torch.empty(size, dtype=dtype)
+    if dtype.is_floating_point:
+        return torch.randn(size).to(dtype)
+    return torch.zeros(size, dtype=dtype)
 
 
 @torch.library.register_fake("voyager::alloc")

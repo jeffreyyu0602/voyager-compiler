@@ -9,18 +9,29 @@ import math
 from functools import reduce
 
 
-class Buffer(namedtuple("Buffer", ["capacity", "access_cost", "unit_static_cost"])):
+class Buffer(
+    namedtuple(
+        "Buffer",
+        ["capacity", "access_cost", "unit_static_cost", "bank_size"],
+    )
+):
     """
     Buffer specification.
 
     Immutable type.
 
-    Buffer attributes include capacity, access cost, unit static cost.
+    Buffer attributes include capacity, access cost, unit static cost,
+    bank size.
 
     Capacity is for a single buffer (If current level has parallelism,
     then it is the capacity of the buffer bank inside each parallel
     units); access cost is the cost per access;
     unit static cost is the static cost per time unit.
+
+    bank_size is the physical bank granularity at this level (None when
+    the level has no banking). An operand cannot share a bank with
+    another operand, so each operand's footprint is rounded up to a
+    multiple of bank_size.
     """
 
     pass
@@ -94,6 +105,7 @@ class Resource(object):
         replication=True,
         memory_partitions=[[0, 0, 0], [0, 0, 0], [0, 0, 0]],
         invalid_underutilized=True,
+        bank_size_list=None,
     ):
 
         # Buffers.
@@ -101,10 +113,20 @@ class Resource(object):
         assert len(buf_capacity_list) == len(buf_unit_static_cost_list)
         assert len(buf_capacity_list) == len(para_count_list)
 
+        # bank_size is per-level; None for levels without banking.
+        if bank_size_list is None:
+            bank_size_list = [None] * len(buf_capacity_list)
+        assert len(buf_capacity_list) == len(bank_size_list)
+
         self.bufs = [
             Buffer(*t)
             for t in list(
-                zip(buf_capacity_list, buf_access_cost_list, buf_unit_static_cost_list)
+                zip(
+                    buf_capacity_list,
+                    buf_access_cost_list,
+                    buf_unit_static_cost_list,
+                    bank_size_list,
+                )
             )
         ]
 

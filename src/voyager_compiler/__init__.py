@@ -135,7 +135,7 @@ def transform(
     fuse_reshape=True,
     split_spmm=False,
     use_fake_mode=True,
-    bufferize=False,
+    use_interstellar_tiling=False,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -177,10 +177,12 @@ def transform(
     # 3. Matrix Operation Tiling
     # -------------------------------------------------------------------------
     # Apply L2 tiling logic specifically for matrix operations (GEMM/Conv) to
-    # optimize for the specific cache size and memory bank configuration.  Skipped
-    # under ``bufferize``: the bufferization lowering tiles each GEMM/conv on
-    # demand (interstellar) instead of splitting it here.
-    if cache_size is not None and not bufferize:
+    # optimize for the specific cache size and memory bank configuration. This
+    # annotates each GEMM/conv with ``l2_tiling`` (the bufferized builders read
+    # it).  Skipped only under ``use_interstellar_tiling``, where the
+    # bufferization lowering tiles each GEMM/conv on demand (interstellar)
+    # instead of splitting it here.
+    if cache_size is not None and not use_interstellar_tiling:
         run_matrix_op_l2_tiling(model, unroll_dims, cache_size, num_banks)
 
     # -------------------------------------------------------------------------
@@ -301,6 +303,7 @@ def compile(
             frequency=frequency,
             double_buffered_accum_buffer=double_buffered_accum_buffer,
             double_buffered_l2=double_buffered_l2,
+            num_banks=num_banks,
         )
 
         # Reuse the tiler's double-buffering decision: when L2 is double-buffered the

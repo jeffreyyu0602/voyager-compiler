@@ -1,23 +1,26 @@
-"""Interstellar-driven per-node tiling for the bufferization lowering.
+"""Per-node tiling for the bufferization lowering.
 
 The bufferization builders (``build_gemm`` / ``build_conv2d``) call
-``interstellar_tile_sizes`` on their anchor op to get the on-chip tile sizes
-directly — there is no separate tiling pass that annotates ``node.meta`` and no
-op decomposition.  A reduction tile smaller than the full extent is what drives
-the ``PipelinedKernel``'s ``num_k`` accumulation loop.
+``get_tiling`` on their anchor op to get the per-dim tile *factors* — preferring
+the anchor's ``l2_tiling`` meta (set by the matrix L2 tiling pass), else running
+interstellar directly.  A reduction factor greater than 1 is what drives the
+``PipelinedKernel``'s ``num_k`` accumulation loop.
 
 ``build_interstellar_tiler`` builds the 4-level interstellar architecture once
 (from the raw hardware description) and returns a ``TilerContext`` threaded down
 to each builder; per-node element widths are read from the nodes themselves.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 
 import torch
 
 from ..mapping_utils import is_bmm, is_conv2d, is_linear, is_matmul
-from ..tiler import _node_dtype_bits
+from ..tiler import _node_dtype_bits, get_dtype_width
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +50,7 @@ def build_interstellar_tiler(
     double_buffered_accum_buffer=False,
     double_buffered_l2=False,
     dram_access_cost=1000,
+    num_banks=None,
 ):
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
@@ -69,6 +73,12 @@ def build_interstellar_tiler(
     ic_dim, oc_dim = unroll
     # DRAM bandwidth GB/s -> bytes per cycle (GB/s and GHz share the 1e9 factor).
     dram_bw = int(dram_bandwidth / frequency)
+
+    # Banking applies only at L2 (the on-chip scratchpad). The bank size is the
+    # physical cache split into ``num_banks`` -> derive it from the real cache
+    # size (``scratchpad_size``), not the L2 capacity below (which is fudged by
+    # the double-buffer ``*2`` hack). None = no banking.
+    l2_bank_size = None if num_banks is None else scratchpad_size // num_banks
 
     architecture = interstellar.Resource(
         buf_capacity_list=[
@@ -94,6 +104,7 @@ def build_interstellar_tiler(
         mac_capacity=0,
         partition_mode=[0, 0, 0, 0],
         invalid_underutilized=False,
+        bank_size_list=[None, None, l2_bank_size, None],
     )
 
     schedule_constraint = {
@@ -135,11 +146,13 @@ def build_interstellar_tiler(
     )
 
 
-def _layer_cache_key(node, in_bits, w_bits, out_bits):
+def _layer_cache_key(node, in_bits, w_bits, out_dtype):
     """A hashable key capturing everything (besides the fixed architecture) that
     determines a node's interstellar mapping: op, operand / output shapes, the
     conv stride/padding/dilation, and the element widths.  Identical layers thus
-    share one optimizer run."""
+    share one optimizer run.  ``out_dtype`` is the outer node's output dtype
+    (a ``(scale, value)`` list for a fused mx output); list-ified to a tuple so
+    the key stays hashable."""
     from ..passes.utils import _pair, get_arg_value
 
     val = node.value
@@ -151,7 +164,7 @@ def _layer_cache_key(node, in_bits, w_bits, out_bits):
         out_shape,
         in_bits,
         w_bits,
-        out_bits,
+        tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
     ]
     if is_conv2d(node):
         key += [
@@ -369,11 +382,16 @@ class RuntimeCalculator:
         return total_time
 
 
-def _extract_layer_from_node(node):
+def _extract_layer_from_node(node, out_dtype=None):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
 
     Reads shapes directly from the FX node, before any tiling has occurred.
+    ``out_dtype`` is the outer (fused) node's output dtype (the true quantized
+    output dtype lives there, not on the matmul/conv anchor).  A fused mx output
+    is ``(scale, value)`` so ``out_dtype`` is then a 2-list -- value (the output
+    dtype) last, scale dtype first; a single dtype (or None) means no output
+    scale and the output width falls back to the anchor's own dtype.
 
     Returns None for layers that should be skipped (depthwise, FC with batch=1,
     3-channel first conv, unsupported weight shapes).
@@ -408,7 +426,7 @@ def _extract_layer_from_node(node):
         # Per-batch output rows M: a bmm keeps its batch dim(s) separate (the
         # tiler maps one (M, N, K) gemm and leaves the batch whole) while a
         # linear / broadcast-matmul flattens its leading dims into M.  Matches
-        # ``interstellar_tile_sizes``' OX (X) dim.
+        # ``get_tiling``'s OX (X) dim.
         width = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
         if width == 1:
             return None  # matrix-vector: nothing to tile along M
@@ -428,6 +446,17 @@ def _extract_layer_from_node(node):
 
     input_node = node.args[0] if len(node.args) > 0 else None
     weight_node = node.args[1] if len(node.args) > 1 else None
+    # Microscaling (mx) ops carry per-block scale operands; their dtype widths +
+    # block size let interstellar account for the scale tensors' L2+ footprint.
+    input_scale = node.kwargs.get("input_scale")
+    weight_scale = node.kwargs.get("weight_scale")
+    # A fused mx output is (scale, value): value (the true quantized output
+    # dtype) is last, the scale dtype first.  A single / None out_dtype has no
+    # output scale; the output width then falls back to the anchor's own dtype.
+    if isinstance(out_dtype, (list, tuple)):
+        of_dtype, of_scale_dtype = out_dtype[-1], out_dtype[0]
+    else:
+        of_dtype, of_scale_dtype = out_dtype, None
     return interstellar.Layer(
         nifm=input_channels,
         nofm=output_channels,
@@ -439,17 +468,26 @@ def _extract_layer_from_node(node):
         hstd=stride_h,
         if_dtype_bits=_node_dtype_bits(input_node),
         fl_dtype_bits=_node_dtype_bits(weight_node),
-        of_dtype_bits=_node_dtype_bits(node),
+        of_dtype_bits=(
+            get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
+        ),
+        if_scale_bits=_node_dtype_bits(input_scale, 0),
+        fl_scale_bits=_node_dtype_bits(weight_scale, 0),
+        of_scale_bits=(
+            get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
+        ),
+        block_size=node.kwargs.get("block_size") or 1,
     )
 
 
-def run_interstellar_tiling(
+def run_interstellar(
     node,
     architecture,
     schedule,
     dram_bandwidth: int,
     double_buffered_accum_buffer: bool = False,
     double_buffered_l2: bool = False,
+    out_dtype=None,
 ):
     """
     Run interstellar with the 4-level DRAM architecture for a single GEMM/conv
@@ -467,7 +505,7 @@ def run_interstellar_tiling(
 
     logger = logging.getLogger(__name__)
 
-    layer = _extract_layer_from_node(node)
+    layer = _extract_layer_from_node(node, out_dtype)
     if layer is None:
         return None
 
@@ -520,190 +558,89 @@ def run_interstellar_tiling(
     return mapping
 
 
-def interstellar_tile_sizes(node, ctx):
-    """Run interstellar on a GEMM/conv ``node`` and return its on-chip tile
-    sizes, or ``None`` if the node is skipped (e.g. the 3-channel first conv).
+def get_tiling(node, tiler=None):
+    """Per-dim tile *counts* for a GEMM/conv ``node`` (standalone or fused
+    ``call_module``), or ``None`` (not a matrix op / untiled / skipped).
 
-    ``mapping.loop_blockings[dim][level]`` are per-level blocking factors whose
-    product over levels (0..3 = PE / L1 / L2 / DRAM) is the loop extent, so the
-    on-chip (SRAM) tile for a dim is ``full_dim // b[dim][3]`` (everything below
-    DRAM) and ``b[dim][3]`` is the number of DRAM tiles.
+    conv -> ``(n_y, n_x, n_c, n_k)``; gemm -> ``(batch.., n_m, n_n, n_k)`` — the
+    output-spatial / M / N counts plus the reduction count last (``n_c`` for
+    conv, ``n_k`` for gemm; the builder's ``num_k``).  The builder derives the
+    tile sizes as ``full_dim // count``.
 
-    Returns conv ``(tile_y, tile_x, tile_c, tile_k)`` or gemm
-    ``(tile_m, tile_n, tile_k)`` — the reduction dim (``IC``) is the conv
-    ``tile_c`` / gemm ``tile_k`` (so gemm is already in output ``M, N`` + reduction
-    order, ready to append to the batch dims).
+    Prefers the anchor's ``l2_tiling`` (set by the matrix L2 tiling pass —
+    output-dim factors; the reduction is kept whole / decomposed away, so its
+    factor is 1).  ``l2_tiling`` may carry the reduction factor explicitly — a
+    3-tuple gemm ``(n_m, n_n, n_k)`` / a 5-tuple conv ``(n_N, n_k, n_y, n_x,
+    n_c)`` — to drive a ``num_k > 1`` reduction sweep.  Otherwise runs
+    interstellar via ``tiler`` (caching each layer's mapping; interstellar does
+    not tile the batch, so batch factors are 1).
     """
     import interstellar
 
-    le = interstellar.le
-
-    in_bits = _node_dtype_bits(node.args[0])
-    w_bits = _node_dtype_bits(node.args[1])
-    out_bits = _node_dtype_bits(node)
-    key = _layer_cache_key(node, in_bits, w_bits, out_bits)
-    if key in ctx.cache:
-        mapping = ctx.cache[key]  # interstellar is slow; map each layer once
-    else:
-        mapping = run_interstellar_tiling(
-            node,
-            ctx.arch,
-            ctx.schedule,
-            ctx.dram_bandwidth,
-            ctx.double_buffered_accum_buffer,
-            double_buffered_l2=ctx.double_buffered_l2,
-        )
-        ctx.cache[key] = mapping  # cache None too (skipped layers)
-    if mapping is None:
-        return None
-    b = mapping.loop_blockings
-
-    def tile(full, dim):
-        count = b[dim][3]  # number of DRAM-level tiles for this loop dim
-        return max(1, full // count) if count else full
-
-    if is_conv2d(node):
-        from ..passes.tiling import _conv2d_layout
-
-        transposed = node.meta.get("transposed", False)
-        _, Y, X, K = _conv2d_layout(node.shape, False, not transposed)
-        _, _, C, _ = _conv2d_layout(node.args[1].shape, True, not transposed)
-        return (
-            tile(Y, le.OY),
-            tile(X, le.OX),
-            tile(C, le.IC),
-            tile(K, le.OC),
-        )
-
-    # linear / matmul: IC == reduction (C), OC == N (K), OX == M (rows).  Return
-    # in (M, N, reduction) order so it appends straight after the batch dims.
-    input_shape = node.args[0].shape
-    X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
-    C = input_shape[-1]
-    weight_shape = node.args[1].shape
-    # N is the weight's last/second-to-last dim (rank-agnostic, so a batched
-    # bmm weight (B, K, N) reads N, not the batch dim).
-    weight_transposed = is_matmul(node) ^ node.meta.get("transposed", False)
-    K = weight_shape[-1] if weight_transposed else weight_shape[-2]
-    return (tile(X, le.OX), tile(K, le.OC), tile(C, le.IC))
-
-
-def _anchor_of(node, predicate):
-    """The GEMM/conv anchor for ``node``: ``node`` itself for a standalone op, or
-    the matching op inside a fused ``call_module``'s submodule; ``None`` if there
-    is no matching anchor."""
     from ..mapping import get_anchor_node
 
-    if node.op == "call_module":
-        submod = node.meta.get("submodule")
-        if not isinstance(submod, torch.fx.GraphModule):
-            return None
-        anchor = get_anchor_node(submod.graph.nodes)
-    else:
-        anchor = node
-    return anchor if anchor is not None and predicate(anchor) else None
-
-
-def conv2d_tiling(node, tiler=None):
-    """Logical on-chip tile ``(tile_y, tile_x, tile_c, tile_k)`` for a conv2d
-    ``node`` (standalone or fused ``call_module``), or ``None`` (untiled /
-    unsupported).
-
-    Parses ``node.meta['tiled_shapes']`` when present (the per-tensor tiles the
-    tiler annotated, keyed by outer nodes); otherwise runs interstellar via
-    ``tiler``.  Both paths return the same logical format; ``tile_c`` is the
-    reduction (input-channel) tile driving the builder's ``num_k``.
-    """
-    from .utils import _NHWC, _unproject
-
-    anchor = _anchor_of(node, is_conv2d)
-    if anchor is None:
+    anchor = get_anchor_node(node)
+    is_conv = is_conv2d(anchor)
+    if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
         return None
 
-    shapes = node.meta.get("tiled_shapes") or {}
-    if shapes:
-        dims = _NHWC if anchor.meta.get("transposed", False) else None
-        out_keyed = shapes.get(node)
-        if out_keyed is None:
-            return None  # untiled (whole tensor)
-        if isinstance(node.value, (list, tuple)):
-            out_keyed = out_keyed[-1]  # activation output drives the grid
-        _, tk, toh, tow = (int(x) for x in _unproject(out_keyed, dims))
-        in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
-        in_keyed = shapes.get(in_node)
-        if in_keyed is None:
-            return None
-        tc = int(_unproject(in_keyed, dims)[1])
-        return (toh, tow, tc, tk)
-
-    return interstellar_tile_sizes(anchor, tiler) if tiler is not None else None
-
-
-def gemm_tiling(node, tiler=None):
-    """Flat tile ``(batch.., tile_m, tile_n, tile_k)`` for a GEMM ``node``
-    (standalone or fused), or ``None``.
-
-    The leading dims are the full output tile (batch may be tiled); the trailing
-    ``tile_k`` is the reduction (K) tile driving the builder's ``num_k``.  Parses
-    ``node.meta['tiled_shapes']`` when present, else runs interstellar.
-    """
-    anchor = _anchor_of(node, lambda n: is_linear(n) or is_matmul(n))
-    if anchor is None:
-        return None
-
-    shapes = node.meta.get("tiled_shapes") or {}
-    if shapes:
-        out_keyed = shapes.get(node)
-        if out_keyed is None:
-            return None  # untiled (whole tensor)
-        if isinstance(node.value, (list, tuple)):
-            out_keyed = out_keyed[-1]
-        in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
-        in_keyed = shapes.get(in_node)
-        if in_keyed is None:
-            return None
-        return tuple(out_keyed) + (int(in_keyed[-1]),)
+    l2_tiling = anchor.meta.get("l2_tiling")
+    logger.debug(f"Found {anchor.name} tiling: {l2_tiling}")
+    if l2_tiling is not None:
+        if is_conv:
+            # ``(n_N, n_k, n_y, n_x)`` keeps the reduction whole (``n_c = 1``);
+            # an optional 5th element sets the C-reduction factor directly.
+            if len(l2_tiling) == 5:
+                _, nk, ny, nx, nc = l2_tiling
+            else:
+                _, nk, ny, nx = l2_tiling
+                nc = 1
+            return (ny, nx, nc, nk)
+        # ``(n_m, n_n)`` keeps the reduction whole (``n_k = 1``); an optional
+        # 3rd element sets the K-reduction factor directly.
+        if len(l2_tiling) == 3:
+            nm, nn, nk = l2_tiling
+        else:
+            nm, nn = l2_tiling
+            nk = 1
+        return (1,) * (anchor.value.ndim - 2) + (nm, nn, nk)
 
     if tiler is None:
         return None
-    ts = interstellar_tile_sizes(anchor, tiler)  # (tile_m, tile_n, tile_k)
-    if ts is None:
-        return None
-    # interstellar does not tile the batch dims -> keep them whole.
-    out = anchor.value
-    return tuple(out.shape[: out.ndim - 2]) + ts
 
-
-def output_tiling(node, tile):
-    """Per-output-dim tile *counts* (full // tile) in the output's physical
-    layout for a GEMM/conv ``node``, or ``None`` (untiled).
-
-    ``tile`` is the already-computed ``conv2d_tiling`` / ``gemm_tiling`` result
-    (so interstellar is not re-run).  The fused pointwise operands / outputs tile
-    at the output block, so this is the divisor passed to ``compute_tiled_shape``
-    / ``compute_output_tiled_shapes`` (mirroring ``mapping.adjust_tiling``).
-    """
-    from .utils import _NHWC, _project, _unproject
-
-    if tile is None:
-        return None
-    anchor = _anchor_of(
-        node, lambda n: is_conv2d(n) or is_linear(n) or is_matmul(n)
+    # Run interstellar (cached per layer; the optimizer is slow).  ``out_dtype``
+    # is the outer (fused) node's output dtype.
+    out_dtype = node.meta.get("dtype")
+    key = _layer_cache_key(
+        anchor,
+        _node_dtype_bits(anchor.args[0]),
+        _node_dtype_bits(anchor.args[1]),
+        out_dtype,
     )
-    if anchor is None:
-        return None
-    out = node.value
-    out = (
-        out[-1] if isinstance(out, (list, tuple)) else out
-    )  # activation output
-
-    if is_conv2d(anchor):
-        toh, tow, _, tk = (
-            tile  # conv2d_tiling: (tile_y, tile_x, tile_c, tile_k)
-        )
-        dims = _NHWC if anchor.meta.get("transposed", False) else None
-        N, _, _, _ = _unproject(out.shape, dims)
-        out_tile = _project((N, tk, toh, tow), dims)  # physical output tile
+    if key in tiler.cache:
+        mapping = tiler.cache[key]
     else:
-        out_tile = tile[:-1]  # gemm_tiling: (batch.., tile_m, tile_n, tile_k)
-    return tuple(f // t for f, t in zip(out.shape, out_tile))
+        logger.debug(f"Running interstellar for {anchor.name}")
+        mapping = run_interstellar(
+            anchor,
+            tiler.arch,
+            tiler.schedule,
+            tiler.dram_bandwidth,
+            tiler.double_buffered_accum_buffer,
+            double_buffered_l2=tiler.double_buffered_l2,
+            out_dtype=out_dtype,
+        )
+        tiler.cache[key] = mapping  # cache None too (skipped layers)
+    if mapping is None:
+        return None
+
+    le = interstellar.le
+    b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
+
+    if is_conv:
+        return (b[le.OY][3], b[le.OX][3], b[le.IC][3], b[le.OC][3])
+    return (1,) * (anchor.value.ndim - 2) + (
+        b[le.OX][3],
+        b[le.OC][3],
+        b[le.IC][3],
+    )

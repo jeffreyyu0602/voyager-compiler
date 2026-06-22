@@ -22,6 +22,11 @@ class Layer(object):
     fl_dtype_bits: weight/filter element width in bits.
     psum_dtype_bits: partial-sum accumulator width in bits.
     of_dtype_bits: output activation element width in bits.
+    if_scale_bits: microscaling input-scale element width in bits (0 = none).
+    fl_scale_bits: microscaling weight-scale element width in bits (0 = none).
+    of_scale_bits: microscaling output-scale element width in bits (0 = none).
+    block_size: microscaling group size (elements per scale); the scale tensor
+        holds one scale per block_size value elements.
     """
 
     def __init__(
@@ -39,6 +44,10 @@ class Layer(object):
         fl_dtype_bits=8,
         psum_dtype_bits=32,
         of_dtype_bits=8,
+        if_scale_bits=0,
+        fl_scale_bits=0,
+        of_scale_bits=0,
+        block_size=1,
     ):
         self.nifm = nifm
         self.nofm = nofm
@@ -55,6 +64,10 @@ class Layer(object):
         self.fl_dtype_bits = fl_dtype_bits
         self.psum_dtype_bits = psum_dtype_bits
         self.of_dtype_bits = of_dtype_bits
+        self.if_scale_bits = if_scale_bits
+        self.fl_scale_bits = fl_scale_bits
+        self.of_scale_bits = of_scale_bits
+        self.block_size = block_size
         assert self.wofm > 0
         assert self.hofm > 0
         assert self.nimg > 0

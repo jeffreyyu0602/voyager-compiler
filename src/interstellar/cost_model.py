@@ -628,7 +628,65 @@ def _output_dtype_bits(point, layer, level):
     return layer.psum_dtype_bits if ic_above > 1 else layer.of_dtype_bits
 
 
-def get_bank_size(point, layer, level):
+def _scale_bytes(value_count, scale_bits, block_size):
+    """Microscaling scale-tensor bytes for ``value_count`` value elements: one
+    scale of ``scale_bits`` bits per ``block_size``-element block.  0 when the
+    operand has no microscaling scale (``scale_bits == 0``).  Only added at L2+
+    (the byte-pool levels); L0/L1 hold a scale buffer that tracks the value
+    buffer 1:1, so if the value tile fits its scale does too.
+    """
+    if not scale_bits:
+        return 0.0
+    return value_count / block_size * scale_bits / 8.0
+
+
+def _round_to_bank(num_bytes, bank_size):
+    """Round a bank group's byte footprint up to a whole number of banks.
+    No-op when the level has no banking (``bank_size`` is None / 0)."""
+    if not bank_size:
+        return num_bytes
+    return math.ceil(num_bytes / bank_size) * bank_size
+
+
+def _level_bytes(if_count, of_count, fl_count, of_bits, layer, bank_size):
+    """Per-operand (input, output, weight) byte footprint at a byte-pool level
+    (L2+), given each operand's element count and the output's stored width.
+
+    Each operand's bytes = packed value bytes + its microscaling scale bytes (1
+    scale per ``block_size`` elements; 0 if unscaled).  The output scale is
+    counted only once the output is the final quantized output
+    (``of_bits == of_dtype_bits``), not a mid-reduction partial sum (psum).
+
+    A bank cannot be shared across bank groups, so each group's bytes are
+    rounded up to a whole number of ``bank_size``-byte banks (no-op when the
+    level is un-banked).  The input value and its scale live in separate banks;
+    the weight (value+scale) shares one bank, as does the output (value+scale).
+    """
+    bs = layer.block_size
+
+    if_value = if_count * layer.if_dtype_bits / 8.0
+    if_scale = _scale_bytes(if_count, layer.if_scale_bits, bs)
+
+    fl_value = fl_count * layer.fl_dtype_bits / 8.0
+    fl_scale = _scale_bytes(fl_count, layer.fl_scale_bits, bs)
+
+    of_value = of_count * of_bits / 8.0
+    of_scale = 0.0
+    if of_bits == layer.of_dtype_bits:
+        of_scale = _scale_bytes(of_count, layer.of_scale_bits, bs)
+
+    # Input value and input scale occupy separate banks; weight and output each
+    # share a bank between their value and scale.
+    if_bytes = _round_to_bank(if_value, bank_size) + _round_to_bank(
+        if_scale, bank_size
+    )
+    fl_bytes = _round_to_bank(fl_value + fl_scale, bank_size)
+    of_bytes = _round_to_bank(of_value + of_scale, bank_size)
+
+    return (if_bytes, of_bytes, fl_bytes)
+
+
+def get_bank_size(point, layer, level, resource):
 
     blocking_accum_list = []
     for i in range(le.NUM):
@@ -644,16 +702,16 @@ def get_bank_size(point, layer, level):
         # fit is checked in element counts, independent of the layer's dtype.
         return (if_bank_size, of_bank_size, fl_bank_size)
 
-    # L2/L3 are flat byte pools where sub-byte operands pack -> compare in bytes.
+    # L2/L3 are flat byte pools where sub-byte operands pack -> compare in bytes
+    # (value + microscaling scale), rounded up to the level's banks.
     of_bits = _output_dtype_bits(point, layer, level)
-    return (
-        if_bank_size * layer.if_dtype_bits / 8.0,
-        of_bank_size * of_bits / 8.0,
-        fl_bank_size * layer.fl_dtype_bits / 8.0,
+    bank_size = resource.buffer(level).bank_size
+    return _level_bytes(
+        if_bank_size, of_bank_size, fl_bank_size, of_bits, layer, bank_size
     )
 
 
-def get_block_size(point, layer, level):
+def get_block_size(point, layer, level, resource):
     """
     Calculate the size of ifmap, ofmap, filter at current level
     """
@@ -684,22 +742,21 @@ def get_block_size(point, layer, level):
         return (if_block_size, of_block_size, fl_block_size)
 
     of_bits = _output_dtype_bits(point, layer, level)
-    return (
-        if_block_size * layer.if_dtype_bits / 8.0,
-        of_block_size * of_bits / 8.0,
-        fl_block_size * layer.fl_dtype_bits / 8.0,
+    bank_size = resource.buffer(level).bank_size
+    return _level_bytes(
+        if_block_size, of_block_size, fl_block_size, of_bits, layer, bank_size
     )
 
 
-def get_block_sizes(num_levels, point, layer):
+def get_block_sizes(num_levels, point, layer, resource):
     """
     Get size of ifmap, ofmap, filter
     """
     bank_list = []
     block_list = []
     for level in range(num_levels):
-        block_list.append(get_block_size(point, layer, level))
-        bank_list.append(get_bank_size(point, layer, level))
+        block_list.append(get_block_size(point, layer, level, resource))
+        bank_list.append(get_bank_size(point, layer, level, resource))
 
     return [bank_list, block_list]
 
@@ -707,17 +764,27 @@ def get_block_sizes(num_levels, point, layer):
 def fit_in_level(cap, blocks, invalid_underutilized, level, memory_partitions):
     """
     Check if the current level mem size >= current level loop blocking size
-    invalid_underutilized is used to exclude mapping points with too low memory utilization (< 50%)
-    #LMEI can later put the memory utilization threshold as a user defined parameter
+    invalid_underutilized is used to exclude mapping points with too low memory
+    utilization (< 50%) #LMEI can later put the memory utilization threshold
+    as a user defined parameter
     """
     if type(cap) is list:
-        # I/O/W example: [0,0,1] I is stored in memory 0,  O is stored in memory 0,  W is stored in memory 1
-        # leave last empty
+        # I/O/W example: [0,0,1] I is stored in memory 0,  O is stored in memory
+        #  0,  W is stored in memory 1 leave last empty
 
-        # memory_partitions = [[0,1, 2],[0,0,1],[0,0,None]] #if 3 level do not contain weights [0, 0, None]
+        # memory_partitions = [[0,1,2],[0,0,1],[0,0,None]] #if 3 level do not
+        # contain weights [0, 0, None]
 
         # capacity =  [[2,2], [30000,30000], [1000000,1000000]]
         for i in range(len(cap)):
+            # ``memory_partitions[level]`` has three entries, one per operand
+            # (input, output, weight); each entry is the index of the bank (a
+            # slot in the ``cap`` array) where that operand is stored. Here we
+            # iterate over the banks, and for each bank ``i`` we collect the
+            # operand positions assigned to it. E.g. for [0, 0, 0] all three
+            # operands map to bank 0, so bank 0's indices are [0, 1, 2]; for
+            # [0, 0, 1], bank 0's indices are [0, 1] (input, output) and bank
+            # 1's are [2] (weight).
             indices = [
                 index
                 for index, partition in enumerate(memory_partitions[level])
@@ -726,30 +793,32 @@ def fit_in_level(cap, blocks, invalid_underutilized, level, memory_partitions):
             size = sum([blocks[j] for j in indices])
             if size == 0:
                 continue
-            if (size > cap[i]) == True:
+            if size > cap[i]:
                 return False  # it does not fit
 
+            # Optional under-utilization prune (OFF in voyager, where
+            # invalid_underutilized=False): reject a mapping that leaves this
+            # bank under half full *when it could hold more*.  Blocking more is
+            # only possible if every operand here still has data one level up to
+            # pull down; if an operand is already fully resident at this level
+            # (None at level+1), a bigger block is impossible, so a half-full
+            # bank is unavoidable and must not be penalized.
             check_if_underutilized = 0
 
-            # print level, i, invalid_underutilized, memory_partitions[level+1][i], size, cap[i]
             if invalid_underutilized:
-
+                # Where each of this bank's operands lives one level up; None
+                # means it is not stored above (fully resident at this level).
                 last_layer = []
                 for mem in indices:
                     last_layer.append(memory_partitions[level + 1][mem])
                 if None not in last_layer:
-                    if (
-                        (size <= cap[i]) and (2 * size <= cap[i])
-                    ) == True:  # if double the size fit then there will be a better to block partition that will utilized all memory,
-                        # print "NO level: ", level,"blocks: ",  blocks, "size: ", size, "cap: ", cap, "indices: ", indices, "last_layer", last_layer
+                    # All operands continue upward, so a bigger block is
+                    # possible; 2*size <= cap[i] means the bank is <= 50% full.
+                    if 2 * size <= cap[i]:
                         check_if_underutilized += 1
 
-                    else:
-                        test = 1
-                else:
-                    # print "OK level: ", level,"blocks: ",  blocks, "size: ", size, "cap: ", cap, "indices: ", indices, "last_layer", last_layer
-                    test = 2
-
+            # Drop the under-utilized point.  (check_if_underutilized resets per
+            # bank and maxes at 1, so this only fires for single-bank levels.)
             if check_if_underutilized == len(cap):
                 return False
 
@@ -757,16 +826,6 @@ def fit_in_level(cap, blocks, invalid_underutilized, level, memory_partitions):
 
     else:
         total_size = sum(blocks)
-        # for size,contain in zip(blocks, contains):
-        #     if contain:
-        #         total_size += size
-
-        # total_capacity = 0
-        # for size,contain in zip(cap, contains):
-        #     if contain:
-        #         total_capacity += size
-
-        # total_size = sum(blocks)
         if invalid_underutilized:
             return (total_size <= cap) and (2 * total_size >= cap)
         else:
@@ -782,7 +841,7 @@ def valid_partition_number(resource, partitioning, level):
 def valid_partitioning_current_level(resource, point, layer, level, verbose=False):
     valid_size = fit_in_level(
         resource.buffer(level).capacity,
-        get_bank_size(point, layer, level),
+        get_bank_size(point, layer, level, resource),
         resource.invalid_underutilized,
         level,
         resource.memory_partitions,
@@ -795,7 +854,7 @@ def valid_mapping_point_current_level(resource, point, layer, level, verbose=Fal
     if resource.paras[level].count > 1:
         valid_size = fit_in_level(
             resource.buffer(level).capacity,
-            get_bank_size(point, layer, level),
+            get_bank_size(point, layer, level, resource),
             resource.invalid_underutilized,
             level,
             resource.memory_partitions,
@@ -803,7 +862,7 @@ def valid_mapping_point_current_level(resource, point, layer, level, verbose=Fal
     else:
         valid_size = fit_in_level(
             resource.buffer(level).capacity,
-            get_block_size(point, layer, level),
+            get_block_size(point, layer, level, resource),
             resource.invalid_underutilized,
             level,
             resource.memory_partitions,
@@ -840,7 +899,7 @@ def valid_blocking_size_current_level(resource, point, layer, level, verbose=Fal
             capacity[i] = capacity[i] * resource.paras[level].count
         return fit_in_level(
             capacity,
-            get_block_size(point, layer, level),
+            get_block_size(point, layer, level, resource),
             (resource.invalid_underutilized and (level not in resource.para_index)),
             level,
             resource.memory_partitions,
@@ -848,22 +907,13 @@ def valid_blocking_size_current_level(resource, point, layer, level, verbose=Fal
     else:
         return fit_in_level(
             resource.buffer(level).capacity * resource.paras[level].count,
-            get_block_size(point, layer, level),
+            get_block_size(point, layer, level, resource),
             (resource.invalid_underutilized and (level not in resource.para_index)),
             level,
             resource.memory_partitions,
         )
 
         # get_block_size(point, layer, level), (level > min(resource.para_index)))
-
-
-def valid_blocking_size(resource, point, layer, verbose=False):
-    for level in range(resource.buffer_levels()):
-        if not valid_blocking_size_current_level(
-            resource, point, layer, level, verbose
-        ):
-            return False
-    return True
 
 
 def valid_mapping_point(resource, point, layer, verbose=False):
@@ -888,42 +938,6 @@ def get_total_access_cost(resource, array_cost):
         total_access_cost.insert(index + delta, array_cost[i])
         delta += 1
     return total_access_cost
-
-
-def get_array_level_cost(
-    resource, point, layer_size, level, next_level_access, verbose=False
-):
-    """
-    Given next_level_access (above-level memory access)
-    calculate the current level (paralleled level) inter-PE data access
-    thus calculate the current level (paralleled level) inter-PE communication energy
-    i.e. the energy spent on interconnection
-
-    Specific to Systolic Array template.
-
-    level_access: [[close access for I/O/W],[far access on one dimension for I/O/W],[far access on another dimension]]
-    close access means data are passing from one PE to its neighbour PE
-    Far access means data need to jump from one PE to PEs far away from it.
-    Far jump happens because of dataflow spatial replication (e.g. 2D array -> kinds of 3D array)
-    """
-
-    # TODO add support for other access_mode # don't get it
-    # LMEI to distinguish O (partial sum) in buffer_access from A and W
-
-    assert resource.paras[level].count and resource.paras[level].access_mode
-
-    level_access, level_cost = get_array_access_and_cost(
-        level, resource.paras[level], next_level_access, point
-    )
-
-    total_cost = 0
-    for i in range(len(level_access)):
-        total_cost += level_access[i] * level_cost[i]
-
-    if verbose >= 3:
-        print("Level ", level, " array level access: ", level_access)
-
-    return total_cost
 
 
 def get_array_and_curr_level_cost(resource, point, layer, level, verbose=False):
@@ -990,84 +1004,8 @@ def get_level_cost(resource, point, layer, level, verbose=False):
         )
 
     if verbose >= 3:
-        print("Level", level, " access: ", level_access)
+        print("Level", level, " access: ", buffer_access[level])
     return level_cost
-
-
-def get_total_access(resource, point, layer, verbose=False):
-    layer_size = get_layer_size(layer)
-
-    access_list, array_cost = get_access(point, layer, resource)
-
-    if verbose >= 3:
-        print("access breakdown: ", access_list)
-
-    total_level_access = []
-    for i in range(len(access_list)):
-        """List of total access of each buffer at level i"""
-        if not isinstance(access_list[i][0], list):
-            buffer_access = list(map(mul, access_list[i], layer_size))
-            total_level_access.append(sum(buffer_access))
-        else:
-            for j in range(len(access_list[i])):
-                buffer_access = list(map(mul, access_list[i][j], layer_size))
-                total_level_access.append(sum(buffer_access))
-
-    return total_level_access
-
-
-def get_level_costs(resource, point, layer, verbose=False):
-    num_levels = resource.buffer_levels()
-
-    level_energy = []
-    for level in range(num_levels):
-        level_energy.append(get_level_cost(resource, point, layer, level))
-
-    para_index = [i for i, e in enumerate(resource.paras) if e.access_mode != 0]
-
-    delta = 1
-    for index in para_index:
-        array_energy = (
-            get_array_and_curr_level_cost(resource, point, layer, index + 1)
-            - level_energy[index + delta]
-        )
-        level_energy.insert(index + delta, array_energy)
-        delta += 1
-
-    return level_energy
-
-
-# FIXME
-def get_block_cost(resource, point, layer, verbose=False):
-    """
-    Get the cost of the given mapping point on given resource.
-
-    If the point is not feasible on the resource, return inf.
-    """
-    # TODO include static energy
-    num_levels = resource.buffer_levels()
-
-    access_list, array_cost = get_access(point, layer, resource)
-    layer_size = get_layer_size(layer)
-
-    total_access_cost = get_total_access_cost(resource, array_cost)
-    assert len(total_access_cost) == len(access_list)
-
-    block_costs = [0.0, 0.0, 0.0]
-    for i in range(len(total_access_cost)):
-        buffer_access = [a * b for a, b in list(zip(access_list[i], layer_size))]
-        block_cost = [x * total_access_cost[i] for x in buffer_access]
-        block_costs = list(map(add, block_cost, block_costs))
-
-    if verbose:
-        print("access_list: ", access_list)
-        bank_size_list, block_size_list = get_block_sizes(num_levels, point, layer)
-        print("bank_size_list: ", bank_size_list)
-        print("block_size_list: ", block_size_list)
-        print("layer_size: ", layer_size)
-        print("block costs: ", block_costs)
-
-    return block_costs
 
 
 def get_cost(resource, point, layer, verbose=False):
@@ -1101,9 +1039,9 @@ def get_cost(resource, point, layer, verbose=False):
                 total_cost += access_list[i][j] * total_access_cost[i][j]
 
     if verbose:
+        layer_size = get_layer_size(layer)
         # print("total_access_cost", total_access_cost)
         # print("access_list", access_list)
-
         # print("layer_size",layer_size)
 
         idx_adjust = 0
@@ -1144,7 +1082,9 @@ def get_cost(resource, point, layer, verbose=False):
             )
         )
 
-        bank_size_list, block_size_list = get_block_sizes(num_levels, point, layer)
+        bank_size_list, block_size_list = get_block_sizes(
+            num_levels, point, layer, resource
+        )
 
         # print("bank_size_list", bank_size_list)
         # print("block_size_list", block_size_list)
