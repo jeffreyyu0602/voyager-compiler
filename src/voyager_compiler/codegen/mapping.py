@@ -3,7 +3,7 @@ import logging
 import math
 import operator
 import os
-from typing import List, Dict, Callable, Union, Any
+from typing import List, Dict, Callable, Union, Any, Optional
 from collections import defaultdict
 
 import graphviz
@@ -34,6 +34,7 @@ from .mapping_utils import (
     set_tensor_field,
 )
 from .memory import MemoryAllocator, Segment
+from .normalize import normalize
 from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
@@ -221,7 +222,8 @@ def _create_and_insert_subgraph(
     model: torch.nn.Module,
     named_modules: Dict[str, torch.nn.Module],
     node_order: Dict[Node, int] = None,
-) -> Node:
+    normalize_iteration_space: bool = False,
+) -> Optional[Node]:
     if node_order is None:
         node_order = {n: i for i, n in enumerate(model.graph.nodes)}
     nodes.sort(key=lambda n: node_order[n])
@@ -233,13 +235,24 @@ def _create_and_insert_subgraph(
         new_node = model.graph.create_node(
             "call_module", node_name, new_args, {}
         )
-    nodes[-1].replace_all_uses_with(new_node)
-    for node in reversed(nodes):
-        if not node.users:
-            model.graph.erase_node(node)
     new_node.meta["submodule"] = submodule
     if (dtype := nodes[-1].meta.get("dtype", None)) is not None:
         new_node.meta["dtype"] = dtype
+    nodes[-1].replace_all_uses_with(new_node)
+
+    # Normalize the fused submodule to the anchor's iteration space.
+    if normalize_iteration_space:
+        result = normalize(model, new_node, submodule)
+        if result is None:
+            new_node.replace_all_uses_with(nodes[-1])
+            model.graph.erase_node(new_node)
+            delattr(model, node_name)
+            named_modules.pop(node_name, None)
+            return None
+
+    for node in reversed(nodes):
+        if not node.users:
+            model.graph.erase_node(node)
     return new_node
 
 
@@ -797,7 +810,11 @@ def fuse_operator(
     nodes_map = {v.name: k.name for k, v in nodes_map.items()}
 
     for fused_nodes in fused_nodes_list:
-        node = _create_and_insert_subgraph(fused_nodes, model, named_modules)
+        node = _create_and_insert_subgraph(
+            fused_nodes, model, named_modules, normalize_iteration_space=True
+        )
+        if node is None:
+            continue
         update_submod_user_meta(model, node)
         propagate_shape(node, model)
         gm = named_modules[node.target]
@@ -1198,21 +1215,20 @@ def adjust_tiling(
             )
             break
 
-    logger.debug("Scratchpad allocation result:")
-    for n, s in scratchpad_map.items():
-        logger.debug(f"  {n}: {s}")
-
-    strides = anchor_node.meta.get("tile_strides")
-    if strides is not None:
-        node.meta["tile_strides"] = normalize_shape(anchor_node, strides)
-
-    strategy.print_banking_info(key_to_node, node)
-
     if total_size > cache_size:
         logger.warning(
             f"[MEM_ALLOC_FAIL] {node}: Could not allocate scratchpad "
             f"memory of size {total_size} bytes (limit: {cache_size} bytes)"
         )
+    else:
+        logger.debug("Scratchpad allocation result:")
+        for n, s in scratchpad_map.items():
+            logger.debug(f"  {n}: {s}")
+        strategy.print_banking_info(key_to_node, node)
+
+    strides = anchor_node.meta.get("tile_strides")
+    if strides is not None:
+        node.meta["tile_strides"] = normalize_shape(anchor_node, strides)
 
     # Run interstellar tiler for GEMM nodes if hardware config is provided
     if interstellar is not None:

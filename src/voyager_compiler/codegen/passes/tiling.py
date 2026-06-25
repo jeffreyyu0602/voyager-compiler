@@ -934,6 +934,9 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
         node_to_replace = _create_and_insert_subgraph(
             fused_nodes, model, named_modules
         )
+        assert (
+            node_to_replace is not None
+        ), "Failed to create subgraph for quantize_mx + gemm"
 
         gm = export_model(module, load_arg(example_inputs))
     else:
@@ -1412,6 +1415,9 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         **common_args, extra_size_fn=_gemm_residual_size
     )
 
+    if tile_sizes is None:
+        return None, None
+
     c_tiled = tile_sizes[1]
 
     if c_tiled < C and c_tiled != C // num_c_tile:
@@ -1460,6 +1466,8 @@ def run_matrix_op_l2_tiling(
 
             if tile_sizes is not None:
                 split_conv2d_node(model, node, tile_sizes)
+            else:
+                logger.warning(f"Failed to tile Conv2d node: {node}")
 
         elif is_linear(node) or is_matmul(node):
             tile_sizes, tiled_shapes = search_gemm_tiling(
@@ -1469,7 +1477,7 @@ def run_matrix_op_l2_tiling(
             if tile_sizes is not None:
                 split_gemm_node(model, node, tile_sizes, tiled_shapes)
             else:
-                raise RuntimeError(f"Failed to tile GEMM node: {node}")
+                logger.warning(f"Failed to tile GEMM node: {node}")
 
     graph.lint()
     graph.eliminate_dead_code()

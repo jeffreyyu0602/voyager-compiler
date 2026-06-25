@@ -619,6 +619,32 @@ def is_prunable_op(node: Node) -> bool:
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])
 
+    # A same-dtype ``to.dtype`` is a pure pass-through, so it can be deleted
+    # outright; a real dtype conversion must stay a cast.
+    if node.target == torch.ops.aten.to.dtype:
+        input_node = node.args[0]
+        src_dtype = getattr(input_node, "dtype", None)
+        if src_dtype is None:
+            value = getattr(input_node, "value", None)
+            if not isinstance(value, torch.Tensor):
+                value = getattr(input_node, "meta", {}).get("val")
+            if isinstance(value, torch.Tensor):
+                src_dtype = value.dtype
+            else:
+                return False
+
+        dst_dtype = get_arg_value(node, 1, "dtype")
+
+        # Normalize both to a bare dtype name ("float32") so a ``torch.dtype``
+        # (from the operand's value) compares equal to the stringified ``dst`` /
+        # a string logical dtype ("nf4_6").
+        if isinstance(src_dtype, torch.dtype):
+            src_dtype = str(src_dtype).split(".")[1]
+        if isinstance(dst_dtype, torch.dtype):
+            dst_dtype = str(dst_dtype).split(".")[1]
+
+        return src_dtype == dst_dtype
+
     return False
 
 
@@ -633,29 +659,8 @@ def is_nop(node: Node) -> bool:
 
     # A select operation that selects the entire tensor
     if node.target == torch.ops.aten.select.int:
-        return node.args[0].shape[node.args[1]] == 1
-
-    # aten.to.dtype is a nop only when the dtype is unchanged (e.g. a device
-    # transfer with no type change).  A real dtype conversion must be emitted
-    # as a cast op, not silenced.
-    if node.target == torch.ops.aten.to.dtype:
-        input_node = node.args[0]
-
-        src_dtype = getattr(input_node, "dtype", None)
-
-        if src_dtype is None:
-            value = getattr(input_node, "value", None)
-            if not isinstance(value, torch.Tensor):
-                value = getattr(input_node, "meta", {}).get("val")
-
-            if isinstance(value, torch.Tensor):
-                src_dtype = value.dtype
-
-        dst_dtype = get_arg_value(node, 1, "dtype")
-        if isinstance(dst_dtype, torch.dtype):
-            dst_dtype = str(dst_dtype).split(".")[1]
-
-        return src_dtype == dst_dtype
+        shape = getattr(node.args[0], "shape", None)
+        return shape is not None and shape[node.args[1]] == 1
 
     return node.target in [
         torch.ops.aten.as_strided.default,
@@ -672,6 +677,25 @@ def is_nop(node: Node) -> bool:
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.view.default,
     ]
+
+
+def is_shape_changing_nop(node: Node) -> bool:
+    """A ``nop`` (no compute) whose output shape differs from its input shape
+    — a ``view`` / ``reshape`` / ``squeeze`` / ``unsqueeze`` / size-1 ``select``
+    that regroups or drops dims.  Such a node sitting *between* two fused
+    compute stages breaks the single-iteration-space assumption and is relocated
+    to the fused module's boundary by the iteration-space normalizer (see
+    ``normalize.py``).  A shape-*preserving* nop (same in/out shape) can stay
+    inside the fused chain.
+    """
+    if not is_nop(node):
+        return False
+    inp = node.args[0]
+    return (
+        hasattr(node, "shape")
+        and hasattr(inp, "shape")
+        and tuple(node.shape) != tuple(inp.shape)
+    )
 
 
 def is_addressing_op(node: Node) -> bool:
