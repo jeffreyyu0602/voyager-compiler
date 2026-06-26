@@ -37,6 +37,14 @@ from .codegen import (  # noqa: F401
     print_bufferized_graph,
 )
 from .memory_planning import MemoryPlan, plan_memory  # noqa: F401
+from .reporting import (  # noqa: F401
+    ScheduleResult,
+    compress_schedule,
+    estimate_schedule,
+    report,
+    write_excel_report,
+    write_perfetto,
+)
 
 __all__ = [
     "ops",
@@ -47,4 +55,10 @@ __all__ = [
     "print_bufferized_graph",
     "plan_memory",
     "MemoryPlan",
+    "ScheduleResult",
+    "estimate_schedule",
+    "compress_schedule",
+    "write_excel_report",
+    "write_perfetto",
+    "report",
 ]
