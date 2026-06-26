@@ -136,6 +136,7 @@ def transform(
     split_spmm=False,
     use_fake_mode=True,
     use_interstellar_tiling=False,
+    bufferize=False,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -153,7 +154,8 @@ def transform(
     # Break down complex operators (like MultiHeadAttention) into simpler
     # primitives and handle memory copy/concat operations.
 
-    split_multi_head_attention(model)
+    if not bufferize:
+        split_multi_head_attention(model)
 
     # TODO Disabled for large models. This will be removed in the future once
     # we can handle stack/cat using DMA properly.

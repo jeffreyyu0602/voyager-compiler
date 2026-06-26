@@ -13,6 +13,7 @@ def get_transform_args(args, vector_stages):
         "fuse_reshape": fuse_reshape,
         "split_spmm": args.split_spmm,
         "use_interstellar_tiling": args.use_interstellar_tiling,
+        "bufferize": args.bufferize,
     }
 
 

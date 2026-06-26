@@ -549,7 +549,7 @@ def _build_for_untiled(node: Node):
         value, is_index = t
         return tiles[value] if is_index else value
 
-    def compute(grid_index, *tiles):
+    def compute(*tiles):
         args = [_fill(t, tiles) for t in arg_tmpl]
         kwargs = {k: _fill(t, tiles) for k, t in kw_tmpl.items()}
         return op(*args, **kwargs)

@@ -651,10 +651,12 @@ class _FusedInfo:
     output(s)`` on the anchor's result tile.  ``input_values`` are the tensors
     those ops consume (a residual, a scale, …); ``in_specs[i]`` is that input's
     tile ``_InputSpec`` (tiled at the output block, mapped to the grid), or
-    ``None`` for a whole input.  The GEMM / conv builders append these straight
-    onto the kernel's ``inputs`` / ``in_specs``.  ``output_specs`` is one
-    ``(full_shape, tile_shape, dtype, index_map)`` per fused output (a tuple ⇒
-    multi-output, e.g. ``quantize_mx``).
+    ``None`` for a whole input; ``in_sources[i]`` is that input's *outer* graph
+    node (the placeholder's ``meta['source_node']``) — its entry in the fused
+    node's ``all_input_nodes``, used to order operands canonically.  The GEMM /
+    conv builders append these onto the kernel's ``inputs`` / ``in_specs``.
+    ``output_specs`` is one ``(full_shape, tile_shape, dtype, index_map)`` per
+    fused output (a tuple ⇒ multi-output, e.g. ``quantize_mx``).
     """
 
     def __init__(
@@ -666,6 +668,7 @@ class _FusedInfo:
         in_specs,
         output_specs,
         tiling=None,
+        in_sources=None,
     ):
         self.anchor_node = anchor_node
         self.is_conv = is_conv
@@ -674,6 +677,7 @@ class _FusedInfo:
         self.in_specs = in_specs
         self.output_specs = output_specs
         self.tiling = tiling
+        self.in_sources = in_sources
 
 
 def _detect_mha_relayout(fused_ops):
@@ -810,6 +814,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
                 )
 
     fused_gm = _build_fused_gm(submod, anchor, fused_ops, input_nodes)
+    # Each fused operand's *outer* graph node (its entry in the fused node's
+    # ``all_input_nodes``), so the builder can order operands canonically.
+    in_sources = [n.meta.get("source_node", n) for n in input_nodes]
 
     multi_outputs = isinstance(node.value, (list, tuple))
     vals = list(node.value) if multi_outputs else [node.value]
@@ -860,22 +867,23 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         in_specs,
         output_specs,
         tiling,
+        in_sources,
     )
 
 
 def _map_kernel(compute: Callable, num_outputs: int):
     """Map kernel (no cross-tile reduction): adapt a return-style
-    ``compute(grid_index, *in_tiles) -> Tensor | tuple`` into the scheduler's
-    mutate-style ``kernel(grid_index, *in_tiles, *out_banks)`` — run ``compute``
-    once per tile and write each result straight into its output bank.  Every
-    num_k == 1 op (gemm / conv / pointwise / pool) uses this; the cross-tile
-    reduction case uses ``_reduction_fused_kernel``.
+    ``compute(*in_tiles) -> Tensor | tuple`` into the scheduler's mutate-style
+    ``kernel(grid_index, *in_tiles, *out_banks)`` — runs ``compute`` per tile,
+    writing each result straight into its output bank.  Every num_k == 1 op
+    (gemm / conv / pointwise / pool) uses this; the cross-tile reduction case
+    uses ``_reduction_fused_kernel``.
     """
 
     def kernel(grid_index, *args):
         in_tiles = args[: len(args) - num_outputs]
         out_banks = args[len(args) - num_outputs :]
-        results = compute(grid_index, *in_tiles)
+        results = compute(*in_tiles)
         if not isinstance(results, (tuple, list)):
             results = (results,)
         for bank, value in zip(out_banks, results):
@@ -891,13 +899,14 @@ def _reduction_fused_kernel(
     op_dtype: Optional[torch.dtype],
     out_specs: List[_OutputSpec],
     fused_gm: Optional[Callable],
-    num_fused_operands: int,
+    num_fused_operands: int = 0,
+    fused_operand_indices: Optional[List[int]] = None,
 ):
     """Kernel for an op whose reduction needs > 1 tile (every num_k > 1 GEMM /
     conv; the num_k == 1 map case uses ``_map_kernel``).
 
-    ``compute(grid_index, in_tiles, first)`` runs the bare op (GEMM / conv) on
-    the current tiles; on the ``first`` reduction step it folds the bias straight
+    ``compute(in_tiles, first)`` runs the bare op (GEMM / conv) on the current
+    tiles; on the ``first`` reduction step it folds the bias straight
     into the op (the hardware does ``op + bias`` in one pass).  The bias rides
     only the first reduction step — which is the same step that *initializes* the
     accumulator — so the bias gate and the reduction init collapse into the
@@ -922,11 +931,11 @@ def _reduction_fused_kernel(
         def init():
             # First reduction step: op with the bias folded in, initializing
             # the accumulator.
-            return to_acc(compute(grid_index, in_tiles, True))
+            return to_acc(compute(in_tiles, True))
 
         def accumulate(prev=scratch):
             # Later steps: bare op (no bias) added to the running accumulator.
-            return to_acc(compute(grid_index, in_tiles, False)) + prev
+            return to_acc(compute(in_tiles, False)) + prev
 
         voyager.copy_tile(
             torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
@@ -942,7 +951,13 @@ def _reduction_fused_kernel(
         def post_process():
             outs = scratch if op_dtype is None else scratch.to(op_dtype)
             if fused_gm is not None:
-                outs = fused_gm(outs, *in_tiles[n_in - num_fused_operands :])
+                # Fused operands are either explicit canonical indices (the
+                # reordered build) or the trailing ``num_fused_operands`` tiles.
+                if fused_operand_indices is not None:
+                    fused = [in_tiles[i] for i in fused_operand_indices]
+                else:
+                    fused = in_tiles[n_in - num_fused_operands :]
+                outs = fused_gm(outs, *fused)
             if not isinstance(outs, (tuple, list)):
                 outs = (outs,)
             for bank, out in zip(out_banks, outs):
@@ -1126,9 +1141,8 @@ def build_conv2d(
 
         add_kw_input("input_scale", in_scale_qspec)
         add_kw_input("weight_scale", wt_scale_qspec)
-
-        for name in ("input_code", "weight_code"):
-            add_kw_input(name, None)
+        add_kw_input("input_code", None)
+        add_kw_input("weight_code", None)
 
     # Fused post-op operands (a residual, …): append each through ``in_specs``,
     # tiled at the output (N, K, oH, oW) block in the same physical layout as
@@ -1161,7 +1175,7 @@ def build_conv2d(
             t, size=(d0, d1, d2, d3), stride=(d1 * d2 * d3, d2 * d3, d3, 1)
         )
 
-    def conv_partial(grid_index, in_tiles, first):
+    def conv2d_kernel(in_tiles, first):
         """The bare conv op on the current tiles, dense-strided (``_fix_stride``)
         so it can feed a ``torch.cond`` branch.  On the ``first`` reduction step
         the [K] bias folds straight into the op (the hardware does conv + bias in
@@ -1175,11 +1189,11 @@ def build_conv2d(
         bias = extra[0] if (bias_n is not None and first) else None  # [K]
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
-    def compute(grid_index, in_tile, w_tile, *extra):
+    def compute(in_tile, w_tile, *extra):
         # num_k == 1 map: the conv completes in one step (bias folds straight in,
         # no reduction cond), then the fused tail (if any) is applied here.
         in_tiles = (in_tile, w_tile, *extra)
-        result = conv_partial(grid_index, in_tiles, True)
+        result = conv2d_kernel(in_tiles, True)
         if info is not None:
             # The fused operands are the last ``num_fused`` extras.
             fused_tiles = extra[len(extra) - num_fused :]
@@ -1195,7 +1209,7 @@ def build_conv2d(
             _ScratchSpec(_project((tn, tk, toh, tow), out_dims), acc_dtype)
         ]
         kernel = _reduction_fused_kernel(
-            conv_partial,
+            conv2d_kernel,
             reduction_dim=4,
             last_idx=num_k - 1,
             out_specs=out_specs,
@@ -1227,22 +1241,28 @@ def build_gemm(
 ):
     """Pipeline builder for a linear / matmul / batched-matmul node — including
     the microscaling / codebook (``*_mx``) variants and a fused bias — covering
-    the cross-tile K reduction the old pointwise engine couldn't do.  Grid ``(M,
-    N, K)`` (or ``(B, M, N, K)`` for a batched matmul) tiles with K innermost;
-    the kernel accumulates ``act_tile @ weight_tile`` into the output bank,
-    initialize on ``k == 0``.  Returns the gm, or ``None`` (unsupported).
+    the cross-tile K reduction.  Grid ``(M, N, K)`` (or ``(B, M, N, K)`` for a
+    batched matmul) tiles with K innermost; the kernel accumulates ``act_tile @
+    weight_tile`` into the output bank, initialize on ``k == 0``.  Returns the
+    gm, or ``None`` (unsupported).
+
+    Operands are assembled in the fused node's ``all_input_nodes`` order so
+    the positional splice in ``replace_node_with_graph_module`` binds each
+    placeholder to the right outer operand even when a fused-tail operand is
+    graph-ordered before the anchor; ``compute`` / ``gemm_kernel`` then
+    dispatch by *canonical index* (``act_idx`` / ``kw_idx`` / ``fused_idx``),
+    not a positional ``*extra`` split.
     """
     from voyager_compiler.codegen.lowering.tiling import get_tiling
     from voyager_compiler.codegen.mapping_utils import is_linear, is_matmul
     from voyager_compiler.codegen.passes.utils import get_arg_value
 
     # A fused ``call_module`` (GEMM + post-op pointwise ops): read the op /
-    # tiling off the GEMM anchor inside the submodule, append the fused operands
-    # through ``in_specs``, and apply the fused ops in ``compute``.  ``anchor``
-    # is the bare ``node`` for a non-fused op.  A num_k == 1 fused op (the K
-    # reduction fits one tile) applies the tail in ``compute``; num_k > 1
-    # accumulates the GEMM partials into a scratch ref and applies the tail once
-    # on the last K step.
+    # tiling off the GEMM anchor inside the submodule; the fused operands
+    # thread through ``in_specs`` and the tail runs in ``compute``.  ``anchor``
+    # is the bare ``node`` for a non-fused op.  num_k == 1 (K reduction fits one
+    # tile) applies the tail in ``compute``; num_k > 1 accumulates the GEMM
+    # partials into a scratch ref, applying the tail once on the last K step.
     info = (
         parse_fused_submodule(node, tiler) if node.op == "call_module" else None
     )
@@ -1346,93 +1366,94 @@ def build_gemm(
             for shape, tile, dtype, imap in info.output_specs
         ]
 
-    inputs, in_specs = [act, weight], [act_spec, weight_spec]
+    # Every kernel input maps to one entry of ``node.all_input_nodes`` via the
+    # anchor placeholder's ``source_node`` (the fused operands carry theirs in
+    # ``info.in_sources``).  Collect ``outer_node -> (value, spec)``, then
+    # materialize ``inputs`` / ``in_specs`` in ``all_input_nodes`` order and
+    # record each role's *canonical* tile index for ``compute``.
+    src = lambda n: n.meta.get("source_node", n)
+    node_to_spec = {
+        src(anchor.args[0]): (act, act_spec),
+        src(anchor.args[1]): (weight, weight_spec),
+    }
 
-    # Bias [N] tiles along N (grid dim ``gn``); folded once on the k==0 step
-    # (below), since later steps only accumulate partials into the bank — adding
-    # bias per-k would multiply-count it.  It is the first extra (``extra[0]``)
-    # when present.
+    # Bias [N] tiles along N (grid dim ``gn``); folded once on the k==0 step.
     bias_n = get_arg_value(anchor, 2, "bias")
     if bias_n is not None:
-        inputs.append(bias_n.value.clone())
-        in_specs.append(_InputSpec((tn,), (gn,), (False,)))
+        node_to_spec[src(bias_n)] = (
+            bias_n.value.clone(),
+            _InputSpec((tn,), (gn,), (False,)),
+        )
 
-    # On the microscaling targets (linear_mx / matmul_mx) the per-block scales
-    # tile along the reduction (// block_size, sharing the operand's batch +
-    # block layout) and the codebook tables (input_code / weight_code, only
-    # present on these targets) load whole (untiled, None spec); each threads to
-    # the op by keyword.
+    # Microscaling (linear_mx / matmul_mx): per-block scales tile along the
+    # reduction; codebooks load whole (None spec).  Each threads by keyword.
     bs = anchor.kwargs.get("block_size")
-
-    kw_slots = {}
+    kw_nodes = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
         v = anchor.kwargs.get(name)
         if not isinstance(v, torch.fx.Node):
             return
-
         if not hasattr(v, "value"):
             raise ValueError(
                 f"Expected materialized value for FX node kwarg {name!r}"
             )
-
-        kw_slots[name] = len(in_specs) - 2
-        inputs.append(v.value.clone())
-        in_specs.append(spec)
+        kw_nodes[name] = src(v)
+        node_to_spec[src(v)] = (v.value.clone(), spec)
 
     if anchor.target in (
         torch.ops.quantized_ops.linear_mx.default,
         torch.ops.quantized_ops.matmul_mx.default,
     ):
-        in_scale_qspec = _spec(act.shape, (tm, tk // bs), (gm, gk))
-        wt_scale_qspec = _spec(weight.shape, _proj(tn, tk // bs), _proj(gn, gk))
+        add_kw_input("input_scale", _spec(act.shape, (tm, tk // bs), (gm, gk)))
+        add_kw_input(
+            "weight_scale",
+            _spec(weight.shape, _proj(tn, tk // bs), _proj(gn, gk)),
+        )
+        add_kw_input("input_code", None)
+        add_kw_input("weight_code", None)
 
-        add_kw_input("input_scale", in_scale_qspec)
-        add_kw_input("weight_scale", wt_scale_qspec)
+    # Fused post-op operands (residual, scale, …), keyed by their outer node.
+    if info is not None:
+        for s, val, spec in zip(
+            info.in_sources, info.input_values, info.in_specs
+        ):
+            node_to_spec[s] = (val, spec)
 
-        for name in ("input_code", "weight_code"):
-            add_kw_input(name, None)
+    order = {n: i for i, n in enumerate(node.all_input_nodes)}
+    assert len(node_to_spec) == len(order), "gemm operand shared across roles"
+    inputs = [node_to_spec[n][0] for n in node.all_input_nodes]
+    in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
+
+    act_idx = order[src(anchor.args[0])]
+    weight_idx = order[src(anchor.args[1])]
+    bias_idx = order[src(bias_n)] if bias_n is not None else None
+    kw_idx = {name: order[n] for name, n in kw_nodes.items()}
+    fused_idx = [order[s] for s in info.in_sources] if info is not None else []
 
     op = anchor.target
-
-    # Fused post-op operands (a residual, a scale, …): append each through
-    # ``in_specs`` so the scheduler pipelines it like any tiled input, tiled at
-    # the output (M/N) block (specs built by ``parse_fused_submodule``).  A
-    # ``None`` spec is a whole (codebook / scalar) operand passed through.
-    # ``compute`` then applies ``info.fused_gm`` to the GEMM result with these
-    # tiles.
-    if info is not None:
-        inputs += info.input_values
-        in_specs += info.in_specs
-    # The fused operands are the *last* inputs (appended above), so the kernel
-    # picks them off the tail of ``*extra`` by count.
-    num_fused = len(info.input_values) if info is not None else 0
-
     num_k = K // tk  # reduction tiles (grid extent along ``gk``)
 
-    def gemm_partial(grid_index, in_tiles, first):
-        """The bare GEMM op on the current tiles.  On the ``first`` reduction
-        step the bias folds straight into the op (``w @ x + bias`` in one pass);
-        later steps only accumulate partials, which must not re-add it.
+    def gemm_kernel(in_tiles, first):
+        """The bare GEMM op on the current tiles, by canonical index.  On the
+        ``first`` reduction step the bias folds straight in; later steps only
+        accumulate partials, which must not re-add it.
         """
-        activation, weight_tile, *extra = in_tiles
-        kw = {name: extra[i] for name, i in kw_slots.items()}
+        act_tile = in_tiles[act_idx]
+        weight_tile = in_tiles[weight_idx]
+        kw = {name: in_tiles[i] for name, i in kw_idx.items()}
         if bs is not None:
             kw["block_size"] = bs
-        if bias_n is None:
-            return op(activation, weight_tile, **kw)
-        bias = extra[0] if first else None  # bias [N] is the first extra
-        return op(activation, weight_tile, bias, **kw)
+        if bias_idx is None:
+            return op(act_tile, weight_tile, **kw)
+        bias = in_tiles[bias_idx] if first else None
+        return op(act_tile, weight_tile, bias, **kw)
 
-    def compute(grid_index, activation, weight_tile, *extra):
-        # num_k == 1 map: the GEMM completes in one step (bias folds straight in,
-        # no reduction cond), then the fused tail (if any) is applied here.
-        in_tiles = (activation, weight_tile, *extra)
-        result = gemm_partial(grid_index, in_tiles, True)
+    def compute(*in_tiles):
+        # num_k == 1 map: GEMM in one step, then the fused tail (if any).
+        result = gemm_kernel(in_tiles, True)
         if info is not None:
-            # The fused operands are the last ``num_fused`` extras.
-            fused_tiles = extra[len(extra) - num_fused :]
-            return info.fused_gm(result, *fused_tiles)
+            return info.fused_gm(result, *[in_tiles[i] for i in fused_idx])
         return result
 
     if num_k > 1:
@@ -1442,13 +1463,13 @@ def build_gemm(
         acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
         scratch_specs = [_ScratchSpec(tuple(tb) + (tm, tn), acc_dtype)]
         kernel = _reduction_fused_kernel(
-            gemm_partial,
+            gemm_kernel,
             reduction_dim=gk,
             last_idx=num_k - 1,
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
             fused_gm=info.fused_gm if info is not None else None,
-            num_fused_operands=num_fused,
+            fused_operand_indices=fused_idx,
         )
     else:
         # num_k == 1: a map (the tail, if any, is applied inside ``compute``).
@@ -1548,8 +1569,7 @@ def build_pointwise(node, *, num_banks: int = 2):
             for cb in _codebook_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
-        def compute(grid_index, *tiles):
-            return submod(*tiles)
+        compute = submod
 
     else:
         # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
@@ -1570,7 +1590,7 @@ def build_pointwise(node, *, num_banks: int = 2):
         op = node.target
         codebooks = _codebook_arg_nodes(node)
 
-        def compute(grid_index, *tiles):
+        def compute(*tiles):
             args = [
                 tiles[i] if i is not None else a
                 for i, a in zip(arg_slots, op_args)
@@ -1741,7 +1761,7 @@ def build_pool(node, *, num_banks: int = 2):
         # not inside ``compute`` — dynamo can't trace an FX-node attribute read.
         extra = tuple(anchor.args[4:])
 
-        def compute(grid_index, tile):
+        def compute(tile):
             # Only the input becomes the halo tile, padding is zeroed (folded
             # into the halo load).
             return anchor.target(tile, [kH, kW], [sh, sw], [0, 0], *extra)
@@ -1788,10 +1808,7 @@ def build_pool(node, *, num_banks: int = 2):
         for o, ts in zip(outputs, tiled_shape)
     ]
 
-    def compute(grid_index, *tiles):
-        return submod(*tiles)
-
-    kernel = _map_kernel(compute, len(outputs))
+    kernel = _map_kernel(submod, len(outputs))
     gm = build_pipelined_buffers(
         kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
     )
