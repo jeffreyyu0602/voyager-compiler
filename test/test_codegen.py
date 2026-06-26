@@ -21,7 +21,8 @@ from voyager_compiler import (
     QuantizationConfig,
     QuantizationSpec,
     TorchExportableModuleWithStaticCache,
-    add_qspec_args,
+    add_compile_args,
+    add_quantization_args,
     compile,
     convert_and_export_with_split_cache,
     convert_pt2e,
@@ -203,86 +204,6 @@ if __name__ == "__main__":
         help="Percentage of outliers to filter when quantizing activations.",
     )
     parser.add_argument(
-        "--cache_size",
-        type=int,
-        default=None,
-        help="Total L2 SRAM size in SoC.",
-    )
-    parser.add_argument(
-        "--num_banks",
-        type=int,
-        default=None,
-        help="Number of banks in the accelerator.",
-    )
-    parser.add_argument(
-        "--input_buffer_size",
-        type=int,
-        default=1024,
-        help="Input buffer size per IC dim (in # elements).",
-    )
-    parser.add_argument(
-        "--weight_buffer_size",
-        type=int,
-        default=1024,
-        help="Weight buffer size per OC dim (in # elements).",
-    )
-    parser.add_argument(
-        "--accum_buffer_size",
-        type=int,
-        default=1024,
-        help="Accum buffer size per OC dim (in # elements).",
-    )
-    parser.add_argument(
-        "--double_buffered_accum_buffer",
-        action="store_true",
-        help="Use double-buffered accumulation buffer for interstellar tiling.",
-    )
-    parser.add_argument(
-        "--double_buffered_l2",
-        action="store_true",
-        help=(
-            "Overlap DRAM I/O with compute (ping-pong). Halves the effective "
-            "L2 capacity seen by the tiling optimizer."
-        ),
-    )
-    parser.add_argument(
-        "--dram_size",
-        type=int,
-        default=None,
-        help=(
-            "DRAM capacity in bytes. When set, runs interstellar with a "
-            "4-level memory hierarchy."
-        ),
-    )
-    parser.add_argument(
-        "--dram_bandwidth",
-        type=float,
-        default=200.0,
-        help="DRAM bandwidth in GB/s.",
-    )
-    parser.add_argument(
-        "--frequency",
-        type=float,
-        default=1.0,
-        help=(
-            "Accelerator clock frequency in GHz. Used with --dram_bandwidth to "
-            "compute bandwidth in input elements per cycle."
-        ),
-    )
-    parser.add_argument(
-        "--transform_layout",
-        action="store_true",
-        help=(
-            "Whether to transpose Conv2d inputs and weights and Linear weights "
-            "to a systolic-array friendly layout."
-        ),
-    )
-    parser.add_argument(
-        "--transpose_fc",
-        action="store_true",
-        help="Whether to transpose the weights of fully connected layers.",
-    )
-    parser.add_argument(
         "--use_maxpool_2x2",
         action="store_true",
         help="Whether to use 2x2 maxpool for resnet18 and resnet50.",
@@ -293,20 +214,6 @@ if __name__ == "__main__":
         help=(
             "Whether to transform Conv2d operations with small input channels "
             "into linear operations using im2col."
-        ),
-    )
-    parser.add_argument(
-        "--hardware_unrolling",
-        type=lambda x: tuple(map(int, x.split(","))),
-        default=None,
-        help="Hardware unroll dimensions for the accelerator.",
-    )
-    parser.add_argument(
-        "--disable_reshape_fusion",
-        action="store_true",
-        help=(
-            "Whether to not fuse reshape operation with following GEMM in "
-            "Transformer."
         ),
     )
     parser.add_argument(
@@ -325,41 +232,18 @@ if __name__ == "__main__":
         help="Whether to quantize the fully connected layers.",
     )
     parser.add_argument(
-        "--split_spmm",
-        action="store_true",
-        help=(
-            "Whether to split linear_mx with outliers into dense and SpMM "
-            "operations."
-        ),
-    )
-    parser.add_argument(
         "--attn_implementation",
         default="eager",
         choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
     )
     parser.add_argument(
-        "--bufferize",
-        action="store_true",
-        help=(
-            "Use the bufferized FX lowering path: rewrite tiled "
-            "GEMM/conv/pointwise nodes into explicit while_loop nests over "
-            "voyager.* primitives and emit model.txt / bufferized_graph.txt / "
-            "compute_graph from that graph, instead of run_memory_mapping + "
-            "gen_code.  Requires --cache_size (the L2 tiling pass sets the "
-            "l2_tiling meta the bufferizer consumes)."
-        ),
+        "--log_level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="WARNING",
+        help="Logging level.",
     )
-    parser.add_argument(
-        "--use_interstellar_tiling",
-        action="store_true",
-        help=(
-            "Tile GEMM/conv on demand via interstellar in the bufferization "
-            "lowering, instead of the run_matrix_op_l2_tiling pass.  When set, "
-            "that pass is skipped (no l2_tiling meta) and each GEMM/conv is "
-            "tiled by interstellar at build time."
-        ),
-    )
-    add_qspec_args(parser)
+    add_quantization_args(parser)
+    add_compile_args(parser)
     args = parser.parse_args()
 
     logger.setLevel(getattr(logging, args.log_level))

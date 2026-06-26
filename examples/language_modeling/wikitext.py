@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     get_default_quantizer,
     prepare_pt2e,
     convert_pt2e,
@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument(
         '--print_model', action='store_true', help='Print node scope information'
     )
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     return parser.parse_args()
 
 

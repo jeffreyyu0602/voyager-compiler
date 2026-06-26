@@ -20,7 +20,7 @@ from transformers import set_seed
 
 from honk_model import SpeechResModel, configs
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     get_default_quantizer,
     prepare_pt2e,
     quantize,
@@ -252,7 +252,7 @@ def parse_args():
     parser.add_argument('--num_train_epochs', type=int, default=30)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--qat', action='store_true', help='Perform quantization-aware training.')
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     return parser.parse_args()
 
 

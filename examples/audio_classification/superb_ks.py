@@ -7,7 +7,7 @@ from datasets import load_dataset
 from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
 from torchaudio.sox_effects import apply_effects_file
 
-from voyager_compiler import add_qspec_args, with_execution_context
+from voyager_compiler import add_experiment_args, with_execution_context
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="Process model parameters.")
     parser.add_argument('--model_id', help='Fine-tuned model identifier')
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     return parser.parse_args()
 
 

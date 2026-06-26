@@ -33,7 +33,6 @@ from voyager_compiler import (
     DerivedQuantizationSpec,
     QuantizationConfig,
     QuantizationSpec,
-    add_qspec_args,
     convert_pt2e,
     export_model,
     prepare_pt2e,

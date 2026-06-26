@@ -50,7 +50,7 @@ from transformers.utils.versions import require_version
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
-from voyager_compiler import add_qspec_args, quantize, with_execution_context
+from voyager_compiler import add_experiment_args, quantize, with_execution_context
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -204,7 +204,7 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     args = parser.parse_args()
 
     # Sanity checks

@@ -60,7 +60,7 @@ import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     get_default_quantizer,
     prepare_pt2e,
     quantize,
@@ -322,7 +322,7 @@ def parse_args():
             "Only applicable when `--with_tracking` is passed."
         ),
     )
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     args = parser.parse_args()
 
     # Sanity checks

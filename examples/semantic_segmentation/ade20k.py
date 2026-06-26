@@ -15,7 +15,7 @@ from transformers import AutoModelForSemanticSegmentation
 
 from metrics import eval_metrics
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     convert_pt2e,
     get_default_quantizer,
     prepare_pt2e,
@@ -72,7 +72,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Process model parameters.")
     parser.add_argument('--model_id', required=True, help='Fine-tuned model identifier')
     parser.add_argument('--attention_probs_qmax', type=int, default=None)
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     return parser.parse_args()
 
 

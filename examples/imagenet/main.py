@@ -24,7 +24,7 @@ from torch.utils.data import Subset
 import torchao
 from tqdm import tqdm
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     convert_pt2e,
     get_default_quantizer,
     prepare_pt2e,
@@ -106,7 +106,7 @@ parser.add_argument('--output_dir', default=None,
                     help="Directory to save model checkpoints.")
 parser.add_argument('--eager_mode_qat', action="store_true",
                     help="Use eager mode quantization for QAT.")
-add_qspec_args(parser)
+add_experiment_args(parser)
 
 best_acc1 = 0
 

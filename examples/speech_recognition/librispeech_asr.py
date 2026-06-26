@@ -8,7 +8,7 @@ from evaluate import load
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 from voyager_compiler import (
-    add_qspec_args,
+    add_experiment_args,
     quantize,
     plot_histogram,
     plot_layer_range,
@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--model_id", default="openai/whisper-tiny", help="Model to perform evaluation.")
     parser.add_argument("--batch_size", type=int, default=8, help="Evaluation batch size.")
     parser.add_argument("--output_dir", default=None, help="Output directory for scores.")
-    add_qspec_args(parser)
+    add_experiment_args(parser)
     return parser.parse_args()
 
 

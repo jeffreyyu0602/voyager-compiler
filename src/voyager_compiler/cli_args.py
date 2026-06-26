@@ -1,0 +1,399 @@
+import argparse
+
+from voyager_compiler.quantizer.quantizer import QuantizationSpec
+from voyager_compiler.utils import SLURM_ARGS
+
+__all__ = [
+    "add_quantization_args",
+    "add_compile_args",
+    "add_experiment_args",
+]
+
+
+qconfig_help_string = """
+Input arguments as a comma-separated list. The first argument must specify the dtype.
+Subsequent arguments can be specified using either abbreviations or full names.
+Abbreviations and their full names:
+  - qs: qscheme
+  - qmax: quant_max
+  - ahl: amax_history_len
+  - ax: ch_axis
+  - bs: block_size
+
+Example usage:
+  --params int8,qscheme=qscheme1,quant_max=127,amax_history_len=50,ch_axis=0,block_size=32
+or
+  --params int8,qs=qscheme1,qmax=127,ahl=50,ax=0,bs=32
+
+Parameter details:
+  - dtype (str): Data type (e.g., int8, int4, fp8_e4m3, fp8_e5m2, fp4_e2m1, posit8_1)
+  - qscheme (str): Quantization scheme
+  - quant_max (float): Maximum quantization value
+  - amax_history_len (int): Length of the amax history (default: 50)
+  - ch_axis (int): Channel axis (default: 0)
+  - block_size (int): Block size (default: 32)
+"""
+
+
+def add_quantization_args(parser=None):
+    if parser is None:
+        parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--activation",
+        default=None,
+        help=(
+            "Activation quantization specification. Comma-separated key=value pairs "
+            "using abbreviations or full names. See below for details:\n" + qconfig_help_string
+        ),
+    )
+    parser.add_argument(
+        "--output_activation",
+        default=None,
+        help=(
+            "Output activation quantization specification. Format same as activation."
+        ),
+    )
+    parser.add_argument(
+        "--weight",
+        default=None,
+        help=(
+            "Weight quantization specification. Format same as activation."
+        ),
+    )
+    parser.add_argument(
+        "--bias",
+        default=None,
+        help=(
+            "Bias quantization specification. Format same as activation."
+        ),
+    )
+    parser.add_argument(
+        "--residual",
+        default=None,
+        help="Residual quantization specification. Format same as activation.",
+    )
+    parser.add_argument(
+        "--error",
+        default=None,
+        type=QuantizationSpec.from_str,
+        help=(
+            "Activation gradient quantization data type and configurations. Format same as activation."
+        ),
+    )
+    parser.add_argument(
+        '--force_scale_power_of_two',
+        action='store_true',
+        help='Whether to force the scaling factor to be a power of two.',
+    )
+    parser.add_argument(
+        '--calibration_steps',
+        type=int,
+        default=0,
+        help='Number of calibration steps for PTQ',
+    )
+    parser.add_argument(
+        '--convert_model',
+        action='store_true',
+        help='Whether to convert the model to quantized model.',
+    )
+    parser.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Use bf16 (mixed) precision instead of 32-bit float.",
+    )
+    #  -- legacy / deprecated args (kept for backward compatibility) ----------------
+    parser.add_argument(
+        "--pt2e",
+        action="store_true",
+        help="Whether to use PyTorch 2 torch.export post-training static quantizaion.",
+    )
+    parser.add_argument(
+        "--quantize_forward",
+        default='gemm',
+        help=(
+            "Forward operations to quantize. Choose from gemm, residual, "
+            "activation, layernorm, and scaling."
+        ),
+    )
+    parser.add_argument(
+        "--quantize_backprop",
+        default='gemm',
+        help=(
+            "Backprop operations to quantize. Choose from gemm, residual, "
+            "activation, layernorm, and scaling."
+        ),
+    )
+    parser.add_argument(
+        "--op_fusion",
+        type=lambda x: x.split(','),
+        default=None,
+        help="Fuse operation with previous GEMM to reduce quantization error.",
+    )
+    parser.add_argument(
+        "--posit_exp",
+        action="store_true",
+        help="Whether to use posit approximated exponential function in softmax."
+    )
+    parser.add_argument(
+        "--posit_exp_shifted",
+        action="store_true",
+        help="Whether to use shifted posit approximated exponential function in softmax."
+    )
+    parser.add_argument(
+        "--posit_reciprocal",
+        action="store_true",
+        help="Whether to use posit approximated reciprocal function in softmax."
+    )
+    parser.add_argument(
+        "--record_histogram",
+        action="store_true",
+        help="Whether to store and plot the histogram of tensor value.",
+    )
+    return parser
+
+
+def add_experiment_args(parser=None):
+    if parser is None:
+        parser = argparse.ArgumentParser(description="Run quantized inference or training.")
+    add_quantization_args(parser)
+    #----------------------------------------------------
+    # Wandb and logging arguments
+    #----------------------------------------------------
+    parser.add_argument(
+        '--project',
+        default=None,
+        help='The name of the project where the new run will be sent.'
+    )
+    parser.add_argument(
+        '--run_name',
+        default=None,
+        help='A short display name for this run, which is this run will be identified in the UI.'
+    )
+    parser.add_argument(
+        '--run_id',
+        default=None,
+        help='A unique ID for a wandb run, used for resuming.'
+    )
+    parser.add_argument(
+        "--sweep_config_json",
+        type=str,
+        default=None,
+        help="Inline JSON string for W&B sweep configuration"
+    )
+    parser.add_argument(
+        '--sweep_id',
+        default=None,
+        help='The unique identifier for a sweep generated by W&B CLI or Python SDK.'
+    )
+    parser.add_argument(
+        "--sweep_count",
+        type=int,
+        default=None,
+        help="The number of sweep config trials to try."
+    )
+    parser.add_argument(
+        "--log_level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        default="WARNING",
+        help="Set the logging level"
+    )
+    parser.add_argument(
+        "--log_file",
+        default=None,
+        help="Set the logging file. If not specified, the log will be printed to stdout."
+    )
+    #----------------------------------------------------
+    # Training arguments
+    #----------------------------------------------------
+    parser.add_argument("--gpu", type=int, default=None, help="GPU to use.")
+    parser.add_argument(
+        "--do_train", action="store_true", help="Whether to run training"
+    )
+    parser.add_argument(
+        "--sgd", action="store_true", help="Whether to use SGD optimizer."
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.0,
+        help="Ratio of warmup steps in the lr scheduler."
+    )
+    parser.add_argument(
+        "--num_hidden_layers",
+        type=int,
+        default=None,
+        help="Number of Tranformer encoder layers to use."
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=0,
+        help="The dimension of the low-rank matrices."
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=8,
+        help="The scaling factor for the low-rank matrices."
+    )
+    parser.add_argument(
+        "--target_modules",
+        type=lambda x: x.split(','),
+        default="query,value",
+        help="The modules (for example, attention blocks) to apply the LoRA update matrices."
+    )
+    parser.add_argument(
+        "--peft_model_id",
+        default=None,
+        help="Name of path of pre-trained peft adapter."
+    )
+    #----------------------------------------------------
+    # Slurm arguments
+    #----------------------------------------------------
+    subparsers = parser.add_subparsers(
+        help='sub-command help', dest='execution_mode'
+    )
+    parser_slurm = subparsers.add_parser("slurm", help="slurm command help")
+    for k, v in SLURM_ARGS.items():
+        parser_slurm.add_argument("--" + k, **v)
+    parser_bash = subparsers.add_parser("bash", help="bash command help")
+    return parser
+
+
+def add_compile_args(parser=None):
+    if parser is None:
+        parser = argparse.ArgumentParser()
+
+    # -- memory hierarchy ---------------------------------------------------
+    parser.add_argument(
+        "--cache_size", type=int, default=None, help="Total L2 SRAM size (bytes)."
+    )
+    parser.add_argument(
+        "--num_banks",
+        type=int,
+        default=None,
+        help="Number of banks in the accelerator.",
+    )
+    parser.add_argument(
+        "--bank_width",
+        type=int,
+        default=None,
+        help="Memory bank width (bytes) for memory planning.",
+    )
+    parser.add_argument(
+        "--double_buffered_l2",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Overlap DRAM I/O with compute (ping-pong); halves L2 for tiling.",
+    )
+    parser.add_argument(
+        "--input_buffer_size",
+        type=int,
+        default=1024,
+        help="Input buffer size per IC dim (# elements).",
+    )
+    parser.add_argument(
+        "--weight_buffer_size",
+        type=int,
+        default=1024,
+        help="Weight buffer size per OC dim (# elements).",
+    )
+    parser.add_argument(
+        "--accum_buffer_size",
+        type=int,
+        default=1024,
+        help="Accum buffer size per OC dim (# elements).",
+    )
+    parser.add_argument(
+        "--double_buffered_accum_buffer",
+        action="store_true",
+        help="Use a double-buffered accumulation buffer (interstellar tiling).",
+    )
+    parser.add_argument(
+        "--dram_size",
+        type=int,
+        default=None,
+        help="DRAM capacity (bytes); enables the 4-level interstellar hierarchy.",
+    )
+    parser.add_argument(
+        "--dram_bandwidth",
+        type=float,
+        default=200.0,
+        help="DRAM bandwidth in GB/s.",
+    )
+    parser.add_argument(
+        "--frequency",
+        type=float,
+        default=1.0,
+        help="Clock frequency in GHz (with --dram_bandwidth -> bytes/cycle).",
+    )
+
+    # -- data layout + hardware unrolling -----------------------------------
+    parser.add_argument(
+        "--transform_layout",
+        action="store_true",
+        help="Transpose conv/linear inputs+weights to a systolic-friendly layout.",
+    )
+    parser.add_argument(
+        "--transpose_fc",
+        action="store_true",
+        help="Transpose the weights of fully connected layers.",
+    )
+    parser.add_argument(
+        "--hardware_unrolling",
+        type=lambda x: tuple(map(int, x.split(","))),
+        default=None,
+        help="Hardware unroll dimensions, e.g. 16,16.",
+    )
+
+    # -- tiling / bufferized lowering ---------------------------------------
+    parser.add_argument(
+        "--disable_reshape_fusion",
+        action="store_true",
+        help="Do not fuse reshape with the following GEMM in Transformers.",
+    )
+    parser.add_argument(
+        "--split_spmm",
+        action="store_true",
+        help="Split linear_mx with outliers into dense + SpMM operations.",
+    )
+    parser.add_argument(
+        "--bufferize",
+        action="store_true",
+        help=(
+            "Use the bufferized FX lowering path: rewrite tiled "
+            "GEMM/conv/pointwise into while_loop nests over voyager.* "
+            "primitives, then emit from that graph."
+        ),
+    )
+    parser.add_argument(
+        "--use_interstellar_tiling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Tile GEMM/conv on demand via interstellar during bufferization.",
+    )
+
+    # -- reporting (timing / DRAM-traffic estimator) ------------------------
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="After compile, estimate the schedule and dump <basename>.xlsx + "
+        ".perfetto.json (requires --bufferize).",
+    )
+    parser.add_argument(
+        "--report_output_dir",
+        default=".",
+        help="Directory for the reporting workbook / trace.",
+    )
+    parser.add_argument(
+        "--report_basename",
+        default="schedule",
+        help="Base filename for the reporting outputs.",
+    )
+    parser.add_argument(
+        "--setup_cycles",
+        type=int,
+        default=1000,
+        help="Per-transfer DRAM setup latency (cycles) for the estimator.",
+    )
+    return parser
