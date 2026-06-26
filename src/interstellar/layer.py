@@ -27,6 +27,11 @@ class Layer(object):
     of_scale_bits: microscaling output-scale element width in bits (0 = none).
     block_size: microscaling group size (elements per scale); the scale tensor
         holds one scale per block_size value elements.
+    fused_size_fn: optional callable ``fn(out_tile, bank_size) -> bytes``
+        giving the L2+ storage (in bytes, bank-rounded) of fused post-op
+        operands (residual, bias, ...) that share the output's bank domain.
+        ``out_tile`` is the per-output-loop-dim tile at the level. None = no
+        fused operands (contributes 0).
     """
 
     def __init__(
@@ -48,6 +53,7 @@ class Layer(object):
         fl_scale_bits=0,
         of_scale_bits=0,
         block_size=1,
+        fused_size_fn=None,
     ):
         self.nifm = nifm
         self.nofm = nofm
@@ -68,6 +74,7 @@ class Layer(object):
         self.fl_scale_bits = fl_scale_bits
         self.of_scale_bits = of_scale_bits
         self.block_size = block_size
+        self.fused_size_fn = fused_size_fn
         assert self.wofm > 0
         assert self.hofm > 0
         assert self.nimg > 0

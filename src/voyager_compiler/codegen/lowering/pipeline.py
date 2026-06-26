@@ -740,7 +740,10 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     from voyager_compiler.codegen.lowering.bufferization import (
         _codebook_arg_nodes,
     )
-    from voyager_compiler.codegen.lowering.tiling import get_tiling
+    from voyager_compiler.codegen.lowering.tiling import (
+        _operand_placeholders,
+        get_tiling,
+    )
     from voyager_compiler.codegen.lowering.utils import (
         _NHWC,
         _build_fused_gm,
@@ -792,6 +795,10 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     # cloned tensor value, and its tile ``_InputSpec`` (tiled at the output
     # block, mapped to the grid via ``out_index_map``); ``None`` for a codebook
     # / scalar passed whole, or an untiled op.
+    # The anchor's own operands (act / weight / scales, traced through any input
+    # dequantize / reshape) are handled by the builder, not as fused post-op
+    # operands -- exclude them here.
+    anchor_operands = set(_operand_placeholders(anchor))
     fused_ops = []
     input_nodes, input_values, in_specs = [], [], []
     for sn in submod.graph.nodes:
@@ -800,7 +807,11 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         fused_ops.append(sn)
         codebooks = _codebook_arg_nodes(sn)
         for inp in sn.all_input_nodes:
-            if inp.op != "placeholder" or inp in input_nodes:
+            if (
+                inp.op != "placeholder"
+                or inp in input_nodes
+                or inp in anchor_operands
+            ):
                 continue
             input_nodes.append(inp)
             input_values.append(inp.value.clone())

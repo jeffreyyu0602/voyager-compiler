@@ -292,7 +292,9 @@ def get_fl_access(resource, point, layer, mac_capacity=1):
     return access_counts_per_level
 
 
-def get_if_size(blocking_accum_list, partitioning_accum_list, partitioning_list, layer):
+def get_if_size(
+    blocking_accum_list, partitioning_accum_list, partitioning_list, layer
+):
     """
     Get size of if block at current level including both temporal and spatial loop part
 
@@ -327,7 +329,9 @@ def get_if_size(blocking_accum_list, partitioning_accum_list, partitioning_list,
     )  # Duplication when OC partitions
 
 
-def get_of_size(blocking_accum_list, partitioning_accum_list, partitioning_list):
+def get_of_size(
+    blocking_accum_list, partitioning_accum_list, partitioning_list
+):
     """
     Get size of of block at current level including both temporal and spatial loop part
 
@@ -351,7 +355,9 @@ def get_of_size(blocking_accum_list, partitioning_accum_list, partitioning_list)
     )  # Duplication when IC, FX or FY partitions
 
 
-def get_fl_size(blocking_accum_list, partitioning_accum_list, partitioning_list):
+def get_fl_size(
+    blocking_accum_list, partitioning_accum_list, partitioning_list
+):
     """
     Get size of fl block at current level
 
@@ -394,7 +400,9 @@ def get_if_bank_size(blocking_accum_list, layer):
     width = fx_acc + (ox_acc - 1) * layer.wstd
     height = fy_acc + (oy_acc - 1) * layer.hstd
 
-    return width * height * blocking_accum_list[le.IC] * blocking_accum_list[le.ON]
+    return (
+        width * height * blocking_accum_list[le.IC] * blocking_accum_list[le.ON]
+    )
 
 
 def get_of_bank_size(blocking_accum_list):
@@ -501,26 +509,36 @@ def get_array_access_and_cost(level, para, access_list, point):
                 * partitions_far[i][le.FY]
                 * partitions_far[i][le.OC]
             )
-            if_partitions_far = if_partitions_far if if_partitions_far != 1 else 0
+            if_partitions_far = (
+                if_partitions_far if if_partitions_far != 1 else 0
+            )
             of_partitions_far = (
                 partitions_far[i][le.FX]
                 * partitions_far[i][le.FY]
                 * partitions_far[i][le.IC]
             )
-            of_partitions_far = of_partitions_far if of_partitions_far != 1 else 0
+            of_partitions_far = (
+                of_partitions_far if of_partitions_far != 1 else 0
+            )
             fl_partitions_far = (
                 partitions_far[i][le.OX]
                 * partitions_far[i][le.OY]
                 * partitions_far[i][le.ON]
             )
-            fl_partitions_far = fl_partitions_far if fl_partitions_far != 1 else 0
+            fl_partitions_far = (
+                fl_partitions_far if fl_partitions_far != 1 else 0
+            )
 
             if_array_block_access = if_block_access * if_partitions_far
             of_array_block_access = of_block_access * of_partitions_far
             fl_array_block_access = fl_block_access * fl_partitions_far
 
             array_access.append(
-                [if_array_block_access, of_array_block_access, fl_array_block_access]
+                [
+                    if_array_block_access,
+                    of_array_block_access,
+                    fl_array_block_access,
+                ]
             )
 
         return [array_access, [nearest_pe_cost] + across_block_cost]
@@ -589,7 +607,9 @@ def get_access(point, layer, resource):
     access_list = list(zip(if_accesses, of_accesses, fl_accesses))
 
     # para_mode = [e.access_mode for i, e in enumerate(resource.paras) if e.access_mode != 0]
-    para_mode_level = [i for i, e in enumerate(resource.paras) if e.access_mode != 0]
+    para_mode_level = [
+        i for i, e in enumerate(resource.paras) if e.access_mode != 0
+    ]
     partitions = list(zip(*point.loop_partitionings))
     array_costs = []
     if para_mode_level:
@@ -648,7 +668,9 @@ def _round_to_bank(num_bytes, bank_size):
     return math.ceil(num_bytes / bank_size) * bank_size
 
 
-def _level_bytes(if_count, of_count, fl_count, of_bits, layer, bank_size):
+def _level_bytes(
+    if_count, of_count, fl_count, of_bits, layer, bank_size, fused_bytes=0.0
+):
     """Per-operand (input, output, weight) byte footprint at a byte-pool level
     (L2+), given each operand's element count and the output's stored width.
 
@@ -661,6 +683,10 @@ def _level_bytes(if_count, of_count, fl_count, of_bits, layer, bank_size):
     rounded up to a whole number of ``bank_size``-byte banks (no-op when the
     level is un-banked).  The input value and its scale live in separate banks;
     the weight (value+scale) shares one bank, as does the output (value+scale).
+
+    ``fused_bytes`` is the already-bank-rounded storage of fused post-op
+    operands (residual, bias, ...).  They never share the output's bank, so the
+    output is rounded on its own and the fused total is added on top.
     """
     bs = layer.block_size
 
@@ -681,16 +707,37 @@ def _level_bytes(if_count, of_count, fl_count, of_bits, layer, bank_size):
         if_scale, bank_size
     )
     fl_bytes = _round_to_bank(fl_value + fl_scale, bank_size)
-    of_bytes = _round_to_bank(of_value + of_scale, bank_size)
+    of_bytes = _round_to_bank(of_value + of_scale, bank_size) + fused_bytes
 
     return (if_bytes, of_bytes, fl_bytes)
+
+
+def _fused_bytes(
+    layer, blocking_accum_list, partitioning_accum_list, bank_size
+):
+    """Bytes for the layer's fused post-op operands at this level, via the
+    layer's ``fused_size_fn`` (0 when there is none).  ``out_tile`` is the
+    per-output-loop-dim tile: blocking only for the bank (per-PE) size, blocking
+    x partitioning for the block (full spatial) size.
+    """
+    if not layer.fused_size_fn:
+        return 0.0
+    out_tile = {}
+    for d in (le.ON, le.OC, le.OY, le.OX):
+        extent = blocking_accum_list[d]
+        if partitioning_accum_list is not None:
+            extent *= partitioning_accum_list[d]
+        out_tile[d] = extent
+    return layer.fused_size_fn(out_tile, bank_size)
 
 
 def get_bank_size(point, layer, level, resource):
 
     blocking_accum_list = []
     for i in range(le.NUM):
-        blocking_accum_list.append(reduce(mul, point.loop_blocking(i)[: level + 1], 1))
+        blocking_accum_list.append(
+            reduce(mul, point.loop_blocking(i)[: level + 1], 1)
+        )
 
     if_bank_size = get_if_bank_size(blocking_accum_list, layer)
     of_bank_size = get_of_bank_size(blocking_accum_list)
@@ -706,8 +753,15 @@ def get_bank_size(point, layer, level, resource):
     # (value + microscaling scale), rounded up to the level's banks.
     of_bits = _output_dtype_bits(point, layer, level)
     bank_size = resource.buffer(level).bank_size
+    fused_bytes = _fused_bytes(layer, blocking_accum_list, None, bank_size)
     return _level_bytes(
-        if_bank_size, of_bank_size, fl_bank_size, of_bits, layer, bank_size
+        if_bank_size,
+        of_bank_size,
+        fl_bank_size,
+        of_bits,
+        layer,
+        bank_size,
+        fused_bytes,
     )
 
 
@@ -721,7 +775,9 @@ def get_block_size(point, layer, level, resource):
     partitioning_reshape = list(zip(*point.loop_partitionings))
     partitioning_list = partitioning_reshape[level]
     for i in range(le.NUM):
-        blocking_accum_list.append(reduce(mul, point.loop_blocking(i)[: level + 1], 1))
+        blocking_accum_list.append(
+            reduce(mul, point.loop_blocking(i)[: level + 1], 1)
+        )
         partitioning_accum_list.append(
             reduce(mul, point.loop_partitioning(i)[: level + 1], 1)
         )  # FIXME inclusive mode also duplicates data
@@ -743,8 +799,17 @@ def get_block_size(point, layer, level, resource):
 
     of_bits = _output_dtype_bits(point, layer, level)
     bank_size = resource.buffer(level).bank_size
+    fused_bytes = _fused_bytes(
+        layer, blocking_accum_list, partitioning_accum_list, bank_size
+    )
     return _level_bytes(
-        if_block_size, of_block_size, fl_block_size, of_bits, layer, bank_size
+        if_block_size,
+        of_block_size,
+        fl_block_size,
+        of_bits,
+        layer,
+        bank_size,
+        fused_bytes,
     )
 
 
@@ -838,7 +903,9 @@ def valid_partition_number(resource, partitioning, level):
     return actual_parallelism <= max_parallelism
 
 
-def valid_partitioning_current_level(resource, point, layer, level, verbose=False):
+def valid_partitioning_current_level(
+    resource, point, layer, level, verbose=False
+):
     valid_size = fit_in_level(
         resource.buffer(level).capacity,
         get_bank_size(point, layer, level, resource),
@@ -850,7 +917,9 @@ def valid_partitioning_current_level(resource, point, layer, level, verbose=Fals
     return valid_size
 
 
-def valid_mapping_point_current_level(resource, point, layer, level, verbose=False):
+def valid_mapping_point_current_level(
+    resource, point, layer, level, verbose=False
+):
     if resource.paras[level].count > 1:
         valid_size = fit_in_level(
             resource.buffer(level).capacity,
@@ -872,7 +941,12 @@ def valid_mapping_point_current_level(resource, point, layer, level, verbose=Fal
     valid_para = valid_partition_number(resource, partitioning, level)
 
     if verbose == 3:
-        print("Level ", level, ": Partitioned block size fit in bank: ", valid_size)
+        print(
+            "Level ",
+            level,
+            ": Partitioned block size fit in bank: ",
+            valid_size,
+        )
         print("Level ", level, ": Partition number is valid: ", valid_para)
 
     return valid_size and valid_para
@@ -881,12 +955,16 @@ def valid_mapping_point_current_level(resource, point, layer, level, verbose=Fal
 def valid_partitioning(resource, point, layer, verbose=False):
     para_level = resource.para_index
     for level in para_level:
-        if not valid_partitioning_current_level(resource, point, layer, level, verbose):
+        if not valid_partitioning_current_level(
+            resource, point, layer, level, verbose
+        ):
             return False
     return True
 
 
-def valid_blocking_size_current_level(resource, point, layer, level, verbose=False):
+def valid_blocking_size_current_level(
+    resource, point, layer, level, verbose=False
+):
     """
     Check if the blocking size of the current level fits in memory.
     """
@@ -900,7 +978,10 @@ def valid_blocking_size_current_level(resource, point, layer, level, verbose=Fal
         return fit_in_level(
             capacity,
             get_block_size(point, layer, level, resource),
-            (resource.invalid_underutilized and (level not in resource.para_index)),
+            (
+                resource.invalid_underutilized
+                and (level not in resource.para_index)
+            ),
             level,
             resource.memory_partitions,
         )
@@ -908,7 +989,10 @@ def valid_blocking_size_current_level(resource, point, layer, level, verbose=Fal
         return fit_in_level(
             resource.buffer(level).capacity * resource.paras[level].count,
             get_block_size(point, layer, level, resource),
-            (resource.invalid_underutilized and (level not in resource.para_index)),
+            (
+                resource.invalid_underutilized
+                and (level not in resource.para_index)
+            ),
             level,
             resource.memory_partitions,
         )
@@ -918,7 +1002,9 @@ def valid_blocking_size_current_level(resource, point, layer, level, verbose=Fal
 
 def valid_mapping_point(resource, point, layer, verbose=False):
     for i in range(resource.buffer_levels()):
-        if not valid_mapping_point_current_level(resource, point, layer, i, verbose):
+        if not valid_mapping_point_current_level(
+            resource, point, layer, i, verbose
+        ):
             return False
     return True
 
@@ -964,7 +1050,9 @@ def get_array_and_curr_level_cost(resource, point, layer, level, verbose=False):
     for i in range(len(buffer_level_access)):
         index = resource.memory_partitions[level][i]
         if index is not None:
-            level_cost += buffer_level_access[i] * resource.access_cost[level][index]
+            level_cost += (
+                buffer_level_access[i] * resource.access_cost[level][index]
+            )
     # operand_costs = [access_cost * num_accesses for access_cost,num_accesses in zip(total_buffer_access,resource.access_cost[level]) ]
     # level_cost = sum(operand_costs)
 
@@ -1000,7 +1088,8 @@ def get_level_cost(resource, point, layer, level, verbose=False):
     for i in range(3):
         memory_partition = resource.memory_partitions[level][i]
         level_cost += (
-            buffer_access[level][i] * resource.access_cost[level][memory_partition]
+            buffer_access[level][i]
+            * resource.access_cost[level][memory_partition]
         )
 
     if verbose >= 3:
@@ -1049,7 +1138,8 @@ def get_cost(resource, point, layer, verbose=False):
             idx_adjust = 1
 
         layer_access_cost = (
-            total_access_cost[: 1 + idx_adjust] + total_access_cost[2 + idx_adjust :]
+            total_access_cost[: 1 + idx_adjust]
+            + total_access_cost[2 + idx_adjust :]
         )
         print(
             "16b_Access_Energy_[RegisterFile(s),Buffer,DRAM]_(pJ): \n\tifmap: {}\n\tofmap: {}\n\tfilter: {}".format(
@@ -1066,7 +1156,9 @@ def get_cost(resource, point, layer, verbose=False):
             )
         )
 
-        layer_num_access = access_list[: 1 + idx_adjust] + access_list[2 + idx_adjust :]
+        layer_num_access = (
+            access_list[: 1 + idx_adjust] + access_list[2 + idx_adjust :]
+        )
         print(
             "Tiles_Accessed_from_[RegisterFile(s),Buffer,DRAM]_in_Layer: \n\tifmap: {}\n\tofmap: {}\n\tfilter: {}".format(
                 [item[0] for item in layer_num_access],

@@ -146,13 +146,13 @@ def build_interstellar_tiler(
     )
 
 
-def _layer_cache_key(node, in_bits, w_bits, out_dtype):
+def _layer_cache_key(node, in_bits, w_bits, out_dtype, fused=()):
     """A hashable key capturing everything (besides the fixed architecture) that
     determines a node's interstellar mapping: op, operand / output shapes, the
-    conv stride/padding/dilation, and the element widths.  Identical layers thus
-    share one optimizer run.  ``out_dtype`` is the outer node's output dtype
-    (a ``(scale, value)`` list for a fused mx output); list-ified to a tuple so
-    the key stays hashable."""
+    conv stride/padding/dilation, the element widths, and the fused post-op
+    operand descriptors.  Identical layers thus share one optimizer run.
+    ``out_dtype`` is the outer node's output dtype (a ``(scale, value)`` list for
+    a fused mx output); list-ified to a tuple so the key stays hashable."""
     from ..passes.utils import _pair, get_arg_value
 
     val = node.value
@@ -165,6 +165,7 @@ def _layer_cache_key(node, in_bits, w_bits, out_dtype):
         in_bits,
         w_bits,
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
+        tuple(fused),
     ]
     if is_conv2d(node):
         key += [
@@ -173,6 +174,128 @@ def _layer_cache_key(node, in_bits, w_bits, out_dtype):
             _pair(get_arg_value(node, 5, "dilation", 1)),
         ]
     return tuple(key)
+
+
+def _output_pos_to_loop_dim(anchor):
+    """Map each output-tensor dim position to its interstellar output loop dim
+    (``ON`` batch / ``OC`` channels / ``OY`` height / ``OX`` width), in the
+    anchor's physical layout — so a fused operand's shape can be broadcast onto
+    the output tile.  conv: NCHW or NHWC (``meta['transposed']``); gemm:
+    ``(batch.., M, N)`` with ``M -> OX``, ``N -> OC``, batch dims ``-> ON``.
+    """
+    import interstellar
+
+    le = interstellar.le
+    if is_conv2d(anchor):
+        if anchor.meta.get("transposed", False):
+            return [le.ON, le.OY, le.OX, le.OC]  # NHWC
+        return [le.ON, le.OC, le.OY, le.OX]  # NCHW
+    ndim = anchor.value.ndim
+    return [le.ON] * (ndim - 2) + [le.OX, le.OC]
+
+
+def _operand_placeholders(root):
+    """External placeholder operands feeding ``root``'s subtree (``root``
+    inclusive), tracing through pre-processing ops (``dequantize`` / reshape)
+    and skipping each op's quantization codebook / qmap args.
+    """
+    from .bufferization import _codebook_arg_nodes
+
+    leaves, stack, visited = [], [root], set()
+    while stack:
+        n = stack.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n.op == "placeholder":
+            leaves.append(n)
+            continue
+        codebooks = _codebook_arg_nodes(n)
+        for inp in n.all_input_nodes:
+            if inp not in codebooks:
+                stack.append(inp)
+    return leaves
+
+
+def _fused_operand_specs(node, anchor):
+    """Per fused post-op operand of a fused ``call_module`` ``node``: a
+    ``(dims, dtype_bits)`` pair, where ``dims`` are the interstellar output loop
+    dims (a subset of ``ON/OC/OY/OX``) the operand is *tiled* along — broadcast
+    (size-1) dims dropped, so its tile size is ``prod(out_tile[d] for d in
+    dims)``.  Empty for a bare node, or one whose fused ops add no tiled tensor
+    operand (codebooks / scalars don't count).
+
+    A post-op operand is any submodule placeholder that is *not* one of the
+    anchor's own operands (act / weight / scales, traced through any input
+    dequantize / reshape — those are counted by the interstellar ``Layer``) and
+    is not a codebook / qmap or scalar.  Defining it by exclusion catches an
+    operand fed through a ``dequantize`` (e.g. the attention mask).  The
+    submodule is already ShapeProp'd (placeholders carry ``.value``).
+    """
+    submod = node.meta.get("submodule")
+    if submod is None:
+        return []
+
+    from .bufferization import _codebook_arg_nodes
+
+    pos_to_loop_dim = _output_pos_to_loop_dim(anchor)
+    out_ndim = anchor.value.ndim
+
+    anchor_operands = set(_operand_placeholders(anchor))
+    codebooks = set()
+    for n in submod.graph.nodes:
+        codebooks |= _codebook_arg_nodes(n)
+
+    specs = []
+    for p in submod.graph.nodes:
+        if p.op != "placeholder":
+            continue
+        if p.value.numel() == 1 or p in anchor_operands or p in codebooks:
+            continue
+        op_shape = tuple(p.shape)
+        offset = out_ndim - len(op_shape)  # right-align (broadcast)
+        dims = tuple(
+            pos_to_loop_dim[offset + i]
+            for i, sz in enumerate(op_shape)
+            if sz > 1
+        )
+        specs.append((dims, _node_dtype_bits(p)))
+    return specs
+
+
+def _make_fused_size_fn(specs):
+    """Build the ``Layer.fused_size_fn`` closure from ``_fused_operand_specs``.
+    ``fn(out_tile, bank_size) -> bytes``: each operand's tile bytes is
+    ``prod(out_tile[d] for d in dims) * dtype_bits / 8``; an operand whose tile
+    is >= half a bank gets its own bank(s), the sub-half ones pack into one
+    shared bank (an un-banked level just sums, no rounding).  ``None`` when there
+    are no fused operands.
+    """
+    if not specs:
+        return None
+
+    def fn(out_tile, bank_size):
+        sizes = []
+        for dims, dtype_bits in specs:
+            count = 1
+            for d in dims:
+                count *= out_tile[d]
+            sizes.append(count * dtype_bits / 8.0)
+
+        if not bank_size:
+            return sum(sizes)
+        total = 0.0
+        small = 0.0
+        for s in sizes:
+            if s >= bank_size / 2:
+                total += math.ceil(s / bank_size) * bank_size
+            else:
+                small += s
+        if small:
+            total += math.ceil(small / bank_size) * bank_size
+        return total
+
+    return fn
 
 
 class RuntimeCalculator:
@@ -382,7 +505,7 @@ class RuntimeCalculator:
         return total_time
 
 
-def _extract_layer_from_node(node, out_dtype=None):
+def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
 
@@ -477,6 +600,7 @@ def _extract_layer_from_node(node, out_dtype=None):
             get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
         ),
         block_size=node.kwargs.get("block_size") or 1,
+        fused_size_fn=fused_size_fn,
     )
 
 
@@ -488,6 +612,7 @@ def run_interstellar(
     double_buffered_accum_buffer: bool = False,
     double_buffered_l2: bool = False,
     out_dtype=None,
+    fused_size_fn=None,
 ):
     """
     Run interstellar with the 4-level DRAM architecture for a single GEMM/conv
@@ -505,7 +630,7 @@ def run_interstellar(
 
     logger = logging.getLogger(__name__)
 
-    layer = _extract_layer_from_node(node, out_dtype)
+    layer = _extract_layer_from_node(node, out_dtype, fused_size_fn)
     if layer is None:
         return None
 
@@ -609,13 +734,16 @@ def get_tiling(node, tiler=None):
         return None
 
     # Run interstellar (cached per layer; the optimizer is slow).  ``out_dtype``
-    # is the outer (fused) node's output dtype.
+    # is the outer (fused) node's output dtype; the fused post-op operands add
+    # their own L2+ banks (modeled via ``layer.fused_size_fn``).
     out_dtype = node.meta.get("dtype")
+    fused_specs = _fused_operand_specs(node, anchor)
     key = _layer_cache_key(
         anchor,
         _node_dtype_bits(anchor.args[0]),
         _node_dtype_bits(anchor.args[1]),
         out_dtype,
+        tuple(fused_specs),
     )
     if key in tiler.cache:
         mapping = tiler.cache[key]
@@ -629,6 +757,7 @@ def get_tiling(node, tiler=None):
             tiler.double_buffered_accum_buffer,
             double_buffered_l2=tiler.double_buffered_l2,
             out_dtype=out_dtype,
+            fused_size_fn=_make_fused_size_fn(fused_specs),
         )
         tiler.cache[key] = mapping  # cache None too (skipped layers)
     if mapping is None:
