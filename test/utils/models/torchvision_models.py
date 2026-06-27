@@ -15,7 +15,7 @@ from voyager_compiler import (
     compile,
     derive_bias_qparams_fn,
     extract_input_preprocessor,
-    fuse,
+    fuse_operator,
 )
 from voyager_compiler.codegen import get_conv_bn_layers
 
@@ -144,12 +144,12 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     old_output = gm(*example_args)
 
-    transform(gm, example_args, **transform_args, fuse_operator=False)
+    transform(gm, example_args, **transform_args, skip_op_fusion=False)
 
     gm, preprocess_fn = extract_input_preprocessor(gm)
     example_args = (preprocess_fn(*example_args),)
 
-    fuse(gm, vector_stages, example_args)
+    fuse_operator(gm, vector_stages)
 
     gm.graph.print_tabular()
 

@@ -34,7 +34,7 @@ from .mapping_utils import (
     set_tensor_field,
 )
 from .memory import MemoryAllocator, Segment
-from .normalize import normalize
+from .normalize import IterationSpaceNormalizer, NormalizationError
 from .param_pb2 import Model, Operation, Tensor
 from .passes.utils import get_arg_value
 from .shape_prop import ShapeProp
@@ -46,6 +46,7 @@ from ..pt2e_utils import (
     dtype_byte_size,
     fetch_attr,
     propagate_shape,
+    set_node_value,
     update_submod_user_meta,
 )
 from ..quantize_pt2e import create_getattr_from_value
@@ -220,7 +221,6 @@ def rename_nodes_with_param_names(model: GraphModule):
 def _create_and_insert_subgraph(
     nodes: List[Node],
     model: torch.nn.Module,
-    named_modules: Dict[str, torch.nn.Module],
     node_order: Dict[Node, int] = None,
     normalize_iteration_space: bool = False,
 ) -> Optional[Node]:
@@ -230,7 +230,6 @@ def _create_and_insert_subgraph(
     submodule, new_args = _create_subgraph(nodes)
     node_name = get_submodule_name(model, nodes)
     setattr(model, node_name, submodule)
-    named_modules[node_name] = submodule
     with model.graph.inserting_after(nodes[-1]):
         new_node = model.graph.create_node(
             "call_module", node_name, new_args, {}
@@ -240,14 +239,20 @@ def _create_and_insert_subgraph(
         new_node.meta["dtype"] = dtype
     nodes[-1].replace_all_uses_with(new_node)
 
-    # Normalize the fused submodule to the anchor's iteration space.
+    args = map_arg(new_node.args, lambda n: n.value.clone())
+    result = ShapeProp(submodule).propagate(*args)
+    set_node_value(new_node, result)
+
+    # Normalize the fused submodule to the anchor's iteration space; skip the
+    # group (leaving it fused as-is) if it cannot share one iteration space.
     if normalize_iteration_space:
-        result = normalize(model, new_node, submodule)
-        if result is None:
+        try:
+            IterationSpaceNormalizer().normalize(model, new_node)
+        except NormalizationError as exc:
+            logger.warning("normalization failed: %s: %s", new_node, exc)
             new_node.replace_all_uses_with(nodes[-1])
-            model.graph.erase_node(new_node)
             delattr(model, node_name)
-            named_modules.pop(node_name, None)
+            model.graph.erase_node(new_node)
             return None
 
     for node in reversed(nodes):
@@ -772,7 +777,6 @@ def fuse_operator(
     and perform fusion on each branch.
     """
     graph = model.graph
-    named_modules = dict(model.named_modules(remove_duplicate=False))
 
     nodes_map = {}
     fused_nodes_list = []
@@ -811,13 +815,13 @@ def fuse_operator(
 
     for fused_nodes in fused_nodes_list:
         node = _create_and_insert_subgraph(
-            fused_nodes, model, named_modules, normalize_iteration_space=True
+            fused_nodes, model, normalize_iteration_space=True
         )
         if node is None:
             continue
         update_submod_user_meta(model, node)
         propagate_shape(node, model)
-        gm = named_modules[node.target]
+        gm = node.meta.get("submodule")
 
         for n in list(gm.graph.nodes):
             if (name := nodes_map.get(n.name, None)) is None:

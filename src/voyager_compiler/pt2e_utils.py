@@ -76,6 +76,23 @@ def fetch_attr(module, target):
     return attr_itr
 
 
+def set_node_value(node: Node, value):
+    if isinstance(value, torch.Tensor):
+        node.shape = value.shape
+        node.value = value.cpu().clone()
+    elif isinstance(value, (tuple, list)):
+        # A tuple may mix tensors with scalars (e.g. the integer loop counters carried
+        # by a while_loop); keep non-tensor elements as-is.
+        node.shape = tuple(
+            x.shape if isinstance(x, torch.Tensor) else None for x in value
+        )
+        node.value = tuple(
+            x.cpu().clone() if isinstance(x, torch.Tensor) else x for x in value
+        )
+    else:
+        node.value = value
+
+
 def propagate_shape(node: Node, model: GraphModule = None):
     def load_arg(a):
         return map_arg(a, lambda n: getattr(n, "value", n.meta.get("val")))
@@ -95,20 +112,7 @@ def propagate_shape(node: Node, model: GraphModule = None):
     elif node.op == 'output':
         result = load_arg(node.args[0])
 
-    if isinstance(result, torch.Tensor):
-        node.shape = result.shape
-        node.value = result.cpu().clone()
-    elif isinstance(result, (tuple, list)):
-        # A tuple may mix tensors with scalars (e.g. the integer loop counters carried
-        # by a while_loop); keep non-tensor elements as-is.
-        node.shape = tuple(
-            x.shape if isinstance(x, torch.Tensor) else None for x in result
-        )
-        node.value = tuple(
-            x.cpu().clone() if isinstance(x, torch.Tensor) else x for x in result
-        )
-    else:
-        node.value = result
+    set_node_value(node, result)
 
 
 def get_device_map(model: GraphModule, max_memory=None, verbose=False):

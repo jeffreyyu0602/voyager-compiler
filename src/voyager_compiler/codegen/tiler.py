@@ -1,35 +1,41 @@
 import logging
 import math
-import re
+from typing import Optional
+
+from ..pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
 
 
 def get_dtype_width(dtype) -> int:
-    s = str(dtype).split(".")[-1]
-    bit_search = re.search(r"[^\d](\d+)(_.*)?$", s)
-    if bit_search is None:
-        raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
-    return int(bit_search.groups()[0])
+    """Element width in bits, derived from the canonical ``dtype_byte_size``
+    so the dtype-name parsing lives in exactly one place."""
+    return round(dtype_byte_size(dtype) * 8)
 
 
-def _node_dtype_bits(node, default: int = 8) -> int:
+def _node_dtype_bits(node, default: Optional[int] = None) -> int:
     """
     Element width in bits for an FX node's tensor, read from the graph.
 
     Prefers node.meta["dtype"] (the compiler's tracked storage dtype, e.g. an
-    NF4 weight), falling back to the runtime tensor dtype node.value.dtype.
-    Returns `default` when no dtype can be determined.
+    NF4 weight), falling back to the runtime tensor dtype node.value.dtype.  A
+    multi-output node (meta dtype / value is a list, e.g. quantize_mx) uses its
+    primary (last) output.
     """
-    if node is None:
-        return default
-    dtype = node.meta.get("dtype")
-    if dtype is None:
-        val = getattr(node, "value", None)
-        if val is None or not hasattr(val, "dtype"):
-            return default
-        dtype = str(val.dtype).split(".")[1]
-    return get_dtype_width(dtype)
+    if node is not None:
+        dtype = node.meta.get("dtype")
+        if isinstance(dtype, (list, tuple)):
+            dtype = dtype[-1]
+        if dtype is None:
+            val = getattr(node, "value", None)
+            if isinstance(val, (list, tuple)):
+                val = val[-1] if val else None
+            dtype = getattr(val, "dtype", None)
+        if dtype is not None:
+            return round(dtype_byte_size(dtype) * 8)
+    if default is None:
+        raise ValueError(f"node {node} has no dtype to size the operand")
+    return default
 
 
 class RuntimeCalculator:
@@ -355,23 +361,14 @@ def run_interstellar_for_tiled_op(
         f"stride=({layer.hstd},{layer.wstd})"
     )
 
-    # Get dtype widths from the outer graph node (not submodule placeholders)
-    input_node = output_node.args[0]
-    if (input_dtype := input_node.meta.get("dtype")) is None:
-        input_dtype = str(input_node.value.dtype).split(".")[-1]
-    input_width = get_dtype_width(input_dtype)
-
-    output_dtype = output_node.meta.get("dtype")
-    if isinstance(output_dtype, (list, tuple)):
-        output_dtype = output_dtype[-1]
-    if output_dtype is None:
-        val = output_node.value
-        out_val = val[-1] if isinstance(val, (list, tuple)) else val
-        output_dtype = str(out_val.dtype).split(".")[-1]
-    output_width = get_dtype_width(output_dtype)
+    # dtype widths from the outer graph node (not submodule placeholders);
+    # ``_node_dtype_bits`` reads meta['dtype'] / value.dtype (multi-output ->
+    # primary/last).
+    input_width = _node_dtype_bits(output_node.args[0])
+    output_width = _node_dtype_bits(output_node)
 
     # Check for high-precision operands in fused post-GEMM vector ops
-    has_hp_vector_input = False
+    has_high_prec_vector_input = False
     if output_node.op == "call_module":
         gm = named_modules[output_node.target]
         for n in gm.graph.nodes:
@@ -379,12 +376,8 @@ def run_interstellar_for_tiled_op(
                 continue
 
             n = n.meta.get("source_node", n)
-
-            if (dtype := n.meta.get("dtype")) is None:
-                dtype = str(n.value.dtype).split(".")[-1]
-
-            if get_dtype_width(dtype) > input_width:
-                has_hp_vector_input = True
+            if _node_dtype_bits(n) > input_width:
+                has_high_prec_vector_input = True
                 break
 
     has_sparse_op = gemm_node.kwargs.get("A_indptr") is not None
@@ -400,7 +393,7 @@ def run_interstellar_for_tiled_op(
         layer.hstd,
         input_width,
         output_width,
-        has_hp_vector_input,
+        has_high_prec_vector_input,
         has_sparse_op,
     )
 
@@ -413,7 +406,7 @@ def run_interstellar_for_tiled_op(
             input_width,
             output_width,
             double_buffered_accum_buffer,
-            has_hp_vector_input,
+            has_high_prec_vector_input,
             has_sparse_op,
         )
         _, runtime, mapping, _ = interstellar.optimizer.opt_optimizer(

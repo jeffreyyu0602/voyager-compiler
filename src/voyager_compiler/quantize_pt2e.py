@@ -33,7 +33,7 @@ from .codegen.mapping_utils import (
     is_conv2d,
     is_matmul,
 )
-from .decomposed import quantized_decomposed_lib
+from .decomposed import quantized_ops_lib
 
 logger = logging.getLogger(__name__)
 
@@ -471,12 +471,12 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
     if activation_post_process.outlier_threshold is not None:
-        outlier_max_pct = (
-            math.ceil(activation_post_process.outlier_max_pct * 100) / 100.0
+        max_outlier_pct = (
+            math.ceil(activation_post_process.max_outlier_pct * 100) / 100.0
         )
-        activation_post_process.outlier_max_pct = max(outlier_max_pct, 0.05)
+        activation_post_process.max_outlier_pct = max(max_outlier_pct, 0.05)
         logger.info(
-            f"{node.target} has maximum outlier percentage {outlier_max_pct:.2%}"
+            f"{node.target} has maximum outlier percentage {max_outlier_pct:.2%}"
         )
 
     # Can only fuse scale calculation with quantization if along the last dim
@@ -570,7 +570,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
                 args.extend([
                     activation_post_process.outlier_threshold,
-                    activation_post_process.outlier_max_pct,
+                    activation_post_process.max_outlier_pct,
                 ])
                 num_outputs = 5
             else:
@@ -609,7 +609,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     (
                         input_node,
                         activation_post_process.outlier_threshold,
-                        activation_post_process.outlier_max_pct,
+                        activation_post_process.max_outlier_pct,
                     ),
                 )
                 output_nodes = [

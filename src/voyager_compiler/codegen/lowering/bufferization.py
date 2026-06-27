@@ -281,9 +281,9 @@ def propagate_logical_dtypes(
     ``'fp8_e5m3'``) on input / weight / scale nodes, and the pass tags each
     output buffer (``voyager.alloc``) with the output's logical dtype, so
     codegen emits the logical dtype rather than the physical storage dtype.
-    Threads through ``while_loop`` bodies via their carried / additional inputs.
-    Ops whose output is genuinely physical (the fp32 accumulator from a
-    GEMM/conv) keep no logical dtype.
+    Threads through ``while_loop`` bodies (carried / additional inputs) and
+    ``cond`` branches (their operands).  Ops whose output is genuinely physical
+    (the fp32 accumulator from a GEMM/conv) keep no logical dtype.
 
     TODO: per-*tile* logical-dtype inheritance previously rode ``load_tile`` /
     ``store_tile`` (now retired); the equivalent for ``copy_tile`` /
@@ -311,6 +311,20 @@ def propagate_logical_dtypes(
                 ]
                 child = {ph: _dt(inp) for ph, inp in zip(body_phs, inputs)}
                 propagate_logical_dtypes(body, child)
+        elif node.target is _COND:
+            # Both branches share the operand list (args[3]); thread logical
+            # dtypes into each branch's placeholders, like a while_loop body.
+            operands = list(node.args[3]) if len(node.args) > 3 else []
+            for graph_arg in (node.args[1], node.args[2]):
+                branch = getattr(gm, str(graph_arg.target), None)
+                if isinstance(branch, GraphModule):
+                    branch_phs = [
+                        n for n in branch.graph.nodes if n.op == "placeholder"
+                    ]
+                    child = {
+                        ph: _dt(inp) for ph, inp in zip(branch_phs, operands)
+                    }
+                    propagate_logical_dtypes(branch, child)
         elif node.target is operator.getitem:
             src = node.args[0]
             if isinstance(src, Node) and src.target is while_loop:

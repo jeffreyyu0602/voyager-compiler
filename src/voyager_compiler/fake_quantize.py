@@ -302,7 +302,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         assert outlier_pct is None or outlier_threshold is None, (
             "Only one of outlier_pct and outlier_threshold can be set."
         )
-        self.outlier_max_pct = 0.0
+        self.max_outlier_pct = 0.0
 
         factory_kwargs = {'device': device, 'dtype': torch.float}
 
@@ -336,10 +336,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         if outlier_pct is not None:
             self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
             self.register_buffer(
-                "outlier_threshold_history", torch.tensor(0.0, **factory_kwargs)
-            )
-            self.register_buffer(
-                "outlier_initialized", torch.tensor(False, device=device),
+                "outlier_threshold", torch.tensor([], **factory_kwargs),
             )
 
     @torch.jit.export
@@ -372,28 +369,29 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             exp = torch.floor(torch.log2(torch.abs(x.detach().float())))
             self.histogram += torch.histc(exp, 254, min=-126, max=127)
 
-        if self.outlier_pct is not None:
-            q = 1.0 - self.outlier_pct
-            value = torch.quantile(x.abs().float(), q)
+        if self.outlier_pct is not None and self.observer_enabled[0] == 1:
+            flat = x.abs().flatten()
+            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
 
-            if not self.outlier_initialized:
-                self.outlier_threshold_history.copy_(value)
-                self.outlier_initialized.fill_(True)
+            vals = torch.topk(flat, k, largest=True, sorted=False).values
+            threshold = vals.min()
+
+            if self.outlier_threshold.numel() == 0:
+                self.outlier_threshold.resize_as_(threshold)
+                self.outlier_threshold.copy_(threshold)
             else:
-                self.outlier_threshold_history.mul_(self.outlier_ema_decay).add_(
-                    value * (1.0 - self.outlier_ema_decay)
+                self.outlier_threshold.mul_(self.outlier_ema_decay).add_(
+                    threshold * (1.0 - self.outlier_ema_decay)
                 )
 
-            self.outlier_threshold = self.outlier_threshold_history.item()
-
-        # Remove outliers from the activation.
+        # Remove outliers from x before quantization
+        skip = None
         if self.outlier_threshold is not None:
+            skip = x.abs() >= self.outlier_threshold
             orig_x = x.clone()
-            mask = torch.abs(x) < self.outlier_threshold
-            x = torch.where(mask, x, torch.zeros_like(x))
-
-            outlier_pct = mask.bitwise_not().sum().item() / x.numel()
-            self.outlier_max_pct = max(outlier_pct, self.outlier_max_pct)
+            x = x.masked_fill(skip, 0.0)
+            outlier_pct = skip.sum().item() / x.numel()
+            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
 
         if self.qscheme == qt.microscaling:
             x = MXFakeQuantFunction.apply(
@@ -434,9 +432,9 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 self.force_scale_power_of_two,
             )
 
-        # Restore outliers
-        if self.outlier_threshold is not None:
-            x = torch.where(mask, x, orig_x)
+        # Restore all outlier positions.
+        if skip is not None:
+            x = torch.where(skip, orig_x, x)
 
         return x
 

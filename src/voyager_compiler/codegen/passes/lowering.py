@@ -253,8 +253,7 @@ def _decompose_bmm_mx_with_outlier_inputs(model: GraphModule, node: Node):
         return result
 
     node_group = [quantize_node, node] + list(quantize_node.users)
-    named_modules = dict(model.named_modules())
-    submod_node = _create_and_insert_subgraph(node_group, model, named_modules)
+    submod_node = _create_and_insert_subgraph(node_group, model)
     assert (
         submod_node is not None
     ), "Failed to create submodule for BMM with outlier inputs"

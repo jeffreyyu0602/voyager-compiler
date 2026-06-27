@@ -70,7 +70,7 @@ def _nbytes(node, bank_width=None) -> int:
     set and aligning to ``bank_width``."""
     t = _val(node)
     if t is None:
-        return 0
+        raise ValueError(f"{node} has no sized value to allocate memory for")
     dtype = node.meta.get("dtype") or t.dtype
     size = math.ceil(t.numel() * dtype_byte_size(dtype))
     return int(_align_size(size, bank_width))
@@ -342,11 +342,7 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
 
     bufs: Dict[Node, _Buf] = {}
     for root, mem in members.items():
-        tiles = [
-            m
-            for m in mem
-            if m.meta.get("space") == "Scratchpad" and _val(m) is not None
-        ]
+        tiles = [m for m in mem if m.meta.get("space") == "Scratchpad"]
         if not tiles:
             continue
         def_t = min(order[m] for m in tiles)

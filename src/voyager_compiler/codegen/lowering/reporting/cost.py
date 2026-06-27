@@ -9,7 +9,7 @@ their real footprint.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch.fx import Node
@@ -39,9 +39,15 @@ def _val(node):
     return None
 
 
-def _shape(node) -> Optional[Tuple[int, ...]]:
+def _shape(node) -> Tuple[int, ...]:
+    """Every node ``_shape`` is asked about is a node of interest (an anchor, a
+    tile buffer, a DMA operand) that must carry a shape, so a missing value is
+    an error, not a silent ``None`` (``_val`` already reduces a multi-output
+    node to its representative tensor)."""
     v = _val(node)
-    return tuple(int(d) for d in v.shape) if v is not None else None
+    if v is None:
+        raise ValueError(f"{node} has no shape (a sized value is required)")
+    return tuple(int(d) for d in v.shape)
 
 
 def _dtype(node):
@@ -49,8 +55,7 @@ def _dtype(node):
     dt = node.meta.get("dtype") if isinstance(node, Node) else None
     if dt is not None:
         return dt
-    v = _val(node)
-    return v.dtype if v is not None else torch.float32
+    return _val(node).dtype
 
 
 # --------------------------------------------------------------------------
@@ -61,9 +66,7 @@ def _dtype(node):
 def tile_bytes(buffer_node: Node, sizes) -> int:
     """Physical bytes of a ``sizes`` tile of ``buffer_node`` (rounded up; a
     sub-byte dtype gives a fractional bytes-per-element)."""
-    n = 1
-    for s in sizes:
-        n *= int(s)
+    n = math.prod(sizes)
     return math.ceil(n * dtype_byte_size(_dtype(buffer_node)))
 
 
@@ -76,62 +79,49 @@ def dram_cycles(n_bytes: int, cost: CostParams) -> int:
 # --------------------------------------------------------------------------
 
 
-def _prod(dims) -> int:
-    n = 1
-    for d in dims:
-        n *= int(d)
-    return n
-
-
-# A fused ``call_module``'s *output* shape lives on its anchor (the submodule's
-# GEMM/conv); its *input* shapes live on the compute node's own args.  For a
-# bare op, anchor is the node itself, so both come from the same place.
-
-
-def _gemm_macs(node: Node, anchor: Node) -> int:
-    """MACs of a GEMM tile: ``prod(out[:-1]) * out[-1] * in[-1]`` (folds any
-    batch dims into the row count; works for linear / matmul / bmm)."""
-    out = _shape(anchor)
-    inp = _shape(node.args[0]) if node.args else None
-    if not out or not inp:
-        return 0
-    return _prod(out[:-1]) * out[-1] * inp[-1]
-
-
-def _conv_macs(node: Node, anchor: Node) -> int:
-    """MACs of a conv tile: ``prod(out) * C * kh * kw``.  Channel / kernel dims
-    depend on the physical layout (``meta['transposed']`` => NHWC / HWIO)."""
-    out = _shape(anchor)
-    w = _shape(node.args[1]) if len(node.args) > 1 else None
-    if not out or not w:
-        return 0
-    transposed = anchor.meta.get("transposed", node.meta.get("transposed"))
-    if transposed:  # weight HWIO = [kh, kw, C, K]
-        kh, kw, c = w[0], w[1], w[2]
-    else:  # weight OIHW = [K, C, kh, kw]
-        c, kh, kw = w[1], w[2], w[3]
-    return _prod(out) * c * kh * kw
-
-
 def op_info(node: Node, cost: CostParams) -> OpInfo:
     """Classify a compute node and compute its ideal (100%-utilization) cycle
     count.  GEMM/conv use the ``unroll[0]*unroll[1]`` systolic throughput;
-    vector ops use the ``unroll[1]`` lane count."""
+    vector ops use the ``unroll[1]`` lane count.
+
+    All shapes come from the *anchor* -- the real GEMM/conv/vector op (inside
+    the submodule for a fused ``call_module``, the node itself when bare).  Its
+    inner nodes are shape-propagated at fusion, so ``anchor.args[i]`` is
+    unambiguously the i-th operand (a fused wrapper's args may interleave
+    scales / codes / bias).
+    """
     anchor = get_anchor_node(node) or node
     macs_unroll = max(1, cost.unroll[0] * cost.unroll[1])
     vec_unroll = max(1, cost.unroll[1])
+    out = _shape(anchor)
+
     if is_conv2d(anchor):
-        macs = _conv_macs(node, anchor)
+        # MACs = prod(out) * C * kh * kw; the channel / kernel dims sit at
+        # different positions per layout (transposed => HWIO, else OIHW).
+        w = _shape(anchor.args[1])
+        if anchor.meta.get("transposed", False):  # HWIO = [kh, kw, C, K]
+            kh, kw, c = w[0], w[1], w[2]
+        else:  # OIHW = [K, C, kh, kw]
+            c, kh, kw = w[1], w[2], w[3]
+        macs = math.prod(out) * c * kh * kw
         return OpInfo(
             node.name, "conv", math.ceil(macs / macs_unroll), {"macs": macs}
         )
+
     if is_gemm_op(anchor):
-        macs = _gemm_macs(node, anchor)
+        # MACs = prod(out) * K; each output element costs K = in[-1] MACs
+        # (folds batch dims; works for linear / matmul / bmm).
+        macs = math.prod(out) * _shape(anchor.args[0])[-1]
         return OpInfo(
             node.name, "gemm", math.ceil(macs / macs_unroll), {"macs": macs}
         )
-    out = _shape(anchor) or _shape(node) or ()
-    ops = _prod(out)
+
+    # Vector op: work is the larger of input / output element count -- a
+    # reduction reads its whole input to make a smaller output.  Use the
+    # anchor's primary input (all_input_nodes[0]) to skip qmap / codebook
+    # operands.
+    in_shape = _shape(anchor.all_input_nodes[0])
+    ops = max(math.prod(out), math.prod(in_shape))
     return OpInfo(
         node.name, "vector", math.ceil(ops / vec_unroll), {"ops": ops}
     )

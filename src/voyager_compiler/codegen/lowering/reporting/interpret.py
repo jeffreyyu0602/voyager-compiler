@@ -23,7 +23,7 @@ from torch.fx import GraphModule, Node
 
 from ..codegen import _loop_extents, _norm_extent
 from .classify import classify
-from .cost import _shape, _val, op_info, tile_bytes
+from .cost import _val, op_info, tile_bytes
 from .model import CostParams, ScheduleResult
 from .scheduler import ResourceState
 
@@ -100,12 +100,12 @@ def _root(node, bind: Dict[Node, Node]):
 
 
 def _dma_dir(node: Node, bind):
-    """Identify an ``async_copy``'s DRAM buffer and direction.  Primary rule:
-    the operand rooted in DRAM is the buffer (``src`` DRAM => load / read;
-    ``dst`` DRAM => store / write).  Falls back to the shape rule (operand whose
-    shape differs from ``sizes``) when spaces are unavailable.  Returns
-    ``(root_buffer, sizes, is_load)`` — the root carries the dtype for bytes.
-    """
+    """Identify an ``async_copy``'s DRAM buffer and direction: the operand
+    rooted in DRAM is the buffer (``src`` DRAM => load / read; ``dst`` DRAM =>
+    store / write).  Exactly one operand must be DRAM -- every copy is
+    DRAM<->Scratchpad -- so an ambiguous pair means a malformed graph and
+    raises.  Returns ``(root_buffer, sizes, is_load)`` -- the root carries the
+    dtype for bytes."""
     src, dst = node.args[0], node.args[1]
     sizes = tuple(int(s) for s in node.args[3])
     src_root, dst_root = _root(src, bind), _root(dst, bind)
@@ -118,8 +118,10 @@ def _dma_dir(node: Node, bind):
         return src_root, sizes, True
     if dsp == "DRAM" and ssp != "DRAM":
         return dst_root, sizes, False
-    is_load = _shape(src) != sizes
-    return (src_root if is_load else dst_root), sizes, is_load
+    raise ValueError(
+        f"async_copy {node.name}: exactly one operand must be in DRAM "
+        f"(src space={ssp!r}, dst space={dsp!r})"
+    )
 
 
 def _sem_key(sem_arg, env, bind):

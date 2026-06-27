@@ -929,11 +929,8 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
 
         # We first create a subgraph for the quantize_mx + gemm then replace
         # the whole subgraph with a tiled version of linear_mx with outlier filter
-        named_modules = dict(model.named_modules())
         fused_nodes = [quantize_mx_node, node] + list(quantize_mx_node.users)
-        node_to_replace = _create_and_insert_subgraph(
-            fused_nodes, model, named_modules
-        )
+        node_to_replace = _create_and_insert_subgraph(fused_nodes, model)
         assert (
             node_to_replace is not None
         ), "Failed to create subgraph for quantize_mx + gemm"

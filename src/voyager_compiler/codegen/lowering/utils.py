@@ -293,7 +293,7 @@ def _fuse_tail_in_body(
     if len(group) < 2:
         return  # bare anchor — nothing fused into this body
 
-    _create_and_insert_subgraph(list(group), gm, dict(gm.named_modules()))
+    _create_and_insert_subgraph(list(group), gm)
     gm.graph.lint()
     gm.recompile()
 
@@ -407,7 +407,7 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     if len(ops) < 2:
         return  # a lone op — nothing to fuse
 
-    _create_and_insert_subgraph(ops, branch, dict(branch.named_modules()))
+    _create_and_insert_subgraph(ops, branch)
     branch.graph.lint()
     branch.recompile()
 

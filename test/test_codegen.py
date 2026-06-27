@@ -28,7 +28,7 @@ from voyager_compiler import (
     convert_pt2e,
     export_model,
     extract_input_preprocessor,
-    fuse,
+    fuse_operator,
     get_default_quantizer,
     prepare_pt2e,
     print_node_scope_tabular,
@@ -808,12 +808,12 @@ if __name__ == "__main__":
 
         old_output = gm(*example_args)
 
-        transform(gm, example_args, **transform_args, fuse_operator=False)
+        transform(gm, example_args, **transform_args, skip_op_fusion=True)
 
         gm, preprocess_fn = extract_input_preprocessor(gm)
         example_args = (preprocess_fn(example_args[0]),)
 
-        fuse(gm, VECTOR_PIPELINE, example_args)
+        fuse_operator(gm, VECTOR_PIPELINE)
 
         gm.graph.print_tabular()
 

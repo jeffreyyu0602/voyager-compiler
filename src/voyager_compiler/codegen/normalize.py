@@ -1386,30 +1386,3 @@ class IterationSpaceNormalizer:
         if mismatch.numel() == 0:
             return ()
         return tuple(int(x) for x in mismatch[0].tolist())
-
-
-def normalize(
-    model: fx.GraphModule, node: fx.Node, submodule: fx.GraphModule
-) -> Optional[NormalizationResult]:
-    """Plug-in entry called by ``fuse_operator`` after the fused submodule is
-    created: normalize that submodule to the anchor's iteration space, in place.
-
-    Populates the child node shapes (the analysis reads ``node.shape``) and
-    skips the group with a warning if it cannot be expressed in one iteration
-    space, leaving it fused as-is.
-    """
-    from .shape_prop import ShapeProp
-
-    inputs = []
-    for n in node.all_input_nodes:
-        value = getattr(n, "value", None)
-        inputs.append(
-            value.clone() if isinstance(value, torch.Tensor) else value
-        )
-    ShapeProp(submodule).propagate(*inputs)
-
-    try:
-        return IterationSpaceNormalizer().normalize(model, node)
-    except NormalizationError as exc:
-        logger.warning("normalize: skipped %s: %s", node.name, exc)
-        return None

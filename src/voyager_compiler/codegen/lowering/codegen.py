@@ -97,17 +97,10 @@ def _trip_str(node) -> str:
     return f" trip=[{', '.join(dims)}]"
 
 
-def _emit_body(
-    gm: GraphModule, body_args, ops: List[Operation], output_dir
-) -> None:
-    """ShapeProp a (sub)graph with given input values and append Operations."""
-    # Pass one value per placeholder, in order (tensors and scalar constants).
-    # This re-runs a loop / cond body in isolation (a single iteration), where a
-    # wait legitimately precedes its matching copy from an earlier iteration, so
-    # ``async_wait``'s counting-semaphore oracle is suspended — codegen needs
-    # only shapes/values, not the balance invariant.
-    with oracle_disabled():
-        ShapeProp(gm).propagate(*body_args)
+def _emit_body(gm: GraphModule, ops: List[Operation], output_dir) -> None:
+    """Append each node of an (already shape-propagated) (sub)graph as
+    Operations.  ``gen_code_bufferized``'s recursive ShapeProp has stamped every
+    node — top level and inside every loop / cond body — so we just emit."""
     named = dict(gm.named_modules(remove_duplicate=False))
     for node in gm.graph.nodes:
         _emit_node(node, gm, named, ops, output_dir)
@@ -116,17 +109,10 @@ def _emit_body(
 def _emit_fused_op(node, named, output_dir) -> Operation:
     """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a
     protobuf ``fused_op`` — an ``OpOverloadList`` of the submodule's compute
-    ops, mirroring the default ``gen_code`` call_module path.  The body's
-    ShapeProp gave the call_module node + its loaded-tile args their
-    ``value``, so we ShapeProp the submodule with those to populate its inner
-    nodes for ``map_node``."""
+    ops.  The submodule's inner nodes are already shape-propagated (the
+    recursive ShapeProp descends into call_modules), so ``map_node`` reads their
+    ``value`` directly."""
     sub = named[str(node.target)]
-    ShapeProp(sub).propagate(
-        *(
-            a.value.clone() if isinstance(a, torch.fx.Node) else a
-            for a in node.args
-        )
-    )
     op = Operation()
     op.fused_op.name = node.name
     for n in sub.graph.nodes:
@@ -205,11 +191,11 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
         return
 
     if node.target is WHILE_LOOP:
-        ops.append(_emit_loop(node, gm, named, output_dir))
+        ops.append(_emit_loop(node, named, output_dir))
         return
 
     if node.target is COND:
-        ops.append(_emit_cond(node, gm, named, output_dir))
+        ops.append(_emit_cond(node, named, output_dir))
         return
 
     # getitem usually just unpacks loop results (no compute) — dropped, UNLESS
@@ -249,15 +235,12 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
     ops.append(op)
 
 
-def _emit_loop(node, parent_gm, parent_named, output_dir) -> Operation:
+def _emit_loop(node, parent_named, output_dir) -> Operation:
     body_gm = parent_named[str(node.args[1].target)]
-    carried = list(node.args[2])
-    extra = list(node.args[3]) if len(node.args) > 3 else []
-    body_args = [_loop_input_value(n) for n in carried + extra]
     placeholders = [n for n in body_gm.graph.nodes if n.op == "placeholder"]
 
     body_ops: List[Operation] = []
-    _emit_body(body_gm, body_args, body_ops, output_dir)
+    _emit_body(body_gm, body_ops, output_dir)
 
     # One Loop per grid dimension; the first len(extents) carried placeholders
     # are the per-dim loop indices (used by the body's static tile addressing).
@@ -284,31 +267,28 @@ def _emit_loop(node, parent_gm, parent_named, output_dir) -> Operation:
     return loops[0]
 
 
-def _emit_cond(node, parent_gm, parent_named, output_dir) -> Operation:
+def _emit_cond(node, parent_named, output_dir) -> Operation:
     """Emit a ``torch.cond`` as a ``Conditional`` proto (MLIR ``scf.if``).
 
     ``node.args`` is ``(pred, true_graph, false_graph, operands)`` (the layout
-    the text printer's ``_print_cond`` also reads).  Each branch is ShapeProp'd
-    with the captured ``operands`` and emitted into its own op list, mirroring
-    ``_emit_loop``'s body emission.  The predicate is referenced by name (a
-    bool-valued node) via ``convert_arg``.  A *dummy* false branch (``return 0``)
-    has no compute ops, so ``_emit_body`` appends nothing and ``false_body`` is
-    left empty — the optional ``else`` is simply omitted.
+    the text printer's ``_print_cond`` also reads).  Both branches are already
+    shape-propagated, so each is emitted into its own op list.  The predicate is
+    referenced by name (a bool-valued node) via ``convert_arg``.  A *dummy* false
+    branch (``return 0``) has no compute ops, so ``_emit_body`` appends nothing
+    and ``false_body`` is left empty — the optional ``else`` is simply omitted.
     """
     true_gm = parent_named[str(node.args[1].target)]
     false_gm = parent_named[str(node.args[2].target)]
-    operands = list(node.args[3]) if len(node.args) > 3 else []
-    body_args = [_loop_input_value(n) for n in operands]
 
     op = Operation()
     op.conditional.predicate.CopyFrom(convert_arg(node.args[0], output_dir))
 
     true_ops: List[Operation] = []
-    _emit_body(true_gm, body_args, true_ops, output_dir)
+    _emit_body(true_gm, true_ops, output_dir)
     op.conditional.true_body.extend(true_ops)
 
     false_ops: List[Operation] = []
-    _emit_body(false_gm, body_args, false_ops, output_dir)
+    _emit_body(false_gm, false_ops, output_dir)
     if false_ops:
         op.conditional.false_body.extend(false_ops)
     return op
@@ -323,8 +303,14 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
-    ShapeProp(model).propagate(*args)
-    named = dict(model.named_modules(remove_duplicate=False))
+    # One recursive pass stamps every node — top level and inside every
+    # while_loop / cond body + fused call_module — with a ``.value``, so the
+    # emit helpers below just read it (no per-body ShapeProp).  oracle_disabled:
+    # bodies are walked a single iteration, where a wait may precede its copy.
+    with oracle_disabled():
+        ShapeProp(model, recurse=True).propagate(*args)
+
+    named_modules = dict(model.named_modules(remove_duplicate=False))
     model_params = Model()
 
     for node in model.graph.nodes:
@@ -343,7 +329,7 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
                 model_params.parameters.append(tensor)
             continue
 
-        _emit_node(node, model, named, model_params.ops, output_dir)
+        _emit_node(node, model, named_modules, model_params.ops, output_dir)
 
     return model_params
 
@@ -384,7 +370,7 @@ def _render_graph(gm, g, env: Dict, counter: list, scope: str = "") -> None:
         if node.op == "get_attr":
             continue
         if node.op == "call_function" and node.target is WHILE_LOOP:
-            _render_loop(node, gm, named, g, env, counter, scope)
+            _render_loop(node, named, g, env, counter, scope)
             continue
 
         # Ordinary op node — namespace id by scope so names are unique across
@@ -397,9 +383,7 @@ def _render_graph(gm, g, env: Dict, counter: list, scope: str = "") -> None:
             g.edge(gid(inp), nid)
 
 
-def _render_loop(
-    node, parent_gm, parent_named, g, env, counter, scope=""
-) -> None:
+def _render_loop(node, parent_named, g, env, counter, scope="") -> None:
     body_gm = parent_named[str(node.args[1].target)]
     carried = list(node.args[2])
     extra = list(node.args[3]) if len(node.args) > 3 else []

@@ -122,7 +122,12 @@ class ResourceState:
     def async_wait(self, node, sem_key, path) -> TimingRecord:
         eid = self._eid()
         fifo = self.sem_fifos.get(sem_key)
-        completion, copy_eid = fifo.popleft() if fifo else (self.now, None)
+        if not fifo:
+            raise ValueError(
+                f"async_wait {node.name} has no outstanding async_copy on "
+                f"its semaphore slot -- a copy / wait mismatch"
+            )
+        completion, copy_eid = fifo.popleft()
         start = self.now
         end = max(self.now, completion)
         deps = self._deps(self.last_now_eid, copy_eid)

@@ -105,24 +105,6 @@ class OpMatcher:
         return self.predicate(node) if self.predicate else True
 
 
-def fuse(
-    model,
-    fusion_pattern,
-    example_args,
-    example_kwargs=None,
-    fuse_reshape=True,
-    fake_mode=None,
-):
-    if example_kwargs is None:
-        example_kwargs = {}
-
-    flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
-
-    fuse_operator(model, fusion_pattern, fuse_reshape)
-    return model
-
-
 def transform(
     model: torch.fx.GraphModule,
     example_args,
@@ -133,7 +115,7 @@ def transform(
     transpose_fc=False,
     cache_size=None,
     num_banks=None,
-    fuse_operator=True,
+    skip_op_fusion=False,
     fuse_reshape=True,
     split_spmm=False,
     use_fake_mode=True,
@@ -225,14 +207,8 @@ def transform(
     # Perform final operator lowering and fuse sequences of operations (e.g.,
     # Conv+ReLU) into single kernels to reduce memory access overhead.
 
-    if fuse_operator:
-        fuse(
-            model,
-            patterns,
-            flatten_args,
-            fuse_reshape=fuse_reshape,
-            fake_mode=fake_mode,
-        )
+    if not skip_op_fusion:
+        fuse_operator(model, patterns, fuse_reshape)
 
     rename_nodes_with_param_names(model)
     deduplicate_nodes(model)
@@ -283,8 +259,6 @@ def compile(
             print_bufferized_graph,
         )
         from .codegen.lowering.tiling import build_interstellar_tiler
-
-        ShapeProp(model).propagate(*flatten_args)
 
         # Build the interstellar tiler once; the bufferization builders tile each
         # GEMM/conv on demand from it (no separate tiling pass / meta annotation).
