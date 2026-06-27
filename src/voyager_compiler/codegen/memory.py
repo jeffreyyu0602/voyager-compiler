@@ -67,10 +67,18 @@ def _find_user_with_target(node: torch.fx.Node, targets):
                 return found
 
         if user.op == 'call_module':
+            # Map this node to the submodule placeholder by argument
+            # position, not by name: a producer can be renamed in the parent
+            # graph after fusion (e.g. by extract_input_preprocessor) while
+            # the submodule placeholder keeps its original name.
             gm = user.meta['submodule']
-            placeholder = next(n for n in gm.graph.nodes if n.name == node.name)
-
-            found = _find_user_with_target(placeholder, targets)
+            placeholders = [
+                n for n in gm.graph.nodes if n.op == 'placeholder'
+            ]
+            idx = next(
+                i for i, arg in enumerate(user.args) if arg is node
+            )
+            found = _find_user_with_target(placeholders[idx], targets)
             if found is not None:
                 return found
 

@@ -22,6 +22,7 @@ from torch.fx import GraphModule, Node
 from ...pt2e_utils import update_submod_user_meta
 from ..mapping import get_anchor_node, replace_node_with_graph_module
 from ..mapping_utils import (
+    quant_table_arg_nodes,
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
@@ -78,7 +79,7 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
     them as codebooks too.
 
     Codebook-ness flows bottom-up: an op flags its codebook args
-    (``_codebook_arg_nodes``) and an operand bound to a codebook sub-graph
+    (``quant_table_arg_nodes``) and an operand bound to a codebook sub-graph
     placeholder is itself a codebook — so a top-level ``code`` / ``qmap``
     get_attr threaded through the loops is caught.
     """
@@ -95,7 +96,7 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
 
     for n in gm.graph.nodes:
         if n.op == "call_function":
-            local |= _codebook_arg_nodes(n)
+            local |= quant_table_arg_nodes(n)
             if n.target is _WHILE_LOOP:
                 operands = list(n.args[2])
                 if len(n.args) > 3:
@@ -336,43 +337,6 @@ def propagate_logical_dtypes(
 
 
 # ---------------------------------------------------------------------------
-# Tile-size derivation from node.meta
-# ---------------------------------------------------------------------------
-
-
-def _is_tiled(node: Node) -> bool:
-    tiling = node.meta.get("l2_tiling")
-    return tiling is not None and math.prod(tiling) > 1
-
-
-_CODEBOOK_PARAMS = {
-    "qmap",
-    "scale_qmap",
-    "output_code",
-    "code",
-    "input_qmap",
-    "output_qmap",
-    "input_code",
-    "weight_code",
-}
-
-
-def _codebook_arg_nodes(node: Node) -> set:
-    """Tensor args of ``node`` that are quantization codebooks / qmaps."""
-    result = set()
-    schema = getattr(node.target, "_schema", None)
-    if schema is None:
-        return result
-    for i, arg in enumerate(schema.arguments):
-        if arg.name not in _CODEBOOK_PARAMS:
-            continue
-        val = node.args[i] if i < len(node.args) else node.kwargs.get(arg.name)
-        if isinstance(val, Node):
-            result.add(val)
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Main pass
 # ---------------------------------------------------------------------------
 
@@ -436,7 +400,10 @@ def bufferize_graph(
         if sub_gm is not None:
             val = node.value
             n_out = len(val) if isinstance(val, (list, tuple)) else 1
-        elif not _is_tiled(node):
+        elif not (
+            (tiling := node.meta.get("l2_tiling")) is not None
+            and math.prod(tiling) > 1
+        ):
             # Untiled / interstellar-skipped op (FC batch-1, depthwise conv, a
             # shape-changing reshape/slice): bufferize whole-tensor (trip-1).
             built = _build_for_untiled(node)
@@ -536,7 +503,7 @@ def _build_for_untiled(node: Node):
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
     outputs = list(val) if isinstance(val, (list, tuple)) else [val]
-    codebooks = _codebook_arg_nodes(node)
+    codebooks = quant_table_arg_nodes(node)
 
     # Resolve each arg *now* into a ``(value, is_index)`` template: an input Node
     # -> ``(tile_slot, True)`` (the loaded tile at that slot is substituted when

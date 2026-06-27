@@ -13,5 +13,6 @@ plots
 slurm_scripts
 test/*
 !test/test_codegen.py
+!test/run_ci.py
 wandb
 .vscode

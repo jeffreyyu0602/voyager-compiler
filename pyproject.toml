@@ -31,7 +31,7 @@ dependencies = [
     "timm",
     "torch==2.8.0",
     "torchao",
-    "transformers==5.1.0",
+    "transformers==5.9.0",
     "wandb",
     "xlsxwriter"
 ]

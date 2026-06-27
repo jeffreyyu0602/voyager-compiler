@@ -27,27 +27,33 @@ def load_model(args):
         args.model_name_or_path = "DEFAULT"
 
     try:
-        model = models.__dict__[args.model](weights=args.model_name_or_path).eval()
+        model = models.__dict__[args.model](
+            weights=args.model_name_or_path
+        ).eval()
     except Exception as e:
         model = models.__dict__[args.model](pretrained=True).eval()
 
         if args.model_name_or_path:
             checkpoint = torch.load(args.model_name_or_path, map_location="cpu")
-            model.load_state_dict(checkpoint['state_dict'], strict=False)
+            model.load_state_dict(checkpoint["state_dict"], strict=False)
 
     if args.bf16:
         model.bfloat16()
     return model
 
 
-def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
     transform_args = get_transform_args(args, vector_stages)
     compile_args = get_compile_args(args)
 
     modules_to_fuse = get_conv_bn_layers(model)
     if len(modules_to_fuse) > 0:
-        model = torch.ao.quantization.fuse_modules(model, modules_to_fuse, inplace=True)
+        model = torch.ao.quantization.fuse_modules(
+            model, modules_to_fuse, inplace=True
+        )
 
     # Accelerator only supports 2x2 maxpool
     if args.use_maxpool_2x2:
@@ -96,14 +102,18 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
                 quantizer.set_module_name(layer, qconfig)
 
         model.features[0][0].padding = (3, 3)
-        model.features[0][0].weight.data = torch.nn.functional.pad(model.features[0][0].weight.data, (2, 2, 2, 2))
+        model.features[0][0].weight.data = torch.nn.functional.pad(
+            model.features[0][0].weight.data, (2, 2, 2, 2)
+        )
 
     # Some designs do not support quantized fc layers
     if not args.quantize_fc:
         quantizer.set_module_name("fc", None)
 
     if args.residual is not None:
-        qspec = QuantizationSpec.from_str(f"{args.residual},qs=per_tensor_symmetric")
+        qspec = QuantizationSpec.from_str(
+            f"{args.residual},qs=per_tensor_symmetric"
+        )
         qconfig = QuantizationConfig(qspec, None, None, None)
         quantizer.set_object_type(torch.ops.aten.add.Tensor, qconfig)
         quantizer.set_object_type(torch.ops.aten.add_.Tensor, qconfig)
@@ -111,7 +121,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        match = re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype, re.IGNORECASE)
+        match = re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype, re.IGNORECASE)
         if match is not None and match.group(2) is not None:
             dtype = f"int{match.group(2)}"
         qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
@@ -135,7 +145,9 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     gm = prepare_pt2e(gm, quantizer)
 
     model_name = model.__class__.__name__
-    for i in tqdm(range(args.calibration_steps), desc=f"Calibrating {model_name}"):
+    for i in tqdm(
+        range(args.calibration_steps), desc=f"Calibrating {model_name}"
+    ):
         inputs = calibration_data[i]["image"]
         with torch.no_grad():
             gm(inputs.to(torch_dtype))
@@ -144,7 +156,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
 
     old_output = gm(*example_args)
 
-    transform(gm, example_args, **transform_args, skip_op_fusion=False)
+    transform(gm, example_args, **transform_args, skip_op_fusion=True)
 
     gm, preprocess_fn = extract_input_preprocessor(gm)
     example_args = (preprocess_fn(*example_args),)
@@ -167,7 +179,9 @@ def evaluate(model, dataset):
     total_samples = 0
 
     with torch.no_grad():
-        for image_label_pair in tqdm(dataset, desc=f"Evaluating {model.__class__.__name__}"):
+        for image_label_pair in tqdm(
+            dataset, desc=f"Evaluating {model.__class__.__name__}"
+        ):
             # for running the original model without the preprocessing function
             # applied to the dataset
             image = image_label_pair["image"].to(device)

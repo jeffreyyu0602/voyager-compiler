@@ -297,7 +297,6 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.scale_dtype = scale_dtype
         self.force_scale_power_of_two = force_scale_power_of_two
         self.record_histogram = record_histogram
-        self.outlier_threshold = outlier_threshold
         self.outlier_pct = outlier_pct
         assert outlier_pct is None or outlier_threshold is None, (
             "Only one of outlier_pct and outlier_threshold can be set."
@@ -336,8 +335,10 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         if outlier_pct is not None:
             self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
             self.register_buffer(
-                "outlier_threshold", torch.tensor([], **factory_kwargs),
+                "outlier_threshold", torch.tensor([], **factory_kwargs)
             )
+        else:
+            self.outlier_threshold = outlier_threshold
 
     @torch.jit.export
     def calculate_qparams(self):

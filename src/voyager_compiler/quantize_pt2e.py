@@ -569,7 +569,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             if activation_post_process.outlier_threshold is not None:
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
                 args.extend([
-                    activation_post_process.outlier_threshold,
+                    float(activation_post_process.outlier_threshold),
                     activation_post_process.max_outlier_pct,
                 ])
                 num_outputs = 5
@@ -608,7 +608,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     torch.ops.quantized_ops.filter_outlier.default,
                     (
                         input_node,
-                        activation_post_process.outlier_threshold,
+                        float(activation_post_process.outlier_threshold),
                         activation_post_process.max_outlier_pct,
                     ),
                 )

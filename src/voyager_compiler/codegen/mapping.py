@@ -1479,12 +1479,14 @@ def run_memory_mapping(
 
         skip_allocation = False
 
-        # Propagate memory metadata for nop nodes
+        # Propagate memory metadata for nop nodes. A scalar constant input
+        # (e.g. a lifted mask fill value) is not allocated memory, so there
+        # is nothing to propagate -- just skip allocation in that case.
         if is_nop(node):
-            assert (
-                "memory" in node.args[0].meta
-            ), f"Node {node} does not have memory metadata, "
-            node.meta["memory"] = copy.deepcopy(node.args[0].meta["memory"])
+            if "memory" in node.args[0].meta:
+                node.meta["memory"] = copy.deepcopy(
+                    node.args[0].meta["memory"]
+                )
             skip_allocation = True
 
         if node.target == operator.getitem:

@@ -380,12 +380,22 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         for i in range(len(self.static_cache)):
             self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
             self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
+            self.register_buffer(
+                f"cumulative_length_{i}",
+                self.static_cache.layers[i].cumulative_length,
+                persistent=False,
+            )
 
         self.static_cache_residual = StaticCache(max_cache_len=max_new_tokens, config=config)
         self.static_cache_residual.early_initialization(batch_size, num_heads, head_dim, dtype, device)
         for i in range(len(self.static_cache_residual)):
             self.register_buffer(f"key_cache_residual_{i}", self.static_cache_residual.layers[i].keys, persistent=False)
             self.register_buffer(f"value_cache_residual_{i}", self.static_cache_residual.layers[i].values, persistent=False)
+            self.register_buffer(
+                f"cumulative_length_residual_{i}",
+                self.static_cache_residual.layers[i].cumulative_length,
+                persistent=False,
+            )
 
     def forward(
         self,
@@ -416,22 +426,21 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
             The adapter matches the model's forward signature with that in `executorch/extension/llm/runner`,
             ensuring that the exported model can be executed in `ExecuTorch` out-of-the-box.
         """
-        past_key_values = self.static_cache
+        # Start by resetting static cache (it's needed to be able to run several generations with the same exported program,
+        # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
+        # already exported)
+        for layer in self.static_cache.layers:
+            layer.cumulative_length.copy_(cache_position[0:1])
+        for layer in self.static_cache_residual.layers:
+            layer.cumulative_length.copy_(cache_position_residual[0:1])
 
-        causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(
-            attention_mask=attention_mask,
-            sequence_length=1,
-            target_length=self.max_cache_len,
-            dtype=self.model.dtype,
-            cache_position=cache_position,
-            batch_size=input_ids.shape[0],
-        )
+        past_key_values = self.static_cache
 
         outs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             cache_position=cache_position,
-            attention_mask=causal_mask,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
             past_key_values_residual=self.static_cache_residual,

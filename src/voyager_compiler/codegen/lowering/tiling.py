@@ -17,7 +17,13 @@ from dataclasses import dataclass, field
 
 import torch
 
-from ..mapping_utils import is_bmm, is_conv2d, is_linear, is_matmul
+from ..mapping_utils import (
+    is_bmm,
+    is_conv2d,
+    is_linear,
+    is_matmul,
+    quant_table_arg_nodes,
+)
 from ..tiler import _node_dtype_bits, get_dtype_width
 
 logger = logging.getLogger(__name__)
@@ -199,8 +205,6 @@ def _operand_placeholders(root):
     inclusive), tracing through pre-processing ops (``dequantize`` / reshape)
     and skipping each op's quantization codebook / qmap args.
     """
-    from .bufferization import _codebook_arg_nodes
-
     leaves, stack, visited = [], [root], set()
     while stack:
         n = stack.pop()
@@ -210,7 +214,7 @@ def _operand_placeholders(root):
         if n.op == "placeholder":
             leaves.append(n)
             continue
-        codebooks = _codebook_arg_nodes(n)
+        codebooks = quant_table_arg_nodes(n)
         for inp in n.all_input_nodes:
             if inp not in codebooks:
                 stack.append(inp)
@@ -236,15 +240,13 @@ def _fused_operand_specs(node, anchor):
     if submod is None:
         return []
 
-    from .bufferization import _codebook_arg_nodes
-
     pos_to_loop_dim = _output_pos_to_loop_dim(anchor)
     out_ndim = anchor.value.ndim
 
     anchor_operands = set(_operand_placeholders(anchor))
     codebooks = set()
     for n in submod.graph.nodes:
-        codebooks |= _codebook_arg_nodes(n)
+        codebooks |= quant_table_arg_nodes(n)
 
     specs = []
     for p in submod.graph.nodes:

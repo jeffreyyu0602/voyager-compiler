@@ -384,6 +384,39 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
 aten = torch.ops.aten
 
 
+# Quantization lookup-table args (qmaps and codebooks) across the
+# quantized_ops quantize/dequantize/quantize_mx family. They are indexed by
+# value, not by iteration position, so they are passed whole (never tiled /
+# position-mapped).
+QUANT_TABLE_PARAMS = {
+    "qmap",
+    "scale_qmap",
+    "input_qmap",
+    "output_qmap",
+    "code",
+    "input_code",
+    "weight_code",
+    "output_code",
+}
+
+
+def quant_table_arg_nodes(node: Node) -> set:
+    """Tensor args of ``node`` that are quantization lookup tables (qmaps /
+    codebooks), identified by schema arg name so positions need not be
+    hardcoded."""
+    result = set()
+    schema = getattr(node.target, "_schema", None)
+    if schema is None:
+        return result
+    for i, arg in enumerate(schema.arguments):
+        if arg.name not in QUANT_TABLE_PARAMS:
+            continue
+        val = node.args[i] if i < len(node.args) else node.kwargs.get(arg.name)
+        if isinstance(val, Node):
+            result.add(val)
+    return result
+
+
 def is_gemm_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.conv2d.default,

@@ -1,12 +1,12 @@
 import itertools
 import logging
 import operator
-from typing import Tuple, Union, Callable, List
+from typing import Tuple, Union, List
 from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
-from torch.fx import GraphModule, Node
+from torch.fx import GraphModule, Node, Interpreter
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
@@ -23,6 +23,7 @@ from ...pt2e_utils import (
     get_aten_graph_module,
     fetch_attr,
     propagate_shape,
+    set_node_value,
 )
 from ...quantize_pt2e import create_getattr_from_value, export_model
 from ...quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
@@ -37,9 +38,9 @@ __all__ = [
     "replace_rmsnorm_with_layer_norm",
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
-    "rewrite_fx_graph",
     "inline_autocast_modules",
     "remove_softmax_dtype_cast",
+    "remove_zero_attention_mask",
     "split_multi_head_attention",
 ]
 
@@ -419,8 +420,8 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
         model (GraphModule): The PyTorch FX GraphModule to be modified.
 
     Returns:
-        GraphModule: The transformed GraphModule with `torch.cat` and `torch.stack`
-        operations adjusted.
+        GraphModule: The transformed GraphModule with `torch.cat` and
+        `torch.stack` operations adjusted.
     """
     graph = model.graph
     for node in list(graph.nodes):
@@ -433,7 +434,8 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
 
         if not all(hasattr(n, "shape") for n in cat_node.args[0]):
             logger.warning(
-                f"Node {cat_node} does not have shape attributes for all inputs."
+                f"Node {cat_node} does not have shape attributes for "
+                "all inputs."
             )
             continue
 
@@ -442,7 +444,8 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
 
         if not all(list(s) == input_shape for s in shapes):
             logger.warning(
-                "Concatenated tensors have different shapes in node %s. Shapes: %s",
+                "Concatenated tensors have different shapes in node "
+                "%s. Shapes: %s",
                 cat_node,
                 shapes,
             )
@@ -508,8 +511,9 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
 
 def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
     """
-    Convert `torch.cat` operations where input tensors have different shapes by
-    replacing them with a `torch.stack` operation along the concatenated dimensions.
+    Convert `torch.cat` operations where input tensors have different
+    shapes by replacing them with a `torch.stack` operation along the
+    concatenated dimensions.
 
     Args:
         model (GraphModule): The PyTorch FX GraphModule to be modified.
@@ -552,9 +556,10 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
 
 def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
     """
-    Convert `torch.expand` operations into explicit memory copying by replicating
-    input elements. This replaces implicit broadcasting with actual memory
-    duplication, ensuring that expanded  dimensions are materialized as stacked tensors.
+    Convert `torch.expand` operations into explicit memory copying by
+    replicating input elements. This replaces implicit broadcasting with
+    actual memory duplication, ensuring that expanded dimensions are
+    materialized as stacked tensors.
 
     Args:
         model (torch.fx.GraphModule): The PyTorch FX GraphModule to be modified.
@@ -587,13 +592,17 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
             def forward(self, input):
                 # Stack along the first dimension to create the expanded shape
                 for dim, size in enumerate(sizes):
+                    # -1 means "keep this dimension" in torch.expand.
+                    if size == -1 or input.shape[dim] == size:
+                        continue
                     if input.shape[dim] == 1 and size > 1:
                         input = torch.stack(
                             [input.squeeze(dim)] * size, dim=dim
                         )
-                    elif input.shape[dim] != size:
+                    else:
                         raise ValueError(
-                            f"Cannot expand dimension {dim} from {input.shape[dim]} to {size}."
+                            f"Cannot expand dimension {dim} from "
+                            f"{input.shape[dim]} to {size}."
                         )
                 return input
 
@@ -822,7 +831,8 @@ def extract_input_preprocessor(model: GraphModule):
         model (GraphModule): The FX graph module to transform.
 
     Returns:
-        GraphModule: The transformed FX graph module with the input preprocessor extracted.
+        GraphModule: The transformed FX graph module with the input
+            preprocessor extracted.
     """
     placeholder = next(
         iter(n for n in model.graph.nodes if n.op == "placeholder")
@@ -870,6 +880,7 @@ def extract_input_preprocessor(model: GraphModule):
     preprocess_nodes[-1].replace_all_uses_with(new_placeholder)
 
     new_placeholder.meta["dtype"] = preprocess_nodes[-1].meta.get("dtype")
+    set_node_value(new_placeholder, preprocess_nodes[-1].value)
 
     model.graph.lint()
     model.graph.eliminate_dead_code()
@@ -877,87 +888,6 @@ def extract_input_preprocessor(model: GraphModule):
     model.graph.erase_node(placeholder)
     model.recompile()
     return model, GraphModule(m, new_graph)
-
-
-def rewrite_fx_graph(model: torch.fx.GraphModule, fn: Callable):
-    """
-    Transforms a given PyTorch FX GraphModule by identifying and replacing
-    nodes that match a user-defined match_and_rewrite with alternative implementations.
-
-    Args:
-        model (torch.fx.GraphModule): The input FX GraphModule to be transformed.
-        fn (Callable): A function that takes three arguments:
-            - sources: The underlying function, module, or primitive operation
-              responsible for a given FX node (from node.meta["source_fn_stack"]).
-            - example_args (Tuple): A tuple of example arguments for the node,
-              extracted from node metadata.
-            - example_kwargs (Dict): A dictionary of example keyword arguments for the node.
-
-            The `match_and_rewrite` function should return:
-                - A `torch.nn.Module` or callable implementing an equivalent
-                  or decomposed version of the operation if a match is found.
-                - `None` otherwise.
-
-    Returns:
-        torch.fx.GraphModule: The transformed GraphModule with selected nodes
-        replaced by decomposed modules returned by `match_and_rewrite`.
-
-    Notes:
-        - Each matched node is replaced using `export_model` with the returned
-          module from `match_and_rewrite`.
-        - The original node is erased from the graph after replacement.
-        - The transformed graph is cleaned up via linting, dead code elimination,
-          and recompilation.
-
-    Example:
-        >>> def match_and_rewrite(source_fn, args, kwargs):
-        ...     if source_fn not in [torch.nn.Conv2d, torch.nn.functional.conv2d]:
-        ...         return None
-        ...     # Replace with a no-op or alternative module
-        ...     class Identity(nn.Module):
-        ...         def forward(self, x): return x
-        ...     return Identity
-        >>> transformed = rewrite_fx_graph(fx_model, match_and_rewrite)
-    """
-    for node in list(model.graph.nodes):
-        if node.op != "call_function":
-            continue
-
-        if (source_fn_st := node.meta.get("source_fn_stack")) is None:
-            continue
-
-        source_fn = source_fn_st[-1][1]
-
-        def get_value(n: Node):
-            if "val" in n.meta:
-                return n.meta["val"]
-            return getattr(n, "value", None)
-
-        example_args = map_arg(node.args, get_value)
-        example_kwargs = map_arg(node.kwargs, get_value)
-
-        if (cls := fn(source_fn, example_args, example_kwargs)) is None:
-            continue
-
-        new_args = map_arg(tuple(node.all_input_nodes), get_value)
-        gm = export_model(cls(), new_args, example_kwargs)
-
-        # PyTorch PT2E expect nodes to have no kwargs in the exported graph.
-        # Clone has a memory_format kwarg, zeros_like has a pin_memory kwarg, and
-        # gelu has a has an approximate kwarg that persist in exported graph.
-        # This is just a work around for these.
-        for n in list(gm.graph.nodes):
-            if n.target == torch.ops.aten.zeros.default:
-                n.kwargs = {}
-
-        replace_node_with_graph_module(model, node, gm)
-
-        model.graph.erase_node(node)
-
-    model.graph.lint()
-    model.graph.eliminate_dead_code()
-    model.recompile()
-    return model
 
 
 def inline_autocast_modules(model: torch.fx.GraphModule):
@@ -990,6 +920,52 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     graph.eliminate_dead_code()
     model.graph.lint()
     model.compile()
+
+
+def remove_zero_attention_mask(model: GraphModule, example_inputs):
+    """Drop additive attention masks that are provably all-zero.
+
+    Eager attention in transformers materializes ``add(scores, mask)`` where
+    ``mask = where(valid, 0.0, min_value)``. For bidirectional models with no
+    padding (e.g. ViT) every position is valid, so the mask is identically
+    zero and the add is a no-op. The mask is evaluated on ``example_inputs``
+    and an add is bypassed only when its mask operand is in fact all zero;
+    dead-code elimination then removes the mask-building chain. Masks that
+    are not all zero (e.g. real causal masks) are left untouched.
+    """
+    masks = {}
+
+    class _Capture(Interpreter):
+        def run_node(self, n):
+            out = super().run_node(n)
+            if n.op == "call_function" and "where" in str(n.target):
+                masks[n] = out
+            return out
+
+    _Capture(model).run(*example_inputs)
+
+    removed = 0
+    for mask_node, value in masks.items():
+        # Guard: only drop the add when the mask is genuinely all zero.
+        if not isinstance(value, torch.Tensor) or not bool(
+            (value == 0).all()
+        ):
+            continue
+        for add_node in list(mask_node.users):
+            if add_node.target != torch.ops.aten.add.Tensor:
+                continue
+            others = [a for a in add_node.args if a is not mask_node]
+            if len(others) != 1:
+                continue
+            add_node.replace_all_uses_with(others[0])
+            model.graph.erase_node(add_node)
+            removed += 1
+
+    logger.info(f"Removed {removed} zero attention-mask add(s)")
+    model.graph.eliminate_dead_code()
+    model.graph.lint()
+    model.recompile()
+    return model
 
 
 def remove_softmax_dtype_cast(model: torch.fx.GraphModule):

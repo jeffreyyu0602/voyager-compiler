@@ -22,6 +22,7 @@ from .mapping_utils import (
     is_elementwise_op,
     is_nop,
     is_shape_changing_nop,
+    quant_table_arg_nodes,
 )
 from ..pt2e_utils import propagate_shape
 
@@ -196,9 +197,23 @@ class IterationSpaceNormalizer:
 
         self._check_analysis_size(iteration_shape, context="iteration space")
 
+        # Quantization lookup tables (qmap/code/...) are indexed by value, not
+        # by iteration position, so they have no address map to propagate;
+        # they are passed whole to every tile. Skip them.
+        quant_tables = set()
+        for node in child.graph.nodes:
+            quant_tables |= quant_table_arg_nodes(node)
+
         input_plans: Dict[str, InputPlan] = {}
         for placeholder in normalizable_placeholders:
+            if placeholder in quant_tables:
+                continue
+
             original_shape = self._node_tensor_shape(placeholder)
+            # A scalar input broadcasts to any iteration shape, so it has no
+            # address map to propagate; pass it whole, like the quant tables.
+            if math.prod(original_shape) == 1:
+                continue
             self._validate_external_layout(placeholder, original_shape)
 
             propagated = self._propagate_map(

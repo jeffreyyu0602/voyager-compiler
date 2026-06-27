@@ -86,6 +86,7 @@ from voyager_compiler.codegen.mapping_utils import (
     is_gemm_op,
     is_linear,
     is_matmul,
+    quant_table_arg_nodes,
 )
 from voyager_compiler.codegen.passes.tiling import compute_output_tiled_shapes
 from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
@@ -678,10 +679,6 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     projected to the output's physical layout).  The factors are stashed on
     ``_FusedInfo.tiling`` so the builder reuses them (no second tiler run).
     """
-    from voyager_compiler.codegen.lowering.bufferization import (
-        _codebook_arg_nodes,
-    )
-
     submod = node.meta.get("submodule")
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
@@ -722,7 +719,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         if sn is anchor or sn.op != "call_function":
             continue
         fused_ops.append(sn)
-        codebooks = _codebook_arg_nodes(sn)
+        codebooks = quant_table_arg_nodes(sn)
         for inp in sn.all_input_nodes:
             if (
                 inp.op != "placeholder"
@@ -1382,10 +1379,6 @@ def build_pointwise(node, *, num_banks: int = 2):
     writes each output tile once (no cross-tile reduction).  Returns the gm, or
     ``None``.
     """
-    from voyager_compiler.codegen.lowering.bufferization import (
-        _codebook_arg_nodes,
-    )
-
     # Tiling comes from the anchor's ``l2_tiling`` — per-output-dim tile counts
     # set by the vector L2 tiling pass.  A non-fused op with no ``l2_tiling`` is
     # bufferized whole-tensor elsewhere; a fused untiled submodule falls back to
@@ -1411,7 +1404,7 @@ def build_pointwise(node, *, num_banks: int = 2):
         for sn in submod.graph.nodes:
             if sn.op != "call_function":
                 continue
-            for cb in _codebook_arg_nodes(sn):
+            for cb in quant_table_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
         compute = submod
@@ -1433,7 +1426,7 @@ def build_pointwise(node, *, num_banks: int = 2):
         op_args = [_plain(a) for a in node.args]
         op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
         op = node.target
-        codebooks = _codebook_arg_nodes(node)
+        codebooks = quant_table_arg_nodes(node)
 
         def compute(*tiles):
             args = [
@@ -1514,10 +1507,6 @@ def build_pool(node, *, num_banks: int = 2):
     input loads the halo while the tail operands tile at the output block.
     Returns the gm, or ``None``.
     """
-    from voyager_compiler.codegen.lowering.bufferization import (
-        _codebook_arg_nodes,
-    )
-
     anchor = get_anchor_node(node)
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
@@ -1609,7 +1598,7 @@ def build_pool(node, *, num_banks: int = 2):
     codebooks = set()
     for sn in submod.graph.nodes:
         if sn.op == "call_function":
-            for cb in _codebook_arg_nodes(sn):
+            for cb in quant_table_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
     inputs, in_specs = [], []

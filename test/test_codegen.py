@@ -394,7 +394,7 @@ if __name__ == "__main__":
         inputs_embeds = model.model.embed_tokens(input_ids)
 
         past_seen_tokens = (
-            past_key_values.get_seq_length()
+            past_key_values.get_seq_length().item()
             if past_key_values is not None
             else 0
         )
