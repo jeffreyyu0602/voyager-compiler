@@ -121,17 +121,46 @@ TS_FORMAT = "%Y-%m-%d_%H-%M-%S"
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
 
 
+def _label(command):
+    """``<network>/<scheme>/<unrolling>`` — unique per command (unrolling
+    disambiguates commands sharing a network/scheme, e.g. resnet18 E4M3)."""
+    network = command.network or command.model
+    unroll = command.unrolling.replace(",", "x")
+    return f"{network}/{command.scheme}/{unroll}"
+
+
+assert len({_label(c) for c in COMMANDS}) == len(COMMANDS), (
+    "COMMANDS have duplicate <network>/<scheme>/<unrolling> labels; give "
+    "colliding commands distinct 'network' names"
+)
+
+
+def _matches(label, pattern):
+    """Does ``pattern`` select ``label`` (``network/scheme/unrolling``)?
+
+    Matching is anchored at ``/`` segment boundaries, not raw substring: a
+    single token matches a whole segment by prefix (so ``bert`` selects
+    ``bert`` but not ``mobilebert_encoder``, while ``mobilebert`` still
+    selects ``mobilebert_encoder`` and ``resnet`` selects both resnets); a
+    ``a/b`` token matches as an anchored path prefix.
+    """
+    segs = label.lower().split("/")
+    parts = pattern.lower().strip("/").split("/")
+    if len(parts) == 1:
+        return any(s.startswith(parts[0]) for s in segs)
+    return len(parts) <= len(segs) and all(
+        segs[i].startswith(parts[i]) for i in range(len(parts))
+    )
+
+
 def _build(command, run_dir):
     """Expand a Command into ``(label, dest, argv)`` for this run.
 
-    The label is ``<network>/<scheme>/<unrolling>`` (unrolling disambiguates
-    commands that share a network/scheme, e.g. resnet18 E4M3). The argv runs
-    this repo's test_codegen.py with --model_output_dir pointed into the
-    timestamped run folder; --dump_tensors / --bufferize are never added.
+    The argv runs this repo's test_codegen.py with --model_output_dir pointed
+    into the timestamped run folder; --dump_tensors / --bufferize are never
+    added.
     """
-    network = command.network or command.model
-    unroll = command.unrolling.replace(",", "x")
-    label = f"{network}/{command.scheme}/{unroll}"
+    label = _label(command)
     dest = run_dir / label
 
     argv = [sys.executable, str(TEST_CODEGEN), command.model]
@@ -210,9 +239,40 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "output_dir",
+        nargs="?",
         help="Location for dated CI artifacts (created if missing).",
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        metavar="SUBSTR",
+        help="Run only commands whose <network>/<scheme>/<unrolling> label "
+        "contains SUBSTR (case-insensitive; repeatable).",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List command labels and exit.",
+    )
     args = parser.parse_args()
+
+    commands = COMMANDS
+    if args.only:
+        commands = [
+            c
+            for c in COMMANDS
+            if any(_matches(_label(c), p) for p in args.only)
+        ]
+
+    if args.list:
+        for command in commands:
+            print(_label(command))
+        return 0
+
+    if not args.output_dir:
+        parser.error("output_dir is required (unless --list)")
+    if not commands:
+        parser.error(f"--only {args.only} matched no commands")
 
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -228,12 +288,12 @@ def main():
         print(f"comparing model.txt against previous run: {prev_run.name}")
     else:
         print("no previous run found; this run is the baseline")
-    print(f"running {len(COMMANDS)} commands\n")
+    print(f"running {len(commands)} commands\n")
 
     results = []  # (label, status, verdict, diff_excerpt)
-    for idx, command in enumerate(COMMANDS, 1):
+    for idx, command in enumerate(commands, 1):
         label, dest, argv = _build(command, run_dir)
-        print(f"[{idx}/{len(COMMANDS)}] {label} ... ", end="", flush=True)
+        print(f"[{idx}/{len(commands)}] {label} ... ", end="", flush=True)
         status = _run_one(label, dest, argv)
         verdict, excerpt = _compare(label, status, run_dir, prev_run)
         results.append((label, status, verdict, excerpt))

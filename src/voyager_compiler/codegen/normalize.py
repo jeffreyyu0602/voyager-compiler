@@ -8,7 +8,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Iterable,
     Mapping,
     Optional,
     Sequence,
@@ -21,16 +20,25 @@ from torch import fx
 from .mapping_utils import (
     is_elementwise_op,
     is_nop,
+    is_reshape_op,
     is_shape_changing_nop,
     quant_table_arg_nodes,
 )
-from ..pt2e_utils import propagate_shape
+from .shape_prop import ShapeProp
+from ..pt2e_utils import propagate_shape, set_node_value
 
 logger = logging.getLogger(__name__)
 
 
 Shape = Tuple[int, ...]
 NodePredicate = Callable[[fx.Node], bool]
+
+# Emit relayouts as aten call_function ops (not call_method): the rest of the
+# compiler recognizes these as shape nops and aliases their memory.
+_RELAYOUT_OPS = {
+    "view": torch.ops.aten.view.default,
+    "reshape": torch.ops.aten.reshape.default,
+}
 
 
 class NormalizationError(RuntimeError):
@@ -85,13 +93,11 @@ class _OutputDescription:
     map_target: fx.Node
     iteration_node: fx.Node
     external_shapes: Tuple[Shape, ...]
-    mx_node: Optional[fx.Node] = None
-    selected_index: Optional[int] = None
-    primary_plan_index: int = 0
+    output_relayout: Tuple[fx.Node, ...] = ()
 
     @property
     def is_multi_output(self) -> bool:
-        return self.selected_index is None and len(self.external_shapes) > 1
+        return len(self.external_shapes) > 1
 
 
 @dataclass
@@ -168,20 +174,18 @@ class IterationSpaceNormalizer:
         anchor = get_anchor_node(call_node)
         # Keep only a *strong* anchor (gemm/conv/layernorm/softmax); a pointwise
         # "anchor" means the group is anchorless (iteration == output shape).
-        if (
-            anchor is None
-            or is_elementwise_op(anchor)
-            or self._is_supported_mx_op(anchor)
-        ):
+        if anchor is None or is_elementwise_op(anchor):
             anchor = None
 
         if anchor is None:
-            iteration_shape = self._node_tensor_shape(output.iteration_node)
+            iteration_shape = output.iteration_node.shape
             anchor_inputs: set[fx.Node] = set()
             normalizable_placeholders = placeholders
         else:
-            iteration_shape = self._node_tensor_shape(anchor)
-            anchor_inputs = self._placeholder_ancestors(anchor)
+            iteration_shape = anchor.shape
+            anchor_inputs = {
+                n for n in self._ancestors(anchor) if n.op == "placeholder"
+            }
             self._validate_anchor_stream(
                 anchor, output.map_target, iteration_shape
             )
@@ -209,7 +213,7 @@ class IterationSpaceNormalizer:
             if placeholder in quant_tables:
                 continue
 
-            original_shape = self._node_tensor_shape(placeholder)
+            original_shape = placeholder.shape
             # A scalar input broadcasts to any iteration shape, so it has no
             # address map to propagate; pass it whole, like the quant tables.
             if math.prod(original_shape) == 1:
@@ -270,13 +274,6 @@ class IterationSpaceNormalizer:
                 ),
             )
 
-        output_plans = self._build_output_plans(
-            output=output,
-            iteration_shape=iteration_shape,
-        )
-        output_plan = output_plans[output.primary_plan_index]
-
-        # No mutation occurs before this point.
         placeholder_bindings = self._bind_parent_arguments(
             call_node, placeholders
         )
@@ -286,25 +283,19 @@ class IterationSpaceNormalizer:
             placeholder_bindings=placeholder_bindings,
             input_plans=input_plans,
         )
-        self._rewrite_child(
-            child=child,
-            anchor=anchor,
-            iteration_shape=iteration_shape,
-            input_plans=input_plans,
-            output=output,
-            output_plans=output_plans,
-        )
-        self._rewrite_parent_output(
-            parent,
-            call_node,
-            output,
-            output_plans,
-            iteration_shape,
-        )
+        self._rewrite_child(child=child, anchor=anchor, output=output)
 
         child.graph.eliminate_dead_code()
         child.graph.lint()
         child.recompile()
+
+        args = fx.map_arg(call_node.all_input_nodes, lambda n: n.value)
+        result = ShapeProp(child).propagate(*args)
+        set_node_value(call_node, result)
+
+        output_plans = self._build_output_plans(output)
+        output_plan = output_plans[-1]
+        self._rewrite_parent_output(parent, call_node, output, output_plans)
 
         return NormalizationResult(
             iteration_shape=iteration_shape,
@@ -346,7 +337,7 @@ class IterationSpaceNormalizer:
                 env[node] = None
             elif anchor is not None and node is anchor:
                 env[node] = None
-            elif is_shape_changing_nop(node):
+            elif is_shape_changing_nop(node) or is_reshape_op(node):
                 source = node.all_input_nodes[0]
                 source_map = env.get(source) if source is not None else None
                 env[node] = (
@@ -362,10 +353,22 @@ class IterationSpaceNormalizer:
                 env[node] = (
                     env.get(source) if isinstance(source, fx.Node) else None
                 )
+            elif node.target in {
+                torch.ops.quantized_ops.dequantize.default,
+                torch.ops.quantized_ops.quantize.default,
+            }:
+                # Microscaling (de)quantization is not a true elementwise
+                # op: its scale/zero_point are per-block parameters indexed
+                # by block, not by iteration position, so they carry no
+                # address map. Only the data input (args[0]) does.
+                source = node.args[0] if node.args else None
+                env[node] = (
+                    env.get(source) if isinstance(source, fx.Node) else None
+                )
             elif is_elementwise_op(node):
                 maps = [
                     env[arg]
-                    for arg in self._node_args(node)
+                    for arg in node.all_input_nodes
                     if env.get(arg) is not None
                 ]
                 if not maps:
@@ -554,58 +557,66 @@ class IterationSpaceNormalizer:
                 "Only tensor outputs are supported", node=output_node
             )
 
+        core, relayout = self._strip_output_relayout(value)
+        if relayout:
+            return _OutputDescription(
+                value_node=value,
+                map_target=core,
+                iteration_node=core,
+                external_shapes=(value.shape,),
+                output_relayout=relayout,
+            )
+
         if self._is_supported_mx_op(value):
-            shapes = self._tuple_output_shapes(value)
-            data_node = self._mx_data_node(value)
             return _OutputDescription(
                 value_node=value,
                 map_target=value,
-                iteration_node=data_node,
-                external_shapes=shapes,
-                mx_node=value,
-                primary_plan_index=len(shapes) - 1,
+                iteration_node=value.args[0],
+                external_shapes=value.shape,
             )
-
-        if self._is_getitem_node(value):
-            source = value.args[0]
-            index = value.args[1] if len(value.args) > 1 else None
-            if (
-                isinstance(source, fx.Node)
-                and self._is_supported_mx_op(source)
-                and isinstance(index, int)
-            ):
-                shapes = self._tuple_output_shapes(source)
-                data_node = self._mx_data_node(source)
-                if index < 0:
-                    index += len(shapes)
-                if index < 0 or index >= len(shapes):
-                    raise NormalizationError(
-                        f"MX output index {index} is out of range",
-                        node=value,
-                    )
-                return _OutputDescription(
-                    value_node=value,
-                    map_target=source,
-                    iteration_node=data_node,
-                    external_shapes=(self._node_tensor_shape(value),),
-                    mx_node=source,
-                    selected_index=index,
-                )
 
         return _OutputDescription(
             value_node=value,
             map_target=value,
             iteration_node=value,
-            external_shapes=(self._node_tensor_shape(value),),
+            external_shapes=(value.shape,),
         )
+
+    def _strip_output_relayout(
+        self, value: fx.Node
+    ) -> Tuple[fx.Node, Tuple[fx.Node, ...]]:
+        """Peel a trailing single-use chain of relayout ops (view / reshape /
+        squeeze / unsqueeze / transpose / permute) off the output, returning
+        the core node that feeds it and the chain (output-first). Only honored
+        when the chain contains a transpose/permute: that cannot be re-expressed
+        as a parent view, so it must stay inside the fused op and the iteration
+        space ends at the core."""
+        chain = []
+        node = value
+        while (
+            (is_reshape_op(node) or is_shape_changing_nop(node))
+            and len(node.users) == 1
+            and node.all_input_nodes
+        ):
+            chain.append(node)
+            node = node.all_input_nodes[0]
+        if not any(is_reshape_op(n) for n in chain):
+            return value, ()
+        return node, tuple(chain)
 
     def _build_output_plans(
         self,
-        *,
         output: _OutputDescription,
-        iteration_shape: Shape,
     ) -> Tuple[OutputPlan, ...]:
-        internal_shapes = self._internal_output_shapes(output, iteration_shape)
+        # Internal shapes were just stamped onto the output node by ShapeProp.
+        # An MX node's shape is already a tuple of per-output shapes; an
+        # ordinary single output is one shape, wrapped to match external_shapes.
+        is_mx = self._is_supported_mx_op(output.value_node)
+        if is_mx:
+            internal_shapes = tuple(tuple(s) for s in output.value_node.shape)
+        else:
+            internal_shapes = (tuple(output.value_node.shape),)
+
         if len(internal_shapes) != len(output.external_shapes):
             raise NormalizationError(
                 "Internal and external output arity differ",
@@ -622,13 +633,13 @@ class IterationSpaceNormalizer:
                     f"internal={internal_shape}, external={external_shape}",
                     node=output.value_node,
                 )
-            if output.mx_node is not None and not self._same_non_unit_dims(
+            if is_mx and not self._same_non_unit_dims(
                 internal_shape, external_shape
             ):
                 raise NormalizationError(
                     "MX output restore would regroup non-unit dimensions and "
                     "change quantization block semantics",
-                    node=output.mx_node,
+                    node=output.value_node,
                 )
             plans.append(
                 OutputPlan(
@@ -642,87 +653,6 @@ class IterationSpaceNormalizer:
                 )
             )
         return tuple(plans)
-
-    def _internal_output_shapes(
-        self,
-        output: _OutputDescription,
-        iteration_shape: Shape,
-    ) -> Tuple[Shape, ...]:
-        if output.mx_node is None:
-            return (iteration_shape,)
-
-        mx_shapes = self._mx_output_shapes(output.mx_node, iteration_shape)
-        if output.selected_index is None:
-            return mx_shapes
-        return (mx_shapes[output.selected_index],)
-
-    def _mx_output_shapes(
-        self,
-        node: fx.Node,
-        data_shape: Shape,
-    ) -> Tuple[Shape, ...]:
-        scale_shape = self._mx_scale_shape(node, data_shape)
-        if node.target == torch.ops.quantized_ops.quantize_mx.default:
-            return (scale_shape, data_shape)
-
-        if node.target == torch.ops.quantized_ops.quantize_mx_outlier.default:
-            if len(data_shape) < 2:
-                raise NormalizationError(
-                    "quantize_mx_outlier requires at least a matrix-shaped "
-                    "input",
-                    node=node,
-                )
-            max_pct = float(self._get_arg(node, 9, "max_pct", 0.01))
-            batch_shape = data_shape[:-2]
-            mat_shape = data_shape[-2:]
-            max_nnz = int(math.prod(mat_shape) * max_pct)
-            sparse_shape = batch_shape + (max_nnz,)
-            indptr_shape = batch_shape + (mat_shape[0] + 1,)
-            return (
-                sparse_shape,
-                sparse_shape,
-                indptr_shape,
-                scale_shape,
-                data_shape,
-            )
-
-        raise NormalizationError("Unsupported MX op", node=node)
-
-    def _mx_scale_shape(self, node: fx.Node, data_shape: Shape) -> Shape:
-        axes = self._get_arg(node, 2, "axes", None)
-        block_size = self._get_arg(node, 3, "block_size", None)
-        if axes is None or block_size is None:
-            raise NormalizationError(
-                "MX quantization requires static axes and block_size",
-                node=node,
-            )
-        axes = (axes,) if isinstance(axes, int) else tuple(axes)
-        rank = len(data_shape)
-        scale_shape = list(data_shape)
-        for axis in axes:
-            axis = int(axis)
-            if axis < 0:
-                axis += rank
-            if axis < 0 or axis >= rank:
-                raise NormalizationError(
-                    f"MX axis {axis} is out of range for shape {data_shape}",
-                    node=node,
-                )
-            scale_shape[axis] = math.ceil(scale_shape[axis] / int(block_size))
-        return tuple(scale_shape)
-
-    def _get_arg(
-        self,
-        node: fx.Node,
-        index: int,
-        name: str,
-        default: Any = None,
-    ) -> Any:
-        if name in node.kwargs:
-            return self._resolve_static(node.kwargs[name])
-        if len(node.args) > index:
-            return self._resolve_static(node.args[index])
-        return default
 
     def _same_non_unit_dims(self, left: Shape, right: Shape) -> bool:
         return tuple(dim for dim in left if dim != 1) == tuple(
@@ -759,20 +689,13 @@ class IterationSpaceNormalizer:
                         f"Cannot insert {plan.parent_operation} for non-node "
                         f"argument {name}"
                     )
-                formatted = parent.graph.call_method(
-                    plan.parent_operation,
-                    args=(value, *plan.boundary_shape),
+                formatted = parent.graph.call_function(
+                    _RELAYOUT_OPS[plan.parent_operation],
+                    (value, list(plan.boundary_shape)),
                 )
                 # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
                 formatted.meta = dict(value.meta)
-                self._set_shape_meta(formatted, plan.boundary_shape)
                 propagate_shape(formatted, parent)
-                formatted.meta["iteration_space_boundary"] = {
-                    "iteration_shape": plan.iteration_shape,
-                    "broadcast_dims": plan.broadcast_dims,
-                    "base": plan.base,
-                    "strides": plan.strides,
-                }
                 # Retarget the placeholder's ``source_node`` to the new ``view``
                 plan.placeholder.meta["source_node"] = formatted
                 if binding_kind == "arg":
@@ -782,53 +705,22 @@ class IterationSpaceNormalizer:
 
         call_node.args = tuple(args)
         call_node.kwargs = kwargs
-        call_node.meta["iteration_shape"] = (
-            next(iter(input_plans.values())).iteration_shape
-            if input_plans
-            else call_node.meta.get("iteration_shape")
-        )
-        call_node.meta["input_fetch_plans"] = {
-            name: {
-                "boundary_shape": plan.boundary_shape,
-                "broadcast_dims": plan.broadcast_dims,
-                "base": plan.base,
-                "strides": plan.strides,
-            }
-            for name, plan in input_plans.items()
-        }
 
     def _rewrite_child(
         self,
         *,
         child: fx.GraphModule,
         anchor: Optional[fx.Node],
-        iteration_shape: Shape,
-        input_plans: Mapping[str, InputPlan],
         output: _OutputDescription,
-        output_plans: Tuple[OutputPlan, ...],
     ) -> None:
-        for plan in input_plans.values():
-            placeholder = plan.placeholder
-            self._set_shape_meta(placeholder, plan.boundary_shape)
-            placeholder.meta["iteration_space_boundary"] = {
-                "iteration_shape": plan.iteration_shape,
-                "broadcast_dims": plan.broadcast_dims,
-                "base": plan.base,
-                "strides": plan.strides,
-            }
-
-        anchor_ancestors = (
-            self._ancestors(anchor) if anchor is not None else set()
-        )
-        removable = []
-        for node in child.graph.nodes:
-            if not is_shape_changing_nop(node):
-                continue
-            if anchor is not None and node in anchor_ancestors:
-                # Shape operations used to construct anchor operands remain
-                # part of the anchor prelude.
-                continue
-            removable.append(node)
+        # Shape-nops to keep: those building anchor operands (the anchor
+        # prelude) and the trailing output relayout kept inside the fused op.
+        keep = self._ancestors(anchor) | set(output.output_relayout)
+        removable = [
+            node
+            for node in child.graph.nodes
+            if is_shape_changing_nop(node) and node not in keep
+        ]
 
         for node in removable:
             source = node.all_input_nodes[0] if node.all_input_nodes else None
@@ -837,44 +729,7 @@ class IterationSpaceNormalizer:
                     "Shape no-op has no tensor input", node=node
                 )
             node.replace_all_uses_with(source)
-
-        # Erase in reverse topological order after uses have been replaced.
-        for node in reversed(removable):
-            if len(node.users) == 0:
-                child.graph.erase_node(node)
-
-        descendants = (
-            self._descendants(anchor)
-            if anchor is not None
-            else set(child.graph.nodes)
-        )
-        for node in child.graph.nodes:
-            if is_elementwise_op(node) and (
-                anchor is None or node in descendants
-            ):
-                node.meta["iteration_shape"] = iteration_shape
-                # This is the hardware logical shape. Direct PyTorch
-                # execution may retain a smaller broadcast-compatible
-                # intermediate shape.
-                node.meta["hardware_tensor_shape"] = iteration_shape
-
-        if output.mx_node is None:
-            self._set_shape_meta(
-                output.value_node, output_plans[0].internal_shape
-            )
-            output.value_node.meta["iteration_shape"] = iteration_shape
-            return
-
-        mx_shapes = self._mx_output_shapes(output.mx_node, iteration_shape)
-        self._set_tuple_shape_meta(output.mx_node, mx_shapes)
-        output.mx_node.meta["iteration_shape"] = iteration_shape
-        output.mx_node.meta["hardware_tensor_shape"] = iteration_shape
-        if output.selected_index is not None:
-            self._set_shape_meta(
-                output.value_node,
-                output_plans[0].internal_shape,
-            )
-            output.value_node.meta["iteration_shape"] = iteration_shape
+            child.graph.erase_node(node)
 
     def _rewrite_parent_output(
         self,
@@ -882,50 +737,30 @@ class IterationSpaceNormalizer:
         call_node: fx.Node,
         output: _OutputDescription,
         output_plans: Tuple[OutputPlan, ...],
-        iteration_shape: Shape,
     ) -> None:
-        call_node.meta["iteration_shape"] = iteration_shape
-        call_node.meta["output_plans"] = [
-            {
-                "internal_shape": plan.internal_shape,
-                "external_shape": plan.external_shape,
-                "parent_operation": plan.parent_operation,
-            }
-            for plan in output_plans
-        ]
-
         if output.is_multi_output:
-            self._set_tuple_shape_meta(
-                call_node,
-                tuple(plan.internal_shape for plan in output_plans),
-            )
-            self._rewrite_parent_tuple_output(call_node, output_plans)
+            self._rewrite_parent_tuple_output(parent, call_node, output_plans)
             return
 
         plan = output_plans[0]
-        self._set_shape_meta(call_node, plan.internal_shape)
         if plan.parent_operation == "identity":
             return
 
         old_users = list(call_node.users)
         with parent.graph.inserting_after(call_node):
-            restored = parent.graph.call_method(
-                plan.parent_operation,
-                args=(call_node, *plan.external_shape),
+            restored = parent.graph.call_function(
+                _RELAYOUT_OPS[plan.parent_operation],
+                (call_node, list(plan.external_shape)),
             )
         # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
         restored.meta = dict(call_node.meta)
-        self._set_shape_meta(restored, plan.external_shape)
-        self._copy_reshaped_value(restored, call_node, plan.external_shape)
-        restored.meta["iteration_space_output_restore"] = {
-            "internal_shape": plan.internal_shape,
-            "external_shape": plan.external_shape,
-        }
+        propagate_shape(restored, parent)
         for user in old_users:
             user.replace_input_with(call_node, restored)
 
     def _rewrite_parent_tuple_output(
         self,
+        parent: fx.GraphModule,
         call_node: fx.Node,
         output_plans: Tuple[OutputPlan, ...],
     ) -> None:
@@ -934,11 +769,11 @@ class IterationSpaceNormalizer:
 
         graph = call_node.graph
         for user in list(call_node.users):
-            if not self._is_getitem_node(user):
+            if user.target != operator.getitem:
                 if user.op == "output":
                     user.args = (
                         self._materialize_tuple_outputs(
-                            call_node, output_plans
+                            parent, call_node, output_plans
                         ),
                     )
                     continue
@@ -963,28 +798,24 @@ class IterationSpaceNormalizer:
 
             plan = output_plans[index]
             self._set_tuple_item_meta(user, call_node, index)
-            self._set_shape_meta(user, plan.internal_shape)
+            propagate_shape(user, parent)
             if plan.parent_operation == "identity":
                 continue
 
             old_users = list(user.users)
             with graph.inserting_after(user):
-                restored = graph.call_method(
-                    plan.parent_operation,
-                    args=(user, *plan.external_shape),
+                restored = graph.call_function(
+                    _RELAYOUT_OPS[plan.parent_operation],
+                    (user, list(plan.external_shape)),
                 )
             restored.meta = dict(user.meta)
-            self._set_shape_meta(restored, plan.external_shape)
-            self._copy_reshaped_value(restored, user, plan.external_shape)
-            restored.meta["iteration_space_output_restore"] = {
-                "internal_shape": plan.internal_shape,
-                "external_shape": plan.external_shape,
-            }
+            propagate_shape(restored, parent)
             for old_user in old_users:
                 old_user.replace_input_with(user, restored)
 
     def _materialize_tuple_outputs(
         self,
+        parent: fx.GraphModule,
         call_node: fx.Node,
         output_plans: Tuple[OutputPlan, ...],
     ) -> Tuple[fx.Node, ...]:
@@ -996,23 +827,18 @@ class IterationSpaceNormalizer:
                 item = graph.call_function(operator.getitem, (call_node, index))
             item.meta = dict(call_node.meta)
             self._set_tuple_item_meta(item, call_node, index)
-            self._set_shape_meta(item, plan.internal_shape)
+            propagate_shape(item, parent)
             insert_after = item
             if plan.parent_operation == "identity":
                 outputs.append(item)
                 continue
             with graph.inserting_after(insert_after):
-                restored = graph.call_method(
-                    plan.parent_operation,
-                    args=(item, *plan.external_shape),
+                restored = graph.call_function(
+                    _RELAYOUT_OPS[plan.parent_operation],
+                    (item, list(plan.external_shape)),
                 )
             restored.meta = dict(item.meta)
-            self._set_shape_meta(restored, plan.external_shape)
-            self._copy_reshaped_value(restored, item, plan.external_shape)
-            restored.meta["iteration_space_output_restore"] = {
-                "internal_shape": plan.internal_shape,
-                "external_shape": plan.external_shape,
-            }
+            propagate_shape(restored, parent)
             outputs.append(restored)
             insert_after = restored
         return tuple(outputs)
@@ -1089,61 +915,6 @@ class IterationSpaceNormalizer:
                 "Unsupported shape no-op", node=node
             ) from exc
 
-    def _extract_method_shape(self, node: fx.Node) -> Shape:
-        raw = node.args[1:]
-        if len(raw) == 1 and isinstance(
-            self._resolve_static(raw[0]), (tuple, list, torch.Size)
-        ):
-            raw_shape = self._resolve_static(raw[0])
-        else:
-            raw_shape = tuple(self._resolve_static(x) for x in raw)
-        return self._normalize_shape_arg(raw_shape)
-
-    def _normalize_shape_arg(self, value: Any) -> Shape:
-        if isinstance(value, int):
-            return (int(value),)
-        if isinstance(value, (tuple, list, torch.Size)):
-            return tuple(int(v) for v in value)
-        raise NormalizationError(f"Expected a static shape, got {value!r}")
-
-    def _is_full_range_getitem(self, index: Any, input_shape: Shape) -> bool:
-        if not isinstance(index, tuple):
-            index = (index,)
-
-        expanded: list[Any] = []
-        ellipsis_seen = False
-        explicit_consumed = sum(1 for item in index if item is not Ellipsis)
-        for item in index:
-            if item is Ellipsis:
-                if ellipsis_seen:
-                    return False
-                ellipsis_seen = True
-                missing = len(input_shape) - explicit_consumed
-                expanded.extend([slice(None)] * missing)
-            else:
-                expanded.append(item)
-        expanded.extend([slice(None)] * (len(input_shape) - len(expanded)))
-        if len(expanded) != len(input_shape):
-            return False
-
-        for extent, item in zip(input_shape, expanded):
-            if not isinstance(item, slice):
-                return False
-            start = (
-                0 if item.start is None else self._maybe_static_int(item.start)
-            )
-            stop = (
-                extent
-                if item.stop is None
-                else self._maybe_static_int(item.stop)
-            )
-            step = 1 if item.step is None else self._maybe_static_int(item.step)
-            if start is None or stop is None or step is None:
-                return False
-            if start != 0 or stop != extent or step != 1:
-                return False
-        return True
-
     # ------------------------------------------------------------------
     # Metadata and FX utilities
     # ------------------------------------------------------------------
@@ -1158,100 +929,6 @@ class IterationSpaceNormalizer:
                 torch.ops.quantized_ops.quantize_mx_outlier.default,
             }
         )
-
-    def _is_getitem_node(self, node: fx.Node) -> bool:
-        return node.op == "call_function" and node.target is operator.getitem
-
-    def _mx_data_node(self, node: fx.Node) -> fx.Node:
-        if not node.args or not isinstance(node.args[0], fx.Node):
-            raise NormalizationError(
-                "MX quantization input must be a tensor node", node=node
-            )
-        return node.args[0]
-
-    def _node_tensor_shape(self, node: fx.Node) -> Shape:
-        shape = getattr(node, "shape", None)
-        if shape is not None:
-            return self._normalize_shape_arg(shape)
-        value = getattr(node, "value", None)
-        if isinstance(value, torch.Tensor):
-            return tuple(int(dim) for dim in value.shape)
-        raise NormalizationError("Node does not have a tensor shape", node=node)
-
-    def _tuple_output_shapes(self, node: fx.Node) -> Tuple[Shape, ...]:
-        shape = getattr(node, "shape", None)
-        if isinstance(shape, (tuple, list)) and shape:
-            first = shape[0]
-            if isinstance(first, (tuple, list, torch.Size)):
-                return tuple(self._normalize_shape_arg(s) for s in shape)
-
-        value = getattr(node, "value", None)
-        if isinstance(value, (tuple, list)) and all(
-            isinstance(v, torch.Tensor) for v in value
-        ):
-            return tuple(tuple(int(dim) for dim in v.shape) for v in value)
-
-        raise NormalizationError(
-            "MX output node does not have tuple tensor shapes", node=node
-        )
-
-    def _set_shape_meta(self, node: fx.Node, shape: Shape) -> None:
-        shape = tuple(shape)
-        node.shape = torch.Size(shape)
-        node.meta["normalized_shape"] = tuple(shape)
-        self._reshape_node_value(node, shape)
-        tensor_meta = node.meta.get("tensor_meta")
-        if tensor_meta is not None and hasattr(tensor_meta, "_replace"):
-            updates: Dict[str, Any] = {"shape": torch.Size(shape)}
-            if hasattr(tensor_meta, "stride"):
-                updates["stride"] = self._contiguous_strides(shape)
-            try:
-                node.meta["tensor_meta"] = tensor_meta._replace(**updates)
-            except (TypeError, ValueError):
-                pass
-
-    def _set_tuple_shape_meta(
-        self,
-        node: fx.Node,
-        shapes: Tuple[Shape, ...],
-    ) -> None:
-        shapes = tuple(tuple(shape) for shape in shapes)
-        node.shape = tuple(torch.Size(shape) for shape in shapes)
-        node.meta["normalized_shape"] = shapes
-        value = getattr(node, "value", None)
-        if not isinstance(value, (tuple, list)) or len(value) != len(shapes):
-            return
-        reshaped = []
-        changed = False
-        for item, shape in zip(value, shapes):
-            if isinstance(item, torch.Tensor) and item.numel() == math.prod(
-                shape
-            ):
-                reshaped.append(item.reshape(shape).cpu().clone())
-                changed = True
-            else:
-                reshaped.append(item)
-        if changed:
-            node.value = tuple(reshaped)
-
-    def _reshape_node_value(self, node: fx.Node, shape: Shape) -> None:
-        value = getattr(node, "value", None)
-        if isinstance(value, torch.Tensor) and value.numel() == math.prod(
-            shape
-        ):
-            node.value = value.reshape(shape).cpu().clone()
-
-    def _copy_reshaped_value(
-        self,
-        target: fx.Node,
-        source: fx.Node,
-        shape: Shape,
-    ) -> None:
-        value = getattr(source, "value", None)
-        if isinstance(value, torch.Tensor) and value.numel() == math.prod(
-            shape
-        ):
-            target.value = value.reshape(shape).cpu().clone()
 
     def _validate_external_layout(
         self, placeholder: fx.Node, shape: Shape
@@ -1293,9 +970,6 @@ class IterationSpaceNormalizer:
             bindings[placeholder.name] = ("kwarg", key)
         return bindings
 
-    def _placeholder_ancestors(self, node: fx.Node) -> set[fx.Node]:
-        return {n for n in self._ancestors(node) if n.op == "placeholder"}
-
     def _ancestors(self, node: Optional[fx.Node]) -> set[fx.Node]:
         if node is None:
             return set()
@@ -1308,30 +982,6 @@ class IterationSpaceNormalizer:
             result.add(current)
             stack.extend(current.all_input_nodes)
         return result
-
-    def _descendants(self, node: Optional[fx.Node]) -> set[fx.Node]:
-        if node is None:
-            return set()
-        result: set[fx.Node] = set()
-        stack = list(node.users)
-        while stack:
-            current = stack.pop()
-            if current in result:
-                continue
-            result.add(current)
-            stack.extend(current.users)
-        return result
-
-    def _node_args(self, node: fx.Node) -> list[fx.Node]:
-        found: list[fx.Node] = []
-
-        def collect(arg: Any) -> Any:
-            if isinstance(arg, fx.Node):
-                found.append(arg)
-            return arg
-
-        fx.map_arg((node.args, node.kwargs), collect)
-        return found
 
     def _broadcast_map(
         self, value: torch.Tensor, output_shape: Shape, node: fx.Node
@@ -1354,33 +1004,6 @@ class IterationSpaceNormalizer:
                 f"{count} elements, exceeding limit "
                 f"{self.config.max_address_map_elements}"
             )
-
-    def _target_name(self, node: fx.Node) -> str:
-        target = node.target
-        if isinstance(target, str):
-            return target
-        module = getattr(target, "__module__", "")
-        qualname = getattr(
-            target, "__qualname__", getattr(target, "__name__", repr(target))
-        )
-        return f"{module}.{qualname}" if module else str(qualname)
-
-    def _resolve_static(self, value: Any) -> Any:
-        if isinstance(value, fx.Node):
-            if "val" in value.meta and not isinstance(
-                value.meta["val"], torch.Tensor
-            ):
-                return value.meta["val"]
-            raise NormalizationError(
-                "Dynamic shape arguments are not supported by this "
-                "implementation",
-                node=value,
-            )
-        return value
-
-    @staticmethod
-    def _maybe_static_int(value: Any) -> Optional[int]:
-        return int(value) if isinstance(value, int) else None
 
     @staticmethod
     def _contiguous_strides(shape: Shape) -> Tuple[int, ...]:
