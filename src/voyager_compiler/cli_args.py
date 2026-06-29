@@ -1,5 +1,10 @@
 import argparse
 
+from voyager_compiler.codegen.lowering.reporting.model import (
+    DEFAULT_DRAM_ACCESS_LATENCY_NS,
+    DEFAULT_DRAM_BANDWIDTH_GBS,
+    DEFAULT_DRAM_SIZE_GB,
+)
 from voyager_compiler.quantizer.quantizer import QuantizationSpec
 from voyager_compiler.utils import SLURM_ARGS
 
@@ -43,7 +48,8 @@ def add_quantization_args(parser=None):
         default=None,
         help=(
             "Activation quantization specification. Comma-separated key=value pairs "
-            "using abbreviations or full names. See below for details:\n" + qconfig_help_string
+            "using abbreviations or full names. See below for details:\n"
+            + qconfig_help_string
         ),
     )
     parser.add_argument(
@@ -56,16 +62,12 @@ def add_quantization_args(parser=None):
     parser.add_argument(
         "--weight",
         default=None,
-        help=(
-            "Weight quantization specification. Format same as activation."
-        ),
+        help=("Weight quantization specification. Format same as activation."),
     )
     parser.add_argument(
         "--bias",
         default=None,
-        help=(
-            "Bias quantization specification. Format same as activation."
-        ),
+        help=("Bias quantization specification. Format same as activation."),
     )
     parser.add_argument(
         "--residual",
@@ -81,20 +83,20 @@ def add_quantization_args(parser=None):
         ),
     )
     parser.add_argument(
-        '--force_scale_power_of_two',
-        action='store_true',
-        help='Whether to force the scaling factor to be a power of two.',
+        "--force_scale_power_of_two",
+        action="store_true",
+        help="Whether to force the scaling factor to be a power of two.",
     )
     parser.add_argument(
-        '--calibration_steps',
+        "--calibration_steps",
         type=int,
         default=0,
-        help='Number of calibration steps for PTQ',
+        help="Number of calibration steps for PTQ",
     )
     parser.add_argument(
-        '--convert_model',
-        action='store_true',
-        help='Whether to convert the model to quantized model.',
+        "--convert_model",
+        action="store_true",
+        help="Whether to convert the model to quantized model.",
     )
     parser.add_argument(
         "--bf16",
@@ -109,7 +111,7 @@ def add_quantization_args(parser=None):
     )
     parser.add_argument(
         "--quantize_forward",
-        default='gemm',
+        default="gemm",
         help=(
             "Forward operations to quantize. Choose from gemm, residual, "
             "activation, layernorm, and scaling."
@@ -117,7 +119,7 @@ def add_quantization_args(parser=None):
     )
     parser.add_argument(
         "--quantize_backprop",
-        default='gemm',
+        default="gemm",
         help=(
             "Backprop operations to quantize. Choose from gemm, residual, "
             "activation, layernorm, and scaling."
@@ -125,24 +127,24 @@ def add_quantization_args(parser=None):
     )
     parser.add_argument(
         "--op_fusion",
-        type=lambda x: x.split(','),
+        type=lambda x: x.split(","),
         default=None,
         help="Fuse operation with previous GEMM to reduce quantization error.",
     )
     parser.add_argument(
         "--posit_exp",
         action="store_true",
-        help="Whether to use posit approximated exponential function in softmax."
+        help="Whether to use posit approximated exponential function in softmax.",
     )
     parser.add_argument(
         "--posit_exp_shifted",
         action="store_true",
-        help="Whether to use shifted posit approximated exponential function in softmax."
+        help="Whether to use shifted posit approximated exponential function in softmax.",
     )
     parser.add_argument(
         "--posit_reciprocal",
         action="store_true",
-        help="Whether to use posit approximated reciprocal function in softmax."
+        help="Whether to use posit approximated reciprocal function in softmax.",
     )
     parser.add_argument(
         "--record_histogram",
@@ -154,57 +156,59 @@ def add_quantization_args(parser=None):
 
 def add_experiment_args(parser=None):
     if parser is None:
-        parser = argparse.ArgumentParser(description="Run quantized inference or training.")
+        parser = argparse.ArgumentParser(
+            description="Run quantized inference or training."
+        )
     add_quantization_args(parser)
-    #----------------------------------------------------
+    # ----------------------------------------------------
     # Wandb and logging arguments
-    #----------------------------------------------------
+    # ----------------------------------------------------
     parser.add_argument(
-        '--project',
+        "--project",
         default=None,
-        help='The name of the project where the new run will be sent.'
+        help="The name of the project where the new run will be sent.",
     )
     parser.add_argument(
-        '--run_name',
+        "--run_name",
         default=None,
-        help='A short display name for this run, which is this run will be identified in the UI.'
+        help="A short display name for this run, which is this run will be identified in the UI.",
     )
     parser.add_argument(
-        '--run_id',
+        "--run_id",
         default=None,
-        help='A unique ID for a wandb run, used for resuming.'
+        help="A unique ID for a wandb run, used for resuming.",
     )
     parser.add_argument(
         "--sweep_config_json",
         type=str,
         default=None,
-        help="Inline JSON string for W&B sweep configuration"
+        help="Inline JSON string for W&B sweep configuration",
     )
     parser.add_argument(
-        '--sweep_id',
+        "--sweep_id",
         default=None,
-        help='The unique identifier for a sweep generated by W&B CLI or Python SDK.'
+        help="The unique identifier for a sweep generated by W&B CLI or Python SDK.",
     )
     parser.add_argument(
         "--sweep_count",
         type=int,
         default=None,
-        help="The number of sweep config trials to try."
+        help="The number of sweep config trials to try.",
     )
     parser.add_argument(
         "--log_level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="WARNING",
-        help="Set the logging level"
+        help="Set the logging level",
     )
     parser.add_argument(
         "--log_file",
         default=None,
-        help="Set the logging file. If not specified, the log will be printed to stdout."
+        help="Set the logging file. If not specified, the log will be printed to stdout.",
     )
-    #----------------------------------------------------
+    # ----------------------------------------------------
     # Training arguments
-    #----------------------------------------------------
+    # ----------------------------------------------------
     parser.add_argument("--gpu", type=int, default=None, help="GPU to use.")
     parser.add_argument(
         "--do_train", action="store_true", help="Whether to run training"
@@ -216,42 +220,42 @@ def add_experiment_args(parser=None):
         "--warmup_ratio",
         type=float,
         default=0.0,
-        help="Ratio of warmup steps in the lr scheduler."
+        help="Ratio of warmup steps in the lr scheduler.",
     )
     parser.add_argument(
         "--num_hidden_layers",
         type=int,
         default=None,
-        help="Number of Tranformer encoder layers to use."
+        help="Number of Tranformer encoder layers to use.",
     )
     parser.add_argument(
         "--lora_rank",
         type=int,
         default=0,
-        help="The dimension of the low-rank matrices."
+        help="The dimension of the low-rank matrices.",
     )
     parser.add_argument(
         "--lora_alpha",
         type=int,
         default=8,
-        help="The scaling factor for the low-rank matrices."
+        help="The scaling factor for the low-rank matrices.",
     )
     parser.add_argument(
         "--target_modules",
-        type=lambda x: x.split(','),
+        type=lambda x: x.split(","),
         default="query,value",
-        help="The modules (for example, attention blocks) to apply the LoRA update matrices."
+        help="The modules (for example, attention blocks) to apply the LoRA update matrices.",
     )
     parser.add_argument(
         "--peft_model_id",
         default=None,
-        help="Name of path of pre-trained peft adapter."
+        help="Name of path of pre-trained peft adapter.",
     )
-    #----------------------------------------------------
+    # ----------------------------------------------------
     # Slurm arguments
-    #----------------------------------------------------
+    # ----------------------------------------------------
     subparsers = parser.add_subparsers(
-        help='sub-command help', dest='execution_mode'
+        help="sub-command help", dest="execution_mode"
     )
     parser_slurm = subparsers.add_parser("slurm", help="slurm command help")
     for k, v in SLURM_ARGS.items():
@@ -266,7 +270,10 @@ def add_compile_args(parser=None):
 
     # -- memory hierarchy ---------------------------------------------------
     parser.add_argument(
-        "--cache_size", type=int, default=None, help="Total L2 SRAM size (bytes)."
+        "--cache_size",
+        type=int,
+        default=None,
+        help="Total L2 SRAM size (bytes).",
     )
     parser.add_argument(
         "--num_banks",
@@ -311,15 +318,22 @@ def add_compile_args(parser=None):
     )
     parser.add_argument(
         "--dram_size",
-        type=int,
-        default=None,
-        help="DRAM capacity (bytes); enables the 4-level interstellar hierarchy.",
+        type=float,
+        default=DEFAULT_DRAM_SIZE_GB,
+        help="DRAM capacity in GB; enables the 4-level interstellar hierarchy.",
     )
     parser.add_argument(
         "--dram_bandwidth",
         type=float,
-        default=200.0,
-        help="DRAM bandwidth in GB/s.",
+        default=DEFAULT_DRAM_BANDWIDTH_GBS,
+        help="Typical mobile SoC DRAM bandwidth in GB/s.",
+    )
+    parser.add_argument(
+        "--dram_access_latency",
+        type=float,
+        default=DEFAULT_DRAM_ACCESS_LATENCY_NS,
+        help="DRAM access latency (ns); per-transfer cycles = latency * "
+        "frequency.",
     )
     parser.add_argument(
         "--frequency",
@@ -389,11 +403,5 @@ def add_compile_args(parser=None):
         "--report_basename",
         default="schedule",
         help="Base filename for the reporting outputs.",
-    )
-    parser.add_argument(
-        "--setup_cycles",
-        type=int,
-        default=None,
-        help="Per-transfer DRAM setup latency (cycles) for the estimator.",
     )
     return parser

@@ -2,8 +2,8 @@
 
 The schedule *structure* — event order, resource lanes, and each event's
 ``start_deps`` — is fixed by the scheduler and written once.  Only the
-*durations* are formulas, so editing the ``Architecture`` inputs (clock,
-bandwidth, setup, unroll) or a node's ``Utilization`` recomputes every event's
+*durations* are formulas, so editing the ``Architecture`` inputs (frequency,
+bandwidth, latency, unroll) or a node's ``Utilization`` recomputes every event's
 ``Start``/``End`` and the Gantt bars **inside Excel**, no Python re-run needed.
 This is sound because the dependency wiring is structural and therefore
 invariant to duration edits.
@@ -58,11 +58,11 @@ def _architecture(wb, result: ScheduleResult):
     ws.set_column(0, 0, 22)
     ws.set_column(1, 1, 14)
     rows = [
-        ("clock", 1.0),  # cycles model uses bandwidth/clock = bytes/cycle
-        ("dram_bandwidth", float(result.cost.bytes_per_cycle)),
-        ("setup_cycles", int(result.cost.setup_cycles)),
-        ("unroll0", int(result.cost.unroll[0])),
-        ("unroll1", int(result.cost.unroll[1])),
+        ("frequency", float(result.cost.frequency)),  # GHz
+        ("dram_bandwidth", float(result.cost.dram_bandwidth)),  # GB/s
+        ("dram_access_latency", float(result.cost.dram_access_latency)),  # ns
+        ("ic_unroll", int(result.cost.unroll[0])),
+        ("oc_unroll", int(result.cost.unroll[1])),
     ]
     for i, (name, val) in enumerate(rows):
         r = i + 1
@@ -71,7 +71,11 @@ def _architecture(wb, result: ScheduleResult):
         wb.define_name(name, f"=Architecture!${'B'}${r + 1}")
     ws.write(7, 0, "bytes/cycle", bold)
     ws.write_formula(
-        7, 1, "=dram_bandwidth/clock", None, result.cost.bytes_per_cycle
+        7,
+        1,
+        "=dram_bandwidth/frequency",
+        None,
+        result.cost.dram_bandwidth / result.cost.frequency,
     )
 
 
@@ -103,9 +107,9 @@ def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
         ws.write_number(r, 2, work)
         work_cell = xl_rowcol_to_cell(r, 2)
         if op.op_type in ("gemm", "conv"):
-            ideal = f"=CEILING({work_cell}/(unroll0*unroll1),1)"
+            ideal = f"=CEILING({work_cell}/(ic_unroll*oc_unroll),1)"
         else:
-            ideal = f"=CEILING({work_cell}/unroll1,1)"
+            ideal = f"=CEILING({work_cell}/oc_unroll,1)"
         ws.write_formula(r, 3, ideal, None, op.ideal_cycles)
         ws.write_number(r, 4, 1.0, edit)  # editable utilization
         ideal_cell = xl_rowcol_to_cell(r, 3)
@@ -125,7 +129,10 @@ def _latency_formula(
         return f"='Operations'!{cell}"
     if rec.latency_kind == "dram":
         b = xl_rowcol_to_cell(row, C_BYTES)
-        return f"=setup_cycles+CEILING({b}/(dram_bandwidth/clock),1)"
+        return (
+            f"=CEILING((dram_access_latency+{b}/dram_bandwidth)"
+            f"*frequency,1)"
+        )
     return "=0"
 
 

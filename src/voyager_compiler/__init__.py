@@ -234,9 +234,10 @@ def compile(
     accum_buffer_size: int = None,
     double_buffered_accum_buffer: bool = False,
     double_buffered_l2: bool = False,
-    dram_size: int = 1 << 34,
-    dram_bandwidth=200,
-    frequency=1.0,
+    dram_size: int = None,
+    dram_bandwidth: float = None,
+    frequency: float = 1.0,
+    dram_access_latency: float = None,
     bufferize: bool = False,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -261,18 +262,14 @@ def compile(
         )
         from .codegen.lowering.tiling import build_interstellar_tiler
 
-        if dram_size is None:
-            dram_size = 1 << 34
-
-        bytes_per_cycle = dram_bandwidth / frequency
         tiler = build_interstellar_tiler(
             unroll_dims,
             input_buffer_size=input_buffer_size,
             weight_buffer_size=weight_buffer_size,
             accum_buffer_size=accum_buffer_size,
             scratchpad_size=cache_size,
-            dram_size=dram_size,
-            dram_bandwidth=bytes_per_cycle,
+            dram_size=dram_size * 1024**3,
+            dram_bandwidth=dram_bandwidth / frequency,
             double_buffered_accum_buffer=double_buffered_accum_buffer,
             double_buffered_l2=double_buffered_l2,
             num_banks=num_banks,
@@ -298,7 +295,9 @@ def compile(
         # live Excel workbook + Perfetto trace alongside the protobuf.
         result = report(
             model,
-            bytes_per_cycle=bytes_per_cycle,
+            dram_bandwidth=dram_bandwidth,
+            dram_access_latency=dram_access_latency,
+            frequency=frequency,
             unroll=unroll_dims,
             output_dir=output_dir,
             basename=output_file,
@@ -307,6 +306,8 @@ def compile(
             f"  total latency      : {result.total_latency:,} cycles\n"
             f"  DRAM read  bytes   : {result.dram_read_bytes:,}\n"
             f"  DRAM write bytes   : {result.dram_write_bytes:,}\n"
+            f"  DRAM total bytes   : "
+            f"{result.dram_read_bytes + result.dram_write_bytes:,}\n"
             f"  scheduled events   : {len(result.records):,}"
         )
 

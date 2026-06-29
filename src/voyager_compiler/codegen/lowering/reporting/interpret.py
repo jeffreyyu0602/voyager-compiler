@@ -232,19 +232,23 @@ def _run_cond(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
 
 def estimate_schedule(
     model: GraphModule,
-    bytes_per_cycle: float,
-    setup_cycles: int,
+    dram_bandwidth: float,
+    dram_access_latency: float,
+    frequency: float,
     unroll: tuple[int, int],
 ) -> ScheduleResult:
     """Walk a bufferized + memory-planned FX graph and return its schedule:
     per-node timing records, total latency, and DRAM read / write bytes.
 
-    Shapes are read from the nodes' existing ``meta['val']`` / ``.value`` (set
-    during bufferization), so the model needs no re-execution.
+    ``dram_bandwidth`` (GB/s), ``dram_access_latency`` (ns) and ``frequency``
+    (GHz) are physical units; ``cost.py`` converts them to cycles.  Shapes are
+    read from the nodes' existing ``meta['val']`` / ``.value`` (set during
+    bufferization), so the model needs no re-execution.
     """
     cost = CostParams(
-        bytes_per_cycle=bytes_per_cycle,
-        setup_cycles=setup_cycles,
+        dram_bandwidth=dram_bandwidth,
+        dram_access_latency=dram_access_latency,
+        frequency=frequency,
         unroll=tuple(unroll),
     )
     rs = ResourceState(cost)

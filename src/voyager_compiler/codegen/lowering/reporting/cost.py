@@ -71,7 +71,10 @@ def tile_bytes(buffer_node: Node, sizes) -> int:
 
 
 def dram_cycles(n_bytes: int, cost: CostParams) -> int:
-    return cost.setup_cycles + math.ceil(n_bytes / cost.bytes_per_cycle)
+    # GB/s == bytes/ns, so n_bytes / dram_bandwidth is the transfer time in ns;
+    # add the access latency (ns) and convert to cycles with frequency (GHz).
+    time_ns = cost.dram_access_latency + n_bytes / cost.dram_bandwidth
+    return math.ceil(time_ns * cost.frequency)
 
 
 # --------------------------------------------------------------------------

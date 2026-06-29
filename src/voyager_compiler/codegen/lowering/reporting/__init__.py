@@ -15,7 +15,6 @@ from .compress import compress_schedule
 from .excel import write_excel_report
 from .interpret import estimate_schedule
 from .model import (
-    DEFAULT_SETUP_CYCLES,
     CostParams,
     LoopSummary,
     OpInfo,
@@ -40,10 +39,11 @@ __all__ = [
 
 def report(
     model,
-    bytes_per_cycle: float,
+    dram_bandwidth: float,
+    dram_access_latency: float,
+    frequency: float,
     unroll: tuple[int, int],
     *,
-    setup_cycles: int = None,
     output_dir: str = ".",
     basename: str = "schedule",
     perfetto: bool = True,
@@ -51,18 +51,16 @@ def report(
     """Estimate, compress, and write the reports for a bufferized + memory-
     planned ``model``.
 
-    ``bytes_per_cycle`` is ``dram_bandwidth / frequency``; ``setup_cycles``
-    falls back to ``DEFAULT_SETUP_CYCLES`` when ``None``.  Writes
+    ``dram_bandwidth`` (GB/s), ``dram_access_latency`` (ns) and ``frequency``
+    (GHz) are physical units (cost.py converts to cycles).  Writes
     ``<basename>.xlsx`` (and, when ``perfetto``, ``<basename>.perfetto.json``)
     under ``output_dir`` and returns the (compressed) ``ScheduleResult``.
     """
-    if setup_cycles is None:
-        setup_cycles = DEFAULT_SETUP_CYCLES
-
     result = estimate_schedule(
         model,
-        bytes_per_cycle=bytes_per_cycle,
-        setup_cycles=setup_cycles,
+        dram_bandwidth=dram_bandwidth,
+        dram_access_latency=dram_access_latency,
+        frequency=frequency,
         unroll=unroll,
     )
     compress_schedule(result)

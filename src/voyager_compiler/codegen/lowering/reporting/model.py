@@ -9,22 +9,27 @@ the contract between them.
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-DEFAULT_SETUP_CYCLES = 50
+DEFAULT_DRAM_SIZE_GB = 16.0
+DEFAULT_DRAM_BANDWIDTH_GBS = 50.0
+DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
 
 
 @dataclass(frozen=True)
 class CostParams:
-    """Editable hardware knobs of the latency / traffic model.
+    """Editable hardware knobs of the latency / traffic model, in physical
+    units; ``cost.py`` converts to cycles via ``frequency``.
 
-    ``bytes_per_cycle`` is already ``dram_bandwidth / frequency`` (the tiler
-    stores it that way), so no further conversion is needed.  ``unroll`` is the
+    ``dram_bandwidth`` is GB/s, ``dram_access_latency`` is ns, ``frequency`` is
+    GHz (so bytes/cycle = ``dram_bandwidth / frequency`` and per-transfer
+    latency cycles = ``dram_access_latency * frequency``).  ``unroll`` is the
     ``(rows, cols)`` of the systolic array: GEMM/conv run at
     ``unroll[0]*unroll[1]`` MACs/cycle, vector ops at ``unroll[1]`` lanes.
     """
 
-    bytes_per_cycle: float
+    dram_bandwidth: float  # GB/s
+    dram_access_latency: float  # ns
+    frequency: float  # GHz
     unroll: Tuple[int, int]
-    setup_cycles: int = DEFAULT_SETUP_CYCLES
 
 
 @dataclass

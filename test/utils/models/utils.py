@@ -37,5 +37,6 @@ def get_compile_args(args):
         "dram_size": args.dram_size,
         "dram_bandwidth": args.dram_bandwidth,
         "frequency": args.frequency,
+        "dram_access_latency": args.dram_access_latency,
         "bufferize": args.bufferize,
     }
