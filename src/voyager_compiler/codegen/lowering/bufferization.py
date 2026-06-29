@@ -273,67 +273,155 @@ def _annotate_and_validate(
 # ---------------------------------------------------------------------------
 
 
-def propagate_logical_dtypes(
-    gm: GraphModule, ph_dtypes: Optional[Dict[Node, str]] = None
+_SELECT = torch.ops.aten.select.int
+
+
+def _dtype_of(n):
+    return n.meta.get("dtype") if isinstance(n, Node) else None
+
+
+def _set_dtype(n, dt) -> bool:
+    """Assign logical dtype ``dt`` to ``n`` if it lacks one; True if changed."""
+    if dt is None or not isinstance(n, Node) or n.meta.get("dtype") == dt:
+        return False
+    n.meta["dtype"] = dt
+    return True
+
+
+def _buffer_of(node):
+    """Walk a copy destination back through ``select`` / NOP views to the
+    underlying ``alloc`` (or placeholder bank) it writes, so a copy tags the
+    buffer and not just the tile view."""
+    seen = set()
+    while isinstance(node, Node) and node not in seen:
+        seen.add(node)
+        if node.target is _VOYAGER_ALLOC or node.op == "placeholder":
+            break
+        if node.target is _SELECT or is_nop(node):
+            node = node.args[0]
+            continue
+        break
+    return node
+
+
+def _outputs_of(gm: GraphModule) -> list:
+    outs = next(n for n in gm.graph.nodes if n.op == "output").args[0]
+    return list(outs) if isinstance(outs, (list, tuple)) else [outs]
+
+
+def _thread_hop(
+    gm: GraphModule, hop: Node, operands, graph_args, rules
 ) -> None:
-    """Flow logical (quantized) dtypes from DRAM tensors onto the nest's tiles.
+    """Recurse the forward pass into each loop body / cond branch: seed its
+    placeholders from the bound ``operands``, propagate, then carry the dtypes it
+    derived back out — onto the captured operands (SRAM banks written in place)
+    and onto the HOP's ``getitem`` result handles (a cond branch's tensor
+    output)."""
+    handles = [
+        u
+        for u in hop.users
+        if u.target is operator.getitem and isinstance(u.args[1], int)
+    ]
+    for ga in graph_args:
+        sub = _subgraph(gm, ga.target)
+        if sub is None:
+            continue
+        phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+        seed = {
+            ph: _dtype_of(op)
+            for op, ph in zip(operands, phs)
+            if _dtype_of(op) is not None
+        }
+        propagate_logical_dtypes(sub, seed, rules)
+        for op, ph in zip(operands, phs):
+            _set_dtype(op, _dtype_of(ph))
+        outs = _outputs_of(sub)
+        for u in handles:
+            if u.args[1] < len(outs):
+                _set_dtype(u, _dtype_of(outs[u.args[1]]))
 
-    The quantizer leaves ``meta['dtype']`` (a string like ``'nf4_6'`` /
-    ``'fp8_e5m3'``) on input / weight / scale nodes, and the pass tags each
-    output buffer (``voyager.alloc``) with the output's logical dtype, so
-    codegen emits the logical dtype rather than the physical storage dtype.
-    Threads through ``while_loop`` bodies (carried / additional inputs) and
-    ``cond`` branches (their operands).  Ops whose output is genuinely physical
-    (the fp32 accumulator from a GEMM/conv) keep no logical dtype.
 
-    TODO: per-*tile* logical-dtype inheritance previously rode ``load_tile`` /
-    ``store_tile`` (now retired); the equivalent for ``copy_tile`` /
-    ``async_copy`` is not yet wired (needed by the quantized end-to-end path).
+def _thread_call_module(gm: GraphModule, node: Node, rules) -> None:
+    """Recurse into a fused ``call_module`` (operands → placeholders), propagate,
+    and set the node's own dtype from the submodule's output(s)."""
+    sub = _subgraph(gm, node.target)
+    if sub is None:
+        return
+    phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+    seed = {
+        ph: _dtype_of(a)
+        for a, ph in zip(node.args, phs)
+        if _dtype_of(a) is not None
+    }
+    propagate_logical_dtypes(sub, seed, rules)
+    outs = _outputs_of(sub)
+    if len(outs) > 1:
+        dts = tuple(_dtype_of(o) for o in outs)
+        if any(dts):
+            _set_dtype(node, dts)
+    else:
+        _set_dtype(node, _dtype_of(outs[0]))
+
+
+def propagate_logical_dtypes(
+    gm: GraphModule,
+    ph_dtypes: Optional[Dict[Node, str]] = None,
+    compute_dtypes: Optional[Dict] = None,
+) -> None:
+    """Stamp each node's logical (quantized) ``meta['dtype']`` in one forward,
+    program-order pass so codegen emits the quantized dtype, not the physical one.
+
+    The rule is read straight from the original node / submodule the quantizer
+    already annotated: ``compute_dtypes`` maps a compute op's target to its output
+    dtype (an int GEMM's ``int24``, a ``quantize_mx`` ``(scale, value)`` tuple,
+    …).  ``ph_dtypes`` seeds this graph's placeholders from the operands bound to
+    them.  Then, in def-before-use order: a compute op takes its rule dtype, a
+    pass-through (copy / select / getitem / NOP) inherits its input's dtype, and a
+    ``while_loop`` / ``cond`` / fused ``call_module`` recurses inline.  Inputs
+    always precede their uses, so a single pass settles the whole graph — no
+    fixpoint or backward flow.
     """
     for ph, d in (ph_dtypes or {}).items():
-        if isinstance(d, str):
-            ph.meta.setdefault("dtype", d)
+        _set_dtype(ph, d)
 
-    def _dt(n):
-        return n.meta.get("dtype") if isinstance(n, Node) else None
-
-    while_loop = torch.ops.higher_order.while_loop
+    rules = compute_dtypes or {}
     for node in gm.graph.nodes:
+        if node.op == "call_module":
+            _thread_call_module(gm, node, rules)
+            continue
         if node.op != "call_function":
             continue
-        if node.target is while_loop:
-            body = getattr(gm, str(node.args[1].target), None)
-            if isinstance(body, GraphModule):
-                inputs = list(node.args[2])
-                if len(node.args) > 3:
-                    inputs += list(node.args[3])
-                body_phs = [
-                    n for n in body.graph.nodes if n.op == "placeholder"
-                ]
-                child = {ph: _dt(inp) for ph, inp in zip(body_phs, inputs)}
-                propagate_logical_dtypes(body, child)
-        elif node.target is _COND:
-            # Both branches share the operand list (args[3]); thread logical
-            # dtypes into each branch's placeholders, like a while_loop body.
+        t = node.target
+        if t is _WHILE_LOOP:
+            extra = list(node.args[3]) if len(node.args) > 3 else []
+            _thread_hop(
+                gm, node, list(node.args[2]) + extra, (node.args[1],), rules
+            )
+        elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            for graph_arg in (node.args[1], node.args[2]):
-                branch = getattr(gm, str(graph_arg.target), None)
-                if isinstance(branch, GraphModule):
-                    branch_phs = [
-                        n for n in branch.graph.nodes if n.op == "placeholder"
-                    ]
-                    child = {
-                        ph: _dt(inp) for ph, inp in zip(branch_phs, operands)
-                    }
-                    propagate_logical_dtypes(branch, child)
-        elif node.target is operator.getitem:
-            src = node.args[0]
-            if isinstance(src, Node) and src.target is while_loop:
-                carried = list(src.args[2])
-                idx = node.args[1]
-                if isinstance(idx, int) and idx < len(carried):
-                    if (d := _dt(carried[idx])) is not None:
-                        node.meta["dtype"] = d
+            _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
+        elif rules.get(t) is not None:
+            # A compute op: its output dtype comes from the original graph's rule.
+            _set_dtype(node, rules[t])
+        elif t is _VOYAGER_ASYNC or t is _VOYAGER_COPY:
+            # A copy: dst (and its buffer) inherits the src's dtype.
+            d = _dtype_of(node.args[0])
+            _set_dtype(node.args[1], d)
+            _set_dtype(_buffer_of(node.args[1]), d)
+        elif t is _SELECT:
+            _set_dtype(node, _dtype_of(node.args[0]))  # bank slot
+        elif t is operator.getitem:
+            sdt = _dtype_of(node.args[0])
+            i = node.args[1]
+            if (
+                isinstance(sdt, (list, tuple))
+                and isinstance(i, int)
+                and i < len(sdt)
+            ):
+                _set_dtype(node, sdt[i])
+        elif is_nop(node):
+            first = next((a for a in node.args if isinstance(a, Node)), None)
+            _set_dtype(node, _dtype_of(first))
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +504,27 @@ def bufferize_graph(
                 f"'{node.name}' ({node.target})"
             )
 
+        # Stamp logical (quantized) dtypes on the nest, all read off the original
+        # ``node`` (the quantizer already annotated it): seed the placeholders
+        # from the input operands' dtypes, and the per-target output-dtype rule
+        # from every compute op of the original submodule (a bare op = itself).
+        # A single forward pass then spreads them through the nest.
+        phs = [p for p in sub_gm.graph.nodes if p.op == "placeholder"]
+        ph_seed = {
+            ph: inp.meta.get("dtype")
+            for ph, inp in zip(phs, node.all_input_nodes)
+        }
+        submod = node.meta.get("submodule")
+        src_nodes = (
+            submod.graph.nodes if isinstance(submod, GraphModule) else [node]
+        )
+        compute_seed = {
+            n.target: n.meta["dtype"]
+            for n in src_nodes
+            if n.op == "call_function" and n.meta.get("dtype") is not None
+        }
+        propagate_logical_dtypes(sub_gm, ph_seed, compute_seed)
+
         with oracle_disabled():
             results = replace_node_with_graph_module(model, node, sub_gm)
 
@@ -449,10 +558,6 @@ def bufferize_graph(
 
     graph.lint()
     model.recompile()
-    # Flow logical (quantized) dtypes onto the new load/store tiles + buffers so
-    # the emitted proto reports the quantized dtype, not the physical storage
-    # one.
-    propagate_logical_dtypes(model)
     annotate_tensor_spaces(model)
     return model
 

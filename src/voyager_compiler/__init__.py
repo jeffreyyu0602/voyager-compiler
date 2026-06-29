@@ -257,6 +257,7 @@ def compile(
             gen_compute_graph_bufferized,
             plan_memory,
             print_bufferized_graph,
+            report,
         )
         from .codegen.lowering.tiling import build_interstellar_tiler
 
@@ -299,6 +300,22 @@ def compile(
             unroll_dims=unroll_dims,
         )
         print_bufferized_graph(model)
+
+        # Estimate latency / DRAM traffic from the scheduled graph and dump a
+        # live Excel workbook + Perfetto trace alongside the protobuf.
+        result = report(
+            model,
+            bytes_per_cycle=dram_bandwidth / frequency,
+            unroll=unroll_dims,
+            output_dir=output_dir,
+            basename=output_file,
+        )
+        print(
+            f"  total latency      : {result.total_latency:,} cycles\n"
+            f"  DRAM read  bytes   : {result.dram_read_bytes:,}\n"
+            f"  DRAM write bytes   : {result.dram_write_bytes:,}\n"
+            f"  scheduled events   : {len(result.records):,}"
+        )
 
         path = os.path.join(output_dir, "tensor_files")
         params = gen_code_bufferized(
