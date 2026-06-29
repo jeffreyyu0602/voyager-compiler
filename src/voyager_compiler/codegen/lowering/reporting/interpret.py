@@ -232,10 +232,9 @@ def _run_cond(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
 
 def estimate_schedule(
     model: GraphModule,
-    *,
     bytes_per_cycle: float,
-    setup_cycles: int = 1000,
-    unroll=(16, 16),
+    setup_cycles: int,
+    unroll: tuple[int, int],
 ) -> ScheduleResult:
     """Walk a bufferized + memory-planned FX graph and return its schedule:
     per-node timing records, total latency, and DRAM read / write bytes.

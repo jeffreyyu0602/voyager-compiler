@@ -393,7 +393,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--setup_cycles",
         type=int,
-        default=1000,
+        default=None,
         help="Per-transfer DRAM setup latency (cycles) for the estimator.",
     )
     return parser

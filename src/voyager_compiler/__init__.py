@@ -234,7 +234,7 @@ def compile(
     accum_buffer_size: int = None,
     double_buffered_accum_buffer: bool = False,
     double_buffered_l2: bool = False,
-    dram_size: int = None,
+    dram_size: int = 1 << 34,
     dram_bandwidth=200,
     frequency=1.0,
     bufferize: bool = False,
@@ -261,16 +261,10 @@ def compile(
         )
         from .codegen.lowering.tiling import build_interstellar_tiler
 
-        # Build the interstellar tiler once; the bufferization builders tile each
-        # GEMM/conv on demand from it (no separate tiling pass / meta annotation).
-        # A caller may forward ``dram_size`` / ``unroll_dims`` as ``None``
-        # explicitly (e.g. the argparse defaults), so fall back here -> the tiler
-        # is always built under bufferize.  Per-node dtype widths are read off the
-        # nodes inside the tiler, so none are passed here.
         if dram_size is None:
             dram_size = 1 << 34
-        if unroll_dims is None:
-            unroll_dims = (16, 16)
+
+        bytes_per_cycle = dram_bandwidth / frequency
         tiler = build_interstellar_tiler(
             unroll_dims,
             input_buffer_size=input_buffer_size,
@@ -278,8 +272,7 @@ def compile(
             accum_buffer_size=accum_buffer_size,
             scratchpad_size=cache_size,
             dram_size=dram_size,
-            dram_bandwidth=dram_bandwidth,
-            frequency=frequency,
+            dram_bandwidth=bytes_per_cycle,
             double_buffered_accum_buffer=double_buffered_accum_buffer,
             double_buffered_l2=double_buffered_l2,
             num_banks=num_banks,
@@ -305,7 +298,7 @@ def compile(
         # live Excel workbook + Perfetto trace alongside the protobuf.
         result = report(
             model,
-            bytes_per_cycle=dram_bandwidth / frequency,
+            bytes_per_cycle=bytes_per_cycle,
             unroll=unroll_dims,
             output_dir=output_dir,
             basename=output_file,

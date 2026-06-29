@@ -9,8 +9,10 @@ the contract between them.
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+DEFAULT_SETUP_CYCLES = 50
 
-@dataclass
+
+@dataclass(frozen=True)
 class CostParams:
     """Editable hardware knobs of the latency / traffic model.
 
@@ -21,8 +23,8 @@ class CostParams:
     """
 
     bytes_per_cycle: float
-    setup_cycles: int = 1000
-    unroll: Tuple[int, int] = (16, 16)
+    unroll: Tuple[int, int]
+    setup_cycles: int = DEFAULT_SETUP_CYCLES
 
 
 @dataclass

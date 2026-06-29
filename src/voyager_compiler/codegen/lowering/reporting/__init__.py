@@ -15,6 +15,7 @@ from .compress import compress_schedule
 from .excel import write_excel_report
 from .interpret import estimate_schedule
 from .model import (
+    DEFAULT_SETUP_CYCLES,
     CostParams,
     LoopSummary,
     OpInfo,
@@ -39,11 +40,10 @@ __all__ = [
 
 def report(
     model,
+    bytes_per_cycle: float,
+    unroll: tuple[int, int],
     *,
-    tiler=None,
-    bytes_per_cycle: float = None,
-    setup_cycles: int = 1000,
-    unroll=(16, 16),
+    setup_cycles: int = None,
     output_dir: str = ".",
     basename: str = "schedule",
     perfetto: bool = True,
@@ -51,16 +51,13 @@ def report(
     """Estimate, compress, and write the reports for a bufferized + memory-
     planned ``model``.
 
-    ``bytes_per_cycle`` defaults to ``tiler.dram_bandwidth`` (already
-    bytes/cycle) when a ``tiler`` is given.  Writes ``<basename>.xlsx`` (and,
-    when ``perfetto``, ``<basename>.perfetto.json``) under ``output_dir`` and
-    returns the (compressed) ``ScheduleResult``.
+    ``bytes_per_cycle`` is ``dram_bandwidth / frequency``; ``setup_cycles``
+    falls back to ``DEFAULT_SETUP_CYCLES`` when ``None``.  Writes
+    ``<basename>.xlsx`` (and, when ``perfetto``, ``<basename>.perfetto.json``)
+    under ``output_dir`` and returns the (compressed) ``ScheduleResult``.
     """
-    if bytes_per_cycle is None:
-        if tiler is None:
-            raise ValueError("pass tiler= or bytes_per_cycle=")
-        bytes_per_cycle = tiler.dram_bandwidth
-        unroll = getattr(tiler, "unroll", unroll)
+    if setup_cycles is None:
+        setup_cycles = DEFAULT_SETUP_CYCLES
 
     result = estimate_schedule(
         model,

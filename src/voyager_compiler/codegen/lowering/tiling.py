@@ -51,8 +51,7 @@ def build_interstellar_tiler(
     accum_buffer_size,
     scratchpad_size,
     dram_size,
-    dram_bandwidth=0,
-    frequency=1.0,
+    dram_bandwidth,
     double_buffered_accum_buffer=False,
     double_buffered_l2=False,
     dram_access_cost=1000,
@@ -61,10 +60,10 @@ def build_interstellar_tiler(
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
 
-    ``unroll`` is ``(ic_dim, oc_dim)``.  ``dram_bandwidth`` is GB/s and is
-    converted here to **bytes per cycle** (``bytes/cycle = bw_GBs / freq_GHz`` —
-    GB/s and GHz share the 1e9 factor); the DRAM transfer accounting is in
-    absolute bytes, so it is not normalized by any element width.
+    ``unroll`` is ``(ic_dim, oc_dim)``.  ``dram_bandwidth`` is in **bytes per
+    cycle** (already ``dram_bandwidth / frequency``); the DRAM transfer
+    accounting is in absolute bytes, so it is not normalized by any element
+    width.
 
     The L0/L1 capacities are slot arrays: one fixed-width slot per element (the
     max dtype in a mixed-precision design; narrower dtypes are padded into a full
@@ -77,8 +76,6 @@ def build_interstellar_tiler(
     import interstellar
 
     ic_dim, oc_dim = unroll
-    # DRAM bandwidth GB/s -> bytes per cycle (GB/s and GHz share the 1e9 factor).
-    dram_bw = int(dram_bandwidth / frequency)
 
     # Banking applies only at L2 (the on-chip scratchpad). The bank size is the
     # physical cache split into ``num_banks`` -> derive it from the real cache
@@ -146,7 +143,7 @@ def build_interstellar_tiler(
     return TilerContext(
         arch=architecture,
         schedule=schedule,
-        dram_bandwidth=dram_bw,
+        dram_bandwidth=dram_bandwidth,
         double_buffered_accum_buffer=double_buffered_accum_buffer,
         double_buffered_l2=double_buffered_l2,
     )
