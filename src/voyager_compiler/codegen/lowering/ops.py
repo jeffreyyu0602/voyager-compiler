@@ -166,10 +166,9 @@ def copy_tile(
     # numel: a halo tile can be *larger* than a small whole input (so numel
     # mis-picks), but only the buffer differs from the tile shape.  ``src`` is
     # the buffer => a load (dst tile <- src block); else a store / whole-tile
-    # copy (dst block <- src tile).  When both equal ``sizes`` (a whole,
-    # untiled operand) it falls to the store branch, which copies the whole
-    # tile.
-    buf = src if tuple(src.shape) != tuple(sizes) else dst
+    # copy (dst block <- src tile).  A transposed copy is always a load, so an
+    # untiled weight (``src.shape == sizes``) must not pick the store branch.
+    buf = src if transposed or tuple(src.shape) != tuple(sizes) else dst
     rank = buf.dim()
     full = _full_indices(rank, indices, dims, static_indices)
     # A halo with padding starts at ``full[d]*stride - pad[d]`` (default pad 0).

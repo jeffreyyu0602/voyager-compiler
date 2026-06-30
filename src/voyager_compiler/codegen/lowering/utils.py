@@ -39,6 +39,7 @@ class _InputSpec:
       ``strides``      step between tiles (``None`` => == ``tile_sizes``).
       ``pad``          per-dim low padding (start -= pad).
       ``pad_value``    out-of-bounds fill for a padded load.
+      ``transposed``   load swaps the tile's last two dims (a fused weight ᵀ).
     """
 
     tile_sizes: Tuple[int, ...]
@@ -47,6 +48,7 @@ class _InputSpec:
     strides: Optional[Tuple[int, ...]] = None
     pad: Optional[Tuple[int, ...]] = None
     pad_value: Optional[float] = None
+    transposed: bool = False
 
 
 @dataclass

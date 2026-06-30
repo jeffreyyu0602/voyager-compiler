@@ -205,14 +205,33 @@ class PipelinedKernel(torch.nn.Module):
         load semaphore ``sem``.
         """
         dims, indices = self._block_address(spec, grid_idx)
+        sizes, strides = spec.tile_sizes, spec.strides
+        if spec.transposed:
+            # The spec is in matmul (Kᵀ) order but the DRAM buffer is its
+            # (N, K) transpose; swap the fetch's last two dims so the DMA
+            # slices it in its own order (``copy_tile`` ``.mT``s it back).
+            def _swap(seq):
+                s = list(seq)
+                s[-2], s[-1] = s[-1], s[-2]
+                return s
+
+            sizes = _swap(sizes)
+            if strides is not None:
+                strides = _swap(strides)
+            if dims is None:
+                indices = _swap(indices)
+            else:
+                a, b = len(spec.index_map) - 2, len(spec.index_map) - 1
+                dims = [b if d == a else a if d == b else d for d in dims]
         voyager.async_copy(
             src,
             dst,
             indices,
-            spec.tile_sizes,
+            sizes,
             sem,
             dims=dims,
-            strides=spec.strides,
+            strides=strides,
+            transposed=spec.transposed,
             pad=spec.pad,
             pad_value=spec.pad_value,
         )
@@ -1115,6 +1134,35 @@ def build_conv2d(
     return gm
 
 
+def _detect_weight_transpose(node: torch.fx.Node):
+    """Resolve a GEMM weight operand through a last-two-dim transpose / permute
+    to the un-transposed external operand it relayouts.
+
+    Returns ``(node, transposed)``.  An attention ``Q @ Kᵀ`` fuses
+    ``K.transpose(-2, -1)`` onto the weight; it is peeled to ``(K, True)``.  The
+    weight spec keeps the matmul (Kᵀ) layout, but the DRAM buffer is K's own
+    ``(N, K)`` storage, so ``_load_block`` swaps the fetch to read it and
+    ``copy_tile`` ``.mT``s the loaded tile into the bank.  Only a transpose of
+    an external operand (placeholder) is peeled; anything else is returned
+    unchanged as ``(operand, False)``.
+    """
+    if node.op != "call_function":
+        return node, False
+    src = node.args[0]
+    if not isinstance(src, torch.fx.Node) or src.op != "placeholder":
+        return node, False
+    ndim = src.value.ndim
+    if node.target is torch.ops.aten.transpose.int:
+        if {a % ndim for a in node.args[1:]} == {ndim - 2, ndim - 1}:
+            return src, True
+    elif node.target is torch.ops.aten.permute.default:
+        swapped = list(range(ndim))
+        swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
+        if list(node.args[1]) == swapped:
+            return src, True
+    return node, False
+
+
 def build_gemm(
     node, *, num_banks: int = 2, accumulate_fp32: bool = False, tiler=None
 ):
@@ -1145,8 +1193,13 @@ def build_gemm(
     if not (is_linear(anchor) or is_matmul(anchor)):
         return None
 
+    # A fused weight transpose (attention ``Q @ Kᵀ``): load the un-transposed
+    # external operand and transpose the tile in the DMA (the weight spec's
+    # ``transposed``); the spec itself stays in the matmul (Kᵀ) layout.
+    weight_node, transposed = _detect_weight_transpose(anchor.args[1])
+
     act = anchor.args[0].value.clone()
-    weight = anchor.args[1].value.clone()
+    weight = weight_node.value.clone()
     out = anchor.value  # the GEMM output (drives the M/N/K grid)
     if not isinstance(out, torch.Tensor) or act.ndim < 2 or weight.ndim < 2:
         return None
@@ -1173,13 +1226,13 @@ def build_gemm(
         K // tk,
     )
 
-    # Weight storage layout: C-major ``(K, N)`` iff ``weight_ck``, else K-major
+    # Weight storage layout: C-major ``(K, N)`` iff ``ck``, else K-major
     # ``(N, K)``.  matmul's weight is naturally C-major and linear's K-major;
-    # ``meta["transposed"]`` flips it (``weight_ck = is_matmul XOR
-    # transposed``).  ``_proj`` orders an (N, K) pair into that layout; weight
-    # and scale share it.
-    weight_ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))
-    _proj = lambda n, k: (k, n) if weight_ck else (n, k)
+    # ``meta["transposed"]`` flips it (``ck = is_matmul XOR transposed``).
+    # ``_proj`` orders an (N, K) pair into that layout; weight and scale share
+    # it.
+    ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))
+    _proj = lambda n, k: (k, n) if ck else (n, k)
 
     def _batch(shape):
         """An operand's leading-batch ``(tiles, index_map, is_broadcast)``
@@ -1211,6 +1264,7 @@ def build_gemm(
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
+    weight_spec.transposed = transposed
     bias_spec = _InputSpec((tn,), (gn,), (False,))
     # The output(s) tile onto the M/N grid dims (K reduction ``gk`` dropped); a
     # fused op may produce several (``quantize_mx``).
@@ -1234,7 +1288,7 @@ def build_gemm(
     src = lambda n: n.meta.get("source_node", n)
     node_to_spec = {
         src(anchor.args[0]): (act, act_spec),
-        src(anchor.args[1]): (weight, weight_spec),
+        src(weight_node): (weight, weight_spec),
     }
 
     # Bias [N] tiles along N (grid dim ``gn``); folded once on the k==0 step.
@@ -1283,7 +1337,7 @@ def build_gemm(
     in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
 
     act_idx = order[src(anchor.args[0])]
-    weight_idx = order[src(anchor.args[1])]
+    weight_idx = order[src(weight_node)]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
     fused_idx = [order[s] for s in info.in_sources] if info is not None else []
