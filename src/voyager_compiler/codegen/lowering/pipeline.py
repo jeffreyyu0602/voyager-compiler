@@ -76,12 +76,10 @@ from voyager_compiler.codegen.lowering.utils import (
     voyager,
 )
 from voyager_compiler.codegen.lowering.ops import MemoryLevel, oracle_disabled
-from voyager_compiler.codegen.lowering.tiling import (
-    _operand_placeholders,
-    get_tiling,
-)
+from voyager_compiler.codegen.lowering.tiling import get_tiling
 from voyager_compiler.codegen.shape_prop import ShapeProp
 from voyager_compiler.codegen.mapping_utils import (
+    ancestors,
     is_conv2d,
     is_gemm_op,
     is_linear,
@@ -712,11 +710,11 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     # tile ``_InputSpec`` (``None`` for a codebook / scalar passed whole, or an
     # untiled op).  The anchor's own operands (act / weight / scales) are
     # handled by the builder, not as fused post-op operands — exclude them here.
-    anchor_operands = set(_operand_placeholders(anchor))
+    anchor_prelude = ancestors(anchor)
     fused_ops = []
     input_nodes, input_values, in_specs = [], [], []
     for sn in submod.graph.nodes:
-        if sn is anchor or sn.op != "call_function":
+        if sn is anchor or sn.op != "call_function" or sn in anchor_prelude:
             continue
         fused_ops.append(sn)
         codebooks = quant_table_arg_nodes(sn)
@@ -724,7 +722,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
             if (
                 inp.op != "placeholder"
                 or inp in input_nodes
-                or inp in anchor_operands
+                or inp in anchor_prelude
             ):
                 continue
             input_nodes.append(inp)

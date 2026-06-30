@@ -24,6 +24,7 @@ __all__ = [
     "pad_vector_op_dimensions",
     "pad_vit_embeddings_output",
     "inline_autocast_modules",
+    "fold_constant_generators",
     "rename_nodes_with_param_names",
     "replace_conv2d_with_im2col",
     "replace_interpolate",

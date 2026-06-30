@@ -37,7 +37,6 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen import (
-    inline_autocast_modules,
     replace_rmsnorm_with_layer_norm,
     remove_softmax_dtype_cast,
 )
@@ -602,7 +601,6 @@ if __name__ == "__main__":
             model_decode=gm,
         )[0]
 
-        inline_autocast_modules(gm)
         remove_softmax_dtype_cast(gm)
 
         hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]

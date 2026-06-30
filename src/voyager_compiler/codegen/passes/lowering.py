@@ -39,6 +39,7 @@ __all__ = [
     "replace_conv2d_with_im2col",
     "extract_input_preprocessor",
     "inline_autocast_modules",
+    "fold_constant_generators",
     "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
     "split_multi_head_attention",
@@ -891,35 +892,89 @@ def extract_input_preprocessor(model: GraphModule):
 
 
 def inline_autocast_modules(model: torch.fx.GraphModule):
-    """
-    Handle autocast HOP by replacing the autocast node with its wrapped module
-    and directly calling the arguments.
+    """Inline wrap HOPs (``autocast`` / ``set_grad_enabled``) by replacing the
+    wrap node with a direct ``call_module`` to its wrapped submodule.
+
+    torch.export emits ``WrapWithAutocast`` for ``torch.autocast`` regions and
+    ``wrap_with_set_grad_enabled`` for ``@torch.no_grad`` regions (e.g. Llama's
+    ``LlamaRotaryEmbedding.forward``).  Both wrap a submodule that the rest of
+    the lowering can only handle once flattened into the parent graph.  The
+    wrapped function is at ``args[fn_idx]`` and its operands follow it.
     """
     graph = model.graph
     named_modules = dict(model.named_modules())
+    set_grad = torch.ops.higher_order.wrap_with_set_grad_enabled
 
     for node in list(graph.nodes):
         if isinstance(
             node.target, torch._higher_order_ops.wrap.WrapWithAutocast
         ):
-            wrapped_func = node.args[4]
-            mod = named_modules.get(wrapped_func.target, None)
+            fn_idx = 4
+        elif node.target is set_grad:
+            fn_idx = 1
+        else:
+            continue
 
-            if mod is None:
-                continue
+        wrapped_func = node.args[fn_idx]
+        mod = named_modules.get(wrapped_func.target, None)
+        if mod is None:
+            continue
 
-            with graph.inserting_before(node):
-                new_node = graph.call_module(
-                    wrapped_func.target, tuple(node.args[5:])
-                )
-            node.replace_all_uses_with(new_node)
-            graph.erase_node(node)
+        with graph.inserting_before(node):
+            new_node = graph.call_module(
+                wrapped_func.target, tuple(node.args[fn_idx + 1 :])
+            )
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
 
-            replace_node_with_graph_module(model, new_node, mod)
+        replace_node_with_graph_module(model, new_node, mod)
 
     graph.eliminate_dead_code()
     model.graph.lint()
     model.compile()
+
+
+def fold_constant_generators(model: GraphModule):
+    """Constant-fold ``call_function`` nodes whose inputs are all constants:
+    input-free generators (``arange`` / ``zeros`` / …) and, transitively, any op
+    fed only by already-folded constants — so a whole constant subgraph (e.g.
+    RoPE's ``arange -> … -> cos/sin`` position setup) collapses to one
+    ``get_attr`` buffer and is not lowered or scheduled as a compute op.
+
+    Walking in program order, a node is constant iff every FX-Node input is a
+    ``get_attr`` (an initial buffer or one this pass just created); it is then
+    evaluated with the real buffer values and replaced by a ``get_attr`` to the
+    result.  Orphaned constant ancestors are dropped by dead-code elimination.
+    """
+    graph = model.graph
+    constants = {n for n in graph.nodes if n.op == "get_attr"}
+
+    def resolve(n: Node):
+        return fetch_attr(model, n.target)
+
+    for node in list(graph.nodes):
+        if node.op != "call_function" or any(
+            inp not in constants for inp in node.all_input_nodes
+        ):
+            continue
+        if not isinstance(getattr(node, "value", None), torch.Tensor):
+            continue
+        const = node.target(
+            *map_arg(node.args, resolve), **map_arg(node.kwargs, resolve)
+        )
+        with graph.inserting_before(node):
+            attr = create_getattr_from_value(
+                model, graph, "folded_const", const
+            )
+        attr.meta["dtype"] = node.meta.get("dtype")
+        set_node_value(attr, const)
+        node.replace_all_uses_with(attr)
+        graph.erase_node(node)
+        constants.add(attr)
+
+    graph.eliminate_dead_code()
+    graph.lint()
+    model.recompile()
 
 
 def remove_zero_attention_mask(model: GraphModule, example_inputs):
@@ -947,9 +1002,7 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
     removed = 0
     for mask_node, value in masks.items():
         # Guard: only drop the add when the mask is genuinely all zero.
-        if not isinstance(value, torch.Tensor) or not bool(
-            (value == 0).all()
-        ):
+        if not isinstance(value, torch.Tensor) or not bool((value == 0).all()):
             continue
         for add_node in list(mask_node.users):
             if add_node.target != torch.ops.aten.add.Tensor:

@@ -18,6 +18,7 @@ import torch
 from torch import fx
 
 from .mapping_utils import (
+    ancestors,
     is_elementwise_op,
     is_nop,
     is_reshape_op,
@@ -184,7 +185,7 @@ class IterationSpaceNormalizer:
         else:
             iteration_shape = anchor.shape
             anchor_inputs = {
-                n for n in self._ancestors(anchor) if n.op == "placeholder"
+                n for n in ancestors(anchor) if n.op == "placeholder"
             }
             self._validate_anchor_stream(
                 anchor, output.map_target, iteration_shape
@@ -715,7 +716,7 @@ class IterationSpaceNormalizer:
     ) -> None:
         # Shape-nops to keep: those building anchor operands (the anchor
         # prelude) and the trailing output relayout kept inside the fused op.
-        keep = self._ancestors(anchor) | set(output.output_relayout)
+        keep = ancestors(anchor) | set(output.output_relayout)
         removable = [
             node
             for node in child.graph.nodes
@@ -969,19 +970,6 @@ class IterationSpaceNormalizer:
                 )
             bindings[placeholder.name] = ("kwarg", key)
         return bindings
-
-    def _ancestors(self, node: Optional[fx.Node]) -> set[fx.Node]:
-        if node is None:
-            return set()
-        result: set[fx.Node] = set()
-        stack = list(node.all_input_nodes)
-        while stack:
-            current = stack.pop()
-            if current in result:
-                continue
-            result.add(current)
-            stack.extend(current.all_input_nodes)
-        return result
 
     def _broadcast_map(
         self, value: torch.Tensor, output_shape: Shape, node: fx.Node

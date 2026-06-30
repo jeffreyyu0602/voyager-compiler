@@ -123,7 +123,8 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     # reduction reads its whole input to make a smaller output.  Use the
     # anchor's primary input (all_input_nodes[0]) to skip qmap / codebook
     # operands.
-    in_shape = _shape(anchor.all_input_nodes[0])
+    in_nodes = anchor.all_input_nodes
+    in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
     return OpInfo(
         node.name, "vector", math.ceil(ops / vec_unroll), {"ops": ops}

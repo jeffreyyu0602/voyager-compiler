@@ -400,6 +400,24 @@ QUANT_TABLE_PARAMS = {
 }
 
 
+def ancestors(node: Node) -> set:
+    """Every transitive input node of ``node`` (its operand prelude): for a
+    matmul ``Q @ Kᵀ`` this is the operand placeholders *and* the ``transpose``
+    that builds ``Kᵀ``, so a pre-anchor relayout is not mistaken for a fused
+    post-op."""
+    if node is None:
+        return set()
+    result = set()
+    stack = list(node.all_input_nodes)
+    while stack:
+        current = stack.pop()
+        if current in result:
+            continue
+        result.add(current)
+        stack.extend(current.all_input_nodes)
+    return result
+
+
 def quant_table_arg_nodes(node: Node) -> set:
     """Tensor args of ``node`` that are quantization lookup tables (qmaps /
     codebooks), identified by schema arg name so positions need not be

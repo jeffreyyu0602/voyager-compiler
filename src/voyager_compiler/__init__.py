@@ -138,6 +138,15 @@ def transform(
     # Break down complex operators (like MultiHeadAttention) into simpler
     # primitives and handle memory copy/concat operations.
 
+    # Fold constant generators (input-free ``arange`` / ``zeros`` / … from e.g.
+    # RoPE position setup) into ``get_attr`` buffers so they are not lowered or
+    # scheduled as compute ops.
+    fold_constant_generators(model)
+
+    # Flatten autocast / no_grad (set_grad_enabled) wrap HOPs that torch.export
+    # leaves around e.g. Llama's RoPE, so the wrap is not lowered as an op.
+    inline_autocast_modules(model)
+
     if not bufferize:
         split_multi_head_attention(model)
 
