@@ -147,15 +147,17 @@ def transform(
     # leaves around e.g. Llama's RoPE, so the wrap is not lowered as an op.
     inline_autocast_modules(model)
 
+    # Delete identity ops (full slices, unit expands, same-dtype casts, zero-prob
+    # dropout) that survive fusion — fewer nodes for every later pass and the
+    # bufferizer to process.
+    remove_prunable_ops(model)
+
     if not bufferize:
         split_multi_head_attention(model)
 
-    # TODO Disabled for large models. This will be removed in the future once
-    # we can handle stack/cat using DMA properly.
-    if len(model.graph.nodes) < 10000:
-        convert_expand_to_memory_copy(model)
-        convert_cat_and_stack_as_stack_on_dim0(model)
-        convert_cat_with_mismatched_shapes_to_stack(model)
+    convert_expand_to_memory_copy(model)
+    convert_cat_and_stack_as_stack_on_dim0(model)
+    convert_cat_with_mismatched_shapes_to_stack(model)
 
     fuse_quantize_dequantize_with_previous_op(model)
 
@@ -293,7 +295,7 @@ def compile(
         # meta['memory'] / meta['scratchpad'] that the proto emitter reads.
         plan_memory(
             model,
-            cache_size,
+            cache_size * 2 if double_buffered_l2 else cache_size,
             num_banks=num_banks,
             bank_width=bank_width,
             unroll_dims=unroll_dims,

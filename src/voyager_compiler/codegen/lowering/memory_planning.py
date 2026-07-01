@@ -390,6 +390,29 @@ def _plan_scratchpad(
     return int(total), {"buffers": len(items)}
 
 
+def _buf_desc(buf: "_Buf", bank_width) -> str:
+    """``name<shape x dtype>`` of the largest tile in a scratchpad buffer (the
+    one that set its size), for the ``[MEM_ALLOC_FAIL]`` diagnostic."""
+    m = max(buf.members, key=lambda x: _nbytes(x, bank_width))
+    v = _val(m)
+    dtype = m.meta.get("dtype") or (v.dtype if v is not None else "?")
+    shape = "x".join(str(d) for d in v.shape) if v is not None else "?"
+    return f"{m.name}<{shape}x{dtype}>"
+
+
+def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
+    """The scratchpad buffers simultaneously live at the busiest schedule step
+    and their summed size -- the concurrency that drives the peak.  Returns
+    ``(peak_bytes, [_Buf, ...] largest-first)``."""
+    peak_bytes, peak_live = 0, []
+    for t in sorted({b.def_t for b in bufs.values()}):
+        live = [b for b in bufs.values() if b.def_t <= t <= b.last_t]
+        total = sum(b.size for b in live)
+        if total > peak_bytes:
+            peak_bytes, peak_live = total, live
+    return peak_bytes, sorted(peak_live, key=lambda b: -b.size)
+
+
 # ---------------------------------------------------------------------------
 # Thread Segments across loop / module boundaries onto the actual tile sites
 # ---------------------------------------------------------------------------
@@ -573,8 +596,8 @@ def plan_memory(
 
     Writes ``meta['memory']`` (DRAM) and ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s, threading them onto loop-body tile sites; returns the pool
-    sizes.  Warns (consistent with the non-bufferized ``[MEM_ALLOC_FAIL]``) if
-    the scratchpad plan exceeds ``cache_size``.
+    sizes. Warns, listing the buffers live at the peak, if the scratchpad
+    plan exceeds ``cache_size``.
     """
     unroll_dim = unroll_dims[1] if unroll_dims else None
 
@@ -596,10 +619,23 @@ def plan_memory(
     _check_invariants(model, bufs)
 
     if cache_size is not None and scratchpad_bytes > cache_size:
+        peak_bytes, live = _peak_live_buffers(bufs)
+        shown = live[:12]
+        detail = "\n".join(
+            f"    {_buf_desc(b, bank_width)}  {b.size} B  "
+            f"[def={b.def_t} last={b.last_t}]"
+            for b in shown
+        )
+        if len(live) > len(shown):
+            detail += f"\n    ... (+{len(live) - len(shown)} more)"
         logger.warning(
-            "[MEM_ALLOC_FAIL] scratchpad plan needs %d bytes > cache_size %d",
+            "[plan_memory] scratchpad plan needs %d bytes > cache_size %d; "
+            "peak concurrency %d B across %d live scratchpad buffers:\n%s",
             scratchpad_bytes,
             cache_size,
+            peak_bytes,
+            len(live),
+            detail,
         )
 
     logger.info(

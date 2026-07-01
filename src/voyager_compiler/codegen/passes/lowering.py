@@ -17,7 +17,12 @@ from ..mapping import (
     _nodes_sequential,
     _create_and_insert_subgraph,
 )
-from ..mapping_utils import is_elementwise_op, is_gemm_op, is_nop
+from ..mapping_utils import (
+    is_elementwise_op,
+    is_gemm_op,
+    is_nop,
+    is_prunable_op,
+)
 from ...pt2e_utils import (
     WrapperModule,
     get_aten_graph_module,
@@ -40,10 +45,31 @@ __all__ = [
     "extract_input_preprocessor",
     "inline_autocast_modules",
     "fold_constant_generators",
+    "remove_prunable_ops",
     "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
     "split_multi_head_attention",
 ]
+
+
+def remove_prunable_ops(model: GraphModule) -> None:
+    """Delete identity ops — a full ``slice``, a unit ``expand``, a same-dtype
+    ``to``, a zero-prob ``dropout`` (see ``is_prunable_op``) — by rewiring each
+    to its input.  They survive fusion (they have users, so dead-code
+    elimination skips them); dropping them shrinks the graph every later pass
+    and the bufferizer must walk.
+    """
+    graph = model.graph
+    removed = 0
+    for n in list(graph.nodes):
+        if is_prunable_op(n):
+            n.replace_all_uses_with(n.all_input_nodes[0])
+            graph.erase_node(n)
+            removed += 1
+    if removed:
+        graph.lint()
+        model.recompile()
+    logger.debug("[transform] removed %d prunable ops", removed)
 
 
 def _decompose_bmm(model: GraphModule, node: Node):

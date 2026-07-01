@@ -21,6 +21,7 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
+from ...mapping_utils import is_nop
 from ..codegen import _loop_extents, _norm_extent
 from .classify import classify
 from .cost import _val, op_info, tile_bytes
@@ -93,6 +94,8 @@ def _root(node, bind: Dict[Node, Node]):
             and node.target is operator.getitem
             and isinstance(_val(node), torch.Tensor)
         ):
+            node = node.args[0]
+        elif node.op == "call_function" and is_nop(node):
             node = node.args[0]
         else:
             break

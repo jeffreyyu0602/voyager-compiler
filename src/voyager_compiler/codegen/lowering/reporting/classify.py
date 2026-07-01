@@ -14,7 +14,12 @@ from torch.fx import Node
 
 from ..bufferization import _NON_COMPUTE, _produces_tensor
 from ..codegen import COND, WHILE_LOOP
-from ...mapping_utils import is_nop
+from ...mapping_utils import (
+    is_indexing_or_concatenation_op,
+    is_memory_op,
+    is_nop,
+    is_reshape_op,
+)
 
 ASYNC_COPY = torch.ops.voyager.async_copy.default
 ASYNC_WAIT = torch.ops.voyager.async_wait.default
@@ -41,7 +46,16 @@ def classify(node: Node) -> str:
     if t is COPY_TILE:
         return "copy_tile"
     # A bare tile-compute op (e.g. the no-accumulate ``aten.linear`` in a
-    # reduction loop's first step): produces a tensor and is not control / NOP.
-    if _produces_tensor(node) and t not in _NON_COMPUTE and not is_nop(node):
+    # reduction loop's first step): produces a tensor and is not control / NOP
+    # / data movement (memory / reshape / indexing ops are kept bare and cost
+    # no systolic time).
+    if (
+        _produces_tensor(node)
+        and t not in _NON_COMPUTE
+        and not is_nop(node)
+        and not is_memory_op(node)
+        and not is_reshape_op(node)
+        and not is_indexing_or_concatenation_op(node)
+    ):
         return "compute"
     return "control"

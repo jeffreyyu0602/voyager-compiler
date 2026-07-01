@@ -383,6 +383,9 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
 
 aten = torch.ops.aten
 
+# Sentinel ``aten.slice`` uses for ``end`` to mean "to the end of the dim".
+INT64_MAX = torch.iinfo(torch.int64).max
+
 
 # Quantization lookup-table args (qmaps and codebooks) across the
 # quantized_ops quantize/dequantize/quantize_mx family. They are indexed by
@@ -657,44 +660,29 @@ def is_prunable_op(node: Node) -> bool:
     """Operations that can be safely deleted from fx.Graph."""
     # A slice from 0 to the end of the input tensor
     if node.target == torch.ops.aten.slice.Tensor:
-        default_args = [0, None, None, 1]
-        dim, start, end, step = (
-            list(node.args[1:]) + default_args[len(node.args) - 1 :]
-        )
+        dim = get_arg_value(node, 1, "dim", 0)
+        start = get_arg_value(node, 2, "start")
+        end = get_arg_value(node, 3, "end")
+        step = get_arg_value(node, 4, "step", 1)
         if start is not None and start != 0 or step != 1:
             return False
         if end is not None and hasattr(node.args[0], "shape"):
             return end >= node.args[0].shape[dim]
-        return (start is None and end is None) or end == 0x7FFFFFFFFFFFFFFF
+        return (start is None and end is None) or end == INT64_MAX
 
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])
 
-    # A same-dtype ``to.dtype`` is a pure pass-through, so it can be deleted
-    # outright; a real dtype conversion must stay a cast.
+    # Dropout with zero probability is the identity.
+    if node.target == torch.ops.aten.dropout.default:
+        return get_arg_value(node, 1, "p") == 0.0
+
+    # A same-dtype ``to.dtype`` is a pure pass-through.
     if node.target == torch.ops.aten.to.dtype:
-        input_node = node.args[0]
-        src_dtype = getattr(input_node, "dtype", None)
-        if src_dtype is None:
-            value = getattr(input_node, "value", None)
-            if not isinstance(value, torch.Tensor):
-                value = getattr(input_node, "meta", {}).get("val")
-            if isinstance(value, torch.Tensor):
-                src_dtype = value.dtype
-            else:
-                return False
-
-        dst_dtype = get_arg_value(node, 1, "dtype")
-
-        # Normalize both to a bare dtype name ("float32") so a ``torch.dtype``
-        # (from the operand's value) compares equal to the stringified ``dst`` /
-        # a string logical dtype ("nf4_6").
-        if isinstance(src_dtype, torch.dtype):
-            src_dtype = str(src_dtype).split(".")[1]
-        if isinstance(dst_dtype, torch.dtype):
-            dst_dtype = str(dst_dtype).split(".")[1]
-
-        return src_dtype == dst_dtype
+        dtype = get_arg_value(node, 1, "dtype")
+        inp = node.args[0]
+        val = getattr(inp, "value", inp.meta["val"])
+        return isinstance(val, torch.Tensor) and dtype == val.dtype
 
     return False
 
@@ -715,11 +703,7 @@ def is_nop(node: Node) -> bool:
 
     return node.target in [
         torch.ops.aten.as_strided.default,
-        torch.ops.aten.clone.default,
         torch.ops.aten.contiguous.default,
-        torch.ops.aten.copy_.default,
-        torch.ops.aten.detach_.default,
-        torch.ops.aten.dropout.default,
         torch.ops.aten.flatten.using_ints,
         torch.ops.aten.lift_fresh_copy.default,
         torch.ops.aten.reshape.default,
@@ -764,3 +748,24 @@ def is_addressing_op(node: Node) -> bool:
         return len(node.args) == 1 or node.args[1] == 0
 
     return False
+
+
+def is_memory_op(node: Node) -> bool:
+    """
+    The following operators requires explicit data movement and thus require
+    additional handling. Note that some operators are storage-preserving
+    in PyTorch. However, the current compiler hasn't implemented handling for
+    storage-preserving operators that change the number of elements in the
+    tensor. For example, ``torch.ops.aten.expand.default`` may increase the
+    number of elements in the tensor. We will add support in the future.
+    """
+    if node.op != "call_function" or is_nop(node):
+        return False
+
+    return node.target in [
+        torch.ops.aten.clone.default,
+        torch.ops.aten.embedding.default,
+        torch.ops.aten.expand.default,
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.to.dtype,
+    ]

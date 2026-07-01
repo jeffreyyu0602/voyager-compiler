@@ -56,15 +56,57 @@ logger = logging.getLogger(__name__)
 DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
 
+def _copy_graph_module(gm: GraphModule) -> GraphModule:
+    """An independent-graph copy of ``gm`` (recursively for child
+    GraphModules) that preserves each node's ``meta`` and ``.value`` and shares
+    the constant params / buffers — WITHOUT recompiling ``forward``.
+
+    The body stays runnable: ``node_copy`` preserves node names, so the shared
+    (already-compiled) ``forward`` works on the copied graph — we skip only the
+    *recompile*, which ``deepcopy`` and the ``.graph`` setter both force.  But a
+    shared body *object* breaks per-site meta (e.g. scratchpad Segments stamped
+    on its nodes), so each splice needs its own node objects; this gives them
+    cheaply.
+
+    ``object.__new__`` (not ``gm.__class__.__new__``) is required: fx's
+    ``GraphModule.__new__`` mints a fresh ``forward``-less subclass each call,
+    whereas we want to keep ``gm``'s class (which carries the compiled
+    ``forward``).
+    """
+    new = object.__new__(gm.__class__)
+    new.__dict__ = dict(gm.__dict__)  # share params / buffers / forward code
+    new._modules = {
+        k: _copy_graph_module(v) if isinstance(v, GraphModule) else v
+        for k, v in gm._modules.items()
+    }
+    new_graph = Graph()
+    remap: Dict[Node, Node] = {}
+    for n in gm.graph.nodes:
+        c = new_graph.node_copy(n, lambda x: remap[x])
+        remap[n] = c
+        if (val := getattr(n, "value", None)) is not None:
+            c.value, c.shape = val, getattr(n, "shape", None)
+    new._graph = new_graph
+    return new
+
+
 def replace_node_with_graph_module(
     model: GraphModule,
     source: Node,
     replacement: GraphModule,
     value_remap=None,
+    propagate: bool = True,
 ) -> List[Node]:
     """Copy ``replacement`` (an exported subgraph) into ``model`` just before
     ``source``, mapping its placeholders to ``source.all_input_nodes``; return
     the output value node(s).
+
+    ``propagate`` re-runs ``propagate_shape`` on each copied node to recover its
+    shape / value.  Pass ``False`` when ``replacement`` is already
+    shape-propagated and its placeholder shapes match this site (e.g. a cached
+    bufferized nest): the precomputed value is carried over instead, which
+    avoids re-executing the whole tiled ``while_loop`` per splice and the
+    O(N^2) ``named_modules`` rescans ``propagate_shape`` does each call.
     """
     graph = model.graph
     if value_remap is None:
@@ -91,9 +133,11 @@ def replace_node_with_graph_module(
             if n.op == "get_attr":
                 attr = fetch_attr(replacement, n.target)
                 if isinstance(attr, GraphModule):
-                    # cond / body subgraph of a while_loop: register as a submodule
+                    # cond / body subgraph of a while_loop: register an
+                    # independent copy (shared body objects would collide when
+                    # later passes stamp per-site meta on their nodes).
                     name = get_new_node_name_with_prefix(n.target)(model)
-                    setattr(model, name, attr)
+                    setattr(model, name, _copy_graph_module(attr))
                     value_remap[n] = graph.create_node("get_attr", name)
                 else:
                     value_remap[n] = create_getattr_from_value(
@@ -101,7 +145,8 @@ def replace_node_with_graph_module(
                     )
             else:
                 value_remap[n] = graph.node_copy(n, lambda n: value_remap[n])
-            propagate_shape(value_remap[n], model)
+            if propagate:
+                propagate_shape(value_remap[n], model)
 
     return [value_remap[n] for n in output]
 
@@ -1484,9 +1529,7 @@ def run_memory_mapping(
         # is nothing to propagate -- just skip allocation in that case.
         if is_nop(node):
             if "memory" in node.args[0].meta:
-                node.meta["memory"] = copy.deepcopy(
-                    node.args[0].meta["memory"]
-                )
+                node.meta["memory"] = copy.deepcopy(node.args[0].meta["memory"])
             skip_allocation = True
 
         if node.target == operator.getitem:

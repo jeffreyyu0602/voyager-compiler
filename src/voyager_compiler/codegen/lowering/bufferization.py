@@ -11,6 +11,7 @@ post-op tail in the kernel.
 Runs after operator fusion and before memory allocation.
 """
 
+import logging
 import math
 import operator
 from typing import Dict, Optional
@@ -26,10 +27,16 @@ from ..mapping_utils import (
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
+    is_indexing_or_concatenation_op,
+    is_memory_op,
     is_nop,
     is_pooling,
+    is_reshape_op,
+    is_shape_changing_nop,
 )
 from .ops import MemoryLevel, oracle_disabled
+
+logger = logging.getLogger(__name__)
 
 voyager = torch.ops.voyager
 
@@ -163,17 +170,19 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
     _annotate_and_validate(gm, codebooks, parent_hop=None, parent_ctx=None)
 
 
-def _is_compute(node: Node, codebooks: set) -> bool:
+def _is_compute(node: Node) -> bool:
     """A tile-compute op subject to the destination-passing rule: it yields a
-    tensor and is not a codebook, a NOP, or a control / DMA / store / buffer
-    op.  A fused ``call_module`` is one L1 compute op."""
-    if node in codebooks or not _produces_tensor(node):
+    tensor and is not a NOP / addressing op.  A fused ``call_module`` is one L1
+    compute op."""
+    if not _produces_tensor(node):
         return False
     if node.op == "call_module":
         return True
     if node.op != "call_function":
         return False
-    return node.target not in _NON_COMPUTE and not is_nop(node)
+    if is_nop(node) or is_indexing_or_concatenation_op(node):
+        return False
+    return node.target not in _NON_COMPUTE
 
 
 def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
@@ -259,7 +268,9 @@ def _annotate_and_validate(
                 branch = _subgraph(gm, graph_arg.target)
                 if branch is not None:
                     _annotate_and_validate(branch, codebooks, node, ctx)
-        elif _is_compute(node, codebooks):
+        elif is_memory_op(node) or is_reshape_op(node):
+            node.meta["space"] = "DRAM"
+        elif _is_compute(node):
             if not _stored(node, ctx):
                 raise Exception(
                     f"destination-passing violation: result of {node.op} "
@@ -425,6 +436,118 @@ def propagate_logical_dtypes(
 
 
 # ---------------------------------------------------------------------------
+# Built-graph cache
+#
+# A built nest is a pure function of the node's *shapes* / structure — the
+# weight / scale / codebook operands are placeholders wired at the splice site,
+# never baked in (``replace_node_with_graph_module`` maps placeholders ->
+# ``all_input_nodes``).  So identical layers (every Llama block is the same)
+# build to identical nests; caching by a structural + shape/dtype signature
+# skips the dominant ``export`` cost for every repeat.
+#
+# The signature is the canonical-form equivalent of an fx ``SubgraphMatcher``
+# match (op / target / literals / topology) plus the shape / dtype / transposed
+# metadata the matcher omits but the builder needs.
+# ---------------------------------------------------------------------------
+
+
+def _hashable(x):
+    """Recursively coerce tiling / dtype metadata to a hashable form."""
+    if isinstance(x, (list, tuple)):
+        return tuple(_hashable(v) for v in x)
+    if isinstance(x, dict):
+        return tuple(sorted((k, _hashable(v)) for k, v in x.items()))
+    return x
+
+
+def _node_value(n):
+    """``(shape, dtype)`` of the tensor ``n`` produced — nested for a tuple
+    output, ``None`` for a non-tensor value.  Reads ``.value`` (else the
+    exported ``meta['val']``), stamped during shape-prop / operator fusion."""
+    val = getattr(n, "value", n.meta.get("val"))
+    if isinstance(val, torch.Tensor):
+        return (tuple(val.shape), str(val.dtype))
+    if isinstance(val, (list, tuple)):
+        return tuple((tuple(v.shape), str(v.dtype)) for v in val)
+    return None
+
+
+def _operand_key(n):
+    """An argument node's *interface*: shape + physical / logical dtype.  Its
+    own ``transposed`` / ``l2_tiling`` (how it is built) belong to where the
+    node is keyed in its own right, not to each use of it as an operand."""
+    return (_node_value(n), _hashable(n.meta.get("dtype")))
+
+
+def _meta_key(n):
+    """A node's own shape / dtype / build-affecting metadata signature: the
+    operand interface plus the metadata that drives *this* node's build."""
+    return (
+        _operand_key(n),
+        _hashable(n.meta.get("transposed")),  # layout flip
+        _hashable(n.meta.get("l2_tiling")),  # explicit tile counts
+    )
+
+
+def _node_to_hashable(node, index_of=None):
+    """Turn one FX node into a hashable signature: op, target, its own
+    shape/dtype/meta, and its args/kwargs.  Each Node argument contributes its
+    ``_meta_key`` (shape/dtype/meta must match) plus its position in the owning
+    graph (``index_of``) to pin the wiring; literals contribute type + value
+    (mirroring ``SubgraphMatcher._match_literals``)."""
+
+    def canonicalize(a):
+        if isinstance(a, Node):
+            ref = index_of.get(a) if index_of is not None else None
+            return ("node", ref, _operand_key(a))
+        if isinstance(a, (list, tuple)):
+            return ("seq", tuple(canonicalize(x) for x in a))
+        return ("lit", type(a).__name__, a)
+
+    # A placeholder / get_attr ``target`` is a per-instance *name* (unique per
+    # layer), so it must not enter the key: placeholders are wildcards and
+    # constants match by shape/dtype (their ``_meta_key``), as in
+    # ``SubgraphMatcher``.  Only the call ops contribute their target.
+    target = (
+        None if node.op in ("placeholder", "get_attr") else str(node.target)
+    )
+    return (
+        node.op,
+        target,
+        _meta_key(node),
+        tuple(canonicalize(a) for a in node.args),
+        tuple(sorted((k, canonicalize(v)) for k, v in node.kwargs.items())),
+    )
+
+
+def _gm_to_hashable(gm):
+    """Hashable signature of a GraphModule: every node's ``_node_to_hashable``
+    in topological order, with Node args referenced by index to pin the
+    wiring."""
+    index_of = {n: i for i, n in enumerate(gm.graph.nodes)}
+    return tuple(_node_to_hashable(n, index_of) for n in gm.graph.nodes)
+
+
+def _bufferize_key(node):
+    """A structural + shape/dtype signature for ``node``'s bufferized nest:
+    two nodes with the same key build to the same nest (only the operand
+    *tensors* wired at the splice site differ).  ``None`` (uncacheable) for a
+    non-tensor bare output or any value that fails to hash."""
+    try:
+        submod = node.meta.get("submodule")
+        if isinstance(submod, GraphModule):
+            key = ("fused", _gm_to_hashable(submod))
+        elif _node_value(node) is None:
+            return None
+        else:
+            key = ("bare", _node_to_hashable(node))
+        hash(key)  # surface any unhashable literal as uncacheable
+        return key
+    except TypeError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Main pass
 # ---------------------------------------------------------------------------
 
@@ -455,6 +578,9 @@ def bufferize_graph(
     # ``pipelined`` (the tiler's double-buffering decision) selects the input
     # software-pipeline depth: 2 banks (double buffer) vs 1 (single buffer).
     num_banks = 2 if pipelined else 1
+    # Identical layers build identical nests; cache by structural signature so
+    # ``export`` runs once per distinct shape, not once per node.
+    build_cache = {}
 
     for node in list(graph.nodes):
         # Dispatch is driven by an *anchor* op: for a fused ``call_module`` it is
@@ -465,44 +591,77 @@ def bufferize_graph(
         # ``call_function`` it is the node itself.
         if node.op not in ("call_module", "call_function"):
             continue
+
+        # A shape-preserving nop is a pure pass-through — rewire its users to
+        # its input
+        if is_nop(node) and not is_shape_changing_nop(node):
+            inp = node.all_input_nodes[0]
+            node.replace_all_uses_with(inp)
+            update_submod_user_meta(model, inp)
+            graph.erase_node(node)
+            continue
+
+        if (
+            node.target == operator.getitem
+            or is_nop(node)
+            or is_memory_op(node)
+            or is_indexing_or_concatenation_op(node)
+            or is_reshape_op(node)
+        ):
+            continue
+
         anchor = get_anchor_node(node)
 
-        # A fused submodule with no matrix/pool anchor runs whole through the
-        # pointwise builder; a bare op only when it is elementwise / a
-        # kept-reduction op (pool only when bare — a fused pool is pointwise).
-        if is_conv2d(anchor):
-            sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
-        elif is_gemm_op(anchor):
-            sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
-        elif is_pooling(anchor):
-            sub_gm = build_pool(node, num_banks=num_banks)
-        elif (
-            is_elementwise_op(anchor)
-            or anchor.target in _REDUCTION_POINTWISE_OPS
-            or anchor.target in _RELAYOUT_POINTWISE_OPS
-        ):
-            sub_gm = build_pointwise(node, num_banks=num_banks)
+        key = _bufferize_key(node)
+        cached = build_cache.get(key) if key is not None else None
+        logger.debug(
+            "[bufferize] %s anchor=%s %s",
+            node.name,
+            anchor.target,
+            "HIT" if cached is not None else "MISS",
+        )
+        if cached is not None:
+            sub_gm, n_out = cached
         else:
-            sub_gm = None
+            # A fused submodule with no matrix/pool anchor runs whole through the
+            # pointwise builder; a bare op only when it is elementwise / a
+            # kept-reduction op (pool only when bare — a fused pool is pointwise).
+            if is_conv2d(anchor):
+                sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
+            elif is_gemm_op(anchor):
+                sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
+            elif is_pooling(anchor):
+                sub_gm = build_pool(node, num_banks=num_banks)
+            elif (
+                is_elementwise_op(anchor)
+                or anchor.target in _REDUCTION_POINTWISE_OPS
+                or anchor.target in _RELAYOUT_POINTWISE_OPS
+            ):
+                sub_gm = build_pointwise(node, num_banks=num_banks)
+            else:
+                sub_gm = None
 
-        if sub_gm is not None:
-            val = node.value
-            n_out = len(val) if isinstance(val, (list, tuple)) else 1
-        elif not (
-            (tiling := node.meta.get("l2_tiling")) is not None
-            and math.prod(tiling) > 1
-        ):
-            # Untiled / interstellar-skipped op (FC batch-1, depthwise conv, a
-            # shape-changing reshape/slice): bufferize whole-tensor (trip-1).
-            built = _build_for_untiled(node)
-            if built is None:
-                continue  # getitem / non-tensor: nothing to load/store
-            sub_gm, n_out = built
-        else:
-            raise Exception(
-                f"bufferization: no builder for tiled node {node.op} "
-                f"'{node.name}' ({node.target})"
-            )
+            if sub_gm is not None:
+                val = node.value
+                n_out = len(val) if isinstance(val, (list, tuple)) else 1
+            elif not (
+                (tiling := node.meta.get("l2_tiling")) is not None
+                and math.prod(tiling) > 1
+            ):
+                # Untiled / interstellar-skipped op (FC batch-1, depthwise conv,
+                # a shape-changing reshape/slice): bufferize whole (trip-1).
+                built = _build_for_untiled(node)
+                if built is None:
+                    continue  # getitem / non-tensor: nothing to load/store
+                sub_gm, n_out = built
+            else:
+                raise Exception(
+                    f"bufferization: no builder for tiled node {node.op} "
+                    f"'{node.name}' ({node.target})"
+                )
+
+            if key is not None:
+                build_cache[key] = (sub_gm, n_out)
 
         # Stamp logical (quantized) dtypes on the nest, all read off the original
         # ``node`` (the quantizer already annotated it): seed the placeholders
@@ -526,7 +685,19 @@ def bufferize_graph(
         propagate_logical_dtypes(sub_gm, ph_seed, compute_seed)
 
         with oracle_disabled():
-            results = replace_node_with_graph_module(model, node, sub_gm)
+            results = replace_node_with_graph_module(
+                model, node, sub_gm, propagate=False
+            )
+        logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
+
+        # Carry the original node's shape/value onto the nest output(s): later
+        # builders read an operand's ``.value`` directly, and ``propagate=False``
+        # skipped the per-node re-execution that used to set it.  Internal nest
+        # nodes keep the exported ``meta['val']`` (enough for memory planning).
+        out_vals = node.value if n_out > 1 else [node.value]
+        out_shapes = node.shape if n_out > 1 else [node.shape]
+        for r, v, s in zip(results, out_vals, out_shapes):
+            r.value, r.shape = v, s
 
         if n_out == 1:
             if "dtype" in node.meta:

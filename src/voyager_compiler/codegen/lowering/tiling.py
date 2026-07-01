@@ -13,6 +13,7 @@ to each builder; per-node element widths are read from the nodes themselves.
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -696,8 +697,10 @@ def get_tiling(node, tiler=None):
     factor is 1).  ``l2_tiling`` may carry the reduction factor explicitly — a
     3-tuple gemm ``(n_m, n_n, n_k)`` / a 5-tuple conv ``(n_N, n_k, n_y, n_x,
     n_c)`` — to drive a ``num_k > 1`` reduction sweep.  Otherwise runs
-    interstellar via ``tiler`` (caching each layer's mapping; interstellar does
-    not tile the batch, so batch factors are 1).
+    interstellar via ``tiler`` (caching each layer's mapping).  Interstellar
+    tiles a single (M, N, K) gemm and never tiles the leading batch dims (e.g.
+    attention heads); the builder loops them, so their counts are the full
+    extent (one tile per batch element).
     """
     import interstellar
 
@@ -707,6 +710,11 @@ def get_tiling(node, tiler=None):
     is_conv = is_conv2d(anchor)
     if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
         return None
+
+    # Interstellar tiles a single (M, N, K) gemm and never tiles the leading
+    # batch dims (e.g. attention heads); the builder loops them, so emit a
+    # full-extent count -- one tile per batch element.
+    gemm_batch = tuple(anchor.value.shape[: anchor.value.ndim - 2])
 
     l2_tiling = anchor.meta.get("l2_tiling")
     logger.debug(f"Found {anchor.name} tiling: {l2_tiling}")
@@ -727,7 +735,7 @@ def get_tiling(node, tiler=None):
         else:
             nm, nn = l2_tiling
             nk = 1
-        return (1,) * (anchor.value.ndim - 2) + (nm, nn, nk)
+        return gemm_batch + (nm, nn, nk)
 
     if tiler is None:
         return None
@@ -746,8 +754,14 @@ def get_tiling(node, tiler=None):
     )
     if key in tiler.cache:
         mapping = tiler.cache[key]
+        logger.debug(
+            "[tiling] %s: mapping cache hit (%d entries)",
+            anchor.name,
+            len(tiler.cache),
+        )
     else:
-        logger.debug(f"Running interstellar for {anchor.name}")
+        logger.info("[tiling] %s: running interstellar", anchor.name)
+        t0 = time.perf_counter()
         mapping = run_interstellar(
             anchor,
             tiler.arch,
@@ -758,6 +772,11 @@ def get_tiling(node, tiler=None):
             out_dtype=out_dtype,
             fused_size_fn=_make_fused_size_fn(fused_specs),
         )
+        logger.info(
+            "[tiling] %s: interstellar took %.2fs",
+            anchor.name,
+            time.perf_counter() - t0,
+        )
         tiler.cache[key] = mapping  # cache None too (skipped layers)
     if mapping is None:
         return None
@@ -767,8 +786,4 @@ def get_tiling(node, tiler=None):
 
     if is_conv:
         return (b[le.OY][3], b[le.OX][3], b[le.IC][3], b[le.OC][3])
-    return (1,) * (anchor.value.ndim - 2) + (
-        b[le.OX][3],
-        b[le.OC][3],
-        b[le.IC][3],
-    )
+    return gemm_batch + (b[le.OX][3], b[le.OC][3], b[le.IC][3])

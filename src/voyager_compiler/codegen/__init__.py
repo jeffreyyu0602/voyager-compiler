@@ -7,7 +7,6 @@ from .passes.tiling import *
 from .passes.utils import *
 from .shape_prop import *
 
-
 __all__ = [
     "MemoryAllocator",
     "ShapeProp",
@@ -25,6 +24,7 @@ __all__ = [
     "pad_vit_embeddings_output",
     "inline_autocast_modules",
     "fold_constant_generators",
+    "remove_prunable_ops",
     "rename_nodes_with_param_names",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
