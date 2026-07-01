@@ -40,6 +40,17 @@ class _InputSpec:
       ``pad``          per-dim low padding (start -= pad).
       ``pad_value``    out-of-bounds fill for a padded load.
       ``transposed``   load swaps the tile's last two dims (a fused weight ᵀ).
+      ``num_banks``    per-operand software-pipeline depth (SRAM bank slots /
+                       prefetch distance ``num_banks - 1``); ``None`` inherits
+                       the scheduler's default.  Lets a reused / low-reuse
+                       operand pick a shallower or deeper pipeline than its
+                       peers.
+      ``first_use_at_exit``
+                       guarded operand first read at its sweep's **last** step,
+                       so the load-wait is deferred to block-exit (overlaps the
+                       sweep with a single buffer).  Builder-set only where
+                       exit-only use is provable; default ``False`` =
+                       wait-at-entry.
     """
 
     tile_sizes: Tuple[int, ...]
@@ -49,6 +60,8 @@ class _InputSpec:
     pad: Optional[Tuple[int, ...]] = None
     pad_value: Optional[float] = None
     transposed: bool = False
+    num_banks: Optional[int] = None
+    first_use_at_exit: bool = False
 
 
 @dataclass
@@ -69,12 +82,22 @@ class _OutputSpec:
       ``tile_sizes`` per-dim output tile (the grid step for its dims).
       ``index_map``  grid dim each output dim maps to.
       ``dtype``      output dtype.
+      ``num_banks``  per-output software-pipeline depth (``None`` inherits the
+                     scheduler default); see ``_InputSpec.num_banks``.
+      ``first_use_at_exit``
+                     guarded output first written at its sweep's **last** step
+                     (e.g. a reduction's ``post_process``), so the reuse-drain
+                     is deferred to block-exit (lets the store overlap the next
+                     tile's sweep with a single buffer).  Builder-set; default
+                     ``False`` = drain-at-entry.  See ``_InputSpec``.
     """
 
     shape: Tuple[int, ...]
     tile_sizes: Tuple[int, ...]
     index_map: Tuple[int, ...]
     dtype: torch.dtype
+    num_banks: Optional[int] = None
+    first_use_at_exit: bool = False
 
 
 @dataclass(frozen=True)

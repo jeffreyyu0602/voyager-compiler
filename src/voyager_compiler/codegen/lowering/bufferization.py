@@ -345,7 +345,11 @@ def _thread_hop(
         }
         propagate_logical_dtypes(sub, seed, rules)
         for op, ph in zip(operands, phs):
-            _set_dtype(op, _dtype_of(ph))
+            d = _dtype_of(ph)
+            _set_dtype(op, d)
+            # Bridge a bank slot view (``select``) to its alloc, so an
+            # in-loop-written output bank tags the bank, not just the slice.
+            _set_dtype(_buffer_of(op), d)
         outs = _outputs_of(sub)
         for u in handles:
             if u.args[1] < len(outs):
