@@ -189,9 +189,13 @@ def transform(
     # for systolic-array based hardware (e.g., transposing weights).
 
     if transform_layout:
-        transpose_conv2d_inputs_and_weights(model)
+        normalize_conv2d_layout(model)
 
-    transpose_linear_weights(model, transform_layout, transpose_fc)
+    normalize_gemm_weight_layout(
+        model,
+        mm_layout="ck" if transform_layout else "kc",
+        mv_layout="ck" if transpose_fc else "kc",
+    )
 
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 

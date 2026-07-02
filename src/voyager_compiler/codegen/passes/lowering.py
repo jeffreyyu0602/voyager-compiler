@@ -135,7 +135,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
             A_data=None,
             A_indices=None,
             A_indptr=None,
-            weight_transposed=False,
+            weight_layout="ck",
         ):
             # Loop through each element in the batch dimensions
             batch_shape = input.shape[:-2]
@@ -154,7 +154,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
                             "A_data": A_data[idx],
                             "A_indices": A_indices[idx],
                             "A_indptr": A_indptr[idx],
-                            "weight_transposed": weight_transposed,
+                            "weight_layout": weight_layout,
                         }
                     )
                 result.append(
@@ -182,7 +182,7 @@ def _decompose_bmm_mx(model: GraphModule, node: Node):
         "A_data": A_data.value if A_data is not None else None,
         "A_indices": A_indices.value if A_indices is not None else None,
         "A_indptr": A_indptr.value if A_indptr is not None else None,
-        "weight_transposed": node.kwargs.get("weight_transposed", True),
+        "weight_layout": node.kwargs.get("weight_layout", "ck"),
     }
 
     gm = export_model(BMM(), (input1, input2), kwargs)
@@ -1070,7 +1070,7 @@ def split_dense_spmm_node(model: GraphModule):
         A_data = kwargs.pop("A_data")
         A_indices = kwargs.pop("A_indices")
         A_indptr = kwargs.pop("A_indptr")
-        weight_transposed = kwargs.pop("weight_transposed", False)
+        weight_layout = kwargs.pop("weight_layout", "kc")
 
         node.kwargs = kwargs
 
@@ -1085,7 +1085,7 @@ def split_dense_spmm_node(model: GraphModule):
                     kwargs.get("weight_scale"),
                     kwargs.get("weight_code"),
                     kwargs.get("block_size"),
-                    weight_transposed,
+                    weight_layout,
                 ),
             )
 

@@ -13,86 +13,10 @@ logger = logging.getLogger(__name__)
 
 quantized_ops_lib = Library("quantized_ops", "DEF")
 
-
-quantized_ops_lib.define(
-    "conv2d(Tensor input, Tensor weight, Tensor? bias=None, "
-    "SymInt[2] stride=1, SymInt[2] padding=0, SymInt[2] dilation=1, "
-    "SymInt groups=1) -> Tensor"
-)
-
-
-@impl(quantized_ops_lib, "conv2d", "CompositeExplicitAutograd")
-def conv2d(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor = None,
-    stride: Union[int, Tuple[int]] = 1,
-    padding: Union[int, Tuple[int]] = 0,
-    dilation: Union[int, Tuple[int]] = 1,
-    groups: int = 1,
-) -> torch.Tensor:
-    return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
-
-
-quantized_ops_lib.define(
-    "max_pool2d(Tensor self, int[2] kernel_size, int[2] stride=[], "
-    "int[2] padding=0, int[2] dilation=1, bool ceil_mode=False) -> Tensor"
-)
-
-
-@impl(quantized_ops_lib, "max_pool2d", "CompositeExplicitAutograd")
-def max_pool2d(
-    self: torch.Tensor,
-    kernel_size: Union[int, Tuple[int]] = 1,
-    stride: Union[int, Tuple[int]] = None,
-    padding: Union[int, Tuple[int]] = 0,
-    dilation: Union[int, Tuple[int]] = 1,
-    ceil_mode: bool = False,
-    return_indices: bool = False,
-) -> torch.Tensor:
-    return F.max_pool2d(
-        self.permute(0, 3, 1, 2),
-        kernel_size,
-        stride,
-        padding,
-        dilation,
-        ceil_mode=ceil_mode,
-        return_indices=return_indices,
-    ).permute(0, 2, 3, 1)
-
-
-quantized_ops_lib.define(
-    "adaptive_avg_pool2d(Tensor self, SymInt[2] output_size) -> Tensor"
-)
-
-
-@impl(quantized_ops_lib, "adaptive_avg_pool2d", "CompositeExplicitAutograd")
-def adaptive_avg_pool2d(
-    self: torch.Tensor, output_size: Union[int, Tuple[int]] = 1
-) -> torch.Tensor:
-    permuted = self.permute(0, 3, 1, 2)
-    return F.adaptive_avg_pool2d(permuted, output_size).permute(0, 2, 3, 1)
-
-
-quantized_ops_lib.define(
-    "linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor"
-)
-
-
-@impl(quantized_ops_lib, "linear", "CompositeExplicitAutograd")
-def linear(
-    input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor = None
-) -> torch.Tensor:
-    return F.linear(input, weight, bias)
-
-
-quantized_ops_lib.define("matmul(Tensor self, Tensor other) -> Tensor")
-
-
-@impl(quantized_ops_lib, "matmul", "CompositeExplicitAutograd")
-def matmul(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
-    return torch.matmul(self, other)
-
+# Registers the auto-generated hardware-layout twins (conv2d /
+# max_pool2d / adaptive_avg_pool2d / linear / matmul) into the namespace
+# just created, before any importer references them.
+from . import layout_ops  # noqa: E402,F401
 
 quantized_ops_lib.define(
     "layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, "
@@ -277,7 +201,7 @@ quantized_ops_lib.define(
     "SymInt[2] stride=1, SymInt[2] padding=0, SymInt[2] dilation=1, "
     "SymInt groups=1, *, Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, "
-    "Tensor? weight_code=None) -> Tensor"
+    'Tensor? weight_code=None, str layout="nchw") -> Tensor'
 )
 
 
@@ -296,7 +220,12 @@ def conv2d_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
+    layout: str = "nchw",
 ) -> torch.Tensor:
+    from .codegen.passes.utils import _pair
+
+    assert layout in ("nchw", "nhwc"), layout
+
     # For codebook quantization, decode input and weight into float values first
     if input_code is not None:
         input = input_code[input.to(torch.long)].to(input.dtype)
@@ -309,7 +238,18 @@ def conv2d_mx(
     if weight_scale is not None:
         weight = weight * expand(weight_scale, weight.shape, block_size)
 
-    return F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    # The dispatcher fills omitted / default-valued args from this Python
+    # signature's scalar defaults; the strict op calls below need pairs.
+    stride, padding, dilation = _pair(stride), _pair(padding), _pair(dilation)
+
+    if layout == "nhwc":
+        # The generated NHWC twin (NHWC activations, HWIO weight).
+        return torch.ops.quantized_ops.conv2d(
+            input, weight, bias, stride, padding, dilation, groups
+        )
+    return torch.ops.aten.conv2d(
+        input, weight, bias, stride, padding, dilation, groups
+    )
 
 
 quantized_ops_lib.define(
@@ -317,7 +257,7 @@ quantized_ops_lib.define(
     "Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, Tensor? weight_code=None, "
     "Tensor? A_data=None, Tensor? A_indices=None, Tensor? A_indptr=None, "
-    "bool weight_transposed=False) -> Tensor"
+    'str weight_layout="kc") -> Tensor'
 )
 
 
@@ -335,8 +275,10 @@ def linear_mx(
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
-    weight_transposed=False,
+    weight_layout: str = "kc",
 ) -> torch.Tensor:
+    assert weight_layout in ("kc", "ck"), weight_layout
+
     if input_code is not None:
         input = input_code[input.to(torch.long)].to(input.dtype)
 
@@ -352,7 +294,12 @@ def linear_mx(
             weight_scale, weight.shape, block_size
         )
 
-    dense_out = F.linear(input, decoded_weight, bias)
+    # Call the operator matching the weight's storage layout: aten for
+    # the KC-native layout, the layout twin for a CK-stored weight.
+    if weight_layout == "kc":
+        dense_out = torch.ops.aten.linear(input, decoded_weight, bias)
+    else:
+        dense_out = torch.ops.quantized_ops.linear(input, decoded_weight, bias)
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -363,7 +310,7 @@ def linear_mx(
             weight_scale,
             weight_code,
             block_size,
-            weight_transposed,
+            weight_layout,
         )
         return dense_out + spmm_out
 
@@ -377,14 +324,16 @@ def _(
     bias: torch.Tensor = None,
     **kwargs,
 ):
-    return F.linear(input, weight, bias)
+    if kwargs.get("weight_layout", "kc") == "ck":
+        return torch.ops.quantized_ops.linear(input, weight, bias)
+    return torch.ops.aten.linear(input, weight, bias)
 
 
 quantized_ops_lib.define(
     "matmul_mx(Tensor self, Tensor other, *, Tensor? input_scale=None, "
     "Tensor? weight_scale=None, int? block_size=None, Tensor? input_code=None, "
     "Tensor? weight_code=None, Tensor? A_data=None, Tensor? A_indices=None, "
-    "Tensor? A_indptr=None, bool weight_transposed=True) -> Tensor"
+    'Tensor? A_indptr=None, str weight_layout="ck") -> Tensor'
 )
 
 
@@ -401,8 +350,10 @@ def matmul_mx(
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
-    weight_transposed=True,
+    weight_layout: str = "ck",
 ) -> torch.Tensor:
+    assert weight_layout in ("kc", "ck"), weight_layout
+
     if input_code is not None:
         self = input_code[self.to(torch.long)].to(self.dtype)
     if input_scale is not None:
@@ -416,7 +367,12 @@ def matmul_mx(
             weight_scale, other.shape, block_size
         )
 
-    dense_out = torch.matmul(self, decoded_other)
+    # Call the operator matching the right operand's storage layout:
+    # aten for the CK-native layout, the layout twin for KC storage.
+    if weight_layout == "ck":
+        dense_out = torch.ops.aten.matmul(self, decoded_other)
+    else:
+        dense_out = torch.ops.quantized_ops.matmul(self, decoded_other)
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -427,7 +383,7 @@ def matmul_mx(
             weight_scale,
             weight_code,
             block_size,
-            weight_transposed,
+            weight_layout,
         )
         return dense_out + spmm_out
 
@@ -440,7 +396,9 @@ def _(
     other: torch.Tensor,
     **kwargs,
 ):
-    return torch.matmul(self, other)
+    if kwargs.get("weight_layout", "ck") == "kc":
+        return torch.ops.quantized_ops.matmul(self, other)
+    return torch.ops.aten.matmul(self, other)
 
 
 quantized_ops_lib.define(
@@ -778,7 +736,7 @@ def _(
 quantized_ops_lib.define(
     "spmm_csr(Tensor data, Tensor indices, Tensor indptr, Tensor B, "
     "Tensor? B_scale=None, Tensor? B_code=None, int? block_size=None, "
-    "bool weight_transposed=False) -> Tensor"
+    'str weight_layout="kc") -> Tensor'
 )
 
 
@@ -791,14 +749,19 @@ def spmm_csr(
     B_scale: Optional[torch.Tensor] = None,
     B_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
-    weight_transposed=False,
+    weight_layout: str = "kc",
 ) -> torch.Tensor:
+    assert weight_layout in ("kc", "ck"), weight_layout
+
     if B_code is not None:
         B = B_code[B.to(torch.long)]
     if B_scale is not None:
         B = B * expand(B_scale, B.shape, block_size)
 
-    if not weight_transposed:
+    # A KC-stored B is [out, contraction]; the sparse mm needs
+    # [contraction, out], so transpose it.  A CK-stored B is already
+    # in that layout.
+    if weight_layout == "kc":
         B = B.mT
 
     batch_shape = indptr.shape[:-1]
@@ -846,9 +809,9 @@ def _(
     B_scale: Optional[torch.Tensor] = None,
     B_code: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
-    weight_transposed=False,
+    weight_layout: str = "kc",
 ):
     batch_shape = indptr.shape[:-1]
     X = indptr.shape[-1] - 1
-    K = B.shape[-1] if weight_transposed else B.shape[-2]
+    K = B.shape[-1] if weight_layout == "ck" else B.shape[-2]
     return data.new_empty((*batch_shape, X, K))

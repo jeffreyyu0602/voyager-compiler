@@ -1,12 +1,11 @@
 import logging
-import math
 import operator
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.fx import GraphModule, Node
 
-from .utils import get_arg_value, _pair
+from .utils import get_arg_value
 from ..banking import require_allocation
 from ..mapping import duplicate_shared_nodes
 from ..mapping_utils import (
@@ -22,22 +21,21 @@ from ..mapping_utils import (
     is_reshape_op,
 )
 from ...pt2e_utils import deduplicate_nodes, fetch_attr, propagate_shape
+from ...layout_ops import (
+    NCHW_TO_NHWC,
+    NHWC_OP_VARIANTS,
+    NHWC_TO_NCHW,
+    WEIGHT_NCHW_TO_HWIO,
+)
 from ...quantize_pt2e import create_getattr_from_value
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "eliminate_reshape_with_no_effect",
-    "transpose_conv2d_inputs_and_weights",
-    "transpose_linear_weights",
+    "normalize_conv2d_layout",
+    "normalize_gemm_weight_layout",
 ]
-
-TRANSPOSED_OPERATORS = {
-    torch.ops.aten.conv2d.default: torch.ops.quantized_ops.conv2d.default,
-    torch.ops.aten.max_pool2d.default: torch.ops.quantized_ops.max_pool2d.default,
-    torch.ops.aten.adaptive_avg_pool2d.default: torch.ops.quantized_ops.adaptive_avg_pool2d.default,
-    torch.ops.quantized_ops.conv2d_mx.default: torch.ops.quantized_ops.conv2d_mx.default,
-}
 
 AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.calculate_mx_qparam.default: 1,
@@ -45,31 +43,6 @@ AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.quantize.default: 3,
     torch.ops.quantized_ops.quantize_mx.default: 2,
 }
-
-NCHW_TO_NHWC = (0, 2, 3, 1)
-NHWC_TO_NCHW = (0, 3, 1, 2)
-WEIGHT_NCHW_TO_HWIO = (2, 3, 1, 0)
-
-
-def conv2d_transposed(
-    input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor = None,
-    stride: Union[int, Tuple[int]] = 1,
-    padding: Union[int, Tuple[int]] = 0,
-    dilation: Union[int, Tuple[int]] = 1,
-    groups: int = 1,
-) -> torch.Tensor:
-    output = torch.ops.aten.conv2d.default(
-        input.permute(0, 3, 1, 2),
-        weight.permute(3, 2, 0, 1) if groups == 1 else weight,
-        bias,
-        _pair(stride),
-        _pair(padding),
-        _pair(dilation),
-        groups,
-    )
-    return output.permute(0, 2, 3, 1)
 
 
 def extract_conv2d_graph(
@@ -102,7 +75,8 @@ def extract_conv2d_graph(
             return src.target == quantized_lib.quantize_mx.default
 
         return (
-            node.target in TRANSPOSED_OPERATORS
+            node.target in NHWC_OP_VARIANTS
+            or node.target is torch.ops.quantized_ops.conv2d_mx.default
             or node.target in ALLOW_LIST_OPS
             or is_elementwise_op(node)
             or is_indexing_or_concatenation_op(node)
@@ -263,19 +237,39 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
         axes = tuple(input_dims.index(a) for a in axes)
         node.update_arg(idx, axes)
 
-    if node.target in TRANSPOSED_OPERATORS:
-        node.target = TRANSPOSED_OPERATORS[node.target]
+    if node.target in NHWC_OP_VARIANTS:
+        node.target = NHWC_OP_VARIANTS[node.target]
+        node.meta["transposed"] = True
+    elif node.target is torch.ops.quantized_ops.conv2d_mx.default:
+        node.kwargs = {**node.kwargs, "layout": "nhwc"}
         node.meta["transposed"] = True
 
+    def update_shape(d, key, order):
+        if key in d:
+            d[key] = tuple(d[key][i] for i in order)
 
-def transpose_conv2d_inputs_and_weights(model: GraphModule):
+    shapes = node.meta.get("tiled_shapes")
+    if shapes is not None and (is_pooling(node) or is_conv2d(node)):
+        for key in ("input", "input_scale", "output"):
+            update_shape(shapes, key, NCHW_TO_NHWC)
+        if not is_depthwise_conv(node):
+            update_shape(shapes, "weight", WEIGHT_NCHW_TO_HWIO)
+            update_shape(shapes, "weight_scale", WEIGHT_NCHW_TO_HWIO)
+        update_shape(node.meta, "l2_tiling", NCHW_TO_NHWC)
+        if stride := node.meta.get("tile_strides"):
+            update_shape(stride, "input", NCHW_TO_NHWC)
+            update_shape(stride, "input_scale", NCHW_TO_NHWC)
+
+
+def normalize_conv2d_layout(model: GraphModule):
     graph = model.graph
     visited_nodes: Set[Node] = set()
 
-    torch.nn.functional.conv2d = conv2d_transposed
-
     for node in list(graph.nodes):
-        if node in visited_nodes or node.target not in TRANSPOSED_OPERATORS:
+        if node in visited_nodes or (
+            node.target not in NHWC_OP_VARIANTS
+            and node.target != torch.ops.quantized_ops.conv2d_mx.default
+        ):
             continue
 
         # Extract the cluster of nodes that can share the NHWC layout
@@ -306,53 +300,6 @@ def transpose_conv2d_inputs_and_weights(model: GraphModule):
                 user.replace_input_with(node_to_treat, permute_node)
 
             _rewrite_node_args_for_layout(node_to_treat)
-
-            def permute(t, dims):
-                return tuple(t[i] for i in dims)
-
-            tiled_shapes = node_to_treat.meta.get("tiled_shapes")
-            if is_pooling(node_to_treat) and tiled_shapes is not None:
-                tiled_shapes["input"] = permute(
-                    tiled_shapes["input"], NCHW_TO_NHWC
-                )
-                tiled_shapes["output"] = permute(
-                    tiled_shapes["output"], NCHW_TO_NHWC
-                )
-
-                tiling = node_to_treat.meta["l2_tiling"]
-                node_to_treat.meta["l2_tiling"] = permute(tiling, NCHW_TO_NHWC)
-
-                if stride := node_to_treat.meta.get("tile_strides"):
-                    stride["input"] = permute(stride["input"], NCHW_TO_NHWC)
-                    node_to_treat.meta["tile_strides"] = stride
-
-            elif is_conv2d(node_to_treat) and tiled_shapes is not None:
-                for key, arg in [
-                    ("input", node_to_treat.args[0]),
-                    ("weight", node_to_treat.args[1]),
-                ]:
-                    input_dims = arg.meta["dims"]
-                    tiled_shapes[key] = permute(tiled_shapes[key], input_dims)
-
-                    scale_key = f"{key}_scale"
-                    if scale_key in tiled_shapes:
-                        tiled_shapes[scale_key] = permute(
-                            tiled_shapes[scale_key], input_dims
-                        )
-
-                tiled_shapes["output"] = permute(
-                    tiled_shapes["output"], NCHW_TO_NHWC
-                )
-
-                tiling = node_to_treat.meta["l2_tiling"]
-                node_to_treat.meta["l2_tiling"] = permute(tiling, NCHW_TO_NHWC)
-
-                if stride := node_to_treat.meta.get("tile_strides"):
-                    stride["input"] = permute(stride["input"], NCHW_TO_NHWC)
-                    stride["input_scale"] = permute(
-                        stride["input_scale"], NCHW_TO_NHWC
-                    )
-                    node_to_treat.meta["tile_strides"] = stride
 
     graph.lint()
     model.recompile()
@@ -416,47 +363,6 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
     model.graph.eliminate_dead_code()
     model.recompile()
     return model
-
-
-def make_linear_wrapper(transpose=False, skip_fc=False):
-    """
-    Returns a function that wraps torch.nn.functional.linear with optional
-    weight transposition.
-    """
-
-    def wrapped_linear(input, weight, bias=None):
-        is_fc = all(dim == 1 for dim in input.shape[:-1])
-        do_transpose = transpose and not (skip_fc and is_fc)
-        return torch.ops.aten.linear.default(
-            input, weight.T if do_transpose else weight, bias
-        )
-
-    return wrapped_linear
-
-
-def make_matmul_wrapper(transpose=False, skip_fc=False):
-    """
-    Returns a function that wraps torch.matmul with optional transposition of
-    the second argument.
-    """
-
-    def wrapped_matmul(input, other):
-        input_shape = input.shape
-        other_shape = other.shape
-
-        is_bmm = len(input_shape) > 2 or len(other_shape) > 2
-        if is_bmm:
-            is_fc = input_shape[-2] == 1
-        else:
-            is_fc = all(s == 1 for s in input_shape[:-1])
-
-        do_transpose = transpose and not (skip_fc and is_fc)
-
-        return torch.ops.aten.matmul.default(
-            input, other if do_transpose else other.transpose(-2, -1)
-        )
-
-    return wrapped_matmul
 
 
 ALLOWED_UPSTREAM_OPS: Set[any] = {
@@ -851,14 +757,23 @@ def _insert_transpose_op(
     return None if success else sorted_path
 
 
-def _process_linear_node(
-    model: GraphModule, node: Node, transpose_weight: bool, skip_fc: bool
-) -> None:
-    """Handles weight mutation for Linear nodes."""
-    is_fc = is_fully_connected(node)
-    if (is_fc and skip_fc) or (not is_fc and not transpose_weight):
-        return
+# The two GEMM weight layouts: ``"kc"`` = [out, contraction] (aten
+# linear's native weight layout), ``"ck"`` = [contraction, out] (aten
+# matmul's native right-operand layout).
+_GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
 
+
+def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
+    """The target layout of ``node``'s class: matrix-vector
+    (fully-connected / batch-1) nodes follow ``mv_layout``, matrix-matrix
+    nodes ``mm_layout``."""
+    return mv_layout if is_fully_connected(node) else mm_layout
+
+
+def _process_linear_node(model: GraphModule, node: Node) -> None:
+    """Flip a linear's KC-native weight storage to CK and retarget the
+    node to the layout twin, whose weight arrives swapped.  The caller
+    decides which nodes to flip."""
     logger.info(f"Transposing weight for linear node {node.name}")
 
     weight_node = node.args[1]
@@ -869,13 +784,13 @@ def _process_linear_node(
         scale = fetch_attr(model, scale_node.target)
         scale.data = scale.data.T
 
-    # Mark spmm_csr users as having a transposed weight
+    # Mark mx / spmm_csr users as consuming a CK-stored weight.
     for user in list(weight_node.users):
         if user.target in [
             torch.ops.quantized_ops.linear_mx.default,
             torch.ops.quantized_ops.spmm_csr.default,
         ]:
-            user.kwargs = {**user.kwargs, "weight_transposed": True}
+            user.kwargs = {**user.kwargs, "weight_layout": "ck"}
 
     if node.target == torch.ops.aten.linear.default:
         node.target = torch.ops.quantized_ops.linear.default
@@ -885,18 +800,11 @@ def _process_linear_node(
 
 
 def _process_matmul_node(
-    model: GraphModule,
-    node: Node,
-    transpose_weight: bool,
-    transpose_fc: bool,
-    transposed_nodes: dict,
+    model: GraphModule, node: Node, transposed_nodes: dict
 ) -> None:
-    """Handles graph transformation for MatMul nodes."""
-    is_fc = is_fully_connected(node)
-    # Note: Logic preserved from original (returns if FC and we WANT transpose_fc)
-    if (is_fc and transpose_fc) or (not is_fc and transpose_weight):
-        return
-
+    """Flip a matmul's CK-native right operand storage to KC and
+    retarget the node to the layout twin, whose operand arrives swapped.
+    The caller decides which nodes to flip."""
     logger.info(f"Transposing weight for matmul node {node.name}")
 
     weight_node = node.args[1]
@@ -911,31 +819,42 @@ def _process_matmul_node(
 
     if node.target == torch.ops.aten.matmul.default:
         node.target = torch.ops.quantized_ops.matmul.default
+    elif node.target == torch.ops.quantized_ops.matmul_mx.default:
+        node.kwargs = {**node.kwargs, "weight_layout": "kc"}
 
     _update_tiled_shapes(node)
     node.meta["transposed"] = True
 
 
-def transpose_linear_weights(
-    model: GraphModule, transpose_weight: bool, transpose_fc: bool = False
+def normalize_gemm_weight_layout(
+    model: GraphModule, mm_layout: str = "kc", mv_layout: str = "kc"
 ) -> GraphModule:
-    """
-    Transpose the weights of linear layers in the given FX graph module.
-    """
-    skip_fc = not transpose_fc
+    """Normalize every GEMM right-operand (weight) to one layout per
+    operation class: matrix-matrix nodes to ``mm_layout``, matrix-vector
+    (fully-connected / batch-1) nodes to ``mv_layout``; each is ``"kc"``
+    ([out, contraction]) or ``"ck"`` ([contraction, out]).
 
-    torch.nn.functional.linear = make_linear_wrapper(transpose_weight, skip_fc)
-    torch.matmul = make_matmul_wrapper(transpose_weight, skip_fc)
+    ``aten.linear`` is KC-native and ``aten.matmul`` CK-native, so
+    exactly the nodes whose class targets the other layout have their
+    weight storage flipped and are retargeted to the ``layout_ops``
+    twins (same name/schema, second operand arrives swapped).  A node is
+    retargeted iff its storage was flipped, so eager execution stays
+    correct in every configuration with no global patching.
+    """
+    assert mm_layout in _GEMM_WEIGHT_LAYOUTS, mm_layout
+    assert mv_layout in _GEMM_WEIGHT_LAYOUTS, mv_layout
 
     transposed_nodes = {}
 
     for node in list(model.graph.nodes):
+        # A node is flipped exactly when its class's target layout differs
+        # from the op's native one (linear: KC, matmul: CK).
         if is_linear(node):
-            _process_linear_node(model, node, transpose_weight, skip_fc)
+            if _node_layout(node, mm_layout, mv_layout) == "ck":
+                _process_linear_node(model, node)
         elif is_matmul(node):
-            _process_matmul_node(
-                model, node, transpose_weight, transpose_fc, transposed_nodes
-            )
+            if _node_layout(node, mm_layout, mv_layout) == "kc":
+                _process_matmul_node(model, node, transposed_nodes)
 
     deduplicate_nodes(model)
     _fuse_quantize_mx_last_axis(model)

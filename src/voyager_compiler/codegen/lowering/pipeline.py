@@ -1242,6 +1242,11 @@ def build_conv2d(
 
     target = anchor.target
     bs = anchor.kwargs.get("block_size")
+    scalar_kwargs = {
+        k: v
+        for k, v in anchor.kwargs.items()
+        if not isinstance(v, torch.fx.Node)
+    }
     kw_nodes = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
@@ -1319,8 +1324,7 @@ def build_conv2d(
         in_tile = in_tiles[in_idx]
         w_tile = in_tiles[w_idx]
         kw = {name: in_tiles[i] for name, i in kw_idx.items()}
-        if bs is not None:
-            kw["block_size"] = bs
+        kw.update(scalar_kwargs)  # block_size / weight_layout / ...
         bias = in_tiles[bias_idx] if (bias_idx is not None and first) else None
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
@@ -1534,6 +1538,11 @@ def build_gemm(
     # Microscaling (linear_mx / matmul_mx): per-block scales tile along the
     # reduction; codebooks load whole (None spec).  Each threads by keyword.
     bs = anchor.kwargs.get("block_size")
+    scalar_kwargs = {
+        k: v
+        for k, v in anchor.kwargs.items()
+        if not isinstance(v, torch.fx.Node)
+    }
     kw_nodes = {}
 
     def add_kw_input(name: str, spec: _InputSpec | None) -> None:
@@ -1588,8 +1597,7 @@ def build_gemm(
         act_tile = in_tiles[act_idx]
         weight_tile = in_tiles[weight_idx]
         kw = {name: in_tiles[i] for name, i in kw_idx.items()}
-        if bs is not None:
-            kw["block_size"] = bs
+        kw.update(scalar_kwargs)  # block_size / weight_layout / ...
         if bias_idx is None:
             return op(act_tile, weight_tile, **kw)
         bias = in_tiles[bias_idx] if first else None

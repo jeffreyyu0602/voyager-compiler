@@ -439,17 +439,7 @@ def quant_table_arg_nodes(node: Node) -> set:
 
 
 def is_gemm_op(node: Node) -> bool:
-    return node.target in [
-        torch.ops.aten.conv2d.default,
-        torch.ops.aten.linear.default,
-        torch.ops.aten.matmul.default,
-        torch.ops.quantized_ops.conv2d.default,
-        torch.ops.quantized_ops.linear.default,
-        torch.ops.quantized_ops.matmul.default,
-        torch.ops.quantized_ops.conv2d_mx.default,
-        torch.ops.quantized_ops.linear_mx.default,
-        torch.ops.quantized_ops.matmul_mx.default,
-    ]
+    return is_conv2d(node) or is_linear(node) or is_matmul(node)
 
 
 def is_conv2d(node: Node) -> bool:
@@ -461,15 +451,7 @@ def is_conv2d(node: Node) -> bool:
 
 
 def is_depthwise_conv(node: Node) -> bool:
-    return (
-        node.target
-        in [
-            torch.ops.aten.conv2d.default,
-            torch.ops.quantized_ops.conv2d_mx.default,
-        ]
-        and len(node.args) == 7
-        and node.args[6] != 1
-    )
+    return is_conv2d(node) and get_arg_value(node, 6, "groups", 1) != 1
 
 
 def is_linear(node: Node) -> bool:
@@ -530,7 +512,9 @@ def is_pooling(node: Node) -> bool:
         aten.max_pool2d.default,
         # NHWC variants (after the data-layout transform)
         torch.ops.quantized_ops.max_pool2d.default,
+        torch.ops.quantized_ops.avg_pool2d.default,
         torch.ops.quantized_ops.adaptive_avg_pool2d.default,
+        torch.ops.quantized_ops._adaptive_avg_pool2d.default,
     ]
 
 
