@@ -9,7 +9,7 @@ and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
 compute on the systolic array, ``async_copy`` on the DRAM interface, and waits
-as zero-time control. DPS ``copy_tile`` (a compute result written into its
+as zero-time control. DPS ``insert`` (a compute result written into its
 buffer) is bookkeeping, not a real op, so it is skipped entirely.
 """
 
@@ -181,7 +181,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             ctx.rs.async_copy(node, n_bytes, is_load, key, path)
         elif kind == "async_wait":
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
-        elif kind == "copy_tile":
+        elif kind == "insert":
             # Destination-passing bookkeeping (writes a compute result into its
             # buffer): zero-time, no resource, no traffic -> not a scheduled op.
             pass

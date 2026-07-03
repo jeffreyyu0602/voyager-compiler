@@ -125,11 +125,11 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
 
 
 _VOYAGER_WAIT = torch.ops.voyager.async_wait.default
-_VOYAGER_COPY = torch.ops.voyager.copy_tile.default
+_VOYAGER_INSERT = torch.ops.voyager.insert.default
 
 # Memory / control-flow / semaphore ops — *not* tile compute, so they are exempt
 # from the destination-passing check below: the buffer producers (``alloc`` /
-# ``zeros``) and the ``copy_tile`` store, the async DMA + its semaphore
+# ``zeros``) and the ``insert`` store, the async DMA + its semaphore
 # ``async_wait``, the index / counter ops (``increment_indices`` /
 # ``delinearize_index``), the bank- and semaphore-read ``select``, and the
 # multi-output / cond-unpack ``getitem``.  (These become registers; not
@@ -140,7 +140,7 @@ _NON_COMPUTE = {
     _VOYAGER_ZEROS,
     _VOYAGER_ASYNC,
     _VOYAGER_WAIT,
-    _VOYAGER_COPY,
+    _VOYAGER_INSERT,
     _VOYAGER_INCR,
     _VOYAGER_DELIN,
     torch.ops.aten.select.int,
@@ -158,7 +158,7 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
         qmaps are *params* (passed to the accelerator, not memory) — unmarked.
       * **Compute** is *not* given a space.  Instead the destination-passing
         invariant is checked: every tile-compute ``call_function`` /
-        ``call_module`` result must be written to a buffer via ``copy_tile``.
+        ``call_module`` result must be written to a buffer via ``insert``.
         Control logic (``_NON_COMPUTE`` + NOPs) is exempt.
 
     Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
@@ -210,13 +210,13 @@ def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
 
 def _stored(node: Node, ctx: tuple) -> bool:
     """True if every consumer of ``node``'s value — threading through NOP /
-    ``getitem`` wrappers and the body->parent boundary — is a ``copy_tile``."""
+    ``getitem`` wrappers and the body->parent boundary — is an ``insert``."""
     gm, parent_hop, parent_ctx = ctx
     users = list(node.users)
     if not users:
         return False
     for u in users:
-        if u.target is _VOYAGER_COPY:
+        if u.target is _VOYAGER_INSERT:
             continue
         if u.op == "output":
             if parent_hop is None:
@@ -275,7 +275,7 @@ def _annotate_and_validate(
                 raise Exception(
                     f"destination-passing violation: result of {node.op} "
                     f"'{node.name}' ({node.target}) is not stored to a buffer "
-                    f"via copy_tile (it feeds a non-store consumer)"
+                    f"via insert (it feeds a non-store consumer)"
                 )
 
 
@@ -418,7 +418,7 @@ def propagate_logical_dtypes(
         elif rules.get(t) is not None:
             # A compute op: its output dtype comes from the original graph's rule.
             _set_dtype(node, rules[t])
-        elif t is _VOYAGER_ASYNC or t is _VOYAGER_COPY:
+        elif t is _VOYAGER_ASYNC or t is _VOYAGER_INSERT:
             # A copy: dst (and its buffer) inherits the src's dtype.
             d = _dtype_of(node.args[0])
             _set_dtype(node.args[1], d)

@@ -157,7 +157,7 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
     #   reusable   -- alloc activation buffers, recycled once dead
     # ``buffer_of`` maps each DRAM node to the node owning its buffer.  Several
     # nodes can name the same physical buffer: an ``alloc`` owns itself, while a
-    # ``getitem``/``copy_tile`` is just another handle to the buffer it pulls
+    # ``getitem``/``insert`` is just another handle to the buffer it pulls
     # out of a loop / writes to, so it resolves back to that owner.
     buffer_of: Dict[Node, Node] = {}
     persistent: List[Node] = []
@@ -421,7 +421,7 @@ def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
 def _thread_segments(model: GraphModule) -> None:
     """Propagate ``meta['memory']`` / ``meta['scratchpad']`` from buffer roots
     onto the body placeholders bound to them and onto in-place compute tiles, so
-    every ``copy_tile`` / ``async_copy`` tile and op tile resolves to an
+    every ``insert`` / ``async_copy`` tile and op tile resolves to an
     address.
     Mirrors the space-threading recursion of ``annotate_tensor_spaces``.
     """

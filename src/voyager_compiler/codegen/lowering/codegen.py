@@ -126,14 +126,14 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
     return op
 
 
-_COPY_TILE = torch.ops.voyager.copy_tile.default
+_INSERT = torch.ops.voyager.insert.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
 
 
 def _feeds_tile_index(node, _seen=None) -> bool:
     """True if ``node`` (transitively) computes a tile DMA block index — it
-    reaches the ``indices`` argument of a ``copy_tile`` / ``async_copy`` through
+    reaches the ``indices`` argument of an ``async_copy`` through
     a chain of scalar index arithmetic.  Such addressing (a pipelined prefetch's
     ``j+1``, or a ``delinearize_index(i)`` of the linear counter) is real
     computation, not loop control, so the whole cone must be emitted rather than
@@ -144,7 +144,7 @@ def _feeds_tile_index(node, _seen=None) -> bool:
         if u in _seen or u.op != "call_function":
             continue
         _seen.add(u)
-        if u.target in (_COPY_TILE, _ASYNC_COPY):
+        if u.target is _ASYNC_COPY:
             ix = 2  # position of the ``indices`` arg
             if len(u.args) > ix and node in (u.args[ix] or ()):
                 return True
@@ -210,13 +210,13 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
     # start/end/step already encodes the iteration, so it is not a compute op.
     elif node.target is INCREMENT_INDICES:
         return
-    # A side-effecting DMA op (``copy_tile`` / ``async_copy`` write a tile;
+    # A side-effecting op (``insert`` / ``async_copy`` write a tile;
     # ``async_wait`` synchronizes a semaphore) returns ``None`` — the buffer /
     # semaphore is a closed-over additional input mutated in place — yet each is
     # a real instruction, always emitted despite its non-tensor value.  A tile
-    # DMA's output is the tile it writes (set from the dest in
+    # write's output is the tile it writes (set from the dest in
     # ``set_output_field``); ``async_wait`` has no output.
-    elif node.target not in (_COPY_TILE, _ASYNC_COPY, _ASYNC_WAIT):
+    elif node.target not in (_INSERT, _ASYNC_COPY, _ASYNC_WAIT):
         # A non-tensor call_function is usually integer loop-index carry
         # arithmetic (k+1, k % num_k, ...) — loop control made explicit by the
         # Loop structure, so not emitted.  The exception is a value that
@@ -517,7 +517,7 @@ def _type_str(node) -> str:
 def _fmt_arg(a):
     if isinstance(a, torch.fx.Node):
         # Annotate every tensor argument with its ``<shape×dtype, space>`` so a
-        # copy_tile's direction is legible inline (e.g. ``copy_tile(src<…,DRAM>,
+        # DMA's direction is legible inline (e.g. ``async_copy(src<…,DRAM>,
         # dst<…,Scratchpad>)`` = a load); scalar / index args (``_type_str``
         # empty) print as the bare name.
         return f"{a.name}{_type_str(a)}"

@@ -2,7 +2,7 @@
 
 Compute cycles are driven by the **anchor only** — a fused ``call_module``'s
 anchor (GEMM/conv) and its pointwise tail run pipelined, so the anchor
-dominates.  DRAM bytes apply to ``async_copy`` only (``copy_tile`` is zero-time
+dominates.  DRAM bytes apply to ``async_copy`` only (``insert`` is zero-time
 DPS bookkeeping).  Byte counts use the physical storage dtype via
 ``dtype_byte_size`` (sub-byte / quantized aware), so packed formats report
 their real footprint.

@@ -8,48 +8,6 @@ Spec-driven for tile addressing, mutate-style for compute (Pallas ``out_ref``
 semantics): each grid step loads every tiled input's current block into its SRAM
 bank, calls ``kernel(grid_index, *in_tiles, *out_banks)`` which writes each
 output SRAM bank, then stores each out bank to DRAM.
-
-  * An operand's block index at a grid point is the tuple of grid coords its
-    ``index_map`` selects (dropping whole / broadcast dims, and ``None``
-    entries — an axis loaded whole, mapped to no grid dim).  An output whose
-    ``index_map`` omits a grid dim keeps its bank live across that (reduction)
-    sweep.
-  * Each tiled input has a ``num_banks``-deep SRAM bank and runs a software
-    pipeline ``D = num_banks - 1`` blocks ahead: prologue primes the first ``D``
-    distinct blocks; each step prefetches the block ``D`` ahead (guarded — at
-    most ``num_banks`` distinct blocks in flight so slots never alias) while the
-    kernel computes the current one.  A guarded input (block reused across a
-    sweep) carries producer ``copy_in`` and consumer ``wait_in`` cursors that
-    advance on different events; an always-advance input needs neither (read
-    slot ``step % N``, copy slot ``(step + D) % N``).  Slots are runtime
-    ``% num_banks`` — no unrolling.
-  * Each output likewise has a ``num_banks``-deep bank and a carried store
-    counter; the kernel accumulates into slot ``store_count % num_banks`` across
-    the reduction sweep.  The tile is stored only when its block completes
-    (changes next, or last step), and the counter then flips the slot so a
-    completed tile's store overlaps the next tile's compute — a reduction writes
-    each output tile once instead of every step.
-  * The kernel writes a bank via ``voyager.copy_tile``, choosing initialize vs.
-    accumulate per ``grid_index`` — the scheduler stays oblivious to which
-    output is a reduction.
-
-Export-driven design notes (each verified against ``export_model``):
-  * In-body bank writes go through the opaque ``voyager.copy_tile`` custom op:
-    ``while_loop`` (a HOP) rejects aten in-place mutation of captured tensors,
-    but custom-op ``Tensor(a!)`` mutation of a captured bank persists.
-  * Accumulate-vs-initialize uses ``torch.cond`` in *functional* form (each
-    branch returns a fresh tensor) followed by a ``copy_tile`` write; a map
-    overwrites directly (no cond).
-  * A guarded DMA is ``torch.cond`` over ``voyager.async_copy`` (or a guarded
-    ``async_wait``): the branch closes over the captured bank / semaphore,
-    mutates them in place, returns an unused ``int``.  The cond is kept alive by
-    ``has_side_effect(torch.ops.higher_order.cond)`` (registered in
-    ``lowering/__init__.py``).  Counters advance with ``torch.sym_ite(changed,
-    count + 1, count)`` outside the cond.
-  * DMA ordering uses per-slot semaphores (a captured ``[num_banks]`` int64 bank
-    per input/output, not loop-carried): ``async_copy(sem)`` increments and a
-    once-per-block-guarded ``async_wait(sem)`` decrements, so the copy->wait
-    dependency is a write-after-write on the shared semaphore.
 """
 
 import math
@@ -166,21 +124,11 @@ class _BufferedRef:
     SRAM ``bank`` and per-slot DMA ``sem`` (Pallas's ``window_ref`` +
     ``sem_recvs`` / ``sem_sends``) — plus the state machine that drives it: slot
     selection, copy / wait predicates, prologue priming, and producer /
-    consumer / store cursor advancement.  Following Pallas, the DRAM source /
-    destination is **passed in per call** (Pallas's ``src_ref``), not owned.
+    consumer / store cursor advancement.
 
     It holds **no mutable runtime state**: each method takes the loop-carried
     counter as a plain argument and returns the updated SymInt (the live cursors
     live in the ``while_loop`` operands), so the scheduler stays exportable.
-    ``kind`` (``_IN`` / ``_OUT``) selects which method set ``PipelinedKernel``
-    drives; the addressing helpers are shared.
-
-    An operand's block index at a grid point is the tuple of grid coords its
-    ``index_map`` selects (dropping whole / broadcast dims, and ``None``
-    entries).  An input whose block is reused across a sweep is *guarded* (it
-    carries producer + consumer cursors and copies / waits only on block
-    changes); one that spans the innermost tiled dim *advances every step* (no
-    cursors, read slot ``step % N``, copy slot ``(step + D) % N``).
     """
 
     _IN = "in"
@@ -206,10 +154,10 @@ class _BufferedRef:
 
     def _block_address(self, grid_idx):
         """The ``(dims, indices)`` addressing this operand's tile for
-        ``copy_tile`` at ``grid_idx``: a spec dim is dynamically indexed iff the
+        ``async_copy`` at ``grid_idx``: a spec dim is dynamically indexed iff the
         grid dim it maps to is tiled (``grid > 1``) and isn't broadcast.  Whole
         / broadcast / ``None``-mapped dims stay at block 0 (omitted).  ``dims``
-        is ``None`` when every dim is dynamic (``copy_tile``'s "all dims"
+        is ``None`` when every dim is dynamic (``async_copy``'s "all dims"
         shorthand).
         """
         spec = self.spec
@@ -298,7 +246,7 @@ class _BufferedRef:
         if spec.transposed:
             # The spec is in matmul (Kᵀ) order but the DRAM buffer is its
             # (N, K) transpose; swap the fetch's last two dims so the DMA
-            # slices it in its own order (``copy_tile`` ``.mT``s it back).
+            # slices it in its own order (``async_copy`` ``.mT``s it back).
             def _swap(seq):
                 s = list(seq)
                 s[-2], s[-1] = s[-1], s[-2]
@@ -520,7 +468,7 @@ class PipelinedKernel(torch.nn.Module):
     """Spec-driven, mutate-style kernel scheduler (see module docstring).
 
     ``kernel(grid_index, *in_tiles, *out_banks)`` is the per-tile compute; it
-    writes each output SRAM bank (via ``voyager.copy_tile``) rather than
+    writes each output SRAM bank (via ``voyager.insert``) rather than
     returning a value.  A ``None`` input spec is a whole / scalar / codebook
     operand, passed through un-tiled.  ``num_banks`` is the software-pipeline
     depth (2 = double buffering).
@@ -983,10 +931,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     ]
 
     # MHA QKV projection fused with the output relayout (view-split-N +
-    # transpose/permute -> ``[B, H, S, head_dim]``).  The gemm tile must be
+    # transpose/permute -> ``[B, H, S, head_dim]``). The gemm tile must be
     # stored to the transposed block: M -> S, N -> head dim (outer = heads,
-    # tiled by the N grid; inner = head_dim, whole).  Override the (single)
-    # output's tile + index_map and retile the body's view to tile dims.
+    # tiled by the N grid; inner = head_dim, whole).
     head_dim = None if is_conv else _detect_mha_relayout(fused_ops)
     if head_dim is not None and tiling is not None and not multi_outputs:
         g_out = anchor.value  # gemm output [*batch, M, N]
@@ -1033,7 +980,7 @@ def _map_kernel(compute: Callable, num_outputs: int):
         if not isinstance(results, (tuple, list)):
             results = (results,)
         for bank, value in zip(out_banks, results):
-            voyager.copy_tile(value, bank, (0,) * bank.ndim, bank.shape)
+            voyager.insert(value, bank)
 
     return kernel
 
@@ -1078,11 +1025,9 @@ def _reduction_fused_kernel(
             # Later steps: bare op (no bias) + the running accumulator.
             return to_acc(compute(in_tiles, False)) + prev
 
-        voyager.copy_tile(
+        voyager.insert(
             torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
             scratch,
-            (0,) * scratch.ndim,
-            scratch.shape,
         )
 
         # On the last reduction coord, cast the accumulator, apply the fused
@@ -1096,7 +1041,7 @@ def _reduction_fused_kernel(
             if not isinstance(outs, (tuple, list)):
                 outs = (outs,)
             for bank, out in zip(out_banks, outs):
-                voyager.copy_tile(out, bank, (0,) * bank.ndim, bank.shape)
+                voyager.insert(out, bank)
             return 1
 
         def skip():
@@ -1377,7 +1322,7 @@ def _detect_weight_transpose(node: torch.fx.Node):
     ``K.transpose(-2, -1)`` onto the weight; it is peeled to ``(K, True)``.  The
     weight spec keeps the matmul (Kᵀ) layout, but the DRAM buffer is K's own
     ``(N, K)`` storage, so ``_load_tile`` swaps the fetch to read it and
-    ``copy_tile`` ``.mT``s the loaded tile into the bank.  Only a transpose of
+    ``async_copy`` ``.mT``s the loaded tile into the bank.  Only a transpose of
     an external operand (placeholder) is peeled; anything else is returned
     unchanged as ``(operand, False)``.
     """

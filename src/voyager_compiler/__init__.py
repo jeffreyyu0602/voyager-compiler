@@ -300,7 +300,7 @@ def compile(
         plan_memory(
             model,
             cache_size * 2 if double_buffered_l2 else cache_size,
-            num_banks=num_banks,
+            num_banks=num_banks * 2 if double_buffered_l2 else num_banks,
             bank_width=bank_width,
             unroll_dims=unroll_dims,
         )

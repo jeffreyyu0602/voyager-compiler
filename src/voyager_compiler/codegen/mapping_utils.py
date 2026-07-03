@@ -204,10 +204,10 @@ def set_output_field(param, node, output_dir):
         # not a tensor — record the name so the reference resolves.
         param.output.node = node.name
     elif node.value is None and node.target in (
-        torch.ops.voyager.copy_tile.default,
+        torch.ops.voyager.insert.default,
         torch.ops.voyager.async_copy.default,
     ):
-        # A side-effecting tile DMA (``copy_tile`` / ``async_copy``; returns ``None`` — its
+        # A side-effecting tile write (``insert`` / ``async_copy``; returns ``None`` — its
         # dest buffer is a closed-over additional input mutated in place).  Its result is
         # the tile it writes, described from the dest buffer (``args[1]``), which carries
         # the planned address; the source tile and block index travel in the op's args.

@@ -4,7 +4,7 @@ Reuses the dialect's own target handles and predicates so the estimator stays
 in lock-step with the lowering: the control / DMA op set is bufferization's
 ``_NON_COMPUTE``; the compute test mirrors bufferization's ``_is_compute``
 (``call_module`` fused groups, or a bare tensor-producing op that is not
-control / NOP).  ``copy_tile`` is *not* a transfer here — it is the
+control / NOP).  ``insert`` is *not* a transfer here — it is the
 destination-passing write of a compute result into its buffer, so it is
 zero-time control.
 """
@@ -23,12 +23,12 @@ from ...mapping_utils import (
 
 ASYNC_COPY = torch.ops.voyager.async_copy.default
 ASYNC_WAIT = torch.ops.voyager.async_wait.default
-COPY_TILE = torch.ops.voyager.copy_tile.default
+INSERT = torch.ops.voyager.insert.default
 
 
 def classify(node: Node) -> str:
     """One of: ``while_loop``, ``cond``, ``compute``, ``async_copy``,
-    ``async_wait``, ``copy_tile``, or ``control`` (everything zero-time:
+    ``async_wait``, ``insert``, or ``control`` (everything zero-time:
     allocs, zeros, index math, selects, getitems)."""
     if node.op == "call_module":
         return "compute"
@@ -43,8 +43,8 @@ def classify(node: Node) -> str:
         return "async_copy"
     if t is ASYNC_WAIT:
         return "async_wait"
-    if t is COPY_TILE:
-        return "copy_tile"
+    if t is INSERT:
+        return "insert"
     # A bare tile-compute op (e.g. the no-accumulate ``aten.linear`` in a
     # reduction loop's first step): produces a tensor and is not control / NOP
     # / data movement (memory / reshape / indexing ops are kept bare and cost

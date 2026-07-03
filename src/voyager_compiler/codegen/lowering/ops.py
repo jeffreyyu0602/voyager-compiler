@@ -10,7 +10,7 @@ Primitives
 ----------
 ``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
 ``voyager.zeros(size, dtype)``       zero-initialised tile / bank (accumulator, semaphore).
-``voyager.copy_tile(src, dst, ...)`` side-effecting tile DMA (load or store).
+``voyager.insert(src, dst, sem)``    destination-passing compute-result write.
 ``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
 ``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
@@ -19,7 +19,7 @@ Primitives
 
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch.library import Library, impl
@@ -90,124 +90,27 @@ def _zeros_fake(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
     return torch.zeros(size, dtype=dtype)
 
 
-# ---------------------------------------------------------------------------
-# Per-dim block-index assembly for ``copy_tile``.
-# ---------------------------------------------------------------------------
-def _full_indices(
-    rank: int,
-    indices: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]],
-    static_indices: Optional[Tuple[int, ...]],
-) -> List[int]:
-    """
-    Assemble the per-dim block index of length ``rank``.
-
-    ``indices`` supplies the block index for the *tiled* ``dims`` (one entry per
-    ``dims`` entry); ``dims=None`` means ``indices`` already covers every dim.
-    The remaining (untiled) dims take their block index from ``static_indices``
-    (constant, default 0).  Keeping the dynamic ``indices`` separate from the
-    constant fill lets each be a *homogeneous* list (all loop counters vs. all
-    ints) — which the loop-aware code generator can serialize, unlike a single
-    list that mixes counters and constants.
-    """
-    if dims is None:
-        return list(indices)
-    full = list(static_indices) if static_indices is not None else [0] * rank
-    for value, d in zip(indices, dims):
-        full[d] = value
-    return full
-
-
-# ---------------------------------------------------------------------------
-# voyager.copy_tile — the tile DMA: copy one tile between ``src`` and ``dst``,
-# covering both a DRAM buffer -> SRAM tile load and an SRAM tile -> DRAM buffer
-# store; the two are the same move in opposite directions.  The *buffer* operand
-# (more than one tile of storage)
-# is addressed at block ``indices`` (start ``indices[d] * strides[d]``, span
-# ``sizes[d]``); the other operand is the whole ``sizes`` tile.  ``dims`` /
-# ``static_indices`` give a partial block index; ``strides`` defaults to
-# ``sizes`` (a smaller step yields overlapping tiles — the conv halo);
-# ``transposed`` applies ``.mT``.  ``dst`` is mutated in place (``Tensor(a!)``),
-# so a bufferized graph names its on-chip / output buffers explicitly
-# (``voyager.alloc``) instead of threading tile tensors as SSA / loop-carried
-# values.
-#
-# On a *load* (``src`` is the buffer), ``pad`` shifts the tile start by
-# ``-pad[d]`` (the receptive-field offset of a halo with padding) and
-# ``pad_value`` fills any region the shifted window pushes off an edge — so a
-# pooling / conv boundary tile is handled in the load itself (uniform fetch
-# params), instead of materializing a padded input buffer.
-# ---------------------------------------------------------------------------
 voyager_lib.define(
-    "copy_tile(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
-    "SymInt[]? dims=None, SymInt[]? static_indices=None, "
-    "SymInt[]? strides=None, bool transposed=False, "
-    "SymInt[]? pad=None, float? pad_value=None) -> ()"
+    "insert(Tensor src, Tensor(a!) dst, Tensor(b!)? semaphore=None) -> ()"
 )
 
 
-@impl(voyager_lib, "copy_tile", "CompositeExplicitAutograd")
-def copy_tile(
+@impl(voyager_lib, "insert", "CompositeExplicitAutograd")
+def insert(
     src: torch.Tensor,
     dst: torch.Tensor,
-    indices: Tuple[int, ...],
-    sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-    strides: Optional[Tuple[int, ...]] = None,
-    transposed: bool = False,
-    pad: Optional[Tuple[int, ...]] = None,
-    pad_value: Optional[float] = None,
+    semaphore: Optional[torch.Tensor] = None,
 ) -> None:
-    if strides is None:
-        strides = sizes
-    # The buffer (the multi-tile operand) is sliced at the block index; the
-    # other operand is exactly one ``sizes`` tile.  Identify it by shape, not
-    # numel: a halo tile can be *larger* than a small whole input (so numel
-    # mis-picks), but only the buffer differs from the tile shape.  ``src`` is
-    # the buffer => a load (dst tile <- src block); else a store / whole-tile
-    # copy (dst block <- src tile).  A transposed copy is always a load, so an
-    # untiled weight (``src.shape == sizes``) must not pick the store branch.
-    buf = src if transposed or tuple(src.shape) != tuple(sizes) else dst
-    rank = buf.dim()
-    full = _full_indices(rank, indices, dims, static_indices)
-    # A halo with padding starts at ``full[d]*stride - pad[d]`` (default pad 0).
-    off = pad if pad is not None else [0] * rank
-    start = [full[d] * strides[d] - off[d] for d in range(rank)]
-    if buf is src and pad_value is not None:
-        # Padded halo load: ``start`` may run off either edge, so don't slice
-        # directly (a negative Python index would wrap).  Fill the tile with
-        # ``pad_value`` and overwrite the in-bounds intersection —
-        # out-of-bounds rows/cols stay padded.
-        dst.fill_(pad_value)
-        src_sl, dst_sl = [], []
-        for d in range(rank):
-            lo, hi = start[d], start[d] + sizes[d]
-            clo, chi = max(lo, 0), min(hi, src.shape[d])
-            src_sl.append(slice(clo, chi))
-            dst_sl.append(slice(clo - lo, chi - lo))
-        dst[tuple(dst_sl)] = src[tuple(src_sl)]
-        return
-    sl = tuple(slice(start[d], start[d] + sizes[d]) for d in range(rank))
-    if buf is src:
-        region = src[sl]
-        dst.copy_(region.mT if transposed else region)
-    else:
-        dst[sl] = src.mT if transposed else src
+    dst.copy_(src)
+    if semaphore is not None:
+        semaphore.add_(1)
 
 
-@torch.library.register_fake("voyager::copy_tile")
-def _copy_tile_fake(
+@torch.library.register_fake("voyager::insert")
+def _insert_fake(
     src: torch.Tensor,
     dst: torch.Tensor,
-    indices: Tuple[int, ...],
-    sizes: Tuple[int, ...],
-    dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
-    strides: Optional[Tuple[int, ...]] = None,
-    transposed: bool = False,
-    pad: Optional[Tuple[int, ...]] = None,
-    pad_value: Optional[float] = None,
+    semaphore: Optional[torch.Tensor] = None,
 ) -> None:
     return None
 
@@ -215,32 +118,18 @@ def _copy_tile_fake(
 # ---------------------------------------------------------------------------
 # voyager.async_copy / voyager.async_wait — the asynchronous DMA pair.
 #
-# ``async_copy(..., semaphore)`` is ``copy_tile`` that "signals" a semaphore;
-# ``async_wait(semaphore)`` "waits on" it.  Both take an int64 ``semaphore``
+# ``async_copy(..., semaphore)`` copies a tile then "signals" a semaphore;
+# ``async_wait(semaphore)`` "waits on" it. Both take an int64 ``semaphore``
 # scalar, **return nothing**, and declare it **mutable** (``Tensor(a!)`` /
-# ``Tensor(b!)``).  The eager impls emulate a counting semaphore: ``async_copy``
+# ``Tensor(b!)``). The eager impls emulate a counting semaphore: ``async_copy``
 # increments it (post / V), ``async_wait`` asserts ``> 0`` and decrements it
 # (wait / P) — so a *correct* pipeline keeps every wait matched by a prior copy
-# into the same slot (a stray wait trips the assert).  The transfer itself is
-# synchronous (already finished), and the ``register_fake`` impls are no-ops
-# (export traces through the fake, never the eager body).
-#
-# The ``(a!)`` / ``(b!)`` mutation does two jobs at the graph level:
-#
-#   * the shared-semaphore write-after-write (a copy writing ``sem[slot]`` then
-#     a later wait writing the same ``sem[slot]``) is the copy→wait ordering
-#     edge — the data dependency the old returned token used to carry through
-#     the loop's token vectors;
-#   * it makes both ops impure, so ``torch.export`` keeps them (a no-output,
-#     non-mutating op is functionalized away *inside* the ``while_loop`` body
-#     where the wait must live — verified empirically; the ``has_side_effect``
-#     registrations in ``lowering/__init__.py`` are belt-and-suspenders).
+# into the same slot (a stray wait trips the assert).
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
-    "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? static_indices=None, "
-    "SymInt[]? strides=None, bool transposed=False, "
-    "SymInt[]? pad=None, float? pad_value=None) -> ()"
+    "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? strides=None, "
+    "bool transposed=False, SymInt[]? pad=None, float? pad_value=None) -> ()"
 )
 
 
@@ -252,27 +141,53 @@ def async_copy(
     sizes: Tuple[int, ...],
     semaphore: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
 ) -> None:
-    copy_tile(
-        src,
-        dst,
-        indices,
-        sizes,
-        dims,
-        static_indices,
-        strides,
-        transposed,
-        pad,
-        pad_value,
-    )
+    if strides is None:
+        strides = sizes
+    # The buffer (the multi-tile operand) is sliced at the block index; the
+    # other operand is exactly one ``sizes`` tile. Identify it by shape, not
+    # numel as a halo tile can be *larger* than a small whole input. A
+    # transposed copy is always a load, so an untiled weight must not pick the
+    # store branch.
+    buf = src if transposed or tuple(src.shape) != tuple(sizes) else dst
+    rank = buf.dim()
+    # Assemble the per-dim block index: ``indices`` covers the tiled ``dims``
+    # (or every dim when ``dims`` is None); untiled dims default to 0.
+    if dims is None:
+        full = list(indices)
+    else:
+        full = [0] * rank
+        for value, d in zip(indices, dims):
+            full[d] = value
+    # A halo with padding starts at ``full[d]*stride - pad[d]`` (default pad 0).
+    off = pad if pad is not None else [0] * rank
+    start = [full[d] * strides[d] - off[d] for d in range(rank)]
+    if buf is src and pad_value is not None:
+        # Padded halo load: ``start`` may run off either edge, so don't slice
+        # directly (a negative Python index would wrap). Fill the tile with
+        # ``pad_value`` and overwrite the in-bounds intersection —
+        # out-of-bounds rows/cols stay padded.
+        dst.fill_(pad_value)
+        src_sl, dst_sl = [], []
+        for d in range(rank):
+            lo, hi = start[d], start[d] + sizes[d]
+            clo, chi = max(lo, 0), min(hi, src.shape[d])
+            src_sl.append(slice(clo, chi))
+            dst_sl.append(slice(clo - lo, chi - lo))
+        dst[tuple(dst_sl)] = src[tuple(src_sl)]
+    else:
+        sl = tuple(slice(start[d], start[d] + sizes[d]) for d in range(rank))
+        if buf is src:
+            region = src[sl]
+            dst.copy_(region.mT if transposed else region)
+        else:
+            dst[sl] = src.mT if transposed else src
     # Emulate a counting semaphore: the completed transfer signals its slot.
     semaphore.add_(1)
-    return None
 
 
 @torch.library.register_fake("voyager::async_copy")
@@ -283,7 +198,6 @@ def _async_copy_fake(
     sizes: Tuple[int, ...],
     semaphore: torch.Tensor,
     dims: Optional[Tuple[int, ...]] = None,
-    static_indices: Optional[Tuple[int, ...]] = None,
     strides: Optional[Tuple[int, ...]] = None,
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,

@@ -3,7 +3,7 @@ Shared helpers for the bufferization builders (``gemm`` / ``pointwise`` /
 ``attention``).
 
 Tile DMA goes through ``voyager.async_copy`` (the guarded prefetch / store) and
-``voyager.copy_tile`` (the in-kernel whole-slot writes); the helpers here are
+``voyager.insert`` (the in-kernel whole-slot writes); the helpers here are
 the remaining shared pieces: the fused pointwise tail, the lenient export
 verifier, exported-graph cleanup, and tagging each ``while_loop`` with its
 per-dimension tile-grid extents (consumed by the loop-aware code generator).
@@ -244,7 +244,7 @@ def _fuse_tail_in_body(
     The group is found by *forward reachability* from the anchor (like
     mapping.py's ``find_sequential_nodes_``), not by op target: from the lone
     anchor walk *down* through ``.users``, collecting the compute cone, and stop
-    at the output store (``copy_tile``) — excluding the write-out wrappers (a
+    at the output store (``insert``) — excluding the write-out wrappers (a
     ``clone`` / multi-output ``getitem`` that only feed that store).  The tail's
     operand loads (residual / scale ``select`` reads) are *inputs* to the tail
     ops, not descendants of the anchor, so they fall outside the cone and become
@@ -288,7 +288,7 @@ def _fuse_tail_in_body(
         return
     anchor = anchors[0]
 
-    copy_tile = voyager.copy_tile.default
+    insert = voyager.insert.default
     clone = torch.ops.aten.clone.default
 
     def _is_writeout_wrapper(n) -> bool:
@@ -297,7 +297,7 @@ def _fuse_tail_in_body(
         return (
             n.target in (clone, operator.getitem)
             and bool(n.users)
-            and all(u.target is copy_tile for u in n.users)
+            and all(u.target is insert for u in n.users)
         )
 
     # Forward cone from the anchor, halting at the store and its write-out
@@ -308,7 +308,7 @@ def _fuse_tail_in_body(
             if (
                 u in group
                 or u.op != "call_function"
-                or u.target is copy_tile
+                or u.target is insert
                 or _is_writeout_wrapper(u)
             ):
                 continue
@@ -348,7 +348,7 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     through the tail (``fused_gm``) into the output.
 
     The finalize cond is found by the **scratch data dependency**: the
-    accumulate cond's result is ``copy_tile``'d into the scratch ref, and the
+    accumulate cond's result is ``insert``'d into the scratch ref, and the
     finalize cond is the other cond that reads that same scratch as an operand.
     Its true branch is just ``fused_gm`` + NOP wrappers (the dense-view / cast /
     multi-output ``getitem`` that match the skip branch's metadata), so the
@@ -357,7 +357,7 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     from voyager_compiler.codegen.mapping_utils import is_nop
 
     cond = torch.ops.higher_order.cond
-    copy_tile = voyager.copy_tile.default
+    insert = voyager.insert.default
 
     def true_branch(c):
         a = c.args[1]
@@ -383,19 +383,16 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     #     accumulate)``: the true branch (``args[1]``) is ``init`` — just the
     #     anchor, whose result is stored directly (through at most a nop cast) —
     #     so only the false branch (``args[2]``, ``accumulate``) has the add.
-    #     There the bare anchor result feeds the add, not a store, so the
-    #     destination-passing check would reject it; folding it into the fused op
-    #     makes the op's *result* the value that is ``copy_tile``'d into scratch.
     accum_branch = getattr(gm, str(anchor_cond.args[2].target), None)
     if isinstance(accum_branch, torch.fx.GraphModule):
         _fuse_tail_in_body(accum_branch, target)
 
-    # 2. The scratch ref = the dest of the ``copy_tile`` fed by the accumulate
+    # 2. The scratch ref = the dest of the ``insert`` fed by the accumulate
     #    cond's result (through the cond's ``getitem`` unpacking).
     scratch = None
     for u in anchor_cond.users:
         chain = list(u.users) if u.target is operator.getitem else [u]
-        copy_n = next((n for n in chain if n.target is copy_tile), None)
+        copy_n = next((n for n in chain if n.target is insert), None)
         if copy_n is not None:
             scratch = copy_n.args[1]
             break
@@ -425,7 +422,7 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
             n.op == "call_function"
             and n.target is not operator.getitem
             and n.target is not torch.ops.aten.to.dtype
-            and n.target is not copy_tile
+            and n.target is not insert
             and not is_nop(n)
         )
     ]
@@ -481,9 +478,9 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
         if n.op == "placeholder" and not n.users:
             gm.graph.erase_node(n)
     # Only ``aten`` ops are safe to drop as dead code.  The ``voyager.*``
-    # primitives (notably the side-effecting ``async_copy`` / ``copy_tile``) and
+    # primitives (notably the side-effecting ``async_copy`` / ``insert``) and
     # the ``while_loop`` / ``cond`` HOPs carry side effects that DCE can't see — a
-    # bufferized loop writes its output through ``copy_tile`` / ``async_copy``
+    # bufferized loop writes its output through ``insert`` / ``async_copy``
     # into an *additional-input* buffer, so the loop has no FX users and default
     # DCE would delete it.  Treating every non-``aten`` node as impure keeps the
     # loop machinery while still cleaning up dead ``aten`` compute.
