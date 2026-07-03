@@ -9,8 +9,10 @@ and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
 compute on the systolic array, ``async_copy`` on the DRAM interface, and waits
-as zero-time control. DPS ``insert`` (a compute result written into its
-buffer) is bookkeeping, not a real op, so it is skipped entirely.
+as zero-time control. A DPS ``insert`` writes a compute result into its buffer:
+a plain one is bookkeeping (skipped), but a ``semaphore``-carrying one marks its
+producing compute asynchronous and posts that semaphore when the compute
+finishes -- so ``async_wait`` can reconcile compute the same way it does a DMA.
 """
 
 import math
@@ -22,8 +24,9 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ...mapping_utils import is_nop
+from ...passes.utils import get_arg_value
 from ..codegen import _loop_extents, _norm_extent
-from .classify import classify
+from .classify import INSERT, classify
 from .cost import _val, tile_bytes
 from .model import CostParams, ScheduleResult
 from .scheduler import ResourceState
@@ -31,6 +34,18 @@ from .scheduler import ResourceState
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
 _SELECT = torch.ops.aten.select.int
+
+
+def _feeds_sem_insert(node: Node) -> bool:
+    """Whether ``node``'s result is published by a ``semaphore``-carrying
+    ``insert`` -- i.e. this compute runs asynchronously (commit, do not wait).
+    """
+    return any(
+        u.op == "call_function"
+        and u.target is INSERT
+        and get_arg_value(u, 2, "semaphore") is not None
+        for u in node.users
+    )
 
 
 @dataclass
@@ -173,7 +188,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif kind == "cond":
             env[node] = _run_cond(node, gm, env, ctx, path)
         elif kind == "compute":
-            ctx.rs.compute(node, path)
+            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
         elif kind == "async_copy":
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
@@ -182,9 +197,12 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif kind == "async_wait":
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif kind == "insert":
-            # Destination-passing bookkeeping (writes a compute result into its
-            # buffer): zero-time, no resource, no traffic -> not a scheduled op.
-            pass
+            # Destination-passing write: zero-time itself, but a semaphore posts
+            # the producing compute's completion so async_wait can consume it.
+            sem = get_arg_value(node, 2, "semaphore")
+            if sem is not None:
+                key = _sem_key(sem, env, ctx.bind)
+                ctx.rs.post_semaphore(key, node.args[0])
         elif _should_eval(node):
             env[node] = _eval(node, env)
     return None

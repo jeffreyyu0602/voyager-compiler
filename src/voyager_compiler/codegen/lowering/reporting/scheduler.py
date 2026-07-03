@@ -1,19 +1,25 @@
 """The resource/timing state machine.
 
-Compute is **synchronous**: a pass occupies the unit(s) named by its
-``OpInfo.units`` — ``mma`` (systolic matrix array), ``vector`` (vector
-unit), or both (a fused GEMM / conv, whose tail runs on the VU) — and
-**advances the program clock**, so compute passes serialize.  The units
-are labelled and queued separately (the report attributes each pass to its
-unit), but they do **not** overlap — asynchronous matrix ∥ vector execution
-is not modelled here yet.
+A compute occupies the unit(s) named by its ``OpInfo.units`` — ``mma``
+(systolic matrix array), ``vector`` (vector unit), or both (a fused GEMM /
+conv, whose tail runs on the VU).  Whether it advances the **program clock**
+depends on how its result is written:
+
+* **synchronous** (its ``insert`` carries no semaphore): advances the program
+  clock, so it serializes and forms the clock the waits reconcile against.
+* **asynchronous** (its result is published by a ``semaphore``-carrying
+  ``insert``): occupies its unit(s) but does **not** advance the program clock,
+  so it runs while the clock moves on other units; the ``insert`` posts its
+  completion onto the semaphore FIFO, exactly as ``async_copy`` does.  Two ops
+  on the same unit still serialize (shared ``*_free`` counter); overlap appears
+  only across different units.
 
 ``async_copy`` *is* asynchronous: it occupies DRAM for its transfer without
 advancing the program clock, so a prefetch overlaps compute; ``async_wait``
-blocks the program clock until the matching transfer (oldest into that
-semaphore slot — a per-slot FIFO) completes.  Every event records the
-``eid``s whose ``end`` determined its ``start = max(...)`` so the workbook
-can recompute the schedule live.
+blocks the program clock until the matching post (oldest into that semaphore
+slot — a per-slot FIFO), whether that post came from a DMA or an async compute.
+Every event records the ``eid``s whose ``end`` determined its
+``start = max(...)`` so the workbook can recompute the schedule live.
 """
 
 from collections import deque
@@ -37,8 +43,11 @@ class ResourceState:
         self.records: List[TimingRecord] = []
         self.ops: Dict[int, OpInfo] = {}  # id(node) -> OpInfo
         self._op_names: set = set()
-        # semaphore slot -> FIFO of (completion_cycle, copy_eid)
+        # semaphore slot -> FIFO of (completion_cycle, producer_eid)
         self.sem_fifos: Dict[object, deque] = {}
+        # id(async compute node) -> its (end, eid), handed to the following
+        # insert so it can post the semaphore
+        self.pending_post: Dict[int, Tuple[int, int]] = {}
         # last events that advanced each clock (for start_deps wiring)
         self.last_now_eid: Optional[int] = None
         self.last_mma_eid: Optional[int] = None
@@ -81,7 +90,7 @@ class ResourceState:
 
     # -- event kinds --------------------------------------------------------
 
-    def compute(self, node, path) -> TimingRecord:
+    def compute(self, node, path, async_post: bool = False) -> TimingRecord:
         eid = self._eid()
         op = self.get_op(node)
         start = max(self.now, *(self._unit_free(u) for u in op.units))
@@ -106,9 +115,22 @@ class ResourceState:
         self.records.append(rec)
         for u in op.units:
             self._occupy(u, end, eid)
-        self.now = end
-        self.last_now_eid = eid
+        # An async compute occupies its unit(s) but leaves the program clock;
+        # the following insert posts its completion.  A sync one advances it.
+        if async_post:
+            self.pending_post[id(node)] = (end, eid)
+        else:
+            self.now = end
+            self.last_now_eid = eid
         return rec
+
+    def post_semaphore(self, sem_key, src_node) -> None:
+        """Publish the async compute ``src_node``'s completion onto ``sem_key``'s
+        FIFO -- the compute-side twin of the post ``async_copy`` makes."""
+        end_eid = self.pending_post.pop(id(src_node), None)
+        if end_eid is None:
+            end_eid = (self.now, self.last_now_eid)
+        self.sem_fifos.setdefault(sem_key, deque()).append(end_eid)
 
     def async_copy(
         self, node, n_bytes: int, is_load: bool, sem_key, path
