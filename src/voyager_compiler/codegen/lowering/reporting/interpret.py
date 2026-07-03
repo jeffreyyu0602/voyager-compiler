@@ -24,7 +24,7 @@ from torch.fx import GraphModule, Node
 from ...mapping_utils import is_nop
 from ..codegen import _loop_extents, _norm_extent
 from .classify import classify
-from .cost import _val, op_info, tile_bytes
+from .cost import _val, tile_bytes
 from .model import CostParams, ScheduleResult
 from .scheduler import ResourceState
 
@@ -173,7 +173,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif kind == "cond":
             env[node] = _run_cond(node, gm, env, ctx, path)
         elif kind == "compute":
-            ctx.rs.compute(node, ctx.rs.get_op(node, op_info), path)
+            ctx.rs.compute(node, path)
         elif kind == "async_copy":
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)

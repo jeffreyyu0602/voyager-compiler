@@ -12,10 +12,10 @@ import math
 from typing import Tuple
 
 import torch
-from torch.fx import Node
+from torch.fx import GraphModule, Node
 
 from ...mapping import get_anchor_node
-from ...mapping_utils import is_conv2d, is_gemm_op
+from ...mapping_utils import is_conv2d, is_fully_connected, is_gemm_op
 from ....pt2e_utils import dtype_byte_size
 from .model import CostParams, OpInfo
 
@@ -93,10 +93,15 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     unambiguously the i-th operand (a fused wrapper's args may interleave
     scales / codes / bias).
     """
-    anchor = get_anchor_node(node) or node
+    anchor = get_anchor_node(node)
     macs_unroll = max(1, cost.unroll[0] * cost.unroll[1])
     vec_unroll = max(1, cost.unroll[1])
     out = _shape(anchor)
+
+    # A fused submodule drives the vector unit too (its tail runs on the VU,
+    # even a bare reshape); a bare matrix op occupies only the matrix unit.
+    fused = isinstance(node.meta.get("submodule"), GraphModule)
+    matrix_units = ("mma", "vector") if fused else ("mma",)
 
     if is_conv2d(anchor):
         # MACs = prod(out) * C * kh * kw; the channel / kernel dims sit at
@@ -108,15 +113,35 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
             c, kh, kw = w[1], w[2], w[3]
         macs = math.prod(out) * c * kh * kw
         return OpInfo(
-            node.name, "conv", math.ceil(macs / macs_unroll), {"macs": macs}
+            node.name,
+            "conv",
+            math.ceil(macs / macs_unroll),
+            {
+                "macs": macs,
+                "input": _shape(anchor.args[0]),
+                "weight": w,
+                "output": out,
+            },
+            units=matrix_units,
         )
 
     if is_gemm_op(anchor):
         # MACs = prod(out) * K; each output element costs K = in[-1] MACs
         # (folds batch dims; works for linear / matmul / bmm).
-        macs = math.prod(out) * _shape(anchor.args[0])[-1]
+        inp = _shape(anchor.args[0])
+        macs = math.prod(out) * inp[-1]
         return OpInfo(
-            node.name, "gemm", math.ceil(macs / macs_unroll), {"macs": macs}
+            node.name,
+            "gemm",
+            math.ceil(macs / macs_unroll),
+            {
+                "macs": macs,
+                "input": inp,
+                "weight": _shape(anchor.args[1]),
+                "output": out,
+            },
+            # A fully-connected (matrix-vector) GEMM runs on the vector unit.
+            units=("vector",) if is_fully_connected(anchor) else matrix_units,
         )
 
     # Vector op: work is the larger of input / output element count -- a
@@ -127,9 +152,9 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
     return OpInfo(
-        node.name, "vector", math.ceil(ops / vec_unroll), {"ops": ops}
+        node.name,
+        "vector",
+        math.ceil(ops / vec_unroll),
+        {"ops": ops, "input": in_shape, "output": out},
+        units=("vector",),
     )
-
-
-def compute_cycles(node: Node, cost: CostParams) -> int:
-    return op_info(node, cost).ideal_cycles

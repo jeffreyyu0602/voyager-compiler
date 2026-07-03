@@ -37,19 +37,22 @@ class TimingRecord:
     """One scheduled execution of one FX node (a loop body node runs many
     times, so one node yields many records, tagged by ``iteration_path``).
 
-    ``resource`` is the lane the event occupies: ``"compute"`` (systolic
-    array), ``"dram"`` (the shared DRAM interface), or ``"control"`` — a
-    synchronization that uses no bandwidth (an ``async_wait``: it can stall the
-    program clock but draws no Gantt bar).  ``start_deps`` lists the ``eid``s
+    ``resource`` is the tuple of lanes the event occupies — each advances
+    that lane's clock and draws its own Gantt bar.  A compute pass holds
+    ``("mma",)`` (matrix unit), ``("vector",)`` (vector unit), or both
+    ``("mma", "vector")`` (a fused GEMM / conv, whose tail runs on the VU);
+    a DMA holds ``("dram",)``; an ``async_wait`` holds ``("control",)`` —
+    a synchronization that uses no bandwidth (it can stall the program
+    clock but draws no visible bar).  ``start_deps`` lists the ``eid``s
     whose ``end`` fed this event's ``start = max(...)`` — recorded so the
-    workbook can wire ``Start = MAX(End_of_dep...)`` and recalculate live (the
-    dependency wiring is structural, hence invariant to edits).
+    workbook can wire ``Start = MAX(End_of_dep...)`` and recalculate live
+    (the dependency wiring is structural, hence invariant to edits).
     """
 
     eid: int
     node_name: str
-    kind: str  # compute | async_copy | async_wait
-    resource: str  # compute | dram | control
+    kind: str  # compute | load | store | async_wait
+    resource: Tuple[str, ...]  # subset of {mma, vector, dram, control}
     start: int
     end: int
     iteration_path: Tuple[int, ...] = ()
@@ -74,6 +77,7 @@ class OpInfo:
     op_type: str  # gemm | conv | vector
     ideal_cycles: int
     detail: dict = field(default_factory=dict)
+    units: Tuple[str, ...] = ("vector",)
 
 
 @dataclass

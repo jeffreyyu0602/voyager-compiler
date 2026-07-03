@@ -22,16 +22,31 @@ from .model import ScheduleResult, TimingRecord
 xl_rowcol_to_cell = None  # bound in write_excel_report
 
 # Events sheet column layout.
-C_EID, C_NODE, C_KIND, C_RES, C_ITER, C_BYTES = 0, 1, 2, 3, 4, 5
-C_START, C_LAT, C_END, C_COMPUTE, C_DRAM, C_READ, C_WRITE = (
-    6,
-    7,
-    8,
-    9,
-    10,
-    11,
-    12,
-)
+C_EID = 0
+C_NODE = 1
+C_KIND = 2
+C_RES = 3
+C_ITER = 4
+C_BYTES = 5
+C_START = 6
+C_LAT = 7
+C_END = 8
+C_COMPUTE = 9
+C_DRAM = 10
+C_READ = 11
+C_WRITE = 12
+
+# Operations sheet column layout (shapes precede the derived Work scalar).
+O_NODE = 0
+O_TYPE = 1
+O_IN = 2
+O_WEIGHT = 3
+O_OUT = 4
+O_WORK = 5
+O_IDEAL = 6
+O_UTIL = 7
+O_EFF = 8
+
 _HEADERS = [
     "EID",
     "Node",
@@ -88,34 +103,51 @@ def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
     headers = [
         "Node",
         "Op type",
-        "Work",
+        "Input",
+        "Weight",
+        "Output",
+        "Macs / Ops",
         "Ideal cycles",
         "Utilization",
         "Effective cycles",
     ]
     for c, h in enumerate(headers):
         ws.write(0, c, h, bold)
-    ws.set_column(0, 0, 18)
-    ws.set_column(3, 5, 14)
+    ws.set_column(O_NODE, O_NODE, 18)
+    ws.set_column(O_IN, O_OUT, 18)
+    ws.set_column(O_IDEAL, O_EFF, 14)
 
     op_row: Dict[str, int] = {}
     for i, op in enumerate(result.ops):
         r = i + 1
         work = op.detail.get("macs", op.detail.get("ops", 0))
-        ws.write(r, 0, op.key)
-        ws.write(r, 1, op.op_type)
-        ws.write_number(r, 2, work)
-        work_cell = xl_rowcol_to_cell(r, 2)
+        ws.write(r, O_NODE, op.key)
+        ws.write(r, O_TYPE, op.op_type)
+        # Operand shapes (the ``Work`` scalar's provenance).
+        for col, dim in (
+            (O_IN, "input"),
+            (O_WEIGHT, "weight"),
+            (O_OUT, "output"),
+        ):
+            shape = op.detail.get(dim)
+            if shape is not None:
+                ws.write(r, col, "x".join(str(int(d)) for d in shape))
+        ws.write_number(r, O_WORK, work)
+        work_cell = xl_rowcol_to_cell(r, O_WORK)
         if op.op_type in ("gemm", "conv"):
             ideal = f"=CEILING({work_cell}/(ic_unroll*oc_unroll),1)"
         else:
             ideal = f"=CEILING({work_cell}/oc_unroll,1)"
-        ws.write_formula(r, 3, ideal, None, op.ideal_cycles)
-        ws.write_number(r, 4, 1.0, edit)  # editable utilization
-        ideal_cell = xl_rowcol_to_cell(r, 3)
-        util_cell = xl_rowcol_to_cell(r, 4)
+        ws.write_formula(r, O_IDEAL, ideal, None, op.ideal_cycles)
+        ws.write_number(r, O_UTIL, 1.0, edit)  # editable utilization
+        ideal_cell = xl_rowcol_to_cell(r, O_IDEAL)
+        util_cell = xl_rowcol_to_cell(r, O_UTIL)
         ws.write_formula(
-            r, 5, f"=CEILING({ideal_cell}/{util_cell},1)", None, op.ideal_cycles
+            r,
+            O_EFF,
+            f"=CEILING({ideal_cell}/{util_cell},1)",
+            None,
+            op.ideal_cycles,
         )
         op_row[op.key] = r
     return op_row
@@ -125,7 +157,7 @@ def _latency_formula(
     rec: TimingRecord, row: int, op_row: Dict[str, int]
 ) -> str:
     if rec.latency_kind == "compute":
-        cell = xl_rowcol_to_cell(op_row[rec.latency_ref], 5)
+        cell = xl_rowcol_to_cell(op_row[rec.latency_ref], O_EFF)
         return f"='Operations'!{cell}"
     if rec.latency_kind == "dram":
         b = xl_rowcol_to_cell(row, C_BYTES)
@@ -149,7 +181,7 @@ def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
         ws.write_number(r, C_EID, rec.eid)
         ws.write(r, C_NODE, rec.node_name)
         ws.write(r, C_KIND, rec.kind)
-        ws.write(r, C_RES, rec.resource)
+        ws.write(r, C_RES, "/".join(rec.resource))
         ws.write(r, C_ITER, str(rec.iteration_path))
         ws.write_number(r, C_BYTES, rec.bytes)
 
@@ -175,16 +207,20 @@ def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
         ws.write_formula(
             r,
             C_COMPUTE,
-            f'=IF({res}="compute",{lat},0)',
+            f'=IF(AND({res}<>"dram",{res}<>"control"),{lat},0)',
             None,
-            rec.end - rec.start if rec.resource == "compute" else 0,
+            (
+                rec.end - rec.start
+                if rec.resource[0] not in ("dram", "control")
+                else 0
+            ),
         )
         ws.write_formula(
             r,
             C_DRAM,
             f'=IF({res}="dram",{lat},0)',
             None,
-            rec.end - rec.start if rec.resource == "dram" else 0,
+            rec.end - rec.start if rec.resource[0] == "dram" else 0,
         )
         ws.write_number(r, C_READ, rec.bytes if rec.is_read else 0)
         ws.write_number(r, C_WRITE, 0 if rec.is_read else rec.bytes)
