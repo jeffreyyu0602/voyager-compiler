@@ -784,40 +784,20 @@ class _FusedInfo:
         anchor_node,
         is_conv,
         fused_gm,
+        tiling,
         input_values,
         in_specs,
+        in_sources,
         output_specs,
-        tiling=None,
-        in_sources=None,
     ):
         self.anchor_node = anchor_node
         self.is_conv = is_conv
         self.fused_gm = fused_gm
+        self.tiling = tiling
         self.input_values = input_values
         self.in_specs = in_specs
-        self.output_specs = output_specs
-        self.tiling = tiling
         self.in_sources = in_sources
-
-
-def _detect_mha_relayout(fused_ops):
-    """If the fused tail ends with the MHA output relayout — a ``view`` /
-    ``reshape`` that splits the gemm's ``N`` into ``(H, head_dim)`` followed by
-    an MHA ``transpose(1,2)`` / ``permute([0,2,1,3])`` to ``[B, H, S,
-    head_dim]`` (``is_mha_qkv_permute``) — return ``head_dim``; else ``None``.
-    """
-    if not fused_ops:
-        return None
-    perm = fused_ops[-1]
-    if not is_mha_qkv_permute(perm):
-        return None
-    view = perm.args[0]
-    if view.target not in (
-        torch.ops.aten.view.default,
-        torch.ops.aten.reshape.default,
-    ):
-        return None
-    return perm.value.shape[-1]  # head_dim (unchanged by the perm)
+        self.output_specs = output_specs
 
 
 def _retile_mha_view(fused_gm, nb, tm) -> None:
@@ -840,6 +820,56 @@ def _retile_mha_view(fused_gm, nb, tm) -> None:
     view.update_arg(1, dims)
     fused_gm.graph.lint()
     fused_gm.recompile()
+
+
+def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
+    """If the fused tail ends with an MHA output relayout
+    (``is_mha_qkv_permute`` — a ``transpose(1,2)`` / ``permute([0,2,1,3])`` on a
+    4-D tensor), return the relaid-out output ``(tile_sizes, index_map)`` (the
+    tile stored to the permuted block, tiling the output on its own axes) and,
+    for the projection case, retile the body's ``view`` in place; else ``None``
+    (the caller keeps the default, un-permuted output spec).
+
+    Two kinds, differing in where the head comes from:
+
+      * projection: a ``view`` / ``reshape`` splits the gemm's ``N`` into
+        ``(H, head_dim)`` and the permute makes the heads outer ->
+        ``[B, H, S, head_dim]``.  Store the gemm tile transposed -- M -> S,
+        N -> head (outer = heads, tiled by the N grid; inner = head_dim, whole).
+      * ``P @ V`` context matmul: the output is *already* 4-D
+        ``[B, H, S, head_dim]`` with the head a *looped* batch dim, and a bare
+        ``transpose(1,2)`` moves it after M -> ``[B, S, H, head_dim]``.  Tile
+        the output on its permuted axes -- S <- M grid, head <- its (looped)
+        batch grid dim (H_t = 1), head_dim <- N grid. The body already emits the
+        transposed tile, so there is no view to retile.
+
+    ``fused_ops`` must be non-empty and ``tiling`` must not be ``None``.
+    """
+    perm = fused_ops[-1]
+    if not is_mha_qkv_permute(perm):
+        return None
+    head_dim = perm.value.shape[-1]  # head_dim (unchanged by the perm)
+    g_out = anchor.value  # gemm output [*batch, M, N]
+    nb = g_out.ndim - 2
+    grid_m, grid_n = nb, nb + 1
+    M, N = g_out.shape[-2], g_out.shape[-1]
+    nm, nn = tiling[nb], tiling[nb + 1]
+    tm, tn = M // nm, N // nn
+    if perm.value.ndim > g_out.ndim:
+        if tn % head_dim != 0:
+            raise NotImplementedError(
+                f"MHA output relayout: N tile {tn} is not a multiple of "
+                f"head_dim {head_dim} (would split a head across tiles)"
+            )
+        tb = tuple(g_out.shape[:nb])
+        out_tile = tb + (tn // head_dim, tm, head_dim)  # [*b, H_t, S_t, hd]
+        out_imap = tuple(range(nb)) + (grid_n, grid_m, None)  # H<-N, S<-M, hd
+        _retile_mha_view(gm, nb, tm)
+    else:
+        outer = tuple(g_out.shape[: nb - 1])
+        out_tile = outer + (tm, 1, tn)  # [*outer, S_t, H_t=1, head_dim]
+        out_imap = tuple(range(nb - 1)) + (grid_m, nb - 1, grid_n)
+    return out_tile, out_imap
 
 
 def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
@@ -930,38 +960,21 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         (s, t, v.dtype, None) for s, t, v in zip(full_shapes, tiled_shape, vals)
     ]
 
-    # MHA QKV projection fused with the output relayout (view-split-N +
-    # transpose/permute -> ``[B, H, S, head_dim]``). The gemm tile must be
-    # stored to the transposed block: M -> S, N -> head dim (outer = heads,
-    # tiled by the N grid; inner = head_dim, whole).
-    head_dim = None if is_conv else _detect_mha_relayout(fused_ops)
-    if head_dim is not None and tiling is not None and not multi_outputs:
-        g_out = anchor.value  # gemm output [*batch, M, N]
-        nb = g_out.ndim - 2
-        gm, gn = nb, nb + 1
-        M, N = g_out.shape[-2], g_out.shape[-1]
-        nm, nn = tiling[nb], tiling[nb + 1]
-        tm, tn = M // nm, N // nn
-        if tn % head_dim != 0:
-            raise NotImplementedError(
-                f"MHA output relayout: N tile {tn} is not a multiple of "
-                f"head_dim {head_dim} (would split a head across tiles)"
-            )
-        tb = tuple(g_out.shape[:nb])
-        out_tile = tb + (tn // head_dim, tm, head_dim)  # [*b, H_t, S_t, hd]
-        out_imap = tuple(range(nb)) + (gn, gm, None)  # H<-N, S<-M, hd whole
-        output_specs = [(full_shapes[0], out_tile, vals[0].dtype, out_imap)]
-        _retile_mha_view(fused_gm, nb, tm)
+    if not is_conv and fused_ops and tiling is not None:
+        relayout = _detect_mha_relayout(fused_ops, anchor, tiling, fused_gm)
+        if relayout is not None:
+            out_tile, out_imap = relayout
+            output_specs = [(full_shapes[0], out_tile, vals[0].dtype, out_imap)]
 
     return _FusedInfo(
         anchor,
         is_conv,
         fused_gm,
+        tiling,
         input_values,
         in_specs,
-        output_specs,
-        tiling,
         in_sources,
+        output_specs,
     )
 
 
