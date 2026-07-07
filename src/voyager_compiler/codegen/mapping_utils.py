@@ -748,8 +748,10 @@ def is_memory_op(node: Node) -> bool:
 
     return node.target in [
         torch.ops.aten.clone.default,
+        torch.ops.aten.copy_.default,
         torch.ops.aten.embedding.default,
         torch.ops.aten.expand.default,
+        torch.ops.aten.index_copy_.default,
         torch.ops.aten.slice.Tensor,
         torch.ops.aten.to.dtype,
     ]

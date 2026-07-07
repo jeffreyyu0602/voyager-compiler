@@ -557,19 +557,24 @@ def _bufferize_key(node):
 
 
 def bufferize_graph(
-    model: GraphModule, pipelined: bool = False, tiler=None
+    model: GraphModule,
+    pipelined: bool = False,
+    tiler=None,
+    single_buffer_tail: bool = False,
 ) -> GraphModule:
-    """
-    Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
-    Returns the same (mutated) model.
+    """Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
 
     Assumes shapes are already populated (``node.value``); each node is built
-    from its (and its inputs') shapes/dtypes and spliced in place.
+    from its (and its inputs') shapes/dtypes and spliced in place.  Returns the
+    same (mutated) model.
 
-    ``pipelined`` reuses the tiler's double-buffering decision (it already
-    sizes tiles so two L2 tiles fit) to emit software-pipelined loop nests:
-    GEMM/conv double-buffer their C-reduction; pointwise unrolls small grids
-    ahead.
+    Args:
+        model: The FX GraphModule to rewrite in place.
+        pipelined: Emit software-pipelined (double-buffered) loop nests,
+          reusing the tiler's decision that two L2 tiles fit.
+        tiler: Interstellar ``TilerContext`` supplying per-node tile factors.
+        single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
+          post-op operands (SRAM saved vs. prefetch); off => double-buffered.
     """
     from .pipeline import (
         build_conv2d,
@@ -631,9 +636,19 @@ def bufferize_graph(
             # pointwise builder; a bare op only when it is elementwise / a
             # kept-reduction op (pool only when bare — a fused pool is pointwise).
             if is_conv2d(anchor):
-                sub_gm = build_conv2d(node, num_banks=num_banks, tiler=tiler)
+                sub_gm = build_conv2d(
+                    node,
+                    num_banks=num_banks,
+                    single_buffer_tail=single_buffer_tail,
+                    tiler=tiler,
+                )
             elif is_gemm_op(anchor):
-                sub_gm = build_gemm(node, num_banks=num_banks, tiler=tiler)
+                sub_gm = build_gemm(
+                    node,
+                    num_banks=num_banks,
+                    single_buffer_tail=single_buffer_tail,
+                    tiler=tiler,
+                )
             elif is_pooling(anchor):
                 sub_gm = build_pool(node, num_banks=num_banks)
             elif (

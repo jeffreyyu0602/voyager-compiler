@@ -39,6 +39,7 @@ from voyager_compiler.codegen.lowering.tiling import get_tiling
 from voyager_compiler.codegen.shape_prop import ShapeProp
 from voyager_compiler.codegen.mapping_utils import (
     ancestors,
+    is_bmm,
     is_conv2d,
     is_gemm_op,
     is_linear,
@@ -1088,6 +1089,7 @@ def build_conv2d(
     *,
     num_banks: int = _DEFAULT_NUM_BANKS,
     accumulate_fp32: bool = False,
+    single_buffer_tail: bool = False,
     tiler=None,
 ):
     """Pipeline builder for a conv2d (groups=1) node — incl. the microscaling /
@@ -1294,7 +1296,8 @@ def build_conv2d(
         return result
 
     if num_k > 1:
-        _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
+        if single_buffer_tail:
+            _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
         acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
         scratch_specs = [
             _ScratchSpec(_project((tn, tk, toh, tow), out_dims), acc_dtype)
@@ -1361,6 +1364,7 @@ def build_gemm(
     *,
     num_banks: int = _DEFAULT_NUM_BANKS,
     accumulate_fp32: bool = False,
+    single_buffer_tail: bool = False,
     tiler=None,
 ):
     """Pipeline builder for a linear / matmul / batched-matmul node — incl. the
@@ -1383,7 +1387,7 @@ def build_gemm(
         return None
 
     tiling = info.tiling if info is not None else get_tiling(node, tiler)
-    if info is None and tiling is None:
+    if info is None and tiling is None and not is_bmm(node):
         return None
 
     anchor = info.anchor_node if info is not None else node
@@ -1403,7 +1407,12 @@ def build_gemm(
 
     M, K, N = act.shape[-2], act.shape[-1], out.shape[-1]
     if tiling is None:
-        out_ts, tk = tuple(out.shape), K  # untiled -> whole tensor (trip-1)
+        # A BMM keeps its batch dims as per-element tiles (size 1)
+        if is_bmm(anchor):
+            out_ts = (1,) * (out.ndim - 2) + tuple(out.shape[-2:])
+        else:
+            out_ts = tuple(out.shape)
+        tk = K
     else:
         out_tiling, nk = tiling[:-1], tiling[-1]  # batch.. + (n_m, n_n) , n_k
         out_ts = tuple(s // t for s, t in zip(out.shape, out_tiling))
@@ -1569,7 +1578,8 @@ def build_gemm(
         return result
 
     if num_k > 1:
-        _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
+        if single_buffer_tail:
+            _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
         acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
         scratch_specs = [_ScratchSpec(tuple(tb) + (tm, tn), acc_dtype)]
         kernel = _reduction_fused_kernel(

@@ -25,6 +25,7 @@ from ..mapping_utils import (
     is_bmm,
     is_depthwise_conv,
     is_elementwise_op,
+    is_fully_connected,
     is_linear,
     is_matmul,
     is_pooling,
@@ -1436,6 +1437,7 @@ def run_matrix_op_l2_tiling(
     cache_size=None,
     num_banks=None,
     bank_width=None,
+    use_interstellar_tiling=False,
 ):
     """
     Perform heuristic L2 tiling on GEMM/conv operations to fit intermediate data
@@ -1447,6 +1449,9 @@ def run_matrix_op_l2_tiling(
         cache_size (int): Total cache size in bytes.
         num_banks (int, optional): Number of cache banks for bank-aligned tiling.
         bank_width (int, optional): Width of memory for bank-aligned tiling.
+        use_interstellar_tiling (bool): When True, the interstellar path already
+            tiles matrix-matrix GEMMs and convs on demand, so this pass handles
+            only the batch-1 fully-connected (matrix-vector) ops it skips.
     """
     graph = model.graph
 
@@ -1457,6 +1462,8 @@ def run_matrix_op_l2_tiling(
 
     for node in list(graph.nodes):
         if is_conv2d(node):
+            if use_interstellar_tiling:
+                continue
             tile_sizes, tiled_shape = search_conv2d_tiling(
                 node, unroll, cache_size, None, bank_size
             )
@@ -1467,14 +1474,30 @@ def run_matrix_op_l2_tiling(
                 logger.warning(f"Failed to tile Conv2d node: {node}")
 
         elif is_linear(node) or is_matmul(node):
+            # Under interstellar, only the batch-1 FC (matrix-vector) ops need
+            # tiling here; the matrix-matrix GEMMs are tiled by interstellar.
+            if use_interstellar_tiling and not is_fully_connected(node):
+                continue
             tile_sizes, tiled_shapes = search_gemm_tiling(
                 node, unroll, cache_size, None, bank_size
             )
 
-            if tile_sizes is not None:
-                split_gemm_node(model, node, tile_sizes, tiled_shapes)
-            else:
+            if tile_sizes is None:
                 logger.warning(f"Failed to tile GEMM node: {node}")
+            elif use_interstellar_tiling:
+                x_tiled, c_tiled, k_tiled = tile_sizes
+                in_shape = node.args[0].shape
+                X = in_shape[-2] if is_bmm(node) else math.prod(in_shape[:-1])
+                C = in_shape[-1]
+                w_shape = node.args[1].shape
+                K = w_shape[-1] if is_matmul(node) else w_shape[0]
+                node.meta["l2_tiling"] = (
+                    X // x_tiled,
+                    K // k_tiled,
+                    C // c_tiled,
+                )
+            else:
+                split_gemm_node(model, node, tile_sizes, tiled_shapes)
 
     graph.lint()
     graph.eliminate_dead_code()
