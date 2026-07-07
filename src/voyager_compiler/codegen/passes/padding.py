@@ -1,4 +1,5 @@
 import logging
+import math
 import operator
 from typing import List
 
@@ -266,7 +267,7 @@ def pad_matrix_op_dimensions(
     return model
 
 
-def pad_layer_norm_to_hardware_unroll_size(
+def _pad_layer_norm(
     model: GraphModule,
     node: Node,
     unroll: int,
@@ -327,27 +328,36 @@ def pad_layer_norm_to_hardware_unroll_size(
     model.graph.erase_node(node)
 
 
-def pad_calculate_mx_qparam(model, node, unroll):
-    input, axes, bs = node.args[:3]
+def _pad_quantize_mx(model, node, unroll):
+    input = node.args[0]
+    axes = get_arg_value(node, 2, "axes")
+    block_size = get_arg_value(node, 3, "block_size")
     ndim = len(input.shape)
+    axes = {a % ndim for a in axes}
 
+    # A tile boundary on the last dim must land on a hardware-unroll multiple,
+    # and no quantization block may straddle two tiles, so each quant axis must
+    # land on a block multiple.  A dim that is both must satisfy their lcm.  We
+    # do not rely on the GEMM input padding to have aligned the last dim.
     pad_dims = {}
-
-    orig_k = input.shape[-1]
-    if orig_k % unroll != 0:
-        pad_dims[ndim - 1] = (-orig_k) % unroll
-
-    for axis in axes:
-        size = input.shape[axis]
-        if size % bs != 0:
-            pad_dims[axis % ndim] = (bs - (size % bs)) % bs
+    for i in range(ndim):
+        multiple = 1
+        if i == ndim - 1:
+            multiple = unroll
+        if i in axes:
+            multiple = math.lcm(multiple, block_size)
+        if multiple > 1 and input.shape[i] % multiple:
+            pad_dims[i] = (-input.shape[i]) % multiple
 
     if not pad_dims:
         return
 
-    logger.info(f"Padding calculate_mx_qparams {node} with {pad_dims}")
+    logger.info(f"Padding quantize_mx {node} with {pad_dims}")
 
-    min_pad_dim = min(pad_dims.keys())
+    getitems = list(node.users)
+    orig_shapes = {g: tuple(g.shape) for g in getitems}
+
+    min_pad_dim = min(pad_dims)
     pad_tuple = []
     for dim in range(ndim - 1, min_pad_dim - 1, -1):
         pad_tuple.extend([0, pad_dims.get(dim, 0)])
@@ -361,31 +371,61 @@ def pad_calculate_mx_qparam(model, node, unroll):
     propagate_shape(new_input)
     new_input.meta["dtype"] = input.meta.get("dtype")
     node.replace_input_with(input, new_input)
-
     propagate_shape(node)
 
-    def slice_node(n):
-        with model.graph.inserting_after(n.next):
-            for dim in pad_dims.keys():
-                n = model.graph.call_function(
-                    torch.ops.aten.slice.Tensor,
-                    (n, dim, 0, input.shape[dim]),
-                )
-            propagate_shape(n)
-            n.meta["dtype"] = node.meta.get("dtype")
-        return n
-
-    scale_node = slice_node(node)
-
-    for user in list(node.users):
-        if user.target == torch.ops.quantized_ops.quantize.default:
-            users = list(user.users)
-            new_q_node = slice_node(user)
+    # Slice each output back to its pre-pad shape, but only along dims that
+    # actually grew: the quantized value carries every padded dim, whereas the
+    # scale grows only where the pad added whole blocks or non-quant columns.
+    for g in getitems:
+        propagate_shape(g)
+        orig = orig_shapes[g]
+        users = list(g.users)
+        sliced = g
+        for d in range(len(orig)):
+            if g.shape[d] != orig[d]:
+                with model.graph.inserting_after(sliced):
+                    sliced = model.graph.call_function(
+                        torch.ops.aten.slice.Tensor,
+                        (sliced, d, 0, orig[d]),
+                    )
+                propagate_shape(sliced)
+                sliced.meta["dtype"] = g.meta.get("dtype")
+        if sliced is not g:
             for u in users:
-                u.replace_input_with(user, new_q_node)
-            user.replace_input_with(input, new_input)
-        elif user != scale_node:
-            user.replace_input_with(node, scale_node)
+                u.replace_input_with(g, sliced)
+
+
+def _pad_softmax(model, node, unroll):
+    input = node.args[0]
+
+    # The hardware fetches in units of ``unroll`` elements along the last
+    # dim, so pad it to a multiple of ``unroll`` with -inf and slice back.
+    orig = input.shape[-1]
+    pad_k = (-orig) % unroll
+    if pad_k == 0:
+        return
+
+    logger.info(f"Padding softmax {node} with {pad_k}")
+
+    with model.graph.inserting_after(input):
+        new_input = model.graph.call_function(
+            torch.ops.aten.pad.default,
+            (input, [0, pad_k], "constant", float("-inf")),
+        )
+    propagate_shape(new_input)
+    new_input.meta["dtype"] = input.meta.get("dtype")
+    node.replace_input_with(input, new_input)
+    propagate_shape(node)
+
+    with model.graph.inserting_after(node):
+        slice_node = model.graph.call_function(
+            torch.ops.aten.slice.Tensor,
+            (node, -1, 0, orig),
+        )
+    node.replace_all_uses_with(slice_node)
+    slice_node.replace_input_with(slice_node, node)
+    propagate_shape(slice_node)
+    slice_node.meta["dtype"] = node.meta.get("dtype")
 
 
 def pad_vector_op_dimensions(
@@ -405,47 +445,11 @@ def pad_vector_op_dimensions(
     """
     for node in list(model.graph.nodes):
         if node.target == torch.ops.aten.layer_norm.default:
-            pad_layer_norm_to_hardware_unroll_size(model, node, K_unroll)
-            continue
-
-        if node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
-            pad_calculate_mx_qparam(model, node, K_unroll)
-            continue
-
-        if node.target != torch.ops.aten.softmax.int:
-            continue
-
-        input = node.args[0]
-        reduction_dim = input.shape[-1]
-
-        pad_k = (K_unroll - (reduction_dim % K_unroll)) % K_unroll
-
-        if not pad_k:
-            continue
-
-        with model.graph.inserting_after(input):
-            new_input = model.graph.call_function(
-                torch.ops.aten.pad.default,
-                (input, [0, pad_k], "constant", float("-inf")),
-            )
-
-        propagate_shape(new_input)
-        new_input.meta["dtype"] = input.meta.get("dtype")
-        node.replace_input_with(input, new_input)
-
-        propagate_shape(node)
-
-        with model.graph.inserting_after(node):
-            slice_node = model.graph.call_function(
-                torch.ops.aten.slice.Tensor,
-                (node, -1, 0, reduction_dim),
-            )
-
-        node.replace_all_uses_with(slice_node)
-        slice_node.replace_input_with(slice_node, node)
-
-        propagate_shape(slice_node)
-        slice_node.meta["dtype"] = node.meta.get("dtype")
+            _pad_layer_norm(model, node, K_unroll)
+        elif node.target == torch.ops.aten.softmax.int:
+            _pad_softmax(model, node, K_unroll)
+        elif node.target == torch.ops.quantized_ops.quantize_mx.default:
+            _pad_quantize_mx(model, node, K_unroll)
 
     model.graph.lint()
     model.graph.eliminate_dead_code()

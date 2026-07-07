@@ -1551,7 +1551,6 @@ def run_vector_op_node_l2_tiling(
         torch.ops.aten.permute.default,
         torch.ops.aten.transpose.int,
         torch.ops.quantized_ops.layer_norm.default,
-        torch.ops.quantized_ops.calculate_mx_qparam.default,
         torch.ops.quantized_ops.quantize_mx.default,
         torch.ops.quantized_ops.quantize_mx_outlier.default,
     ]:
@@ -1567,13 +1566,19 @@ def run_vector_op_node_l2_tiling(
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
         )
-    elif node.target == torch.ops.quantized_ops.calculate_mx_qparam.default:
-        axes = get_arg_value(node, 1, "axes", None)
-        block_size = get_arg_value(node, 2, "block_size", None)
+    elif node.target in [
+        torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.quantized_ops.quantize_mx_outlier.default,
+    ]:
+        axes = get_arg_value(node, 2, "axes", None)
+        block_size = get_arg_value(node, 3, "block_size", None)
         ndim = len(node.args[0].shape)
 
+        # A quantization block must not straddle a tile boundary, so each
+        # quantization axis gets a min tile of one block; the last dim also
+        # respects the hardware unroll.
         last_dim = None
-        axes = set(axes or ())
+        axes = set(a % ndim for a in (axes or ()))
         min_sizes = tuple(
             (
                 max(block_size, unroll)
@@ -1582,11 +1587,6 @@ def run_vector_op_node_l2_tiling(
             )
             for i in range(ndim)
         )
-    elif node.target in [
-        torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.quantize_mx_outlier.default,
-    ]:
-        last_dim = min(node.args[2])
     elif node.target == torch.ops.aten.transpose.int:
         last_dim = min(*node.args[1:])
     elif node.target == torch.ops.aten.permute.default:

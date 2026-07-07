@@ -743,7 +743,6 @@ _MULTI_OUTPUT_POINTWISE = {
 }
 _REDUCTION_POINTWISE_OPS = _MULTI_OUTPUT_POINTWISE | {
     torch.ops.quantized_ops.quantize.default,
-    torch.ops.quantized_ops.calculate_mx_qparam.default,
     torch.ops.quantized_ops.layer_norm.default,
     torch.ops.aten.layer_norm.default,
     torch.ops.aten.softmax.int,

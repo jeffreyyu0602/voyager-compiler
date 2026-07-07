@@ -123,16 +123,12 @@ def _compute_input_spec(
     tiled / loaded).
 
     ``tiling`` is the per-output-dim tile-factor vector; the operand's tile is
-    ``compute_tiled_shape(input_shape, tiling)`` — the same helper used
-    everywhere else — so a block/reduction axis (input larger than its output,
-    e.g. ``calculate_mx_qparam``) keeps its full per-tile block, and broadcast /
-    unit dims (``s == 1``) stay at 1.
-
-    ``grid_map`` maps each output dim to the grid dim it tiles along; ``None``
-    means the grid *is* the output (pointwise / pool), so the operand's dim
-    ``offset + d`` is its grid dim directly.  GEMM / conv pass their
-    output->grid map (e.g. a transposed-conv NHWC permutation), since their grid
-    carries a reduction dim the output doesn't span.
+    ``compute_tiled_shape(input_shape, tiling)``.  ``grid_map`` maps each output
+    dim to the grid dim it tiles along; ``None`` means the grid *is* the output
+    (pointwise / pool), so the operand's dim ``offset + d`` is its grid dim
+    directly.  GEMM / conv pass their output->grid map (e.g. a transposed-conv
+    NHWC permutation), since their grid carries a reduction dim the output
+    doesn't span.
     """
     from voyager_compiler.codegen.passes.tiling import compute_tiled_shape
 

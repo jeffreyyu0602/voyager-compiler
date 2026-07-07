@@ -6,6 +6,7 @@ import sys
 
 import torch
 import torch.nn as nn
+from torch.utils._pytree import tree_flatten
 from datasets import load_dataset
 from torchvision import models, transforms
 from torch.ao.quantization.quantizer.utils import _annotate_output_qspec
@@ -20,6 +21,7 @@ from voyager_compiler import (
     OpMatcher,
     QuantizationConfig,
     QuantizationSpec,
+    ShapeProp,
     TorchExportableModuleWithStaticCache,
     add_compile_args,
     add_quantization_args,
@@ -525,7 +527,15 @@ if __name__ == "__main__":
 
         convert_pt2e(gm, args.bias)
 
-        old_output = gm(*example_args, *list(example_kwargs.values()))
+        flatten_args, _ = tree_flatten((example_args, example_kwargs))
+        old_output = ShapeProp(gm).propagate(*flatten_args)
+
+        if args.quantize_attention_mask:
+            gm, mask_preprocess_fn = extract_input_preprocessor(
+                gm, "attention_mask"
+            )
+            h, mask, pos, cache = example_args
+            example_args = (h, mask_preprocess_fn(mask), pos, cache)
 
         has_outlier = (
             args.enable_mixed_precision
@@ -635,11 +645,14 @@ if __name__ == "__main__":
         quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
         quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
-        qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
-        attention_mask = next(
-            iter(n for n in gm.graph.nodes if n.target == "attention_mask")
-        )
-        _annotate_output_qspec(attention_mask, qspec)
+        if args.quantize_attention_mask:
+            qspec = QuantizationSpec.from_str(
+                "int1,qs=per_tensor_symmetric,qmax=1"
+            )
+            attention_mask = next(
+                iter(n for n in gm.graph.nodes if n.target == "attention_mask")
+            )
+            _annotate_output_qspec(attention_mask, qspec)
 
         # KV Cache shape: (N, H, S, D)
         #   N = batch size
@@ -682,7 +695,16 @@ if __name__ == "__main__":
         sink_obs_or_fq(gm)
         convert_pt2e(gm, eliminate_no_effect=False)
 
-        old_output = gm(*example_args, **example_kwargs)
+        flatten_args, _ = tree_flatten((example_args, example_kwargs))
+        old_output = ShapeProp(gm).propagate(*flatten_args)
+
+        if args.quantize_attention_mask:
+            gm, mask_preprocess_fn = extract_input_preprocessor(
+                gm, "attention_mask"
+            )
+            example_kwargs["attention_mask"] = mask_preprocess_fn(
+                example_kwargs["attention_mask"]
+            )
 
         fuse_dequantize_quantize(gm)
 

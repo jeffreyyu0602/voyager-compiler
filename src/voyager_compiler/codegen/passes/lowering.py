@@ -584,7 +584,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
 def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
     """
     Convert `torch.expand` operations into explicit memory copying by
-    replicating input elements. This replaces implicit broadcasting with
+    replicating input elements.  This replaces implicit broadcasting with
     actual memory duplication, ensuring that expanded dimensions are
     materialized as stacked tensors.
 
@@ -739,7 +739,7 @@ def _get_im2col_gemm_pattern(
 def replace_conv2d_with_im2col(model: GraphModule):
     """
     Replace Conv2d operations that has input channel dimension equal to 3 with
-    In2col operations in the given FX graph module. Usually this is the first
+    In2col operations in the given FX graph module.  Usually this is the first
     Conv2D layer in torchvision models.
 
     Args:
@@ -849,20 +849,28 @@ def replace_conv2d_with_im2col(model: GraphModule):
     return model
 
 
-def extract_input_preprocessor(model: GraphModule):
+def extract_input_preprocessor(model: GraphModule, input_name=None):
     """
     Extract the input preprocessing operations from the given FX GraphModule
     and create a separate GraphModule.
 
     Args:
         model (GraphModule): The FX graph module to transform.
+        input_name: Target of the placeholder to peel preprocessing from.
+            Defaults to the first placeholder (the activation input); pass
+            e.g. ``"attention_mask"`` to extract that input's quantize.
 
     Returns:
         GraphModule: The transformed FX graph module with the input
             preprocessor extracted.
     """
     placeholder = next(
-        iter(n for n in model.graph.nodes if n.op == "placeholder")
+        iter(
+            n
+            for n in model.graph.nodes
+            if n.op == "placeholder"
+            and (input_name is None or n.target == input_name)
+        )
     )
     preprocess_nodes = [placeholder]
 
@@ -957,7 +965,7 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
 
     graph.eliminate_dead_code()
     model.graph.lint()
-    model.compile()
+    model.recompile()
 
 
 def fold_constant_generators(model: GraphModule):
@@ -983,6 +991,9 @@ def fold_constant_generators(model: GraphModule):
             inp not in constants for inp in node.all_input_nodes
         ):
             continue
+        # Folding dequantize nodes offset the benefit of quantizing the params.
+        if node.target == torch.ops.quantized_ops.dequantize.default:
+            continue
         if not isinstance(getattr(node, "value", None), torch.Tensor):
             continue
         const = node.target(
@@ -1007,11 +1018,11 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
     """Drop additive attention masks that are provably all-zero.
 
     Eager attention in transformers materializes ``add(scores, mask)`` where
-    ``mask = where(valid, 0.0, min_value)``. For bidirectional models with no
+    ``mask = where(valid, 0.0, min_value)``.  For bidirectional models with no
     padding (e.g. ViT) every position is valid, so the mask is identically
-    zero and the add is a no-op. The mask is evaluated on ``example_inputs``
+    zero and the add is a no-op.  The mask is evaluated on ``example_inputs``
     and an add is bypassed only when its mask operand is in fact all zero;
-    dead-code elimination then removes the mask-building chain. Masks that
+    dead-code elimination then removes the mask-building chain.  Masks that
     are not all zero (e.g. real causal masks) are left untouched.
     """
     masks = {}

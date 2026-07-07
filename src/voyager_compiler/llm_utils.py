@@ -1,6 +1,7 @@
 import logging
 from typing import List, Union, Optional
 import math
+import operator
 
 import torch
 from torch import nn
@@ -852,27 +853,18 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         else:
             scale_node = node.args[1]
 
-        is_dynamic_scale = (
-            scale_node.target == torch.ops.quantized_ops.calculate_mx_qparam.default
-        )
-
         prev_node = node.args[0]
         nodes_on_path = [node]
 
-        while (
-            len(prev_node.users) == 1
-            or (
-                prev_node == node.args[0]
-                and len(prev_node.users) == 2
-                and is_dynamic_scale
-                and prev_node == scale_node.args[0]
-            )
-        ):
+        while len(prev_node.users) == 1:
             target = prev_node.target
             if not (
                 is_nop(prev_node)
                 or is_reshape_op(prev_node)
-                or target in (torch.ops.aten.expand.default, torch.ops.aten.slice.Tensor)
+                or target in (
+                    torch.ops.aten.expand.default,
+                    torch.ops.aten.slice.Tensor,
+                )
             ):
                 break
 
@@ -902,9 +894,6 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         dq_input = fetch_attr(model, dq_node.args[0].target)
         if node.target == torch.ops.quantized_ops.quantize_mx.default:
             q_scale = run_through_ops(model, dq_input, nodes_on_path)[0]
-        elif is_dynamic_scale:
-            nodes_on_path[-1] = scale_node
-            q_scale = run_through_ops(model, dq_input, nodes_on_path)
         else:
             q_scale = fetch_attr(model, scale_node.target)
 
@@ -924,7 +913,12 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         rank = output.ndim
         dq_axes = tuple((a + rank) % rank for a in new_dq_axes)
 
-        q_axes = get_arg_value(node, 3, "axes")
+        # quantize_mx puts axes at arg index 2 (index 3 is block_size);
+        # plain quantize keeps axes at index 3.
+        if node.target == torch.ops.quantized_ops.quantize_mx.default:
+            q_axes = node.args[2]
+        else:
+            q_axes = get_arg_value(node, 3, "axes")
         q_axes = tuple((a + rank) % rank for a in q_axes)
         new_axes = tuple(set(q_axes) & set(dq_axes))
 
@@ -951,7 +945,12 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
                 )
             else:
                 new_zero_point = None
-            output_qmap = graph.node_copy(node.args[5])
+            # qmap is at arg index 1 for quantize_mx, index 5 for plain
+            # quantize.
+            if node.target == torch.ops.quantized_ops.quantize_mx.default:
+                output_qmap = graph.node_copy(node.args[1])
+            else:
+                output_qmap = graph.node_copy(node.args[5])
             new_dq = graph.call_function(
                 torch.ops.quantized_ops.dequantize.default,
                 (
@@ -971,7 +970,9 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
                 and q_scale.shape[-1] != output.shape[-1]
             ):
                 q_scale = torch.repeat_interleave(
-                    q_scale, repeats=output.shape[-1] // q_scale.shape[-1], dim=-1
+                    q_scale,
+                    repeats=output.shape[-1] // q_scale.shape[-1],
+                    dim=-1
                 )
 
             with graph.inserting_before(node):
@@ -981,11 +982,22 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
             scale_node.replace_all_uses_with(mx_scale)
             mx_scale.meta["dtype"] = scale_node.meta.get("dtype")
 
-        node.replace_all_uses_with(new_dq)
+        if node.target == torch.ops.quantized_ops.quantize_mx.default:
+            value_getitem = next(
+                u
+                for u in node.users
+                if u.target == operator.getitem and u.args[1] == 1
+            )
+            value_getitem.replace_all_uses_with(new_dq)
+            new_dq.meta["dtype"] = node.meta["dtype"][1]
+        else:
+            node.replace_all_uses_with(new_dq)
+            graph.erase_node(node)
+            new_dq.meta["dtype"] = node.meta.get("dtype")
+
         dq_node.replace_all_uses_with(input_node)
-        graph.erase_node(node)
         graph.erase_node(dq_node)
-        new_dq.meta["dtype"] = node.meta.get("dtype")
+
         new_scale.meta["dtype"] = scale_node.meta.get("dtype")
         if new_zero_point is not None:
             new_zero_point.meta["dtype"] = scale_node.meta.get("dtype")
