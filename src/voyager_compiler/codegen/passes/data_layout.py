@@ -13,7 +13,6 @@ from ..mapping_utils import (
     is_depthwise_conv,
     is_elementwise_op,
     is_fully_connected,
-    is_indexing_or_concatenation_op,
     is_linear,
     is_matmul,
     is_nop,
@@ -53,17 +52,21 @@ def extract_conv2d_graph(
     /indexing/quantization ops that are considered fusable.
     """
 
+    # ``slice`` / ``cat`` are what L2 tiling emits when it splits a conv along
+    # the reduction dim and concatenates the partial outputs.  Both preserve
+    # rank and carry an int ``dim`` at args[1], so their layout can be remapped
+    # (see ``_rewrite_node_args_for_layout``).  ``stack`` (adds a dim),
+    # ``select`` (drops a dim) and ``index`` (args[1] is not a dim) must stay
+    # out of the island.
     ALLOW_LIST_OPS = {
         torch.ops.aten.pad.default,
+        torch.ops.aten.slice.Tensor,
+        torch.ops.aten.cat.default,
         torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.conv2d_mx.default
+        torch.ops.quantized_ops.conv2d_mx.default,
     }
 
     def should_traverse(node: Node) -> bool:
-        # Cannot fuse stack because it creates a new dimension
-        if node.target == torch.ops.aten.stack.default:
-            return False
-
         # Only include reshape if the input is a 4D tensor
         if is_reshape_op(node):
             return len(node.shape) == 4
@@ -76,7 +79,6 @@ def extract_conv2d_graph(
             node.target in NHWC_OP_VARIANTS
             or node.target in ALLOW_LIST_OPS
             or is_elementwise_op(node)
-            or is_indexing_or_concatenation_op(node)
         )
 
     stack = [start]
@@ -140,62 +142,39 @@ def remap_pad_after_permute(
     return tuple(new_pad)
 
 
-def _get_path_to_conv2d(node: torch.fx.Node):
-    for user in node.users:
-        if is_conv2d(user):
-            return [node, user]
-
-        if (
-            is_nop(user)
-            or is_indexing_or_concatenation_op(user)
-            or user.target
-            in [
-                torch.ops.quantized_ops.quantize.default,
-                torch.ops.aten.pad.default,
-            ]
-        ):
-            path = _get_path_to_conv2d(user)
-            if path is not None:
-                return [node] + path
-    return None
-
-
 def _process_conv2d_input_nodes(
     node: Node, model: GraphModule, island_set: Set[Node]
 ):
     graph = model.graph
-    path = _get_path_to_conv2d(node)
 
-    # Case A: Input is a weight (Parameter) or weight scale
-    if node.op == "get_attr" and path is not None:
-        conv2d_node = path[-1]
-        if is_depthwise_conv(conv2d_node) or path[-2] not in (
-            conv2d_node.args[1],
-            conv2d_node.kwargs.get("weight_scale"),
-        ):
+    # Case A: Input is a weight (Parameter) or weight scale.
+    if node.op == "get_attr":
+        user = next((n for n in node.users if is_conv2d(n)), None)
+        if user is None or is_depthwise_conv(user):
             return
 
-        logger.debug(f"Permuting parameter {node}")
+        w = get_arg_value(user, 1, "weight")
+        ws = user.kwargs.get("weight_scale")
+        if node not in [w, ws]:
+            return
+
+        logger.debug(f"Permuting {user} parameter: {node}")
         param = fetch_attr(model, node.target)
         param.data = param.data.permute(2, 3, 1, 0)
 
         node.meta["dims"] = WEIGHT_NCHW_TO_HWIO
+        return
 
-    # Case B: Input is a node flow from outside the island
-    if node.op != "get_attr" and len(node.shape) == 4:
-        is_weight_node = path is not None and id(path[-2]) == id(
-            path[-1].args[1]
-        )
-        dims = WEIGHT_NCHW_TO_HWIO if is_weight_node else NCHW_TO_NHWC
-
-        logger.debug(f"Insert permute after {node} with dims {dims}")
+    # Case B: Input is an activation flowing into the island from outside
+    if len(node.shape) == 4:
+        logger.debug(f"Insert permute after {node} with dims {NCHW_TO_NHWC}")
         with graph.inserting_after(node):
             permute_node = graph.call_function(
                 torch.ops.aten.permute.default,
-                (node, dims),
+                (node, NCHW_TO_NHWC),
             )
 
-        permute_node.meta["dims"] = dims
+        permute_node.meta["dims"] = NCHW_TO_NHWC
         permute_node.meta["dtype"] = node.meta.get("dtype")
 
         for user in list(node.users.keys()):
@@ -213,7 +192,7 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
         pad = remap_pad_after_permute(args[1], input_dims, node.value.ndim)
         node.update_arg(1, pad)
 
-    if is_indexing_or_concatenation_op(node):
+    if node.target in (torch.ops.aten.slice.Tensor, torch.ops.aten.cat.default):
         dim = get_arg_value(node, 1, "dim", 0)
         if dim < 0:
             dim = dim + len(input_dims)

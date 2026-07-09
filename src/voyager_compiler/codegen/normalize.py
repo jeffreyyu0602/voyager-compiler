@@ -624,6 +624,10 @@ class IterationSpaceNormalizer:
                 node=output.value_node,
             )
 
+        mx_restore_safe = not is_mx or self._mx_restore_safe(
+            output.value_node, internal_shapes, output.external_shapes
+        )
+
         plans = []
         for internal_shape, external_shape in zip(
             internal_shapes, output.external_shapes
@@ -634,9 +638,7 @@ class IterationSpaceNormalizer:
                     f"internal={internal_shape}, external={external_shape}",
                     node=output.value_node,
                 )
-            if is_mx and not self._same_non_unit_dims(
-                internal_shape, external_shape
-            ):
+            if is_mx and not mx_restore_safe:
                 raise NormalizationError(
                     "MX output restore would regroup non-unit dimensions and "
                     "change quantization block semantics",
@@ -655,10 +657,45 @@ class IterationSpaceNormalizer:
             )
         return tuple(plans)
 
-    def _same_non_unit_dims(self, left: Shape, right: Shape) -> bool:
-        return tuple(dim for dim in left if dim != 1) == tuple(
-            dim for dim in right if dim != 1
-        )
+    def _mx_restore_safe(
+        self,
+        value_node: fx.Node,
+        internal_shapes: Tuple[Shape, ...],
+        external_shapes: Tuple[Shape, ...],
+    ) -> bool:
+        """Whether restoring a single-axis ``quantize_mx`` op's outputs to
+        ``external_shapes`` keeps every quantization block intact.
+
+        The restore is a pure order-preserving row-major view (guaranteed
+        here: a permute would route through the relayout branch and the
+        restore is an ``aten.view``).  It is block-safe when the quantized
+        (last, unit-stride) axis either keeps its length or has both its pre-
+        and post-restore lengths divisible by ``block_size``: then a data
+        element keeps its linear position ``p`` and its block id ``p //
+        block_size`` on both sides, so no block is split or regrouped and the
+        scales still line up.  Anything else -- a non-``quantize_mx`` op, a
+        non-last quantized axis, or a block-straddling merge -- is rejected.
+        """
+        if value_node.target != torch.ops.quantized_ops.quantize_mx.default:
+            return False
+        axes = value_node.args[2]
+        block_size = value_node.args[3]
+        if not isinstance(block_size, int) or block_size <= 0:
+            return False
+        if len(axes) != 1:
+            return False
+        if any(
+            math.prod(i) != math.prod(e)
+            for i, e in zip(internal_shapes, external_shapes)
+        ):
+            return False
+        # quantize_mx returns (scale, data); blocks live on the data output.
+        data_internal = tuple(internal_shapes[1])
+        data_external = tuple(external_shapes[1])
+        if axes[0] not in (-1, len(data_internal) - 1):
+            return False
+        lb, la = data_internal[-1], data_external[-1]
+        return lb == la or (lb % block_size == 0 and la % block_size == 0)
 
     # ------------------------------------------------------------------
     # Graph rewriting

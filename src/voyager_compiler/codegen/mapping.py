@@ -25,7 +25,7 @@ from .mapping_utils import (
     is_elementwise_op,
     is_fully_connected,
     is_gemm_op,
-    is_indexing_or_concatenation_op,
+    is_addressing_op,
     is_prunable_op,
     is_nop,
     is_reshape_op,
@@ -1374,11 +1374,11 @@ def run_memory_mapping(
             node_to_last_use[n] = user
             user_to_last_uses.setdefault(user, []).append(n)
 
-            if (
-                is_nop(n)
-                or is_indexing_or_concatenation_op(n)
-                or n.target == operator.getitem
-            ):
+            # Nodes that share a buffer with their operands rather than
+            # allocating one, matching the allocation loop below: the operand
+            # must stay live until ``user``.  Everything else -- ``slice``
+            # included -- materializes, so its input dies at the node itself.
+            if is_nop(n) or is_addressing_op(n) or n.target == operator.getitem:
                 for arg in n.all_input_nodes:
                     register_last_uses(arg, user)
 

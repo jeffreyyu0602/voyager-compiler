@@ -32,7 +32,6 @@ from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
 from .codegen.passes.utils import get_arg_value
 from .codegen.mapping_utils import (
     is_gemm_op,
-    is_indexing_or_concatenation_op,
     is_nop,
     is_reshape_op,
     is_conv2d,
@@ -890,6 +889,16 @@ def _eliminate_dequantize_with_no_effect(model: GraphModule):
     return model
 
 
+# Ops a quantize / dequantize can be hoisted past: they move data without
+# computing on it, and take a single tensor input.
+_HOISTABLE_OPS = (
+    torch.ops.aten.slice.Tensor,
+    torch.ops.aten.select.int,
+    torch.ops.aten.expand.default,
+    torch.ops.aten.repeat.default,
+)
+
+
 def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
     """
     Move quantize and dequantize nodes up the graph and place them after the
@@ -921,12 +930,7 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
             if (
                 not is_nop(prev_node)
                 and not is_reshape_op(prev_node)
-                and not is_indexing_or_concatenation_op(prev_node)
-                and prev_node.target
-                not in [
-                    torch.ops.aten.expand.default,
-                    torch.ops.aten.repeat.default,
-                ]
+                and prev_node.target not in _HOISTABLE_OPS
             ):
                 break
 
