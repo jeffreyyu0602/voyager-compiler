@@ -9,10 +9,13 @@ from typing import Dict, Tuple, Any, Optional, Callable, List
 
 import torch
 from torch import Tensor
-from torch.ao.quantization import ObserverOrFakeQuantize
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
-from torch.ao.quantization.quantizer import EdgeOrNode, QuantizationSpecBase
 from torch.fx import GraphModule, Graph, Node
+from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
+from torchao.quantization.pt2e.quantizer import (
+    EdgeOrNode,
+    QuantizationSpecBase,
+)
 
 import voyager_compiler as qt
 from voyager_compiler.fake_quantize import (
@@ -279,7 +282,12 @@ def export_model(
     export_kwargs = {"dynamic_shapes": dynamic_shapes, "strict": strict}
 
     if is_torch_greater_or_equal("2.10"):
-        gm = torch.export.export(*export_args, **export_kwargs)
+        from torch._export.utils import _disable_aten_to_metadata_assertions
+
+        # Each ``.to(dtype)`` makes export emit an ``_assert_tensor_metadata``
+        # node pinning the dtype seen at trace time.
+        with _disable_aten_to_metadata_assertions():
+            gm = torch.export.export(*export_args, **export_kwargs)
         return gm.module(check_guards=False)
     elif is_torch_greater_or_equal("2.8"):
         from torch._export.utils import _disable_aten_to_metadata_assertions
@@ -300,8 +308,8 @@ def export_model(
 
 
 def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
-    from torch.ao.quantization.pt2e import prepare
-    from torch.ao.quantization.quantize_pt2e import prepare_pt2e
+    from torchao.quantization.pt2e import prepare
+    from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e
 
     # replace the default implementation of _create_obs_or_fq_from_qspec
     prepare._get_obs_or_fq_map = _get_obs_or_fq_map
@@ -309,8 +317,7 @@ def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
     if not isinstance(model, GraphModule):
         model = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
 
-    model = prepare_pt2e(model, quantizer)
-    return model
+    return prepare_pt2e(model, quantizer)
 
 
 def _get_module(
@@ -1019,7 +1026,7 @@ def swap_matmul_inputs(model: GraphModule):
     def get_fake_quant_mod(node: Node):
         if node.op == "call_module":
             mod = _get_module(node, modules)
-            if isinstance(mod, torch.ao.quantization.FakeQuantizeBase):
+            if isinstance(mod, FakeQuantizeBase):
                 return mod
 
         return None
@@ -1087,7 +1094,7 @@ def convert_pt2e(
         if node.op == "call_module":
             mod = _get_module(node, modules)
             assert mod is not None
-            if isinstance(mod, torch.ao.quantization.FakeQuantizeBase):
+            if isinstance(mod, FakeQuantizeBase):
                 if mod.qscheme == qt.microscaling:
                     _replace_observer_with_quantize_mx_node_decomposed(
                         model, node, modules

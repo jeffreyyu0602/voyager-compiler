@@ -1,5 +1,3 @@
-import itertools
-import operator
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, Optional
 
@@ -8,19 +6,12 @@ from torch.ao.quantization.fx.utils import (
     get_new_attr_name_with_prefix,
     assert_and_get_unique_device,
 )
-from torch.ao.quantization.pt2e.export_utils import _WrapperModule
-from torch.ao.quantization.pt2e.graph_utils import find_sequential_partitions
-from torch.ao.quantization.quantizer import QuantizationAnnotation
-
-from torch.ao.quantization.quantizer.utils import (
-    _annotate_input_qspec_map,
-    _annotate_output_qspec,
-)
 from torch.fx import Node
-from torch.fx.passes.utils.matcher_with_name_node_map_utils import (
-    SubgraphMatcherWithNameNodeMap,
+from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
+from torchao.quantization.pt2e.quantizer.utils import (
+    annotate_input_qspec_map as _annotate_input_qspec_map,
+    annotate_output_qspec as _annotate_output_qspec,
 )
-from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 
 from .quantizer import QuantizationSpec, DerivedQuantizationSpec
 
@@ -37,9 +28,7 @@ class QuantizationConfig:
 
 
 OperatorPatternType = List[Callable]
-OperatorPatternType.__module__ = (
-    "torch.ao.quantization.quantizer.xnnpack_quantizer_utils"
-)
+OperatorPatternType.__module__ = __name__
 
 AnnotatorType = Callable[
     [

@@ -4,10 +4,10 @@ from enum import Enum
 from typing import Callable, List, Optional, Union, Tuple
 
 from torch import Tensor
-from torch.ao.quantization import ObserverOrFakeQuantize
 from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
-from torch.ao.quantization.quantizer.quantizer import QuantizationSpecBase
 from torch.fx import Node
+from torchao.quantization.pt2e import ObserverOrFakeQuantize
+from torchao.quantization.pt2e.quantizer.quantizer import QuantizationSpecBase
 
 from voyager_compiler.fake_quantize import FusedAmaxObsFakeQuantize
 

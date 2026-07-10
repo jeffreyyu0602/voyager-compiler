@@ -1,0 +1,2895 @@
+{
+  "aten.sym_size.int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.embedding.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            30522,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      0
+    ],
+    "kwargs": {}
+  },
+  "aten.slice.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            512
+          ],
+          "torch.int64"
+        ]
+      },
+      1,
+      null,
+      8
+    ],
+    "kwargs": {}
+  },
+  "aten.add.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.layer_norm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        768
+      ],
+      {
+        "__tensor__": [
+          [
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      1e-12,
+      false
+    ],
+    "kwargs": {}
+  },
+  "aten.dropout.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      0.1,
+      false
+    ],
+    "kwargs": {}
+  },
+  "aten._assert_tensor_metadata.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.int64"
+      },
+      "device": {
+        "__device__": "cpu"
+      },
+      "layout": {
+        "__layout__": "torch.strided"
+      }
+    }
+  },
+  "aten.to.device": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__device__": "cpu"
+      },
+      {
+        "__dtype__": "torch.bool"
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.arange.default": {
+    "args": [
+      1
+    ],
+    "kwargs": {
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.unsqueeze.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.new_ones.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      []
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.bool"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.ge.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      0
+    ],
+    "kwargs": {}
+  },
+  "aten.to.dtype_layout": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.bool"
+        ]
+      }
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.bool"
+      },
+      "layout": {
+        "__layout__": "torch.strided"
+      },
+      "device": {
+        "__device__": "cpu"
+      }
+    }
+  },
+  "aten.__and__.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [],
+          "torch.bool"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.bool"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.index.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      [
+        {
+          "__tensor__": [
+            [
+              1,
+              1,
+              1,
+              1
+            ],
+            "torch.int64"
+          ]
+        },
+        {
+          "__tensor__": [
+            [
+              1,
+              1,
+              1,
+              8
+            ],
+            "torch.int64"
+          ]
+        }
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.expand.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      [
+        1,
+        -1,
+        8,
+        8
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.lift_fresh_copy.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.detach_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.where.ScalarOther": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      {
+        "__tensor__": [
+          [],
+          "torch.float32"
+        ]
+      },
+      -3.4028234663852886e+38
+    ],
+    "kwargs": {}
+  },
+  "aten.linear.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.view.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        1,
+        8,
+        -1,
+        64
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.transpose.int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            12,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      1,
+      2
+    ],
+    "kwargs": {}
+  },
+  "aten.matmul.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            12,
+            8,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            12,
+            64,
+            8
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.mul.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            12,
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      0.125
+    ],
+    "kwargs": {}
+  },
+  "aten.softmax.int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            12,
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      -1
+    ],
+    "kwargs": {}
+  },
+  "aten.contiguous.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            12,
+            64
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.reshape.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            12,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        1,
+        8,
+        -1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.gelu.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            3072
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.ne.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.to.dtype": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      {
+        "__dtype__": "torch.int32"
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.cumsum.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int32"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.type_as.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.gather.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            514
+          ],
+          "torch.int64"
+        ]
+      },
+      1,
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.select.int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      1,
+      0
+    ],
+    "kwargs": {}
+  },
+  "aten.tanh.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            768
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.pow.Tensor_Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            512
+          ],
+          "torch.float32"
+        ]
+      },
+      2
+    ],
+    "kwargs": {}
+  },
+  "aten.mean.dim": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            512
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        -1
+      ],
+      true
+    ],
+    "kwargs": {}
+  },
+  "aten.rsqrt.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            1
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.sub.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.gt.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      0
+    ],
+    "kwargs": {}
+  },
+  "aten.abs.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.lt.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      8
+    ],
+    "kwargs": {}
+  },
+  "aten.div.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      8
+    ],
+    "kwargs": {}
+  },
+  "aten.log.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.full_like.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      15
+    ],
+    "kwargs": {
+      "pin_memory": false
+    }
+  },
+  "aten.min.other": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.where.self": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.add_.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.permute.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        2,
+        0,
+        1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.relu.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            2048
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.le.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.cat.default": {
+    "args": [
+      [
+        {
+          "__tensor__": [
+            [
+              0
+            ],
+            "torch.float32"
+          ]
+        },
+        {
+          "__tensor__": [
+            [
+              1,
+              8,
+              8,
+              64
+            ],
+            "torch.float32"
+          ]
+        }
+      ],
+      -2
+    ],
+    "kwargs": {}
+  },
+  "aten.zeros_like.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {
+      "pin_memory": false
+    }
+  },
+  "aten.neg.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.zeros.default": {
+    "args": [
+      [
+        1,
+        8,
+        8,
+        8
+      ]
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.float32"
+      },
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.conv2d.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            3,
+            224,
+            224
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768,
+            3,
+            16,
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        16,
+        16
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.flatten.using_ints": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            768,
+            14,
+            14
+          ],
+          "torch.float32"
+        ]
+      },
+      2
+    ],
+    "kwargs": {}
+  },
+  "aten.cos.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            64
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.sin.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            64
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.silu.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            3072
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.addmm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            2304
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            768
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            768,
+            2304
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.split.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            2304
+          ],
+          "torch.float32"
+        ]
+      },
+      768,
+      2
+    ],
+    "kwargs": {}
+  },
+  "aten.le.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      64
+    ],
+    "kwargs": {}
+  },
+  "aten.unbind.int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            3,
+            12,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      -3
+    ],
+    "kwargs": {}
+  },
+  "aten.chunk.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            2304
+          ],
+          "torch.float32"
+        ]
+      },
+      2,
+      -1
+    ],
+    "kwargs": {}
+  },
+  "aten.squeeze.dim": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      -2
+    ],
+    "kwargs": {}
+  },
+  "aten.sign.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.ceil.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.sqrt.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.bmm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            12,
+            8,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            12,
+            64,
+            8
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.alias.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            512,
+            768
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.repeat.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            12,
+            512,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        1,
+        1,
+        1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.clamp.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      0,
+      511
+    ],
+    "kwargs": {}
+  },
+  "aten.bitwise_not.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.masked_fill.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            12,
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      -3.4028234663852886e+38
+    ],
+    "kwargs": {}
+  },
+  "aten.gt.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.max.dim": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            64,
+            8,
+            9
+          ],
+          "torch.float32"
+        ]
+      },
+      -1,
+      true
+    ],
+    "kwargs": {}
+  },
+  "aten.topk.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            4
+          ],
+          "torch.float32"
+        ]
+      },
+      4
+    ],
+    "kwargs": {}
+  },
+  "aten.sort.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.floor_divide.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      },
+      4
+    ],
+    "kwargs": {}
+  },
+  "aten.histc.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.float32"
+        ]
+      },
+      4,
+      0,
+      3
+    ],
+    "kwargs": {}
+  },
+  "aten.clamp_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      },
+      null,
+      3
+    ],
+    "kwargs": {}
+  },
+  "aten.masked_fill_.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32,
+            2880
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            32,
+            1
+          ],
+          "torch.bool"
+        ]
+      },
+      0.0
+    ],
+    "kwargs": {}
+  },
+  "aten.sigmoid.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32,
+            2880
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.empty_like.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {
+      "pin_memory": false
+    }
+  },
+  "aten.index_put_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      },
+      [
+        {
+          "__tensor__": [
+            [
+              32
+            ],
+            "torch.int64"
+          ]
+        }
+      ],
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.sum.dim_IntList": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            4,
+            2880
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.arange.start": {
+    "args": [
+      0,
+      8
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.int64"
+      },
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.copy_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            11
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            11
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.pad.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8192,
+            8
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      [
+        -4,
+        0
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.conv1d.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8192,
+            8
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8192,
+            1,
+            4
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      null,
+      [
+        1
+      ],
+      [
+        3
+      ],
+      [
+        1
+      ],
+      8192
+    ],
+    "kwargs": {}
+  },
+  "aten.split_with_sizes.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            8192
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      [
+        2048,
+        2048,
+        4096
+      ],
+      -1
+    ],
+    "kwargs": {}
+  },
+  "aten.exp.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            32
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.softplus.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            32
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.repeat_interleave.self_int": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            16,
+            128
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      2,
+      2
+    ],
+    "kwargs": {}
+  },
+  "aten.ones.default": {
+    "args": [
+      [
+        64,
+        64
+      ]
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.bool"
+      },
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.triu.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            64,
+            64
+          ],
+          "torch.bool"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.tril.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            32,
+            1,
+            64,
+            64
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.clone.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            32,
+            1,
+            1
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.eye.default": {
+    "args": [
+      64
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.float32"
+      },
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.div_.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            8
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            1
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten._grouped_mm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            64,
+            2048
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8,
+            2048,
+            1024
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            8
+          ],
+          "torch.int32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.upsample_bicubic2d.vec": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            384,
+            37,
+            37
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        16,
+        16
+      ],
+      false,
+      null
+    ],
+    "kwargs": {}
+  },
+  "aten.relu_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            64,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.max_pool2d.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            64,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        3,
+        3
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        1,
+        1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.upsample_nearest2d.vec": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            224,
+            224
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        56,
+        56
+      ],
+      null
+    ],
+    "kwargs": {}
+  },
+  "aten.div.Tensor_mode": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            128
+          ],
+          "torch.float32"
+        ]
+      },
+      2
+    ],
+    "kwargs": {
+      "rounding_mode": "floor"
+    }
+  },
+  "aten.pow.Scalar": {
+    "args": [
+      10000,
+      {
+        "__tensor__": [
+          [
+            128
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.stack.default": {
+    "args": [
+      [
+        {
+          "__tensor__": [
+            [
+              1,
+              7,
+              7,
+              64
+            ],
+            "torch.float32"
+          ]
+        },
+        {
+          "__tensor__": [
+            [
+              1,
+              7,
+              7,
+              64
+            ],
+            "torch.float32"
+          ]
+        }
+      ],
+      4
+    ],
+    "kwargs": {}
+  },
+  "aten.scatter_.value": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            8,
+            1
+          ],
+          "torch.float32"
+        ]
+      },
+      1,
+      {
+        "__tensor__": [
+          [
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.index_select.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1026,
+            1024
+          ],
+          "torch.float32"
+        ]
+      },
+      0,
+      {
+        "__tensor__": [
+          [
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.detach.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            1024
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.mul_.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            2560
+          ],
+          "torch.bfloat16"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1
+          ],
+          "torch.bfloat16"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.eq.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      258880
+    ],
+    "kwargs": {}
+  },
+  "aten.__or__.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1
+          ],
+          "torch.bool"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1
+          ],
+          "torch.bool"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.where.ScalarSelf": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1
+          ],
+          "torch.bool"
+        ]
+      },
+      0,
+      {
+        "__tensor__": [
+          [
+            1,
+            1
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.square.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            16384
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.scatter.value": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            8
+          ],
+          "torch.bool"
+        ]
+      },
+      -1,
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            8
+          ],
+          "torch.int64"
+        ]
+      },
+      false
+    ],
+    "kwargs": {}
+  },
+  "aten.full.default": {
+    "args": [
+      [
+        1,
+        8
+      ],
+      -1
+    ],
+    "kwargs": {
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.new_zeros.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      []
+    ],
+    "kwargs": {
+      "dtype": {
+        "__dtype__": "torch.bool"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.eq.Tensor": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            8,
+            1
+          ],
+          "torch.int64"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            1,
+            1,
+            8
+          ],
+          "torch.int64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.randint.low": {
+    "args": [
+      0,
+      262144,
+      [
+        1,
+        256
+      ]
+    ],
+    "kwargs": {
+      "device": {
+        "__device__": "cpu"
+      },
+      "pin_memory": false
+    }
+  },
+  "aten.rsub.Scalar": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1
+          ],
+          "torch.float32"
+        ]
+      },
+      1
+    ],
+    "kwargs": {}
+  },
+  "aten.erf.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            5120
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.ones_like.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            32
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {
+      "pin_memory": false
+    }
+  },
+  "aten.polar.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            32
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            8,
+            32
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.view_as_complex.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            16,
+            8,
+            32,
+            2
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.view_as_real.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            16,
+            8,
+            32
+          ],
+          "torch.complex64"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.batch_norm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            16,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      false,
+      0.1,
+      1e-05,
+      false
+    ],
+    "kwargs": {}
+  },
+  "aten.hardswish_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            16,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.hardsigmoid.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            16,
+            1,
+            1
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.adaptive_avg_pool2d.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            576,
+            7,
+            7
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        1,
+        1
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.silu_.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            32,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.scaled_dot_product_attention.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            6,
+            1370,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            6,
+            1370,
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            1,
+            6,
+            1370,
+            64
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.reshape_as.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            64,
+            147
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            64,
+            3,
+            7,
+            7
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.group_norm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            64,
+            112,
+            112
+          ],
+          "torch.float32"
+        ]
+      },
+      32,
+      {
+        "__tensor__": [
+          [
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            64
+          ],
+          "torch.float32"
+        ]
+      },
+      1e-05,
+      false
+    ],
+    "kwargs": {}
+  },
+  "aten.meshgrid.indexing": {
+    "args": [
+      [
+        {
+          "__tensor__": [
+            [
+              16
+            ],
+            "torch.float32"
+          ]
+        },
+        {
+          "__tensor__": [
+            [
+              16
+            ],
+            "torch.float32"
+          ]
+        }
+      ]
+    ],
+    "kwargs": {
+      "indexing": "ij"
+    }
+  },
+  "aten.tile.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            256,
+            32
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        2
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.roll.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            56,
+            56,
+            128
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        -3,
+        -3
+      ],
+      [
+        1,
+        2
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten.linalg_vector_norm.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            64,
+            3,
+            64,
+            32
+          ],
+          "torch.float32"
+        ]
+      },
+      2.0,
+      [
+        -1
+      ],
+      true
+    ],
+    "kwargs": {}
+  },
+  "aten.clamp_min.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            64,
+            3,
+            64,
+            1
+          ],
+          "torch.float32"
+        ]
+      },
+      1e-12
+    ],
+    "kwargs": {}
+  },
+  "aten.expand_as.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            64,
+            3,
+            64,
+            1
+          ],
+          "torch.float32"
+        ]
+      },
+      {
+        "__tensor__": [
+          [
+            64,
+            3,
+            64,
+            32
+          ],
+          "torch.float32"
+        ]
+      }
+    ],
+    "kwargs": {}
+  },
+  "aten.avg_pool2d.default": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            128,
+            56,
+            56
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        2,
+        2
+      ],
+      [
+        2,
+        2
+      ]
+    ],
+    "kwargs": {}
+  },
+  "aten._upsample_bicubic2d_aa.vec": {
+    "args": [
+      {
+        "__tensor__": [
+          [
+            1,
+            1152,
+            16,
+            16
+          ],
+          "torch.float32"
+        ]
+      },
+      [
+        24,
+        24
+      ],
+      false,
+      null
+    ],
+    "kwargs": {}
+  }
+}

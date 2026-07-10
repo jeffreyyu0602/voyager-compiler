@@ -11,6 +11,10 @@ from torch.fx import Node
 from torch.fx.operator_schemas import normalize_function
 
 import interstellar
+
+# Re-exported: both predicates are generated from the Core ATen IR by
+# ``tools/gen_aten_classifier.py`` and are imported from here across codegen.
+from .aten_classifier import is_compute_op, is_elementwise_op  # noqa: F401
 from .param_pb2 import (
     Argument,
     OpOverload,
@@ -518,111 +522,6 @@ def is_pooling(node: Node) -> bool:
     ]
 
 
-def is_elementwise_op(node: Node) -> bool:
-    return node.target in [
-        # Core aten ops
-        torch.ops.aten.abs.default,
-        torch.ops.aten.acos.default,
-        torch.ops.aten.acosh.default,
-        torch.ops.aten.add.Scalar,
-        torch.ops.aten.add.Tensor,
-        torch.ops.aten.asin.default,
-        torch.ops.aten.asinh.default,
-        torch.ops.aten.atan.default,
-        torch.ops.aten.atan2.default,
-        torch.ops.aten.atan2.out,
-        torch.ops.aten.atanh.default,
-        torch.ops.aten.bitwise_and.Scalar,
-        torch.ops.aten.bitwise_and.Tensor,
-        torch.ops.aten.bitwise_not.default,
-        torch.ops.aten.bitwise_or.Scalar,
-        torch.ops.aten.bitwise_or.Tensor,
-        torch.ops.aten.bitwise_xor.Scalar,
-        torch.ops.aten.bitwise_xor.Tensor,
-        torch.ops.aten.ceil.default,
-        torch.ops.aten.clamp.default,
-        torch.ops.aten.clamp.Tensor,
-        torch.ops.aten.cos.default,
-        torch.ops.aten.cosh.default,
-        torch.ops.aten.div.Scalar,
-        torch.ops.aten.div.Scalar_mode,
-        torch.ops.aten.div.Tensor,
-        torch.ops.aten.div.Tensor_mode,
-        torch.ops.aten.eq.Scalar,
-        torch.ops.aten.eq.Tensor,
-        torch.ops.aten.erf.default,
-        torch.ops.aten.exp.default,
-        torch.ops.aten.expm1.default,
-        torch.ops.aten.floor.default,
-        torch.ops.aten.fmod.Scalar,
-        torch.ops.aten.fmod.Tensor,
-        torch.ops.aten.ge.Scalar,
-        torch.ops.aten.ge.Tensor,
-        torch.ops.aten.gelu.default,
-        torch.ops.aten.gt.Scalar,
-        torch.ops.aten.gt.Tensor,
-        torch.ops.aten.hardtanh.default,
-        torch.ops.aten.isinf.default,
-        torch.ops.aten.isnan.default,
-        torch.ops.aten.le.Scalar,
-        torch.ops.aten.le.Tensor,
-        torch.ops.aten.leaky_relu.default,
-        torch.ops.aten.log.default,
-        torch.ops.aten.log10.default,
-        torch.ops.aten.log1p.default,
-        torch.ops.aten.log2.default,
-        torch.ops.aten.logical_and.default,
-        torch.ops.aten.logical_not.default,
-        torch.ops.aten.logical_or.default,
-        torch.ops.aten.logical_xor.default,
-        torch.ops.aten.lt.Scalar,
-        torch.ops.aten.lt.Tensor,
-        torch.ops.aten.maximum.default,
-        torch.ops.aten.minimum.default,
-        torch.ops.aten.mul.Scalar,
-        torch.ops.aten.mul.Tensor,
-        torch.ops.aten.ne.Scalar,
-        torch.ops.aten.ne.Tensor,
-        torch.ops.aten.neg.default,
-        torch.ops.aten.nonzero.default,
-        torch.ops.aten.pow.Scalar,
-        torch.ops.aten.pow.Tensor_Scalar,
-        torch.ops.aten.pow.Tensor_Tensor,
-        torch.ops.aten.reciprocal.default,
-        torch.ops.aten.relu.default,
-        torch.ops.aten.remainder.Scalar,
-        torch.ops.aten.remainder.Tensor,
-        torch.ops.aten.round.default,
-        torch.ops.aten.rsqrt.default,
-        torch.ops.aten.sigmoid.default,
-        torch.ops.aten.sign.default,
-        torch.ops.aten.sin.default,
-        torch.ops.aten.sinh.default,
-        torch.ops.aten.sqrt.default,
-        torch.ops.aten.sub.Scalar,
-        torch.ops.aten.sub.Tensor,
-        torch.ops.aten.tan.default,
-        torch.ops.aten.tanh.default,
-        torch.ops.aten.trunc.default,
-        torch.ops.aten.where.self,
-        # Inplace versions of the above operations
-        torch.ops.aten.add_.Scalar,
-        torch.ops.aten.add_.Tensor,
-        torch.ops.aten.mul_.Scalar,
-        torch.ops.aten.mul_.Tensor,
-        torch.ops.aten.gelu_.default,
-        torch.ops.aten.hardtanh_.default,
-        torch.ops.aten.relu_.default,
-        # Quantization operations
-        torch.ops.quantized_ops.dequantize.default,
-        torch.ops.quantized_ops.quantize.default,
-        torch.ops.quantized_ops.vmap.default,
-        # Not in the core aten operator set. Will be removed in the future.
-        torch.ops.aten.silu.default,
-        torch.ops.aten.silu_.default,
-    ]
-
-
 def is_reshape_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.transpose.int,
@@ -642,6 +541,9 @@ def is_indexing_or_concatenation_op(node: Node) -> bool:
 
 def is_prunable_op(node: Node) -> bool:
     """Operations that can be safely deleted from fx.Graph."""
+    if node.target == torch.ops.aten.alias.default:
+        return True
+
     # A slice from 0 to the end of the input tensor
     if node.target == torch.ops.aten.slice.Tensor:
         dim = get_arg_value(node, 1, "dim", 0)

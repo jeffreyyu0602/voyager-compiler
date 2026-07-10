@@ -24,10 +24,10 @@ from ...pt2e_utils import update_submod_user_meta
 from ..mapping import get_anchor_node, replace_node_with_graph_module
 from ..mapping_utils import (
     quant_table_arg_nodes,
+    is_compute_op,
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
-    is_indexing_or_concatenation_op,
     is_memory_op,
     is_nop,
     is_pooling,
@@ -46,9 +46,6 @@ voyager = torch.ops.voyager
 # ---------------------------------------------------------------------------
 
 _VOYAGER_ALLOC = torch.ops.voyager.alloc.default  # DRAM output buffer
-_VOYAGER_ZEROS = torch.ops.voyager.zeros.default  # accumulator / semaphore bank
-_VOYAGER_INCR = torch.ops.voyager.increment_indices.default
-_VOYAGER_DELIN = torch.ops.voyager.delinearize_index.default
 _VOYAGER_ASYNC = (
     torch.ops.voyager.async_copy.default
 )  # guarded DRAM<->Scratchpad DMA
@@ -124,28 +121,7 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
     return {p for p in gm.graph.nodes if p.op == "placeholder" and p in local}
 
 
-_VOYAGER_WAIT = torch.ops.voyager.async_wait.default
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
-
-# Memory / control-flow / semaphore ops — *not* tile compute, so they are exempt
-# from the destination-passing check below: the buffer producers (``alloc`` /
-# ``zeros``) and the ``insert`` store, the async DMA + its semaphore
-# ``async_wait``, the index / counter ops (``increment_indices`` /
-# ``delinearize_index``), the bank- and semaphore-read ``select``, and the
-# multi-output / cond-unpack ``getitem``.  (These become registers; not
-# annotated yet.)  ``voyager.zeros`` (the accumulator / per-slot semaphore bank
-# init) is exempt — but a genuine ``aten.zeros`` *is* a compute op and is not.
-_NON_COMPUTE = {
-    _VOYAGER_ALLOC,
-    _VOYAGER_ZEROS,
-    _VOYAGER_ASYNC,
-    _VOYAGER_WAIT,
-    _VOYAGER_INSERT,
-    _VOYAGER_INCR,
-    _VOYAGER_DELIN,
-    torch.ops.aten.select.int,
-    operator.getitem,
-}
 
 
 def annotate_tensor_spaces(gm: GraphModule) -> None:
@@ -159,7 +135,7 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
       * **Compute** is *not* given a space.  Instead the destination-passing
         invariant is checked: every tile-compute ``call_function`` /
         ``call_module`` result must be written to a buffer via ``insert``.
-        Control logic (``_NON_COMPUTE`` + NOPs) is exempt.
+        Control logic (anything ``is_compute_op`` rejects) is exempt.
 
     Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
     when an op's result is the body's output, the check threads to the users of
@@ -172,17 +148,19 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
 
 def _is_compute(node: Node) -> bool:
     """A tile-compute op subject to the destination-passing rule: it yields a
-    tensor and is not a NOP / addressing op.  A fused ``call_module`` is one L1
-    compute op."""
+    tensor and performs arithmetic.  A fused ``call_module`` is one L1 compute
+    op.
+
+    ``is_compute_op`` is an allowlist generated from the Core ATen IR, so the
+    memory / control-flow / semaphore primitives around a kernel — the buffer
+    producers (``alloc`` / ``zeros``), the ``insert`` store, the async DMA and
+    its ``async_wait``, the index arithmetic (``increment_indices`` /
+    ``delinearize_index``), the bank-read ``select`` and the multi-output
+    ``getitem`` — are all excluded by simply not being in it.
+    """
     if not _produces_tensor(node):
         return False
-    if node.op == "call_module":
-        return True
-    if node.op != "call_function":
-        return False
-    if is_nop(node) or is_indexing_or_concatenation_op(node):
-        return False
-    return node.target not in _NON_COMPUTE
+    return node.op == "call_module" or is_compute_op(node)
 
 
 def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
@@ -193,18 +171,19 @@ def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
     outs = out.args[0]
     outs = list(outs) if isinstance(outs, (list, tuple)) else [outs]
     handles = []
-    for i, o in enumerate(outs):
-        if o is node:
-            handles.append(
-                next(
-                    (
-                        u
-                        for u in parent_hop.users
-                        if u.target is operator.getitem and u.args[1] == i
-                    ),
-                    None,
-                )
-            )
+    for index, output in enumerate(outs):
+        if output is not node:
+            continue
+
+        matching_user = next(
+            (
+                user
+                for user in parent_hop.users
+                if user.target is operator.getitem and user.args[1] == index
+            ),
+            None,
+        )
+        handles.append(matching_user)
     return handles
 
 
@@ -252,24 +231,22 @@ def _annotate_and_validate(
         elif node.op == "get_attr":
             if _subgraph(gm, node.target) is None and _produces_tensor(node):
                 node.meta["space"] = "DRAM"  # a weight param
-        elif node.op == "call_function" and node.target is _VOYAGER_ALLOC:
+        elif node.target is _VOYAGER_ALLOC:
             level = (
                 node.args[2] if len(node.args) > 2 else int(MemoryLevel.DRAM)
             )
             node.meta["space"] = (
                 "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
             )
-        elif node.op == "call_function" and node.target is _WHILE_LOOP:
+        elif node.target is _WHILE_LOOP:
             body = _subgraph(gm, node.args[1].target)
             if body is not None:
                 _annotate_and_validate(body, codebooks, node, ctx)
-        elif node.op == "call_function" and node.target is _COND:
+        elif node.target is _COND:
             for graph_arg in (node.args[1], node.args[2]):
                 branch = _subgraph(gm, graph_arg.target)
                 if branch is not None:
                     _annotate_and_validate(branch, codebooks, node, ctx)
-        elif is_memory_op(node) or is_reshape_op(node):
-            node.meta["space"] = "DRAM"
         elif _is_compute(node):
             if not _stored(node, ctx):
                 raise Exception(
@@ -277,6 +254,8 @@ def _annotate_and_validate(
                     f"'{node.name}' ({node.target}) is not stored to a buffer "
                     f"via insert (it feeds a non-store consumer)"
                 )
+        else:
+            node.meta["space"] = "DRAM"
 
 
 # ---------------------------------------------------------------------------
@@ -610,13 +589,7 @@ def bufferize_graph(
             graph.erase_node(node)
             continue
 
-        if (
-            node.target == operator.getitem
-            or is_nop(node)
-            or is_memory_op(node)
-            or is_indexing_or_concatenation_op(node)
-            or is_reshape_op(node)
-        ):
+        if not _is_compute(node):
             continue
 
         anchor = get_anchor_node(node)

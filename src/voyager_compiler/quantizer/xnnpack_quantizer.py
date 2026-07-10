@@ -3,9 +3,8 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional, Union, Tuple, OrderedDict
 
 import torch
-from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor
-from torch.ao.quantization.quantizer import Quantizer
 from torch.fx import Node
+from torchao.quantization.pt2e.quantizer import Quantizer
 
 from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
     _convert_scalars_to_attrs,

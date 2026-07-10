@@ -1,6 +1,7 @@
 import itertools
 import logging
 import operator
+import re
 from typing import Tuple, Union, List
 from collections import defaultdict
 
@@ -605,7 +606,7 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
 
         input_node = node.args[0]
         sizes = node.args[1]
-        original_shape = input_node.meta["val"].shape
+        original_shape = input_node.shape
         assert len(sizes) >= len(
             original_shape
         ), "Sizes must have at least as many dimensions as the original tensor."
@@ -633,7 +634,7 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
                         )
                 return input
 
-        gm = export_model(Expand(), (input_node.meta["val"],))
+        gm = export_model(Expand(), (input_node.value.clone(),))
         replace_node_with_graph_module(model, node, gm)
         model.graph.erase_node(node)
 
@@ -991,18 +992,22 @@ def fold_constant_generators(model: GraphModule):
             inp not in constants for inp in node.all_input_nodes
         ):
             continue
-        # Folding dequantize nodes offset the benefit of quantizing the params.
-        if node.target == torch.ops.quantized_ops.dequantize.default:
+        # Folding a dequantize offsets the benefit of quantizing the params;
+        # folding an expand materializes the replication it stands for.
+        if node.target in [
+            torch.ops.quantized_ops.dequantize.default,
+            torch.ops.aten.expand.default,
+        ]:
             continue
         if not isinstance(getattr(node, "value", None), torch.Tensor):
             continue
         const = node.target(
             *map_arg(node.args, resolve), **map_arg(node.kwargs, resolve)
         )
+        src = next((n.target for n in node.all_input_nodes), "const")
+        prefix = re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
         with graph.inserting_before(node):
-            attr = create_getattr_from_value(
-                model, graph, "folded_const", const
-            )
+            attr = create_getattr_from_value(model, graph, prefix, const)
         attr.meta["dtype"] = node.meta.get("dtype")
         set_node_value(attr, const)
         node.replace_all_uses_with(attr)

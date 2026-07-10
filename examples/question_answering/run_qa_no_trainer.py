@@ -59,6 +59,7 @@ from transformers.utils.versions import require_version
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
     get_default_quantizer,
@@ -843,7 +844,7 @@ def main(args):
     if args.calibration_steps > 0:
         calibrate(model, calibration_data_loader)
         for module in model.modules():
-            if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+            if isinstance(module, FakeQuantizeBase):
                 module.disable_observer()
 
     num_params = sum(p.numel() for p in model.parameters())

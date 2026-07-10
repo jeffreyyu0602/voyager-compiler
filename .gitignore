@@ -16,3 +16,4 @@ test/*
 !test/run_ci.py
 wandb
 .vscode
+tools/artifacts/shards/

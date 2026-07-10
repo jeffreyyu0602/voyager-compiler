@@ -29,9 +29,10 @@ dependencies = [
     "soundfile",
     "tabulate",
     "timm",
-    "torch==2.8.0",
-    "torchao",
-    "transformers==5.9.0",
+    "torch==2.12.1",
+    "torchao==0.17.0",
+    "torchvision==0.27.1",
+    "transformers==5.13.0",
     "wandb",
     "xlsxwriter"
 ]

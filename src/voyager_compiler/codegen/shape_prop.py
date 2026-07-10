@@ -1,4 +1,5 @@
 import logging
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
@@ -38,10 +39,7 @@ class ShapeProp:
         self._recurse = recurse
 
     def propagate(self, *args):
-        if self._mode is not None:
-            with self._mode:
-                return self._propagate(*args)
-        else:
+        with self._mode or nullcontext():
             return self._propagate(*args)
 
     def _subprop(self, target, inputs):

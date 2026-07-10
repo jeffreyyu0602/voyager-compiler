@@ -92,8 +92,7 @@ def build_interstellar_tiler(
                 accum_buffer_size * oc_dim,
                 weight_buffer_size * oc_dim,
             ],
-            # TODO: in the future we should directly pass the full SRAM size.
-            [scratchpad_size if double_buffered_l2 else scratchpad_size * 2],
+            [scratchpad_size],
             [dram_size],
         ],
         buf_access_cost_list=[

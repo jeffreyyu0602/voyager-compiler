@@ -7,13 +7,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 from scipy.interpolate import make_interp_spline
+from torchao.quantization.pt2e import FakeQuantizeBase
 
 logger = logging.getLogger(__name__)
 
 def get_grouped_histogram(model):
     layer_groups = defaultdict(list)
     for name, module in model.named_modules():
-        if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+        if isinstance(module, FakeQuantizeBase):
             if (match := re.search(r'(.*?\.\d+)\.(.*?)?(?=\.activation_pre_process\.\d+)', name)):
                 prefix, layer_name = match.group(1), match.group(2)
             else:

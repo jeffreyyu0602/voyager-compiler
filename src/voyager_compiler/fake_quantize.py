@@ -5,7 +5,7 @@ from typing import Optional, List, Callable, Tuple, Union
 
 import torch
 from torch import Tensor
-from torch.ao.quantization import FakeQuantizeBase, ObserverOrFakeQuantize
+from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
 import voyager_compiler as qt
 from voyager_compiler.decomposed import expand, vmap, quantize_mx

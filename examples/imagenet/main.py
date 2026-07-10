@@ -23,6 +23,7 @@ from torch.utils.data import Subset
 
 import torchao
 from tqdm import tqdm
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
     convert_pt2e,
@@ -272,7 +273,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.calibration_steps > 0:
             calibrate(model)
             for module in model.modules():
-                if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+                if isinstance(module, FakeQuantizeBase):
                     module.disable_observer()
 
         if args.qat_model_id is not None:
@@ -373,7 +374,7 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.calibration_steps > 0:
             calibrate(model)
             for module in model.modules():
-                if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+                if isinstance(module, FakeQuantizeBase):
                     module.disable_observer()
 
         if args.convert_model:

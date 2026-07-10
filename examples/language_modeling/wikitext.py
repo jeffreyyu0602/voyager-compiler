@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
     get_default_quantizer,
@@ -214,7 +215,7 @@ def main(args):
         )
 
         for module in model.modules():
-            if isinstance(module, torch.ao.quantization.FakeQuantizeBase):
+            if isinstance(module, FakeQuantizeBase):
                 module.disable_observer()
 
     if args.convert_model:

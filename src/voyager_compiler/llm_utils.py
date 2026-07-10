@@ -30,8 +30,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-use_llama_attention_kivi = False
-
 
 def process_logits(scores: torch.Tensor, eos_token_id: torch.Tensor) -> torch.Tensor:
     vocab_tensor = torch.arange(scores.shape[-1], device=scores.device)
@@ -254,8 +252,6 @@ def swap_llama_attention(model: PreTrainedModel) -> PreTrainedModel:
     Returns:
         `PreTrainedModel`: The modified model with the custom attention module.
     """
-    global use_llama_attention_kivi
-    use_llama_attention_kivi = True
 
     logger.info("Using custom LlamaAttention module.")
 
@@ -431,9 +427,9 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
         # already exported)
         for layer in self.static_cache.layers:
-            layer.cumulative_length.copy_(cache_position[0:1])
+            layer.cumulative_length.copy_(cache_position[0])
         for layer in self.static_cache_residual.layers:
-            layer.cumulative_length.copy_(cache_position_residual[0:1])
+            layer.cumulative_length.copy_(cache_position_residual[0])
 
         past_key_values = self.static_cache
 

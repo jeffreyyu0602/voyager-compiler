@@ -9,7 +9,9 @@ import torch.nn as nn
 from torch.utils._pytree import tree_flatten
 from datasets import load_dataset
 from torchvision import models, transforms
-from torch.ao.quantization.quantizer.utils import _annotate_output_qspec
+from torchao.quantization.pt2e.quantizer.utils import (
+    annotate_output_qspec as _annotate_output_qspec,
+)
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
@@ -145,6 +147,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     torch.set_printoptions(sci_mode=False, precision=10)
     torch.set_num_threads(32)
+    torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("model")
@@ -630,7 +633,7 @@ if __name__ == "__main__":
         qconfig = QuantizationConfig(act0, None, act1, None)
 
         for layer_idx in range(model.config.num_hidden_layers):
-            module_name = f"model.model.layers.slice(None, {model.config.num_hidden_layers}, None).{layer_idx}.self_attn"
+            module_name = f"model.model.layers.{layer_idx}.self_attn"
             quantizer.set_module_name_object_type_order(
                 module_name, torch.ops.aten.matmul.default, 0, qconfig
             )
