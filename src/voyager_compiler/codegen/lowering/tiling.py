@@ -261,39 +261,123 @@ def _fused_operand_specs(node, anchor):
     return specs
 
 
-def _make_fused_size_fn(specs):
-    """Build the ``Layer.fused_size_fn`` closure from ``_fused_operand_specs``.
-    ``fn(out_tile, bank_size) -> bytes``: each operand's tile bytes is
-    ``prod(out_tile[d] for d in dims) * dtype_bits / 8``; an operand whose tile
-    is >= half a bank gets its own bank(s), the sub-half ones pack into one
-    shared bank (an un-banked level just sums, no rounding).  ``None`` when there
-    are no fused operands.
-    """
-    if not specs:
-        return None
+# Slots of interstellar's (input, output, weight) byte triple.
+_IF, _OF, _FL = 0, 1, 2
 
-    def fn(out_tile, bank_size):
-        sizes = []
-        for dims, dtype_bits in specs:
+
+def output_is_psum(point, level):
+    """Whether the output stored at ``level`` is still a partial sum: it is,
+    while the IC reduction is incomplete *above* this level.  A partial sum is
+    held at the accumulator's width, and carries no output scale yet."""
+    num_levels = len(point.loop_blocking(le.IC))
+    ic_above = 1
+    for lvl in range(level + 1, num_levels):
+        ic_above *= point.loop_blocking(le.IC)[lvl]
+        ic_above *= point.loop_partitioning(le.IC)[lvl]
+    return ic_above > 1
+
+
+def make_size_fn(node, out_dtype=None, fused_specs=(), extra_sharing=0):
+    """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
+    level.
+
+    Interstellar hands over element counts and the mapping; everything that
+    turns those into bytes is policy and lives here -- element widths,
+    microscaling scale tensors (one scale per ``block_size`` values), the bias
+    and fused post-op operands interstellar knows nothing about, and how all of
+    them are packed into banks.
+
+    Operands are grouped one per bank ideally::
+
+        input | input_scale | weight+weight_scale+bias | output+output_scale
+              | each fused operand
+
+    A bank cannot be split between groups, so each group rounds up to a whole
+    bank -- which puts a floor of ``len(groups) * bank_size`` on the tile,
+    however small it is.  With more groups than banks the two *smallest* are
+    merged until they fit (a tiny scale tensor would otherwise waste a whole
+    bank).  ``extra_sharing`` forces further merges; ``run_interstellar`` raises
+    it when nothing maps even at the minimum.
+
+    ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
+    ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
+    """
+    psum_bits = 32
+
+    if isinstance(out_dtype, (list, tuple)):
+        of_scale_dtype, of_dtype = out_dtype[-2], out_dtype[-1]
+    else:
+        of_scale_dtype, of_dtype = None, out_dtype
+    if_bits = _node_dtype_bits(node.args[0])
+    fl_bits = _node_dtype_bits(node.args[1])
+    of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
+    bias_bits = _node_dtype_bits(get_arg_value(node, 2, "bias", None), 0)
+    if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
+    fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
+    of_scale_bits = get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
+    block_size = node.kwargs.get("block_size") or 1
+
+    def _scale_bytes(count, bits):
+        return count / block_size * bits / 8.0 if bits else 0.0
+
+    def size_fn(counts, point, level, partitioning_accum, bank_size, num_banks):
+        if_count, of_count, fl_count = counts
+        is_psum = output_is_psum(point, level)
+
+        def extent(d):
+            """Output-dim extent here: one bank's worth, or the whole spatially
+            replicated block when a partitioning is given."""
+            e = 1
+            for b in point.loop_blocking(d)[: level + 1]:
+                e *= b
+            if partitioning_accum is not None:
+                e *= partitioning_accum[d]
+            return e
+
+        # The output is a wide partial sum until IC is fully reduced; only the
+        # final value carries an output scale.
+        out_bits = psum_bits if is_psum else of_bits
+        of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
+        bias = extent(le.OC) * bias_bits / 8.0 if bias_bits else 0.0
+
+        groups = [
+            (if_count * if_bits / 8.0, _IF),
+            (_scale_bytes(if_count, if_scale_bits), _IF),
+            (
+                fl_count * fl_bits / 8.0
+                + _scale_bytes(fl_count, fl_scale_bits)
+                + bias,
+                _FL,
+            ),
+            (of_count * out_bits / 8.0 + of_scale, _OF),
+        ]
+        for dims, bits in fused_specs:
             count = 1
             for d in dims:
-                count *= out_tile[d]
-            sizes.append(count * dtype_bits / 8.0)
+                count *= extent(d)
+            groups.append((count * bits / 8.0, _OF))
 
+        # An absent operand (no scale, no bias) occupies no bank.
+        groups = [g for g in groups if g[0] > 0]
+
+        out = [0.0, 0.0, 0.0]
         if not bank_size:
-            return sum(sizes)
-        total = 0.0
-        small = 0.0
-        for s in sizes:
-            if s >= bank_size / 2:
-                total += math.ceil(s / bank_size) * bank_size
-            else:
-                small += s
-        if small:
-            total += math.ceil(small / bank_size) * bank_size
-        return total
+            for size, slot in groups:
+                out[slot] += size
+            return tuple(out)
 
-    return fn
+        target = max(1, (num_banks or len(groups)) - extra_sharing)
+        for _ in range(max(0, len(groups) - target)):
+            groups.sort(key=lambda g: g[0])
+            (s0, k0), (s1, k1) = groups[0], groups[1]
+            # Charge the shared bank to the larger member's operand.
+            groups = [(s0 + s1, k0 if s0 >= s1 else k1)] + groups[2:]
+
+        for size, slot in groups:
+            out[slot] += math.ceil(size / bank_size) * bank_size
+        return tuple(out)
+
+    return size_fn
 
 
 class RuntimeCalculator:
@@ -538,7 +622,7 @@ class RuntimeCalculator:
         return total_time
 
 
-def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
+def _extract_layer_from_node(node, out_dtype=None, fused_specs=()):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
 
@@ -594,19 +678,6 @@ def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
         height = 1
         stride_h, stride_w = 1, 1
 
-    input_node = node.args[0] if len(node.args) > 0 else None
-    weight_node = node.args[1] if len(node.args) > 1 else None
-    # Microscaling (mx) ops carry per-block scale operands; their dtype widths +
-    # block size let interstellar account for the scale tensors' L2+ footprint.
-    input_scale = node.kwargs.get("input_scale")
-    weight_scale = node.kwargs.get("weight_scale")
-    # A fused mx output is (scale, value): value (the true quantized output
-    # dtype) is last, the scale dtype first.  A single / None out_dtype has no
-    # output scale; the output width then falls back to the anchor's own dtype.
-    if isinstance(out_dtype, (list, tuple)):
-        of_dtype, of_scale_dtype = out_dtype[-1], out_dtype[0]
-    else:
-        of_dtype, of_scale_dtype = out_dtype, None
     return interstellar.Layer(
         nifm=input_channels,
         nofm=output_channels,
@@ -616,26 +687,36 @@ def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
         hfil=kH,
         wstd=stride_w,
         hstd=stride_h,
-        if_dtype_bits=_node_dtype_bits(input_node),
-        fl_dtype_bits=_node_dtype_bits(weight_node),
-        of_dtype_bits=(
-            get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
-        ),
-        if_scale_bits=_node_dtype_bits(input_scale, 0),
-        fl_scale_bits=_node_dtype_bits(weight_scale, 0),
-        of_scale_bits=(
-            get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
-        ),
-        block_size=node.kwargs.get("block_size") or 1,
-        fused_size_fn=fused_size_fn,
+        size_fn=make_size_fn(node, out_dtype, fused_specs),
     )
+
+
+# The optimizer reports "nothing fits" with a bare assert, so match it narrowly:
+# every other AssertionError in interstellar is a real invariant break.
+_NO_MAPPING = "No valid mapping point found"
+
+
+def _try_optimize(tiler, layer, rc):
+    """Map ``layer``, or ``None`` when no tiling fits the on-chip budget."""
+    try:
+        return interstellar.optimizer.opt_optimizer(
+            tiler.arch,
+            layer,
+            tiler.schedule,
+            rc.calculate_runtime,
+            verbose=False,
+        )
+    except AssertionError as e:
+        if _NO_MAPPING not in str(e):
+            raise
+        return None
 
 
 def run_interstellar(
     node,
     tiler,
     out_dtype=None,
-    fused_size_fn=None,
+    fused_specs=(),
     has_tail_operands=False,
 ):
     """Run interstellar with the 4-level DRAM architecture for a single
@@ -645,15 +726,19 @@ def run_interstellar(
     optimizer, and logs the resulting L1/L2/L3 tile sizes.  The L2 -> L1 bus
     carries ``min(unroll)`` input elements per cycle -- the rate the array's
     narrow side consumes them at -- so its width is
-    ``min(unroll) * layer.if_dtype_bits / 8`` bytes per cycle.
+    ``min(unroll) * if_bits / 8`` bytes per cycle.
+
+    Each operand ideally gets a bank of its own, but a bank cannot be split, so
+    a layer with more operands than banks has no tiling at any size.  Retry with
+    progressively more bank sharing and keep the first (least-shared) mapping.
 
     Args:
         node: The GEMM/conv anchor to map.
         tiler (TilerContext): The shared architecture, schedule and unroll.
         out_dtype: The outer (fused) node's output dtype; a ``(scale, value)``
             list for a fused mx output.
-        fused_size_fn: Sizes the fused tail's own operands for the L2 fit
-            check.
+        fused_specs: The fused tail's own tiled operands, from
+            ``_fused_operand_specs``; they need banks of their own.
         has_tail_operands (bool): The fused tail reads a tiled operand of its
             own (a residual / mask), which keeps the vector unit at high
             precision.
@@ -664,9 +749,16 @@ def run_interstellar(
         cycles of one L3 tile under it (the reporting model's utilization
         denominator).  ``(None, None)`` if the node is skipped.
     """
-    layer = _extract_layer_from_node(node, out_dtype, fused_size_fn)
+    layer = _extract_layer_from_node(node, out_dtype, fused_specs)
     if layer is None:
         return None, None
+
+    of_dtype = (
+        out_dtype[-1] if isinstance(out_dtype, (list, tuple)) else out_dtype
+    )
+    if_bits = _node_dtype_bits(node.args[0])
+    fl_bits = _node_dtype_bits(node.args[1])
+    of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
 
     logger.info(
         f"[interstellar DRAM] {node.name}: "
@@ -675,14 +767,14 @@ def run_interstellar(
         f"kH={layer.hfil} kW={layer.wfil}"
     )
 
-    sram_bandwidth = min(tiler.unroll) * layer.if_dtype_bits / 8
+    sram_bandwidth = min(tiler.unroll) * if_bits / 8
 
-    # Use the layer's per-node dtype widths so the timing model and the
-    # feasibility check (which reads the same Layer dtypes) stay consistent.
+    # Use the node's dtype widths so the timing model and the feasibility check
+    # (which sizes the same operands) stay consistent.
     rc = RuntimeCalculator(
-        layer.if_dtype_bits,
-        layer.fl_dtype_bits,
-        layer.of_dtype_bits,
+        if_bits,
+        fl_bits,
+        of_bits,
         tiler.double_buffered_accum_buffer,
         sram_bandwidth,
         tiler.dram_bandwidth,
@@ -690,13 +782,25 @@ def run_interstellar(
         has_tail_operands=has_tail_operands,
     )
 
-    _, runtime, mapping, _ = interstellar.optimizer.opt_optimizer(
-        tiler.arch,
-        layer,
-        tiler.schedule,
-        rc.calculate_runtime,
-        verbose=False,
-    )
+    result = None
+    for extra_sharing in range(4 + len(fused_specs)):
+        layer.size_fn = make_size_fn(
+            node, out_dtype, fused_specs, extra_sharing
+        )
+        result = _try_optimize(tiler, layer, rc)
+        if result is not None:
+            if extra_sharing:
+                logger.info(
+                    f"[interstellar] {node.name}: no tiling fits one bank per "
+                    f"operand; sharing {extra_sharing} more"
+                )
+            break
+    if result is None:
+        raise RuntimeError(
+            f"{node.name}: no tiling fits on chip even with every operand "
+            f"sharing one bank"
+        )
+    _, runtime, mapping, _ = result
 
     b = mapping.loop_blockings
     logger.info(
@@ -780,7 +884,7 @@ def get_tiling(node, tiler=None):
 
     # Run interstellar (cached per layer; the optimizer is slow).  ``out_dtype``
     # is the outer (fused) node's output dtype; the fused post-op operands add
-    # their own L2+ banks (modeled via ``layer.fused_size_fn``).
+    # their own L2+ banks (modeled via ``layer.size_fn``).
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     key = _layer_cache_key(
@@ -804,7 +908,7 @@ def get_tiling(node, tiler=None):
             anchor,
             tiler,
             out_dtype=out_dtype,
-            fused_size_fn=_make_fused_size_fn(fused_specs),
+            fused_specs=fused_specs,
             has_tail_operands=bool(fused_specs),
         )
         logger.info(

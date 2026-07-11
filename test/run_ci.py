@@ -266,7 +266,8 @@ def main():
 
     if args.list:
         for command in commands:
-            print(_label(command))
+            _, _, argv = _build(command, Path("<run_dir>"))
+            print(" ".join(shlex.quote(a) for a in argv))
         return 0
 
     if not args.output_dir:

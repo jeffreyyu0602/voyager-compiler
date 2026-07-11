@@ -11,6 +11,7 @@ from torch.fx import Node
 from torch.fx.node import map_arg
 from torch.fx.operator_schemas import normalize_function
 
+from ..mapping import is_mha_qkv_permute
 from .utils import get_arg_value, _pair
 from ..mapping import (
     get_node_bytes,
@@ -36,6 +37,7 @@ from ..banking import (
     require_allocation,
     _get_scope,
 )
+from ...layout_ops import NHWC_OP_VARIANTS
 from ...pt2e_utils import WrapperModule, fetch_attr, propagate_shape
 from ...quantize_pt2e import create_getattr_from_value, export_model
 
@@ -1354,7 +1356,30 @@ def search_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
     )
 
 
-def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
+def mha_projection_head_dim(node) -> Optional[int]:
+    """``head_dim`` of the MHA relayout a projection gemm feeds, else ``None``.
+
+    A projection's ``N`` is really ``(heads, head_dim)`` -- the reshape splits
+    it and the permute makes the heads outer -- so its ``N`` tile has to hold
+    whole heads.  A context matmul keeps its rank across the permute and carries
+    no such constraint.  The tail is still flat here (fusion runs later), so
+    walk the single-user chain to reach the permute.
+    """
+    ndim = len(node.shape)
+    curr = node
+    for _ in range(4):
+        users = list(curr.users)
+        if len(users) != 1:
+            return None
+        curr = users[0]
+        if is_mha_qkv_permute(curr):
+            return curr.shape[-1] if len(curr.shape) > ndim else None
+    return None
+
+
+def search_gemm_tiling(
+    node, unroll_dims, cache_size, bank_width, bank_size, k_multiple=1
+):
     if isinstance(unroll_dims, int):
         unroll_dims = (unroll_dims, unroll_dims)
 
@@ -1392,7 +1417,10 @@ def search_gemm_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
         node=node,
         full_shape=full_shape,
         min_sizes=min_sizes,
-        multiple_of=unroll_dims,
+        multiple_of=(
+            unroll_dims[0],
+            math.lcm(unroll_dims[1], k_multiple),
+        ),
         order=order,
         shape_func=_build_gemm_shape_map,
         cache_size=cache_size,
@@ -1478,8 +1506,20 @@ def run_matrix_op_l2_tiling(
             # tiling here; the matrix-matrix GEMMs are tiled by interstellar.
             if use_interstellar_tiling and not is_fully_connected(node):
                 continue
+            # An N tile that cuts a head in half cannot be stored in the
+            # permuted layout the bufferizer folds the relayout into.
+            head_dim = (
+                mha_projection_head_dim(node)
+                if use_interstellar_tiling
+                else None
+            )
             tile_sizes, tiled_shapes = search_gemm_tiling(
-                node, unroll, cache_size, None, bank_size
+                node,
+                unroll,
+                cache_size,
+                None,
+                bank_size,
+                k_multiple=head_dim or 1,
             )
 
             if tile_sizes is None:
@@ -1582,6 +1622,7 @@ def run_vector_op_node_l2_tiling(
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
     min_sizes = (unroll,)
+    multiple_of = None
     if node.target == torch.ops.aten.softmax.int:
         last_dim = get_arg_value(node, 1, "dim", -1)
     elif node.target == torch.ops.aten.layer_norm.default:
@@ -1597,14 +1638,22 @@ def run_vector_op_node_l2_tiling(
         block_size = get_arg_value(node, 3, "block_size", None)
         ndim = len(node.args[0].shape)
 
-        # A quantization block must not straddle a tile boundary, so each
-        # quantization axis gets a min tile of one block; the last dim also
+        # A quantization block must not straddle a tile boundary, so a tile on a
+        # quantization axis holds a whole number of blocks; the last dim also
         # respects the hardware unroll.
         last_dim = None
         axes = set(a % ndim for a in (axes or ()))
         min_sizes = tuple(
             (
                 max(block_size, unroll)
+                if i == ndim - 1
+                else block_size if i in axes else 1
+            )
+            for i in range(ndim)
+        )
+        multiple_of = tuple(
+            (
+                math.lcm(block_size if i in axes else 1, unroll)
                 if i == ndim - 1
                 else block_size if i in axes else 1
             )
@@ -1627,6 +1676,7 @@ def run_vector_op_node_l2_tiling(
         node=node,
         full_shape=output_shape,
         min_sizes=min_sizes,
+        multiple_of=multiple_of,
         last_dim=last_dim,
         shape_func=_build_vector_op_shape_map,
         cache_size=cache_size,
@@ -1649,7 +1699,7 @@ def run_vector_op_l2_tiling(
     bank_width=None,
 ):
     """
-    Perform tiling on vector operations in a model to fit intermediate data into cache.
+    Perform tiling on vector operations to fit intermediate data into cache.
 
     Args:
         model: A model object with a FX Graph containing vector operation nodes.
@@ -1672,43 +1722,22 @@ def run_vector_op_l2_tiling(
     return model
 
 
-# ---------------------------------------------------------------------------
-# Op sets used throughout the pooling tiling section
-# ---------------------------------------------------------------------------
-
-# Ops that use NHWC layout (quantized_ops, produced after the data_layout pass)
-_NHWC_POOL_OPS = {
-    torch.ops.quantized_ops.max_pool2d.default,
-    torch.ops.quantized_ops.adaptive_avg_pool2d.default,
-}
-
-# Max-pooling ops (pad with -inf at boundaries); everything else pads with 0
-_MAX_POOL_OPS = {
-    torch.ops.quantized_ops.max_pool2d.default,
-    torch.ops.aten.max_pool2d.default,
-}
-
-# Non-adaptive: fixed kernel/stride/padding → full 4-D (N, H, W, C) tiling
-_NON_ADAPTIVE_POOL_OPS = {
-    torch.ops.quantized_ops.max_pool2d.default,  # NHWC (after data_layout)
-    torch.ops.aten.max_pool2d.default,  # NCHW (before data_layout)
-}
-
-# Adaptive: input window is proportional to H_in/H_out → only (N, C) tiling
-_ADAPTIVE_POOL_OPS = {
-    torch.ops.quantized_ops.adaptive_avg_pool2d.default,  # NHWC
-    torch.ops.aten.adaptive_avg_pool2d.default,  # NCHW
-    torch.ops.aten._adaptive_avg_pool2d,  # NCHW (core aten)
-}
+def _pool_input_extent(tile, stride, dilation, kernel_size):
+    """Input extent covered by ``tile`` consecutive pooling outputs."""
+    return (tile - 1) * stride + dilation * (kernel_size - 1) + 1
 
 
-# ---------------------------------------------------------------------------
-# Non-adaptive pooling L2 tiling (max_pool2d, avg_pool2d, ...)
-#
-# These ops have explicit kernel_size/stride/padding/dilation, so each output
-# tile maps to a deterministic input window.  Full 4-D (N, H, W, C) tiling is
-# possible; boundary tiles are handled with F.pad before the pool call.
-# ---------------------------------------------------------------------------
+def _pool_window(o0, o1, stride, dilation, kernel_size, padding, size):
+    """
+    Input window for the output tile [o0, o1) of a pooling op.
+
+    Returns (start, end, pad_lo, pad_hi): the window clamped to the real input
+    [0, size), plus the amount of it that falls outside on each side and must
+    be materialized with F.pad.
+    """
+    lo = o0 * stride - padding
+    hi = lo + _pool_input_extent(o1 - o0, stride, dilation, kernel_size)
+    return max(0, lo), min(size, hi), max(0, -lo), max(0, hi - size)
 
 
 def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
@@ -1733,14 +1762,14 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     dilation = _pair(get_arg_value(node, 4, "dilation", 1))
     kernel_size = _pair(get_arg_value(node, 1, "kernel_size"))
 
-    tile_H_in = (
-        (tile_H - 1) * stride[0] + dilation[0] * (kernel_size[0] - 1) + 1
+    tile_H_in = _pool_input_extent(
+        tile_H, stride[0], dilation[0], kernel_size[0]
     )
-    tile_W_in = (
-        (tile_W - 1) * stride[1] + dilation[1] * (kernel_size[1] - 1) + 1
+    tile_W_in = _pool_input_extent(
+        tile_W, stride[1], dilation[1], kernel_size[1]
     )
 
-    if node.target in _NHWC_POOL_OPS:  # NHWC: (N, H, W, C)
+    if node.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
         return {
             "input": (tile_N, tile_H_in, tile_W_in, tile_C),
             "output": (tile_N, tile_H, tile_W, tile_C),
@@ -1752,13 +1781,6 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
         }
 
 
-def _slice_dim(x, dim, start, end, size):
-    """Slice x along dim only when the range is not the full extent."""
-    if start > 0 or end < size:
-        return x[(slice(None),) * dim + (slice(start, end),)]
-    return x
-
-
 def _cat_or_single(parts, dim):
     """Return parts[0] directly when there is only one part, skipping torch.cat."""
     return parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
@@ -1766,16 +1788,14 @@ def _cat_or_single(parts, dim):
 
 def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
     """
-    Factory function that creates a tiled WrapperModule for non-adaptive pooling.
+    Factory function that creates a tiled WrapperModule for non-adaptive
+    pooling.
 
     Tiles over (N, H_out, W_out, C).  Each spatial output tile [h0:h1, w0:w1]
     maps to a contiguous input window computed from stride/dilation/kernel_size.
     Boundary tiles are pre-padded in-layout via F.pad, then node.target is
     called with padding=0.  No explicit NHWC↔NCHW permutes are needed because
     node.target handles layout conversion internally.
-
-    NHWC (quantized_ops): slice [n,h,w,c], pad H/W with (0,0, l,r, t,b).
-    NCHW (aten):          slice [n,c,h,w], pad H/W with (l,r, t,b).
     """
     kernel_size = _pair(get_arg_value(node, 1, "kernel_size"))
     stride = _pair(get_arg_value(node, 2, "stride", kernel_size))
@@ -1784,93 +1804,71 @@ def _make_tiled_non_adaptive_pool_module(node, tile_sizes):
     ceil_mode = get_arg_value(node, 5, "ceil_mode", False)
 
     tile_N, tile_H, tile_W, tile_C = tile_sizes
-    kH, kW = kernel_size
-    stride_h, stride_w = stride
-    dil_h, dil_w = dilation
-    pad_h, pad_w = padding
-
-    is_nhwc = node.target in _NHWC_POOL_OPS
-    pad_value = float("-inf") if node.target in _MAX_POOL_OPS else 0.0
     target = node.target
+    is_nhwc = target in NHWC_OP_VARIANTS.values()
+    pad_value = float("-inf") if "max_pool" in str(target) else 0.0
+
+    if is_nhwc:
+        N, H_in, W_in, C = node.args[0].shape
+        _, H_out, W_out, _ = node.shape
+        h_dim, w_dim, c_dim = 1, 2, 3
+    else:
+        N, C, H_in, W_in = node.args[0].shape
+        _, _, H_out, W_out = node.shape
+        h_dim, w_dim, c_dim = 2, 3, 1
+
+    h_windows = [
+        _pool_window(
+            h0,
+            min(h0 + tile_H, H_out),
+            stride[0],
+            dilation[0],
+            kernel_size[0],
+            padding[0],
+            H_in,
+        )
+        for h0 in range(0, H_out, tile_H)
+    ]
+    w_windows = [
+        _pool_window(
+            w0,
+            min(w0 + tile_W, W_out),
+            stride[1],
+            dilation[1],
+            kernel_size[1],
+            padding[1],
+            W_in,
+        )
+        for w0 in range(0, W_out, tile_W)
+    ]
 
     def forward(input: torch.Tensor) -> torch.Tensor:
-        if is_nhwc:
-            N, H_in, W_in, C = input.shape
-        else:
-            N, C, H_in, W_in = input.shape
-
-        if ceil_mode:
-            H_out = math.ceil(
-                (H_in + 2 * pad_h - dil_h * (kH - 1) - 1) / stride_h + 1
-            )
-            W_out = math.ceil(
-                (W_in + 2 * pad_w - dil_w * (kW - 1) - 1) / stride_w + 1
-            )
-        else:
-            H_out = (H_in + 2 * pad_h - dil_h * (kH - 1) - 1) // stride_h + 1
-            W_out = (W_in + 2 * pad_w - dil_w * (kW - 1) - 1) // stride_w + 1
-
         n_parts = []
         for n0 in range(0, N, tile_N):
             n1 = min(n0 + tile_N, N)
             h_parts = []
-            for h0 in range(0, H_out, tile_H):
-                h1 = min(h0 + tile_H, H_out)
-                h_in_start = h0 * stride_h - pad_h
-                h_in_end = (h1 - 1) * stride_h + dil_h * (kH - 1) + 1 - pad_h
-                ptop = max(0, -h_in_start)
-                pbot = max(0, h_in_end - H_in)
-                h_in_s = max(0, h_in_start)
-                h_in_e = min(H_in, h_in_end)
-
+            for h_s, h_e, ptop, pbot in h_windows:
                 w_parts = []
-                for w0 in range(0, W_out, tile_W):
-                    w1 = min(w0 + tile_W, W_out)
-                    w_in_start = w0 * stride_w - pad_w
-                    w_in_end = (
-                        (w1 - 1) * stride_w + dil_w * (kW - 1) + 1 - pad_w
-                    )
-                    pleft = max(0, -w_in_start)
-                    pright = max(0, w_in_end - W_in)
-                    w_in_s = max(0, w_in_start)
-                    w_in_e = min(W_in, w_in_end)
-
+                for w_s, w_e, pleft, pright in w_windows:
                     c_parts = []
                     for c0 in range(0, C, tile_C):
                         c1 = min(c0 + tile_C, C)
                         if is_nhwc:
-                            # dim order: N=0, H=1, W=2, C=3
-                            x = _slice_dim(input, 0, n0, n1, N)
-                            x = _slice_dim(x, 1, h_in_s, h_in_e, H_in)
-                            x = _slice_dim(x, 2, w_in_s, w_in_e, W_in)
-                            x = _slice_dim(x, 3, c0, c1, C)
-                            if ptop or pbot or pleft or pright:
-                                x = F.pad(
-                                    x,
-                                    (0, 0, pleft, pright, ptop, pbot),
-                                    value=pad_value,
-                                )
+                            x = input[n0:n1, h_s:h_e, w_s:w_e, c0:c1]
+                            pad = (0, 0, pleft, pright, ptop, pbot)
                         else:
-                            # dim order: N=0, C=1, H=2, W=3
-                            x = _slice_dim(input, 0, n0, n1, N)
-                            x = _slice_dim(x, 1, c0, c1, C)
-                            x = _slice_dim(x, 2, h_in_s, h_in_e, H_in)
-                            x = _slice_dim(x, 3, w_in_s, w_in_e, W_in)
-                            if ptop or pbot or pleft or pright:
-                                x = F.pad(
-                                    x,
-                                    (pleft, pright, ptop, pbot),
-                                    value=pad_value,
-                                )
+                            x = input[n0:n1, c0:c1, h_s:h_e, w_s:w_e]
+                            pad = (pleft, pright, ptop, pbot)
+                        if any(pad):
+                            x = F.pad(x, pad, value=pad_value)
                         c_parts.append(
                             target(
                                 x, kernel_size, stride, 0, dilation, ceil_mode
                             )
                         )
-                    cat_dim = -1 if is_nhwc else 1
-                    w_parts.append(_cat_or_single(c_parts, cat_dim))
-                h_parts.append(_cat_or_single(w_parts, 2 if is_nhwc else 3))
-            n_parts.append(_cat_or_single(h_parts, 1 if is_nhwc else 2))
+                    w_parts.append(_cat_or_single(c_parts, c_dim))
+                h_parts.append(_cat_or_single(w_parts, w_dim))
+            n_parts.append(_cat_or_single(h_parts, h_dim))
         return _cat_or_single(n_parts, 0)
 
     return WrapperModule(forward)
@@ -1894,7 +1892,7 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
     def load_arg(a):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
 
-    is_nhwc = node.target in _NHWC_POOL_OPS
+    is_nhwc = node.target in NHWC_OP_VARIANTS.values()
     if is_nhwc:
         N, H_out, W_out, C = node.shape
     else:
@@ -1963,16 +1961,6 @@ def split_non_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
             )
 
 
-# ---------------------------------------------------------------------------
-# Adaptive pooling L2 tiling (adaptive_avg_pool2d, ...)
-#
-# These ops compute each output element from an adaptively-sized input window
-# (proportional to H_in/H_out).  Spatial tiling requires remapping those
-# windows, which is non-trivial.  In practice adaptive pooling almost always
-# reduces spatial dims to (1, 1), so tiling N and C is sufficient.
-# ---------------------------------------------------------------------------
-
-
 def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     """
     Compute tiled input/output shapes for adaptive pooling ops.
@@ -1987,7 +1975,7 @@ def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
         "output" -> shape of the output tile
     """
     tile_N, tile_C = tile_sizes
-    if node.target in _NHWC_POOL_OPS:  # NHWC: (N, H, W, C)
+    if node.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
         H_in, W_in = node.args[0].shape[1], node.args[0].shape[2]
         H_out, W_out = node.shape[1], node.shape[2]
         return {
@@ -2009,14 +1997,11 @@ def _make_tiled_adaptive_pool_module(node, tile_sizes):
 
     Tiles over (N, C) only; the full spatial extent of the input is required
     for each tile because the adaptive window covers the entire input spatially.
-
-    Handles both NHWC (quantized_ops, transposed) and NCHW (aten) layouts:
-      - NHWC: input sliced as [n, :, :, c], permuted to NCHW, pooled, permuted back.
-      - NCHW: input sliced as [n, c, :, :], pooled directly without permutation.
     """
     output_size = get_arg_value(node, 1, "output_size")
     tile_N, tile_C = tile_sizes
-    is_nhwc = node.target in _NHWC_POOL_OPS
+    target = node.target
+    is_nhwc = target in NHWC_OP_VARIANTS.values()
 
     def forward(input: torch.Tensor) -> torch.Tensor:
         N = input.shape[0]
@@ -2028,16 +2013,10 @@ def _make_tiled_adaptive_pool_module(node, tile_sizes):
             for c0 in range(0, C, tile_C):
                 c1 = min(c0 + tile_C, C)
                 if is_nhwc:
-                    x = _slice_dim(input, 0, n0, n1, N)
-                    x = _slice_dim(x, 3, c0, c1, C)
-                    out_tile = F.adaptive_avg_pool2d(
-                        x.permute(0, 3, 1, 2), output_size
-                    ).permute(0, 2, 3, 1)
+                    x = input[n0:n1, :, :, c0:c1]
                 else:
-                    x = _slice_dim(input, 0, n0, n1, N)
-                    x = _slice_dim(x, 1, c0, c1, C)
-                    out_tile = F.adaptive_avg_pool2d(x, output_size)
-                c_parts.append(out_tile)
+                    x = input[n0:n1, c0:c1, :, :]
+                c_parts.append(target(x, output_size))
             cat_dim = -1 if is_nhwc else 1
             n_parts.append(_cat_or_single(c_parts, cat_dim))
         return _cat_or_single(n_parts, 0)
@@ -2059,7 +2038,11 @@ def split_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
         return map_arg(a, lambda n: n.value if isinstance(n, Node) else n)
 
     N = node.shape[0]
-    C = node.shape[-1] if node.target in _NHWC_POOL_OPS else node.shape[1]
+    C = (
+        node.shape[-1]
+        if node.target in NHWC_OP_VARIANTS.values()
+        else node.shape[1]
+    )
     tile_N, tile_C = tile_sizes
     tiling = (N // tile_N, C // tile_C)
 
@@ -2102,11 +2085,6 @@ def split_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
             )
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-
 def run_pool_op_l2_tiling(
     model,
     unroll,
@@ -2135,8 +2113,16 @@ def run_pool_op_l2_tiling(
     bank_size = None if num_banks is None else cache_size // num_banks
 
     for node in list(graph.nodes):
-        if node.target in _NON_ADAPTIVE_POOL_OPS:
-            if node.target in _NHWC_POOL_OPS:
+        if not is_pooling(node):
+            continue
+
+        # The NHWC twins keep the name of the aten op they replace (see
+        # layout_ops) and differ only in namespace, so matching on the op
+        # name covers both layouts.
+        name = str(node.target)
+
+        if name.endswith("max_pool2d.default"):
+            if node.target in NHWC_OP_VARIANTS.values():
                 N, H_out, W_out, C = node.shape
             else:
                 N, C, H_out, W_out = node.shape
@@ -2156,11 +2142,11 @@ def run_pool_op_l2_tiling(
                     model, node, tile_sizes, tiled_shapes
                 )
 
-        elif node.target in _ADAPTIVE_POOL_OPS:
+        elif "adaptive" in name:
             N = node.shape[0]
             C = (
                 node.shape[-1]
-                if node.target in _NHWC_POOL_OPS
+                if node.target in NHWC_OP_VARIANTS.values()
                 else node.shape[1]
             )
             logger.info(f"Running L2 tiling for adaptive pool op: {node}")

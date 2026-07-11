@@ -313,9 +313,6 @@ def _extract_layer_dims(node, key_to_shape, output_shape):
         hfil=kH,
         wstd=stride_w,
         hstd=stride_h,
-        if_dtype_bits=_node_dtype_bits(input_node),
-        fl_dtype_bits=_node_dtype_bits(weight_node),
-        of_dtype_bits=_node_dtype_bits(node),
     )
 
 

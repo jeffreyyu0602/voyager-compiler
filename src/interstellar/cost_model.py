@@ -632,103 +632,21 @@ def get_access(point, layer, resource):
     return [access_list, array_costs]
 
 
-def _output_dtype_bits(point, layer, level):
+def _level_bytes(point, layer, level, resource, counts, partitioning_accum):
+    """Byte footprint of ``counts`` at a byte-pool level (L2+), via the layer's
+    ``size_fn``.  The loop nest gives element counts; turning those into bytes
+    (element widths, scale tensors, fused operands, bank packing) is the
+    caller's policy.
     """
-    Width (in bits) of the output tensor stored at the given level.
-
-    The output holds wide partial sums (psum_dtype_bits) while IC accumulation
-    is still incomplete *above* this level, and the narrow final/quantized
-    output (of_dtype_bits) once IC is fully reduced at or below this level.
-    """
-    num_levels = len(point.loop_blocking(le.IC))
-    ic_above = 1
-    for lvl in range(level + 1, num_levels):
-        ic_above *= point.loop_blocking(le.IC)[lvl]
-        ic_above *= point.loop_partitioning(le.IC)[lvl]
-    return layer.psum_dtype_bits if ic_above > 1 else layer.of_dtype_bits
-
-
-def _scale_bytes(value_count, scale_bits, block_size):
-    """Microscaling scale-tensor bytes for ``value_count`` value elements: one
-    scale of ``scale_bits`` bits per ``block_size``-element block.  0 when the
-    operand has no microscaling scale (``scale_bits == 0``).  Only added at L2+
-    (the byte-pool levels); L0/L1 hold a scale buffer that tracks the value
-    buffer 1:1, so if the value tile fits its scale does too.
-    """
-    if not scale_bits:
-        return 0.0
-    return value_count / block_size * scale_bits / 8.0
-
-
-def _round_to_bank(num_bytes, bank_size):
-    """Round a bank group's byte footprint up to a whole number of banks.
-    No-op when the level has no banking (``bank_size`` is None / 0)."""
-    if not bank_size:
-        return num_bytes
-    return math.ceil(num_bytes / bank_size) * bank_size
-
-
-def _level_bytes(
-    if_count, of_count, fl_count, of_bits, layer, bank_size, fused_bytes=0.0
-):
-    """Per-operand (input, output, weight) byte footprint at a byte-pool level
-    (L2+), given each operand's element count and the output's stored width.
-
-    Each operand's bytes = packed value bytes + its microscaling scale bytes (1
-    scale per ``block_size`` elements; 0 if unscaled).  The output scale is
-    counted only once the output is the final quantized output
-    (``of_bits == of_dtype_bits``), not a mid-reduction partial sum (psum).
-
-    A bank cannot be shared across bank groups, so each group's bytes are
-    rounded up to a whole number of ``bank_size``-byte banks (no-op when the
-    level is un-banked).  The input value and its scale live in separate banks;
-    the weight (value+scale) shares one bank, as does the output (value+scale).
-
-    ``fused_bytes`` is the already-bank-rounded storage of fused post-op
-    operands (residual, bias, ...).  They never share the output's bank, so the
-    output is rounded on its own and the fused total is added on top.
-    """
-    bs = layer.block_size
-
-    if_value = if_count * layer.if_dtype_bits / 8.0
-    if_scale = _scale_bytes(if_count, layer.if_scale_bits, bs)
-
-    fl_value = fl_count * layer.fl_dtype_bits / 8.0
-    fl_scale = _scale_bytes(fl_count, layer.fl_scale_bits, bs)
-
-    of_value = of_count * of_bits / 8.0
-    of_scale = 0.0
-    if of_bits == layer.of_dtype_bits:
-        of_scale = _scale_bytes(of_count, layer.of_scale_bits, bs)
-
-    # Input value and input scale occupy separate banks; weight and output each
-    # share a bank between their value and scale.
-    if_bytes = _round_to_bank(if_value, bank_size) + _round_to_bank(
-        if_scale, bank_size
+    buf = resource.buffer(level)
+    bank_size = buf.bank_size
+    capacity = buf.capacity
+    if isinstance(capacity, list):
+        capacity = capacity[0]
+    num_banks = capacity // bank_size if bank_size else None
+    return layer.size_fn(
+        counts, point, level, partitioning_accum, bank_size, num_banks
     )
-    fl_bytes = _round_to_bank(fl_value + fl_scale, bank_size)
-    of_bytes = _round_to_bank(of_value + of_scale, bank_size) + fused_bytes
-
-    return (if_bytes, of_bytes, fl_bytes)
-
-
-def _fused_bytes(
-    layer, blocking_accum_list, partitioning_accum_list, bank_size
-):
-    """Bytes for the layer's fused post-op operands at this level, via the
-    layer's ``fused_size_fn`` (0 when there is none).  ``out_tile`` is the
-    per-output-loop-dim tile: blocking only for the bank (per-PE) size, blocking
-    x partitioning for the block (full spatial) size.
-    """
-    if not layer.fused_size_fn:
-        return 0.0
-    out_tile = {}
-    for d in (le.ON, le.OC, le.OY, le.OX):
-        extent = blocking_accum_list[d]
-        if partitioning_accum_list is not None:
-            extent *= partitioning_accum_list[d]
-        out_tile[d] = extent
-    return layer.fused_size_fn(out_tile, bank_size)
 
 
 def get_bank_size(point, layer, level, resource):
@@ -743,25 +661,22 @@ def get_bank_size(point, layer, level, resource):
     of_bank_size = get_of_bank_size(blocking_accum_list)
     fl_bank_size = get_fl_bank_size(blocking_accum_list)
 
-    if level <= 1:
+    if level <= 1 or layer.size_fn is None:
         # L0/L1 are slot arrays: each element occupies a fixed-width slot (the max
         # dtype in a mixed-precision design; narrower dtypes are padded), so the
         # fit is checked in element counts, independent of the layer's dtype.
+        # Without a ``size_fn`` every level is sized this way.
         return (if_bank_size, of_bank_size, fl_bank_size)
 
-    # L2/L3 are flat byte pools where sub-byte operands pack -> compare in bytes
-    # (value + microscaling scale), rounded up to the level's banks.
-    of_bits = _output_dtype_bits(point, layer, level)
-    bank_size = resource.buffer(level).bank_size
-    fused_bytes = _fused_bytes(layer, blocking_accum_list, None, bank_size)
+    # L2/L3 are flat byte pools.  No partitioning: this is one bank's (one PE's)
+    # worth, not the spatially replicated block.
     return _level_bytes(
-        if_bank_size,
-        of_bank_size,
-        fl_bank_size,
-        of_bits,
+        point,
         layer,
-        bank_size,
-        fused_bytes,
+        level,
+        resource,
+        (if_bank_size, of_bank_size, fl_bank_size),
+        None,
     )
 
 
@@ -792,24 +707,19 @@ def get_block_size(point, layer, level, resource):
         blocking_accum_list, partitioning_accum_list, partitioning_list
     )
 
-    if level <= 1:
+    if level <= 1 or layer.size_fn is None:
         # L0/L1 are slot arrays (padded to a fixed width); fit is in element
-        # counts, independent of the layer's dtype.  L2/L3 (below) are byte pools.
+        # counts, independent of the layer's dtype.  L2/L3 (below) are byte
+        # pools -- unless there is no ``size_fn`` to convert them.
         return (if_block_size, of_block_size, fl_block_size)
 
-    of_bits = _output_dtype_bits(point, layer, level)
-    bank_size = resource.buffer(level).bank_size
-    fused_bytes = _fused_bytes(
-        layer, blocking_accum_list, partitioning_accum_list, bank_size
-    )
     return _level_bytes(
-        if_block_size,
-        of_block_size,
-        fl_block_size,
-        of_bits,
+        point,
         layer,
-        bank_size,
-        fused_bytes,
+        level,
+        resource,
+        (if_block_size, of_block_size, fl_block_size),
+        partitioning_accum_list,
     )
 
 

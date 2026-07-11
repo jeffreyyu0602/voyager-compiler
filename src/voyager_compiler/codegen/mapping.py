@@ -647,6 +647,27 @@ def fuse_reshape_with_input(
         )
 
 
+def _tile_holds_whole_heads(gemm_node: Node, reshape_node: Node) -> bool:
+    """Whether ``gemm_node``'s N tile is a whole number of heads.
+
+    A projection's ``N`` is really ``(heads, head_dim)``, and the fused relayout
+    stores the tile straight to the permuted block -- which it can only do if no
+    head straddles a tile boundary.  Leaving the reshape unfused when it does
+    costs a separate permute, but keeps the op lowerable.  An untiled gemm (or
+    one interstellar tiles later) has no N tile to check yet.
+    """
+    if len(reshape_node.shape) <= len(gemm_node.shape):
+        return True  # context matmul: keeps its rank, no head packing
+
+    tiling = gemm_node.meta.get("l2_tiling")
+    if tiling is None:
+        return True
+
+    head_dim = reshape_node.shape[-1]
+    n_tile = gemm_node.shape[-1] // tiling[1]
+    return n_tile % head_dim == 0
+
+
 def fuse_reshape_with_output(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
@@ -675,6 +696,13 @@ def fuse_reshape_with_output(
         return "tiled_shapes" in getattr(n, "meta", {})
 
     if len(curr_node.users) > 1 or _is_tiled(curr_node):
+        return False
+
+    if not _tile_holds_whole_heads(curr_node, reshape_node):
+        logger.debug(
+            f"Cannot fuse {reshape_node} with {curr_node}: "
+            f"N tile would split a head"
+        )
         return False
 
     group = search_group(curr_node, candidates)
