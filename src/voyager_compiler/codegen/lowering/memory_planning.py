@@ -171,6 +171,8 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
             persistent.append(n)
         elif n.op == "call_function":
             if n.target is _ALLOC:
+                if n.meta.get("space") == "Scratchpad":
+                    continue
                 buffer_of[n] = n  # new activation buffer
                 reusable.append(n)
             elif n.target is _GETITEM:  # alias: loop result -> carried buffer
