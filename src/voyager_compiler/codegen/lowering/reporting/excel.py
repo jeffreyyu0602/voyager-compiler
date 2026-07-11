@@ -139,7 +139,9 @@ def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
         else:
             ideal = f"=CEILING({work_cell}/oc_unroll,1)"
         ws.write_formula(r, O_IDEAL, ideal, None, op.ideal_cycles)
-        ws.write_number(r, O_UTIL, 1.0, edit)  # editable utilization
+        # Pre-computed (from the interstellar RuntimeCalculator for a tiled
+        # matrix op, else the per-op-type rules) but still editable.
+        ws.write_number(r, O_UTIL, op.utilization, edit)
         ideal_cell = xl_rowcol_to_cell(r, O_IDEAL)
         util_cell = xl_rowcol_to_cell(r, O_UTIL)
         ws.write_formula(
@@ -147,7 +149,7 @@ def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
             O_EFF,
             f"=CEILING({ideal_cell}/{util_cell},1)",
             None,
-            op.ideal_cycles,
+            op.effective_cycles,
         )
         op_row[op.key] = r
     return op_row

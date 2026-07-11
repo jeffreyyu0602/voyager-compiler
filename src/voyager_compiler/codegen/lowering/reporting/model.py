@@ -6,6 +6,7 @@ scheduling (``interpret`` + ``scheduler``), repeated-pattern compression
 the contract between them.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -72,13 +73,24 @@ class TimingRecord:
 @dataclass
 class OpInfo:
     """One static compute node (a row of the Operations sheet).  Many
-    ``TimingRecord``s with the same ``key`` reference one ``OpInfo``."""
+    ``TimingRecord``s with the same ``key`` reference one ``OpInfo``.
+
+    ``utilization`` is the fraction of peak the op sustains, so it costs
+    ``ceil(ideal_cycles / utilization)`` cycles.  It is compute-only (DRAM is
+    modeled separately, as ``async_copy`` events), pre-computed by ``cost.py``,
+    and stays editable in the workbook."""
 
     key: str
     op_type: str  # gemm | conv | vector
     ideal_cycles: int
     detail: dict = field(default_factory=dict)
     units: Tuple[str, ...] = ("vector",)
+    utilization: float = 1.0
+
+    @property
+    def effective_cycles(self) -> int:
+        """The op's real cost: its ideal cycles stretched by its utilization."""
+        return math.ceil(self.ideal_cycles / self.utilization)
 
 
 @dataclass

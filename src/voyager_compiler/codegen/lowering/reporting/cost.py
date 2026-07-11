@@ -78,6 +78,37 @@ def dram_cycles(n_bytes: int, cost: CostParams) -> int:
 
 
 # --------------------------------------------------------------------------
+# Utilization
+# --------------------------------------------------------------------------
+
+
+OP_UTILIZATION = {
+    torch.ops.aten.layer_norm.default: 0.25,
+    torch.ops.aten.softmax.int: 0.33,
+}
+
+
+def op_utilization(
+    node: Node, anchor: Node, units: Tuple[str, ...], ideal_cycles: int
+) -> float:
+    """The utilization to charge ``node``.
+
+    A matrix op the interstellar tiler mapped carries the RuntimeCalculator's
+    per-tile compute cycles (stamped on it by the builder), which is what one of
+    its tiled executions really costs -- so its utilization is the ideal-to-
+    actual ratio.  Everything else is looked up by op.
+
+    The rules key off the *anchor*: a fused ``call_module``'s own target is just
+    the submodule name, so only the anchor names the real op.
+    """
+    per_tile = node.meta.get("tile_compute_cycles")
+    if "mma" in units and per_tile and ideal_cycles > 0:
+        # Only ever a slowdown; clamp away model noise (and a zero divisor).
+        return min(1.0, ideal_cycles / per_tile)
+    return OP_UTILIZATION.get(anchor.target, 0.5)
+
+
+# --------------------------------------------------------------------------
 # Compute cycles
 # --------------------------------------------------------------------------
 
@@ -112,10 +143,11 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
         macs = math.prod(out) * c * kh * kw
+        ideal = math.ceil(macs / macs_unroll)
         return OpInfo(
             node.name,
             "conv",
-            math.ceil(macs / macs_unroll),
+            ideal,
             {
                 "macs": macs,
                 "input": _shape(anchor.args[0]),
@@ -123,6 +155,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
                 "output": out,
             },
             units=matrix_units,
+            utilization=op_utilization(node, anchor, matrix_units, ideal),
         )
 
     if is_gemm_op(anchor):
@@ -134,17 +167,20 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         # its throughput is the vector lane count, not the systolic MAC count.
         fc = is_fully_connected(anchor)
         divisor = vec_unroll if fc else macs_unroll
+        ideal = math.ceil(macs / divisor)
+        units = ("vector",) if fc else matrix_units
         return OpInfo(
             node.name,
             "gemm",
-            math.ceil(macs / divisor),
+            ideal,
             {
                 "macs": macs,
                 "input": inp,
                 "weight": _shape(anchor.args[1]),
                 "output": out,
             },
-            units=("vector",) if fc else matrix_units,
+            units=units,
+            utilization=op_utilization(node, anchor, units, ideal),
         )
 
     # Vector op: work is the larger of input / output element count -- a
@@ -154,10 +190,12 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     in_nodes = anchor.all_input_nodes
     in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
+    ideal = math.ceil(ops / vec_unroll)
     return OpInfo(
         node.name,
         "vector",
-        math.ceil(ops / vec_unroll),
+        ideal,
         {"ops": ops, "input": in_shape, "output": out},
         units=("vector",),
+        utilization=op_utilization(node, anchor, ("vector",), ideal),
     )

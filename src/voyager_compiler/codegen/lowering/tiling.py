@@ -16,18 +16,24 @@ import math
 import time
 from dataclasses import dataclass, field
 
+import interstellar
 import torch
 
+from ..mapping import get_anchor_node
 from ..mapping_utils import (
     is_bmm,
     is_conv2d,
+    is_depthwise_conv,
     is_linear,
     is_matmul,
     quant_table_arg_nodes,
 )
+from ..passes.tiling import _conv2d_layout
+from ..passes.utils import _pair, get_arg_value
 from ..tiler import _node_dtype_bits, get_dtype_width
 
 logger = logging.getLogger(__name__)
+le = interstellar.le
 
 
 @dataclass
@@ -37,11 +43,10 @@ class TilerContext:
 
     arch: object
     schedule: object
+    unroll: tuple  # (ic_dim, oc_dim)
     dram_bandwidth: int  # bytes per cycle
     double_buffered_accum_buffer: bool = False
     double_buffered_l2: bool = False
-    # Per-layer mapping cache (interstellar's optimizer is slow); keyed by
-    # ``_layer_cache_key`` so identical layers map once.
     cache: dict = field(default_factory=dict)
 
 
@@ -74,8 +79,6 @@ def build_interstellar_tiler(
     fit in L2 at once (one computing, one loading), so the effective L2 capacity
     is halved.
     """
-    import interstellar
-
     ic_dim, oc_dim = unroll
 
     # Banking applies only at L2 (the on-chip scratchpad). The bank size is the
@@ -143,6 +146,7 @@ def build_interstellar_tiler(
     return TilerContext(
         arch=architecture,
         schedule=schedule,
+        unroll=unroll,
         dram_bandwidth=dram_bandwidth,
         double_buffered_accum_buffer=double_buffered_accum_buffer,
         double_buffered_l2=double_buffered_l2,
@@ -156,8 +160,6 @@ def _layer_cache_key(node, in_bits, w_bits, out_dtype, fused=()):
     operand descriptors.  Identical layers thus share one optimizer run.
     ``out_dtype`` is the outer node's output dtype (a ``(scale, value)`` list for
     a fused mx output); list-ified to a tuple so the key stays hashable."""
-    from ..passes.utils import _pair, get_arg_value
-
     val = node.value
     out_shape = tuple(val.shape) if isinstance(val, torch.Tensor) else None
     key = [
@@ -186,9 +188,6 @@ def _output_pos_to_loop_dim(anchor):
     the output tile.  conv: NCHW or NHWC (``meta['transposed']``); gemm:
     ``(batch.., M, N)`` with ``M -> OX``, ``N -> OC``, batch dims ``-> ON``.
     """
-    import interstellar
-
-    le = interstellar.le
     if is_conv2d(anchor):
         if anchor.meta.get("transposed", False):
             return [le.ON, le.OY, le.OX, le.OC]  # NHWC
@@ -326,25 +325,31 @@ class RuntimeCalculator:
         weight_dtype_width: int,
         output_dtype_width: int,
         double_buffered_accum_buffer: bool,
+        sram_bandwidth: int,
         dram_bandwidth: int,
         double_buffered_l2: bool = False,
         has_sparse_op: bool = False,
-        has_high_precision_vector_input: bool = False,
+        has_tail_operands: bool = False,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
         self.output_dtype_width = output_dtype_width
         self.double_buffered_accum_buffer = double_buffered_accum_buffer
+        self.sram_bandwidth = sram_bandwidth
         self.dram_bandwidth = dram_bandwidth
         self.double_buffered_l2 = double_buffered_l2
         self.has_sparse_op = has_sparse_op
-        self.has_high_precision_vector_input = has_high_precision_vector_input
+        self.has_tail_operands = has_tail_operands
 
-    def calculate_runtime(self, architecture, layer, mapping):
-        import interstellar
+    def _compute_terms(self, mapping):
+        """The L0-L2 compute of one L3 tile, split into ``(fill, steady,
+        drain)``: the L1 input/weight buffer prologue, the L2 sweep of
+        weight-reuse tiles, and the vector-unit epilogue.
 
-        le = interstellar.le
-
+        Kept apart because a double-buffered sweep overlaps the prologue and
+        the epilogue with the neighbouring tiles, so they are amortized over
+        the sweep rather than paid per tile (see ``per_tile_compute_cycles``).
+        """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
         partitionings = mapping.loop_partitionings
@@ -377,7 +382,12 @@ class RuntimeCalculator:
         input_buffer_loading_size = 1
         for loop in [le.IC, le.OY, le.OX]:
             input_buffer_loading_size *= blockings[loop][1]
-        input_buffer_loading_time = input_buffer_loading_size
+        input_buffer_loading_time = (
+            input_buffer_loading_size
+            * self.input_dtype_width
+            / 8
+            / self.sram_bandwidth
+        )
 
         weight_buffer_loading_size = 1
         for loop in [le.IC, le.OC, le.FY, le.FX]:
@@ -386,7 +396,8 @@ class RuntimeCalculator:
         weight_buffer_loading_time = (
             weight_buffer_loading_size
             * self.weight_dtype_width
-            / self.input_dtype_width
+            / 8
+            / self.sram_bandwidth
         )
         if self.has_sparse_op:
             weight_buffer_loading_time *= 2
@@ -398,7 +409,7 @@ class RuntimeCalculator:
 
         requires_high_precision = (
             self.output_dtype_width > self.input_dtype_width
-            or self.has_high_precision_vector_input
+            or self.has_tail_operands
         )
         if requires_high_precision:
             vector_unit_time *= 2
@@ -432,27 +443,50 @@ class RuntimeCalculator:
         else:
             extra_vector_unit_time = 0
 
+        fill = max(input_buffer_loading_time, weight_buffer_loading_time)
+        steady = l2_blocks * l1_time
         if self.double_buffered_accum_buffer:
-            per_l3_compute_time = (
-                max(input_buffer_loading_time, weight_buffer_loading_time)
-                + l2_blocks * l1_time
-                + vector_unit_time
-            )
+            drain = vector_unit_time
         else:
-            per_l3_compute_time = (
-                max(input_buffer_loading_time, weight_buffer_loading_time)
-                + l2_blocks * l1_time
-                + extra_vector_unit_time
-            )
+            drain = extra_vector_unit_time
+        return fill, steady, drain
 
-        # --- L3 (DRAM): outer tile loop + transfer latency ---
-        # IC is pinned to blocking_size=1 at L3, so l3_blocks is purely spatial.
-        # Each L3 iteration loads inputs+weights from DRAM and writes outputs
-        # back.
+    @staticmethod
+    def _l3_blocks(mapping):
+        """Number of L3 (DRAM) tiles.  IC is pinned to blocking_size=1 at L3,
+        so this is purely spatial."""
+        blockings = mapping.loop_blockings
         l3_blocks = 1
         for i in range(le.NUM):
             if i != le.IC:
                 l3_blocks *= blockings[i][3]
+        return l3_blocks
+
+    def per_tile_compute_cycles(self, mapping):
+        """Compute cycles one tiled operation really costs in the L3 sweep, DRAM
+        excluded -- both what ``calculate_runtime`` sweeps and the reporting
+        model's utilization denominator.
+
+        With a double-buffered L2 consecutive tiles overlap, so the buffer fill
+        and the vector drain are paid *once for the whole sweep*, not once per
+        tile -- only the first tile fills and only the last drains.  Charging
+        them per tile overstates the cost (and so understates utilization).
+
+        The reporting model excludes DRAM here because the scheduler already
+        models it as ``async_copy`` events; folding it in would double-count.
+        """
+        fill, steady, drain = self._compute_terms(mapping)
+        if not self.double_buffered_l2:
+            return fill + steady + drain
+        l3_blocks = self._l3_blocks(mapping)
+        return (fill + l3_blocks * steady + drain) / l3_blocks
+
+    def calculate_runtime(self, architecture, layer, mapping):
+        blockings = mapping.loop_blockings
+        partitionings = mapping.loop_partitionings
+
+        l3_blocks = self._l3_blocks(mapping)
+        per_l3_compute_time = self.per_tile_compute_cycles(mapping)
 
         # DRAM transfer size (in absolute bytes) for one L3 block (levels 0-2
         # only; [3] is the L3 iteration count and belongs in l3_blocks, not in
@@ -518,12 +552,6 @@ def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
     Returns None for layers that should be skipped (depthwise, FC with batch=1,
     3-channel first conv, unsupported weight shapes).
     """
-    import interstellar
-
-    from ..mapping_utils import is_depthwise_conv
-    from ..passes.tiling import _conv2d_layout
-    from ..passes.utils import _pair, get_arg_value
-
     if is_depthwise_conv(node):
         return None
 
@@ -605,33 +633,40 @@ def _extract_layer_from_node(node, out_dtype=None, fused_size_fn=None):
 
 def run_interstellar(
     node,
-    architecture,
-    schedule,
-    dram_bandwidth: int,
-    double_buffered_accum_buffer: bool = False,
-    double_buffered_l2: bool = False,
+    tiler,
     out_dtype=None,
     fused_size_fn=None,
+    has_tail_operands=False,
 ):
-    """
-    Run interstellar with the 4-level DRAM architecture for a single GEMM/conv
-    node.
+    """Run interstellar with the 4-level DRAM architecture for a single
+    GEMM/conv node.
 
     Extracts layer dims from the node's current (pre-tiling) shapes, runs the
-    optimizer, and logs the resulting L1/L2/L3 tile sizes.
+    optimizer, and logs the resulting L1/L2/L3 tile sizes.  The L2 -> L1 bus
+    carries ``min(unroll)`` input elements per cycle -- the rate the array's
+    narrow side consumes them at -- so its width is
+    ``min(unroll) * layer.if_dtype_bits / 8`` bytes per cycle.
 
-    Returns the best MappingPoint (its ``loop_blockings`` give the per-level
-    tile factors), or None if the node is skipped.
+    Args:
+        node: The GEMM/conv anchor to map.
+        tiler (TilerContext): The shared architecture, schedule and unroll.
+        out_dtype: The outer (fused) node's output dtype; a ``(scale, value)``
+            list for a fused mx output.
+        fused_size_fn: Sizes the fused tail's own operands for the L2 fit
+            check.
+        has_tail_operands (bool): The fused tail reads a tiled operand of its
+            own (a residual / mask), which keeps the vector unit at high
+            precision.
+
+    Returns:
+        ``(mapping, per_tile_cycles)`` -- the best MappingPoint (its
+        ``loop_blockings`` give the per-level tile factors) and the compute
+        cycles of one L3 tile under it (the reporting model's utilization
+        denominator).  ``(None, None)`` if the node is skipped.
     """
-    import logging
-
-    import interstellar
-
-    logger = logging.getLogger(__name__)
-
     layer = _extract_layer_from_node(node, out_dtype, fused_size_fn)
     if layer is None:
-        return None
+        return None, None
 
     logger.info(
         f"[interstellar DRAM] {node.name}: "
@@ -640,26 +675,29 @@ def run_interstellar(
         f"kH={layer.hfil} kW={layer.wfil}"
     )
 
+    sram_bandwidth = min(tiler.unroll) * layer.if_dtype_bits / 8
+
     # Use the layer's per-node dtype widths so the timing model and the
     # feasibility check (which reads the same Layer dtypes) stay consistent.
     rc = RuntimeCalculator(
         layer.if_dtype_bits,
         layer.fl_dtype_bits,
         layer.of_dtype_bits,
-        double_buffered_accum_buffer,
-        dram_bandwidth,
-        double_buffered_l2=double_buffered_l2,
+        tiler.double_buffered_accum_buffer,
+        sram_bandwidth,
+        tiler.dram_bandwidth,
+        double_buffered_l2=tiler.double_buffered_l2,
+        has_tail_operands=has_tail_operands,
     )
 
     _, runtime, mapping, _ = interstellar.optimizer.opt_optimizer(
-        architecture,
+        tiler.arch,
         layer,
-        schedule,
+        tiler.schedule,
         rc.calculate_runtime,
         verbose=False,
     )
 
-    le = interstellar.le
     b = mapping.loop_blockings
     logger.info(
         f"[interstellar] {node.name} L1 tiles: "
@@ -676,10 +714,15 @@ def run_interstellar(
         f"IC={b[le.IC][3]} OC={b[le.OC][3]} "
         f"OX={b[le.OX][3]} OY={b[le.OY][3]} ON={b[le.ON][3]}"
     )
+    per_tile_cycles = rc.per_tile_compute_cycles(mapping)
     logger.info(f"[interstellar] {node.name} estimated runtime: {runtime}")
+    logger.info(
+        f"[interstellar] {node.name} per-tile compute cycles: "
+        f"{per_tile_cycles}"
+    )
     logger.info(interstellar.utils.format_tiling(mapping))
 
-    return mapping
+    return mapping, per_tile_cycles
 
 
 def get_tiling(node, tiler=None):
@@ -701,10 +744,6 @@ def get_tiling(node, tiler=None):
     attention heads); the builder loops them, so their counts are the full
     extent (one tile per batch element).
     """
-    import interstellar
-
-    from ..mapping import get_anchor_node
-
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
     if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
@@ -752,7 +791,7 @@ def get_tiling(node, tiler=None):
         tuple(fused_specs),
     )
     if key in tiler.cache:
-        mapping = tiler.cache[key]
+        mapping, per_tile_cycles = tiler.cache[key]
         logger.debug(
             "[tiling] %s: mapping cache hit (%d entries)",
             anchor.name,
@@ -761,26 +800,28 @@ def get_tiling(node, tiler=None):
     else:
         logger.info("[tiling] %s: running interstellar", anchor.name)
         t0 = time.perf_counter()
-        mapping = run_interstellar(
+        mapping, per_tile_cycles = run_interstellar(
             anchor,
-            tiler.arch,
-            tiler.schedule,
-            tiler.dram_bandwidth,
-            tiler.double_buffered_accum_buffer,
-            double_buffered_l2=tiler.double_buffered_l2,
+            tiler,
             out_dtype=out_dtype,
             fused_size_fn=_make_fused_size_fn(fused_specs),
+            has_tail_operands=bool(fused_specs),
         )
         logger.info(
             "[tiling] %s: interstellar took %.2fs",
             anchor.name,
             time.perf_counter() - t0,
         )
-        tiler.cache[key] = mapping  # cache None too (skipped layers)
+        # cache None too (skipped layers)
+        tiler.cache[key] = (mapping, per_tile_cycles)
     if mapping is None:
         return None
 
-    le = interstellar.le
+    # The builders copy this onto the compute nodes of the nest they build (the
+    # anchor is erased on splice), so the reporting cost model can read it back
+    # and turn it into a utilization.
+    anchor.meta["tile_compute_cycles"] = per_tile_cycles
+
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 
     if is_conv:

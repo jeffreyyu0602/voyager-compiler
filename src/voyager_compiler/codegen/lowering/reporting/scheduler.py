@@ -96,7 +96,7 @@ class ResourceState:
         eid = self._eid()
         op = self.get_op(node)
         start = max(self.now, *(self._unit_free(u) for u in op.units))
-        end = start + op.ideal_cycles
+        end = start + op.effective_cycles
         deps = self._deps(
             self.last_now_eid, *(self._unit_last(u) for u in op.units)
         )

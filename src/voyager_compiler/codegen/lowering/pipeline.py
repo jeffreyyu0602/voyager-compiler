@@ -40,6 +40,7 @@ from voyager_compiler.codegen.shape_prop import ShapeProp
 from voyager_compiler.codegen.mapping_utils import (
     ancestors,
     is_bmm,
+    is_compute_op,
     is_conv2d,
     is_gemm_op,
     is_linear,
@@ -1084,6 +1085,23 @@ def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
             in_specs[i].first_use_at_exit = True
 
 
+def _stamp_tile_compute_cycles(gm, anchor) -> None:
+    """Copy the anchor's ``tile_compute_cycles`` -- what one of its tiled
+    executions really costs, per the interstellar RuntimeCalculator -- onto
+    every compute node of the nest just built, at every nesting level (loop
+    body, cond branch).
+    """
+    cycles = anchor.meta.get("tile_compute_cycles")
+    if cycles is None:
+        return
+    for m in gm.modules():
+        if not isinstance(m, torch.fx.GraphModule):
+            continue
+        for n in m.graph.nodes:
+            if n.op == "call_module" or is_compute_op(n):
+                n.meta["tile_compute_cycles"] = cycles
+
+
 def build_conv2d(
     node,
     *,
@@ -1327,6 +1345,7 @@ def build_conv2d(
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
         )
+    _stamp_tile_compute_cycles(gm, anchor)
     return gm
 
 
@@ -1607,6 +1626,7 @@ def build_gemm(
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
         )
+    _stamp_tile_compute_cycles(gm, anchor)
     return gm
 
 
