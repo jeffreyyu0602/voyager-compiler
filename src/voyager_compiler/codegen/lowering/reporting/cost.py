@@ -130,18 +130,21 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         # (folds batch dims; works for linear / matmul / bmm).
         inp = _shape(anchor.args[0])
         macs = math.prod(out) * inp[-1]
+        # A fully-connected (matrix-vector) GEMM runs on the vector unit, so
+        # its throughput is the vector lane count, not the systolic MAC count.
+        fc = is_fully_connected(anchor)
+        divisor = vec_unroll if fc else macs_unroll
         return OpInfo(
             node.name,
             "gemm",
-            math.ceil(macs / macs_unroll),
+            math.ceil(macs / divisor),
             {
                 "macs": macs,
                 "input": inp,
                 "weight": _shape(anchor.args[1]),
                 "output": out,
             },
-            # A fully-connected (matrix-vector) GEMM runs on the vector unit.
-            units=("vector",) if is_fully_connected(anchor) else matrix_units,
+            units=("vector",) if fc else matrix_units,
         )
 
     # Vector op: work is the larger of input / output element count -- a

@@ -134,7 +134,7 @@ def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
                 ws.write(r, col, "x".join(str(int(d)) for d in shape))
         ws.write_number(r, O_WORK, work)
         work_cell = xl_rowcol_to_cell(r, O_WORK)
-        if op.op_type in ("gemm", "conv"):
+        if "mma" in op.units:
             ideal = f"=CEILING({work_cell}/(ic_unroll*oc_unroll),1)"
         else:
             ideal = f"=CEILING({work_cell}/oc_unroll,1)"
@@ -168,7 +168,31 @@ def _latency_formula(
     return "=0"
 
 
-def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
+def _start_term(dep, result, eid_to_row, ii_names):
+    """The ``Start`` MAX-term for one dependency: its ``End`` cell when written,
+    else the congruent last-written event's ``End`` shifted by ``skip`` live
+    initiation intervals.  A truncated-away dep falls back to a cached literal.
+    """
+    if dep in eid_to_row:
+        return xl_rowcol_to_cell(eid_to_row[dep], C_END)
+    remap = result.dep_remap
+    if dep in remap:
+        written, skip, uid = remap[dep]
+        if written in eid_to_row:
+            end = xl_rowcol_to_cell(eid_to_row[written], C_END)
+            return f"({end}+{skip}*{ii_names[uid]})"
+    rec = result.record_by_eid(dep)
+    return str(rec.end if rec else 0)
+
+
+def _events(
+    wb,
+    result: ScheduleResult,
+    op_row: Dict[str, int],
+    written_recs: List[TimingRecord],
+    eid_to_row: Dict[int, int],
+    ii_names: Dict[int, str],
+):
     ws = wb.add_worksheet("Events")
     bold = wb.add_format({"bold": True})
     for c, h in enumerate(_HEADERS):
@@ -176,8 +200,8 @@ def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
     ws.set_column(C_NODE, C_NODE, 16)
     ws.set_column(C_START, C_END, 10)
 
-    for rec in result.records:
-        r = rec.eid + 1  # header occupies row 0
+    for rec in written_recs:
+        r = eid_to_row[rec.eid]
         ws.write_number(r, C_EID, rec.eid)
         ws.write(r, C_NODE, rec.node_name)
         ws.write(r, C_KIND, rec.kind)
@@ -189,10 +213,11 @@ def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
         start = xl_rowcol_to_cell(r, C_START)
         res = xl_rowcol_to_cell(r, C_RES)
         if rec.start_deps:
-            ends = ",".join(
-                xl_rowcol_to_cell(d + 1, C_END) for d in rec.start_deps
+            terms = ",".join(
+                _start_term(d, result, eid_to_row, ii_names)
+                for d in rec.start_deps
             )
-            start_f = f"=MAX({ends})"
+            start_f = f"=MAX({terms})"
         else:
             start_f = "=0"
         ws.write_formula(r, C_START, start_f, None, rec.start)
@@ -227,13 +252,13 @@ def _events(wb, result: ScheduleResult, op_row: Dict[str, int]):
     return ws
 
 
-def _gantt(wb, result: ScheduleResult, lo: int, hi: int, title: str, name: str):
-    """A stacked-bar Gantt over Events rows ``[lo, hi)`` (a transparent Start
-    offset + visible Compute / DRAM bars), linked so it recalculates live."""
+def _gantt(wb, first: int, last: int, title: str, name: str):
+    """A stacked-bar Gantt over Events data rows ``[first, last]`` (1-based, a
+    transparent Start offset + visible Compute / DRAM bars), linked so it
+    recalculates live."""
     ws = wb.add_worksheet(name)
     chart = wb.add_chart({"type": "bar", "subtype": "stacked"})
-    n = hi - lo
-    first, last = lo + 1, hi  # 1-based data rows on the Events sheet
+    n = last - first + 1
 
     def col(c):
         return [
@@ -278,14 +303,12 @@ def _gantt(wb, result: ScheduleResult, lo: int, hi: int, title: str, name: str):
     ws.insert_chart(1, 1, chart)
 
 
-def _summary(wb, result: ScheduleResult):
+def _summary(wb, result: ScheduleResult, last: int, compressed: bool):
     ws = wb.add_worksheet("Summary")
     bold = wb.add_format({"bold": True})
     ws.set_column(0, 0, 20)
     ws.set_column(1, 5, 14)
     ws.write(0, 0, "Totals", bold)
-    n = len(result.records)
-    last = n  # last data row (1-based)
     ws.write(1, 0, "total_latency")
     ws.write_formula(
         1,
@@ -295,24 +318,25 @@ def _summary(wb, result: ScheduleResult):
         None,
         result.total_latency,
     )
-    ws.write(2, 0, "dram_read_bytes")
-    ws.write_formula(
-        2,
-        1,
-        f"=SUM(Events!{xl_rowcol_to_cell(1, C_READ)}:"
-        f"{xl_rowcol_to_cell(last, C_READ)})",
-        None,
-        result.dram_read_bytes,
-    )
-    ws.write(3, 0, "dram_write_bytes")
-    ws.write_formula(
-        3,
-        1,
-        f"=SUM(Events!{xl_rowcol_to_cell(1, C_WRITE)}:"
-        f"{xl_rowcol_to_cell(last, C_WRITE)})",
-        None,
-        result.dram_write_bytes,
-    )
+
+    # Bytes depend on no editable knob; when compressed a live SUM would also
+    # miss the elided rows, so write the exact totals as constants.
+    def _bytes(row, name, col, total):
+        ws.write(row, 0, name)
+        if compressed:
+            ws.write_number(row, 1, total)
+        else:
+            ws.write_formula(
+                row,
+                1,
+                f"=SUM(Events!{xl_rowcol_to_cell(1, col)}:"
+                f"{xl_rowcol_to_cell(last, col)})",
+                None,
+                total,
+            )
+
+    _bytes(2, "dram_read_bytes", C_READ, result.dram_read_bytes)
+    _bytes(3, "dram_write_bytes", C_WRITE, result.dram_write_bytes)
 
     ws.write(5, 0, "Loops (compressed)", bold)
     head = [
@@ -335,11 +359,43 @@ def _summary(wb, result: ScheduleResult):
         ws.write(r, 5, f"prefix + period x {L.repeat_count} + suffix")
 
 
+_XLS_ROW_MAX = 1_048_576  # Excel's hard row limit (row 0 holds the header)
+
+
+def _written_records(result: ScheduleResult) -> List[TimingRecord]:
+    """The records the compressed Events sheet emits, in eid order: every
+    top-level record, plus each loop's prefix, written periods and suffix (or
+    every record of an uncompressed loop)."""
+    unc = {L.loop_uid for L in result.loops if L.uncompressed}
+    keep = set()
+    for L in result.loops:
+        if L.uncompressed:
+            continue
+        keep.update(L.prefix_eids)
+        keep.update(L.suffix_eids)
+        for period in L.written_periods:
+            keep.update(period)
+    return [
+        r
+        for r in result.records
+        if r.loop_uid == -1 or r.loop_uid in unc or r.eid in keep
+    ]
+
+
 def write_excel_report(
-    result: ScheduleResult, path: str, *, max_gantt_rows: int = _MAX_GANTT_ROWS
+    result: ScheduleResult,
+    path: str,
+    *,
+    max_gantt_rows: int = _MAX_GANTT_ROWS,
+    compress_events: bool = False,
 ) -> str:
     """Write the live workbook to ``path`` and return it.  Run
     ``compress_schedule`` first to populate the per-loop summary / period views.
+
+    With ``compress_events`` the Events sheet emits only the compressed
+    schedule (prefix + K representative periods + suffix per loop), staying live
+    via per-loop initiation-interval cells -- so its size no longer grows with
+    the loop trip counts.
     """
     global xl_rowcol_to_cell
     import xlsxwriter
@@ -347,31 +403,48 @@ def write_excel_report(
 
     xl_rowcol_to_cell = _xrc
 
+    if compress_events:
+        written_recs = _written_records(result)
+    else:
+        written_recs = list(result.records)
+    if len(written_recs) > _XLS_ROW_MAX - 1:
+        written_recs = written_recs[: _XLS_ROW_MAX - 1]
+    eid_to_row = {rec.eid: i + 1 for i, rec in enumerate(written_recs)}
+
     wb = xlsxwriter.Workbook(path, {"nan_inf_to_errors": True})
     _architecture(wb, result)
     op_row = _operations(wb, result)
-    _events(wb, result, op_row)
 
-    n = len(result.records)
+    ii_names: Dict[int, str] = {}
+    if compress_events:
+        for i, L in enumerate(result.loops):
+            if L.uncompressed:
+                continue
+            a1, a2 = L.ii_anchor_eids
+            c1 = xl_rowcol_to_cell(eid_to_row[a1], C_START)
+            c2 = xl_rowcol_to_cell(eid_to_row[a2], C_START)
+            ii_names[L.loop_uid] = f"loop_ii_{i}"
+            wb.define_name(ii_names[L.loop_uid], f"=Events!{c2}-Events!{c1}")
+
+    _events(wb, result, op_row, written_recs, eid_to_row, ii_names)
+
+    n = len(written_recs)
     hi = min(n, max_gantt_rows)
     label = "whole graph" if hi == n else f"first {hi} of {n} events"
-    _gantt(wb, result, 0, hi, f"Schedule ({label})", "Gantt")
+    _gantt(wb, 1, hi, f"Schedule ({label})", "Gantt")
 
-    # Representative single period of the first compressed loop (compute/DRAM
-    # overlap inside one steady-state iteration-group).
     for L in result.loops:
-        if L.period_eids:
-            lo, hp = min(L.period_eids), max(L.period_eids) + 1
+        rows = [eid_to_row[e] for e in L.period_eids if e in eid_to_row]
+        if rows:
             _gantt(
                 wb,
-                result,
-                lo,
-                hp,
+                min(rows),
+                max(rows),
                 f"Representative period: {L.loop_name}",
                 "Period",
             )
             break
 
-    _summary(wb, result)
+    _summary(wb, result, n, compress_events)
     wb.close()
     return path

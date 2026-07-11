@@ -529,16 +529,6 @@ def is_reshape_op(node: Node) -> bool:
     ]
 
 
-def is_indexing_or_concatenation_op(node: Node) -> bool:
-    return node.target in [
-        torch.ops.aten.slice.Tensor,
-        torch.ops.aten.select.int,
-        torch.ops.aten.index.Tensor,
-        torch.ops.aten.stack.default,
-        torch.ops.aten.cat.default,
-    ]
-
-
 def is_prunable_op(node: Node) -> bool:
     """Operations that can be safely deleted from fx.Graph."""
     if node.target == torch.ops.aten.alias.default:

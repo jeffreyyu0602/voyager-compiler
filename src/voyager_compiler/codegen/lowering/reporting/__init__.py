@@ -47,6 +47,7 @@ def report(
     output_dir: str = ".",
     basename: str = "schedule",
     perfetto: bool = True,
+    compress_events: bool = False,
 ) -> ScheduleResult:
     """Estimate, compress, and write the reports for a bufferized + memory-
     planned ``model``.
@@ -55,6 +56,8 @@ def report(
     (GHz) are physical units (cost.py converts to cycles).  Writes
     ``<basename>.xlsx`` (and, when ``perfetto``, ``<basename>.perfetto.json``)
     under ``output_dir`` and returns the (compressed) ``ScheduleResult``.
+    ``compress_events`` writes only the compressed schedule to the Events sheet,
+    so it stays small (and fast to write) for large trip counts.
     """
     result = estimate_schedule(
         model,
@@ -66,7 +69,11 @@ def report(
     compress_schedule(result)
 
     os.makedirs(output_dir, exist_ok=True)
-    write_excel_report(result, os.path.join(output_dir, f"{basename}.xlsx"))
+    write_excel_report(
+        result,
+        os.path.join(output_dir, f"{basename}.xlsx"),
+        compress_events=compress_events,
+    )
     if perfetto:
         write_perfetto(
             result, os.path.join(output_dir, f"{basename}.perfetto.json")

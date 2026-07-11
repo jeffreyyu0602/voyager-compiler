@@ -59,6 +59,7 @@ class TimingRecord:
     loop_uid: int = -1  # id() of the enclosing while_loop (-1 = top level)
     bytes: int = 0  # DRAM ops only
     is_read: bool = False  # DRAM loads (vs stores)
+    category: str = ""
     start_deps: Tuple[int, ...] = ()
     # How the workbook recomputes this event's latency.  ("compute", op_key)
     # links to the Operations sheet; ("dram", n_bytes) is the bandwidth
@@ -83,7 +84,13 @@ class OpInfo:
 @dataclass
 class LoopSummary:
     """A compressed ``while_loop`` region: a steady-state period that repeats
-    ``repeat_count`` times, framed by a non-repeating prefix / suffix."""
+    ``repeat_count`` times, framed by a non-repeating prefix / suffix.
+
+    ``written_periods`` are the ``K = carry_distance + 2`` representative
+    periods the live-formula sheet emits (see ``excel.py``); ``period_eids``
+    aliases the first.  ``uncompressed`` loops (too few repeats) are written
+    event-by-event.
+    """
 
     loop_name: str
     trip_count: int
@@ -92,6 +99,11 @@ class LoopSummary:
     suffix_eids: List[int]
     repeat_count: int
     period_duration: int
+    loop_uid: int = -1
+    carry_distance: int = 0
+    written_periods: List[List[int]] = field(default_factory=list)
+    ii_anchor_eids: Tuple[int, int] = (-1, -1)
+    uncompressed: bool = False
 
 
 @dataclass
@@ -110,8 +122,12 @@ class ScheduleResult:
     dram_read_bytes: int
     dram_write_bytes: int
     cost: CostParams
+    dram_weight_bytes: int = 0
+    dram_activation_bytes: int = 0
+    dram_kv_bytes: int = 0
     loops: List[LoopSummary] = field(default_factory=list)
     loop_names: dict = field(default_factory=dict)  # id(loop) -> node name
+    dep_remap: dict = field(default_factory=dict)
 
     def record_by_eid(self, eid: int) -> Optional[TimingRecord]:
         # records are appended in eid order, so index directly when aligned.

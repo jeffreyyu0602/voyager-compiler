@@ -23,7 +23,7 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
-from ...mapping_utils import is_nop
+from ...mapping_utils import is_compute_op, is_nop
 from ...passes.utils import get_arg_value
 from ..codegen import _loop_extents, _norm_extent
 from .classify import INSERT, classify
@@ -142,6 +142,69 @@ def _dma_dir(node: Node, bind):
     )
 
 
+def _is_cache_attr(node) -> bool:
+    """A ``get_attr`` naming a KV-cache buffer (``key_cache_*`` /
+    ``value_cache_*`` / a ``StaticCache`` ``*_keys`` / ``*_values``)."""
+    if not isinstance(node, Node) or node.op != "get_attr":
+        return False
+    low = f"{node.name} {node.target}".lower()
+    return "cache" in low and (
+        "key" in low or "value" in low or "kv" in low
+    )
+
+
+# Compute ops a source trace still walks through: they re-encode a tensor
+# rather than combine it with another.
+_QUANTIZE_OPS = frozenset(
+    {
+        torch.ops.quantized_ops.quantize.default,
+        torch.ops.quantized_ops.dequantize.default,
+        torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.quantized_ops.quantize_mx_outlier.default,
+    }
+)
+
+
+def _trace_source(node, bind: Dict[Node, Node]) -> Node:
+    """Recurse *upward* from a buffer to the ``get_attr`` or placeholder it
+    originates from, stopping at the first op that computes on its input.
+    Everything in between only moves data (``repeat_kv``'s expand / stack /
+    permute / reshape, the ``index_copy_`` cache write) or re-encodes it
+    (``_QUANTIZE_OPS``)."""
+    seen = set()
+    while isinstance(node, Node) and node not in seen:
+        seen.add(node)
+        if node in bind:
+            node = bind[node]
+            continue
+        if node.op != "call_function" or not node.all_input_nodes:
+            return node
+        if is_compute_op(node) and node.target not in _QUANTIZE_OPS:
+            return node
+        node = node.all_input_nodes[0]
+    return node
+
+
+def _buf_category(buf, bind: Dict[Node, Node]) -> str:
+    """Classify a DMA's DRAM root buffer by the tensor role it plays, so
+    traffic can be split: a KV-cache buffer (``key_cache_*`` /
+    ``value_cache_*``) is ``"kv"``; a real parameter (``get_attr``) is
+    ``"weight"``; a graph input or an intermediate ``voyager.alloc`` is
+    ``"activation"``.
+
+    The buffer is often not the cache ``get_attr`` itself but an intermediate
+    (e.g. the ``repeat_kv`` ``permute`` that produces the 32-head K), so trace
+    *upward* to the originating ``get_attr`` before classifying."""
+    if not isinstance(buf, Node):
+        return "activation"
+    src = _trace_source(buf, bind)
+    if _is_cache_attr(src) or _is_cache_attr(buf):
+        return "kv"
+    if buf.op == "get_attr" or src.op == "get_attr":
+        return "weight"
+    return "activation"
+
+
 def _sem_key(sem_arg, env, bind):
     """``(bank_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
 
@@ -193,7 +256,14 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
             key = _sem_key(node.args[4], env, ctx.bind)
-            ctx.rs.async_copy(node, n_bytes, is_load, key, path)
+            ctx.rs.async_copy(
+                node,
+                n_bytes,
+                is_load,
+                key,
+                path,
+                _buf_category(buf, ctx.bind),
+            )
         elif kind == "async_wait":
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif kind == "insert":
@@ -283,5 +353,8 @@ def estimate_schedule(
         dram_read_bytes=rs.read_bytes,
         dram_write_bytes=rs.write_bytes,
         cost=cost,
+        dram_weight_bytes=rs.cat_bytes["weight"],
+        dram_activation_bytes=rs.cat_bytes["activation"],
+        dram_kv_bytes=rs.cat_bytes["kv"],
         loop_names=dict(rs.loop_names),
     )

@@ -40,6 +40,8 @@ class ResourceState:
         self.loop_names: Dict[int, str] = {}  # id(loop) -> node name
         self.read_bytes = 0
         self.write_bytes = 0
+        # DRAM traffic (read + write) bucketed by tensor role.
+        self.cat_bytes = {"weight": 0, "activation": 0, "kv": 0}
         self.records: List[TimingRecord] = []
         self.ops: Dict[int, OpInfo] = {}  # id(node) -> OpInfo
         self._op_names: set = set()
@@ -133,7 +135,7 @@ class ResourceState:
         self.sem_fifos.setdefault(sem_key, deque()).append(end_eid)
 
     def async_copy(
-        self, node, n_bytes: int, is_load: bool, sem_key, path
+        self, node, n_bytes: int, is_load: bool, sem_key, path, category=""
     ) -> TimingRecord:
         eid = self._eid()
         start = max(self.now, self.dram_free)
@@ -150,6 +152,7 @@ class ResourceState:
             loop_uid=self.cur_loop,
             bytes=n_bytes,
             is_read=is_load,
+            category=category,
             start_deps=deps,
             latency_kind="dram",
             latency_ref=n_bytes,
@@ -162,6 +165,8 @@ class ResourceState:
             self.read_bytes += n_bytes
         else:
             self.write_bytes += n_bytes
+        if category in self.cat_bytes:
+            self.cat_bytes[category] += n_bytes
         self.sem_fifos.setdefault(sem_key, deque()).append((end, eid))
         return rec
 
