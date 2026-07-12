@@ -58,11 +58,25 @@ def _write_numpy(np_array: np.ndarray, filename: str, shape: tuple):
         logger.error(f"❌ Failed to save tensor {shape} -> {filename}: {e}")
 
 
+_pending_writes = []
+
+
 def _save_tensor(tensor: torch.Tensor, filename: str):
     """Asynchronously save tensor to a binary file."""
     t = tensor.detach().cpu().contiguous().to(torch.float32)
     np_array = t.numpy()
-    _executor.submit(_write_numpy, np_array, filename, tuple(t.shape))
+    _pending_writes.append(
+        _executor.submit(_write_numpy, np_array, filename, tuple(t.shape))
+    )
+
+
+def flush_tensor_files():
+    """Block until every queued tensor file is on disk — the writes are handed
+    to a thread pool, so a caller that reads ``tensor_files/`` as soon as
+    ``compile`` returns would otherwise race them."""
+    for future in _pending_writes:
+        future.result()
+    _pending_writes.clear()
 
 
 def save_tensor(tensor, filename):

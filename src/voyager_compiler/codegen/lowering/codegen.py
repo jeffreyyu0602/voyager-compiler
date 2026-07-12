@@ -30,6 +30,7 @@ from ..mapping_utils import (
 )
 from ..param_pb2 import Model, Operation, Tensor
 from ..shape_prop import ShapeProp
+from .bufferization import _is_compute
 from .ops import oracle_disabled
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -144,6 +145,22 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
 _INSERT = torch.ops.voyager.insert.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
+_ALLOC = torch.ops.voyager.alloc.default
+
+
+def _dump_dir(node, output_dir):
+    """Where ``node``'s tensors are written, or ``None``: a compute op (operand
+    tiles + result — one tiled op replayed alone) and a DRAM buffer (a whole
+    loop replayed).  The machinery between them — DMA, semaphores, banks, index
+    vectors — the run drives itself.
+    """
+    if output_dir is None:
+        return None
+    if _is_compute(node):
+        return output_dir
+    if node.target is _ALLOC and node.meta.get("space") == "DRAM":
+        return output_dir
+    return None
 
 
 def _feeds_tile_index(node, _seen=None) -> bool:
@@ -244,9 +261,10 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
             if not (_feeds_tile_index(node) or _feeds_cond_predicate(node)):
                 return
 
+    dump_dir = _dump_dir(node, output_dir)
     op = Operation()
-    op.op.CopyFrom(map_node(node, output_dir))
-    set_output_field(op, node, output_dir)
+    op.op.CopyFrom(map_node(node, dump_dir))
+    set_output_field(op, node, dump_dir)
     _set_tiling(op, node)
     ops.append(op)
 
@@ -310,6 +328,39 @@ def _emit_cond(node, parent_named, output_dir) -> Operation:
     return op
 
 
+def compute_op_names(model: GraphModule) -> List[str]:
+    """Every compute op of a bufferized graph, in execution order (descending
+    into loop bodies and cond branches) — the bufferized ``layers.txt``, and the
+    enumeration of the ops a hardware run replays one at a time.  A fused group
+    counts once, as the one op it is emitted as."""
+    names: List[str] = []
+
+    def walk(gm: GraphModule) -> None:
+        named = dict(gm.named_modules(remove_duplicate=False))
+
+        def subgraph(target):
+            sub = named.get(str(target))
+            return sub if isinstance(sub, GraphModule) else None
+
+        for n in gm.graph.nodes:
+            if n.op == "call_module":
+                names.append(n.name)
+            elif n.op != "call_function":
+                continue
+            elif n.target is WHILE_LOOP:
+                if (body := subgraph(n.args[1].target)) is not None:
+                    walk(body)
+            elif n.target is COND:
+                for branch in (n.args[1], n.args[2]):
+                    if (br := subgraph(branch.target)) is not None:
+                        walk(br)
+            elif _is_compute(n):
+                names.append(n.name)
+
+    walk(model)
+    return names
+
+
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     """
     Generate a protobuf ``Model`` from a bufferized FX graph, emitting ``Loop``
@@ -326,6 +377,13 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     with oracle_disabled():
         ShapeProp(model, recurse=True).propagate(*args)
 
+    # One iteration is all a tile needs, but it leaves the DRAM buffers holding
+    # a single tile over ``alloc``'s random fill.  A non-recursive pass runs the
+    # loop for real and re-stamps only the top level, so the buffers end up with
+    # the true tensors and the tiles keep theirs.
+    if output_dir is not None:
+        ShapeProp(model).propagate(*args)
+
     named_modules = dict(model.named_modules(remove_duplicate=False))
     model_params = Model()
 
@@ -337,12 +395,14 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
             continue
         if node.op == "get_attr":
             mod = getattr(model, str(node.target), None)
-            if isinstance(mod, GraphModule):
-                continue  # cond/body subgraphs are emitted inside their loop
+            # Skip cond/body subgraphs, and a codebook / qmap / scale: it
+            # reaches its op as a loop operand, so the proto names the body
+            # placeholder it binds to, not this.
+            if isinstance(mod, GraphModule) or "memory" not in node.meta:
+                continue
             tensor = Tensor()
             set_tensor_field(tensor, node, output_dir)
-            if "memory" in node.meta:
-                model_params.parameters.append(tensor)
+            model_params.parameters.append(tensor)
             continue
 
         _emit_node(node, model, named_modules, model_params.ops, output_dir)

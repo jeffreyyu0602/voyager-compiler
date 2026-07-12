@@ -14,6 +14,7 @@ Runs after operator fusion and before memory allocation.
 import logging
 import math
 import operator
+import re
 from typing import Dict, Optional
 
 import torch
@@ -531,6 +532,112 @@ def _bufferize_key(node):
 
 
 # ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+
+_FUSED_SUFFIX = "_fused"
+
+
+def _base_name(name: str) -> str:
+    """A node name without the per-graph counter FX appended (``select_11`` ->
+    ``select``), so the model-wide numbering can start it afresh."""
+    return re.sub(r"_\d+$", "", name)
+
+
+def _keeps_scope(gm: GraphModule) -> set:
+    """The nodes of ``gm`` a layer name is worth spending on — the ones
+    ``codegen._dump_dir`` writes a file for: the compute ops, the tiles they
+    read, and the DRAM buffers.  A submodule placeholder is excluded: codegen
+    redirects it through ``meta['source_node']``, so its own name is never used.
+    """
+    keep = set()
+    for n in gm.graph.nodes:
+        if _is_compute(n):
+            keep.add(n)
+            keep.update(a for a in n.all_input_nodes if a.op != "placeholder")
+        elif n.target is _VOYAGER_ALLOC and n.meta.get("space") == "DRAM":
+            keep.add(n)
+    return keep
+
+
+def rename_nest_nodes(model: GraphModule) -> None:
+    """Rename each nest's nodes so a name means one thing model-wide.
+
+    Every loop body / cond branch / fused submodule is its own FX namespace, so
+    the nests all reuse the same local names (``select_5``, ``arg2_1``) —
+    ambiguous in ``model.txt``, and fatal for the tensor dump, where the file is
+    named after the node.
+
+    The ops and the tensors that become files (``_keeps_scope``) are named after
+    the op bufferization erased (``meta['scope']``, stamped at the splice): the
+    anchor takes it bare, ``_fused`` when fused with its tail as in the legacy
+    path, the rest take ``<scope>_<local>``.  The machinery around them (DMA,
+    semaphores, index arithmetic) carries no layer identity worth the length, so
+    it is just renumbered model-wide: ``select_137``, ``async_copy_402``.
+    """
+    used = {n.name for n in model.graph.nodes}
+
+    def rename(node: Node, candidate: str) -> None:
+        base, i = candidate, 1
+        while candidate in used:
+            candidate = f"{base}_{i}"
+            i += 1
+        node._rename(candidate)  # registers the name in the graph's namespace
+        used.add(node.name)
+
+    def rename_node(
+        gm: GraphModule, n: Node, scope: str, anchor_target, keep: set
+    ) -> None:
+        """Name ``n``, then recurse into whatever region it opens."""
+        sub = _subgraph(gm, n.target) if n.op == "call_module" else None
+
+        if sub is not None:
+            fuses_anchor = any(
+                x.target is anchor_target for x in sub.graph.nodes
+            )
+            candidate = (
+                scope + _FUSED_SUFFIX if fuses_anchor else f"{scope}_{n.name}"
+            )
+        elif n.target is anchor_target:
+            candidate = scope
+        elif n in keep:
+            candidate = f"{scope}_{n.name}"
+        else:
+            candidate = _base_name(n.name)
+        rename(n, candidate)
+
+        if sub is not None:
+            rename_graph(sub, scope, None, keep=set())
+        elif n.op == "call_function" and n.target is _WHILE_LOOP:
+            if (body := _subgraph(gm, n.args[1].target)) is not None:
+                rename_graph(body, scope, anchor_target)
+        elif n.op == "call_function" and n.target is _COND:
+            for branch in (n.args[1], n.args[2]):
+                if (br := _subgraph(gm, branch.target)) is not None:
+                    rename_graph(br, scope, anchor_target)
+
+    def rename_graph(
+        gm: GraphModule, scope: str, anchor_target, keep: Optional[set] = None
+    ) -> None:
+        if keep is None:
+            keep = _keeps_scope(gm)
+        for n in list(gm.graph.nodes):
+            if n.op == "output":
+                continue
+            if n.op == "get_attr" and _subgraph(gm, n.target) is not None:
+                continue  # a loop body / cond branch handle: never emitted
+            rename_node(gm, n, scope, anchor_target, keep)
+
+    keep = _keeps_scope(model)
+    for node in list(model.graph.nodes):
+        if (scope := node.meta.get("scope")) is None:
+            continue  # not from a nest: its name is already unique
+        rename_node(model, node, *scope, keep)
+
+    model.recompile()
+
+
+# ---------------------------------------------------------------------------
 # Main pass
 # ---------------------------------------------------------------------------
 
@@ -676,11 +783,24 @@ def bufferize_graph(
         }
         propagate_logical_dtypes(sub_gm, ph_seed, compute_seed)
 
+        value_remap = {}
         with oracle_disabled():
             results = replace_node_with_graph_module(
-                model, node, sub_gm, propagate=False
+                model, node, sub_gm, propagate=False, value_remap=value_remap
             )
         logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
+
+        # Scope the nest by the name of the op it replaces -- the only point
+        # where that name is known: the node is erased below, and the cache
+        # shares one ``sub_gm`` between identically-shaped ops (so a builder
+        # cannot stamp it).  ``rename_nest_nodes`` spends it at the end of the
+        # pass.  Placeholders map to pre-existing operands, not to nest nodes.
+        scope = node.name
+        if scope.endswith(_FUSED_SUFFIX):
+            scope = scope[: -len(_FUSED_SUFFIX)]
+        for src, new in value_remap.items():
+            if src.op != "placeholder" and isinstance(new, Node):
+                new.meta["scope"] = (scope, anchor.target)
 
         # Carry the original node's shape/value onto the nest output(s): later
         # builders read an operand's ``.value`` directly, and ``propagate=False``
@@ -722,6 +842,7 @@ def bufferize_graph(
     graph.lint()
     model.recompile()
     annotate_tensor_spaces(model)
+    rename_nest_nodes(model)
     return model
 
 

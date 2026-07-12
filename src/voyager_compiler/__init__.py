@@ -4,6 +4,7 @@ from torch.utils._pytree import tree_flatten
 
 from .cli_args import *
 from .codegen import *
+from .codegen.mapping_utils import flush_tensor_files
 from .decomposed import *
 from .fake_quantize import *
 from .fp8 import *
@@ -279,6 +280,7 @@ def compile(
             print_bufferized_graph,
             report,
         )
+        from .codegen.lowering.codegen import compute_op_names
         from .codegen.lowering.tiling import build_interstellar_tiler
 
         tiler = build_interstellar_tiler(
@@ -340,6 +342,8 @@ def compile(
         )
         with open(os.path.join(output_dir, "model.txt"), "w") as f:
             f.write(text_format.MessageToString(params))
+        with open(os.path.join(output_dir, "layers.txt"), "w") as f:
+            f.write("\n".join(compute_op_names(model)))
         with open(os.path.join(output_dir, "bufferized_graph.txt"), "w") as f:
             f.write(print_bufferized_graph(model, to_string=True))
         gen_compute_graph_bufferized(
@@ -347,6 +351,7 @@ def compile(
             os.path.join(output_dir, output_file),
             timeout=5 * 60,
         )
+        flush_tensor_files()
         return params
 
     allocator = MemoryAllocator(total_memory, bank_width=bank_width)
@@ -384,4 +389,5 @@ def compile(
     if len(model.graph.nodes) < 10000:
         gen_compute_graph(model, os.path.join(output_dir, output_file))
 
+    flush_tensor_files()
     return params

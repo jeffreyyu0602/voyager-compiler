@@ -56,7 +56,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_MEMORY_SIZE = torch.finfo(torch.float32).max
 
 
-def _copy_graph_module(gm: GraphModule) -> GraphModule:
+def _copy_graph_module(
+    gm: GraphModule, remap: Optional[Dict[Node, Node]] = None
+) -> GraphModule:
     """An independent-graph copy of ``gm`` (recursively for child
     GraphModules) that preserves each node's ``meta`` and ``.value`` and shares
     the constant params / buffers — WITHOUT recompiling ``forward``.
@@ -73,20 +75,32 @@ def _copy_graph_module(gm: GraphModule) -> GraphModule:
     whereas we want to keep ``gm``'s class (which carries the compiled
     ``forward``).
     """
+    root = remap is None
+    if remap is None:
+        remap = {}
+
     new = object.__new__(gm.__class__)
     new.__dict__ = dict(gm.__dict__)  # share params / buffers / forward code
     new._modules = {
-        k: _copy_graph_module(v) if isinstance(v, GraphModule) else v
+        k: _copy_graph_module(v, remap) if isinstance(v, GraphModule) else v
         for k, v in gm._modules.items()
     }
     new_graph = Graph()
-    remap: Dict[Node, Node] = {}
     for n in gm.graph.nodes:
         c = new_graph.node_copy(n, lambda x: remap[x])
         remap[n] = c
         if (val := getattr(n, "value", None)) is not None:
             c.value, c.shape = val, getattr(n, "shape", None)
     new._graph = new_graph
+
+    if root:
+        # Rebind ``source_node`` to this copy: it is how codegen resolves a
+        # fused op's tile (name / address / value), and left alone it points
+        # into the template the build cache shares between identical ops.
+        for copied in remap.values():
+            src = copied.meta.get("source_node")
+            if src in remap:
+                copied.meta["source_node"] = remap[src]
     return new
 
 
