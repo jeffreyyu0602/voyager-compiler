@@ -101,7 +101,7 @@ def op_utilization(
     The rules key off the *anchor*: a fused ``call_module``'s own target is just
     the submodule name, so only the anchor names the real op.
     """
-    per_tile = node.meta.get("tile_compute_cycles")
+    per_tile = node.meta.get("per_tile_cycles")
     if "mma" in units and per_tile and ideal_cycles > 0:
         # Only ever a slowdown; clamp away model noise (and a zero divisor).
         return min(1.0, ideal_cycles / per_tile)

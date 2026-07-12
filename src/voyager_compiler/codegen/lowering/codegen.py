@@ -21,6 +21,7 @@ import torch
 from torch.fx import GraphModule
 
 from ..mapping_utils import (
+    build_tiling_proto,
     convert_arg,
     is_nop,
     map_node,
@@ -106,6 +107,19 @@ def _emit_body(gm: GraphModule, ops: List[Operation], output_dir) -> None:
         _emit_node(node, gm, named, ops, output_dir)
 
 
+# The interstellar architecture here is 4-level (PE / L1 / L2 / DRAM), but the
+# DRAM blocking is already explicit as the emitted ``Loop`` nest, so only L1 and
+# L2 are serialized — the two levels the legacy path emits.
+_TILING_NUM_LEVELS = 3
+
+
+def _set_tiling(op: Operation, node) -> None:
+    """Attach the interstellar mapping of a tiled matrix op (stamped on the node
+    by the builder) as the Operation's ``Tiling``."""
+    if "interstellar_tiling" in node.meta:
+        op.tiling.CopyFrom(build_tiling_proto(node, _TILING_NUM_LEVELS))
+
+
 def _emit_fused_op(node, named, output_dir) -> Operation:
     """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a
     protobuf ``fused_op`` — an ``OpOverloadList`` of the submodule's compute
@@ -123,6 +137,7 @@ def _emit_fused_op(node, named, output_dir) -> Operation:
         ):
             op.fused_op.op_list.append(map_node(n, output_dir))
     set_output_field(op, node, output_dir)
+    _set_tiling(op, node)
     return op
 
 
@@ -232,6 +247,7 @@ def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
     op = Operation()
     op.op.CopyFrom(map_node(node, output_dir))
     set_output_field(op, node, output_dir)
+    _set_tiling(op, node)
     ops.append(op)
 
 

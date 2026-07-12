@@ -226,13 +226,21 @@ def set_output_field(param, node, output_dir):
         logger.warning(f"Unsupported output type: {type(node.value)}")
 
 
-def build_tiling_proto(node):
-    """Convert node.meta['interstellar_tiling'] to a Tiling proto."""
+def build_tiling_proto(node, num_levels=None):
+    """Convert node.meta['interstellar_tiling'] to a Tiling proto.
+
+    ``num_levels`` caps the memory levels serialized (1 .. num_levels - 1; level
+    0 is the PE), defaulting to every level of the architecture.  The bufferized
+    path passes 3 (L1, L2): its architecture has a fourth level (DRAM) whose
+    blocking is already explicit as the emitted loop nest.
+    """
     mapping, access_list = node.meta["interstellar_tiling"]
     architecture = node.meta["interstellar_architecture"]
+    if num_levels is None:
+        num_levels = architecture.num_levels
     tiling = Tiling(name=node.name)
 
-    for level in range(1, architecture.num_levels):  # skip level 0 (PE)
+    for level in range(1, num_levels):  # skip level 0 (PE)
         lt = LevelTiling()
         loop_index = 0
         while loop_index < interstellar.le.NUM:

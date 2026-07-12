@@ -744,14 +744,16 @@ def run_interstellar(
             precision.
 
     Returns:
-        ``(mapping, per_tile_cycles)`` -- the best MappingPoint (its
-        ``loop_blockings`` give the per-level tile factors) and the compute
+        ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
+        (its ``loop_blockings`` give the per-level tile factors), the compute
         cycles of one L3 tile under it (the reporting model's utilization
-        denominator).  ``(None, None)`` if the node is skipped.
+        denominator), and the per-level ``(input, output, weight)`` access
+        counts the ``Tiling`` proto reports.  All ``None`` if the node is
+        skipped.
     """
     layer = _extract_layer_from_node(node, out_dtype, fused_specs)
     if layer is None:
-        return None, None
+        return None, None, None
 
     of_dtype = (
         out_dtype[-1] if isinstance(out_dtype, (list, tuple)) else out_dtype
@@ -826,7 +828,11 @@ def run_interstellar(
     )
     logger.info(interstellar.utils.format_tiling(mapping))
 
-    return mapping, per_tile_cycles
+    _, _, access_list = interstellar.cost_model.get_cost(
+        tiler.arch, mapping, layer
+    )
+
+    return mapping, per_tile_cycles, access_list
 
 
 def get_tiling(node, tiler=None):
@@ -895,7 +901,7 @@ def get_tiling(node, tiler=None):
         tuple(fused_specs),
     )
     if key in tiler.cache:
-        mapping, per_tile_cycles = tiler.cache[key]
+        mapping, per_tile_cycles, access_list = tiler.cache[key]
         logger.debug(
             "[tiling] %s: mapping cache hit (%d entries)",
             anchor.name,
@@ -904,7 +910,7 @@ def get_tiling(node, tiler=None):
     else:
         logger.info("[tiling] %s: running interstellar", anchor.name)
         t0 = time.perf_counter()
-        mapping, per_tile_cycles = run_interstellar(
+        mapping, per_tile_cycles, access_list = run_interstellar(
             anchor,
             tiler,
             out_dtype=out_dtype,
@@ -917,14 +923,19 @@ def get_tiling(node, tiler=None):
             time.perf_counter() - t0,
         )
         # cache None too (skipped layers)
-        tiler.cache[key] = (mapping, per_tile_cycles)
+        tiler.cache[key] = (mapping, per_tile_cycles, access_list)
     if mapping is None:
         return None
 
-    # The builders copy this onto the compute nodes of the nest they build (the
-    # anchor is erased on splice), so the reporting cost model can read it back
-    # and turn it into a utilization.
-    anchor.meta["tile_compute_cycles"] = per_tile_cycles
+    # The builders copy these onto the nest they build (the anchor is erased on
+    # splice): ``per_tile_cycles`` so the reporting cost model can turn it into
+    # a utilization, the mapping / architecture so the proto emitter can
+    # serialize the ``Tiling`` message.
+    anchor.meta["tiling"] = {
+        "per_tile_cycles": per_tile_cycles,
+        "interstellar_tiling": (mapping, access_list),
+        "interstellar_architecture": tiler.arch,
+    }
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 

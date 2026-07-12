@@ -1202,7 +1202,9 @@ def adjust_tiling(
     ``scratchpad_map`` for the caller to attach (``run_memory_mapping`` does; the
     bufferized path, which only needs the tiling, ignores it).
 
-    ``interstellar`` is ``(arch, schedule, cache, double_buffered)`` or ``None``.
+    ``interstellar`` is ``None``, or the trailing arguments of
+    ``run_interstellar_for_tiled_op`` in order — ``(arch, schedule,
+    double_buffered, cache)`` — since it is splatted into that call.
     Was ``run_memory_mapping.allocate_scratchpad`` (closures lifted to params).
     """
     from .passes.tiling import compute_output_tiled_shapes, compute_tiled_shape
@@ -1308,24 +1310,10 @@ def adjust_tiling(
         node.meta["tile_strides"] = normalize_shape(anchor_node, strides)
 
     # Run interstellar tiler for GEMM nodes if hardware config is provided
-    if interstellar is not None:
-        (
-            interstellar_arch,
-            interstellar_schedule,
-            interstellar_cache,
-            double_buffered_accum_buffer,
-        ) = interstellar
-        if interstellar_arch is not None and is_gemm_op(anchor_node):
-            run_interstellar_for_tiled_op(
-                node,
-                anchor_node,
-                final_tiled_shapes,
-                interstellar_arch,
-                interstellar_schedule,
-                double_buffered_accum_buffer,
-                interstellar_cache,
-                named_modules,
-            )
+    if interstellar is not None and is_gemm_op(anchor_node):
+        run_interstellar_for_tiled_op(
+            node, anchor_node, final_tiled_shapes, *interstellar, named_modules
+        )
 
     return scratchpad_map
 
@@ -1349,19 +1337,14 @@ def run_memory_mapping(
         unroll_dims = (unroll_dims, unroll_dims)
 
     # Build interstellar arch/schedule once if hardware config is provided
-    interstellar_arch = None
-    interstellar_schedule = None
-    interstellar_cache = {}
+    interstellar = None
     if (
         unroll_dims
         and input_buffer_size is not None
         and weight_buffer_size is not None
         and accum_buffer_size is not None
     ):
-        (
-            interstellar_arch,
-            interstellar_schedule,
-        ) = build_architecture_and_schedule(
+        arch, schedule = build_architecture_and_schedule(
             unroll_dims[0],
             unroll_dims[1],
             cache_size,
@@ -1369,6 +1352,7 @@ def run_memory_mapping(
             weight_buffer_size,
             accum_buffer_size,
         )
+        interstellar = (arch, schedule, double_buffered_accum_buffer, {})
 
     if allocator is None:
         allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE, bank_width)
@@ -1422,13 +1406,6 @@ def run_memory_mapping(
         """
         nodes_to_delete = user_to_last_uses.get(user, [])
         return nodes_to_delete
-
-    interstellar = (
-        interstellar_arch,
-        interstellar_schedule,
-        interstellar_cache,
-        double_buffered_accum_buffer,
-    )
 
     def allocate_scratchpad(node: Node):
         # Tiling + scratchpad logic lives in the module-level ``adjust_tiling``
