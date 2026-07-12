@@ -37,6 +37,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from ..banking import require_allocation
+from .bufferization import _viewed_buffer
 from ..memory import MemorySpace, Segment, _align_size
 from ...pt2e_utils import dtype_byte_size
 
@@ -344,7 +345,13 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
 
     bufs: Dict[Node, _Buf] = {}
     for root, mem in members.items():
-        tiles = [m for m in mem if m.meta.get("space") == "Scratchpad"]
+        # A view (a bank slot, a reshape) names memory another buffer owns, so
+        # it is planned no region of its own.
+        tiles = [
+            m
+            for m in mem
+            if m.meta.get("space") == "Scratchpad" and _viewed_buffer(m) is None
+        ]
         if not tiles:
             continue
         def_t = min(order[m] for m in tiles)
@@ -479,10 +486,14 @@ def _thread_segments(model: GraphModule) -> None:
                         carried = list(src.args[2])
                         if idx < len(carried) and get(carried[idx]) is not None:
                             _set(node, get(carried[idx]), local)
-                elif node.target not in (_ZERO, _INCR, _ALLOC):
+                elif (
+                    node.target not in (_ZERO, _INCR, _ALLOC)
+                    and _viewed_buffer(node) is None
+                ):
                     # In-place compute tile: inherit the segment of its first
                     # scratchpad input (e.g. accumulate-add reuses the
-                    # accumulator).
+                    # accumulator).  A view gets no address at all — a bank slot
+                    # is indexed at runtime, so it has none to give.
                     if (
                         node.meta.get("space") == "Scratchpad"
                         and "scratchpad" not in node.meta
