@@ -138,7 +138,8 @@ def _dma_dir(node: Node, bind):
         return dst_root, sizes, False
     raise ValueError(
         f"async_copy {node.name}: exactly one operand must be in DRAM "
-        f"(src space={ssp!r}, dst space={dsp!r})"
+        f"(src {src} -> root {src_root} in {ssp!r}; "
+        f"dst {dst} -> root {dst_root} in {dsp!r})"
     )
 
 

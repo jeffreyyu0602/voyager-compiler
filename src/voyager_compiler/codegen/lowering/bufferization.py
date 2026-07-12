@@ -123,6 +123,7 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
 
 
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
+_VOYAGER_ZEROS = torch.ops.voyager.zeros.default
 
 
 def annotate_tensor_spaces(gm: GraphModule) -> None:
@@ -130,13 +131,18 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
     computation lands in one.
 
       * **Buffers** carry ``node.meta['space']``: a ``voyager.alloc`` is
-        Scratchpad (``MemoryLevel.SRAM``) or DRAM (its level arg); a top-level
-        input placeholder and a weight ``get_attr`` are DRAM.  Codebooks /
-        qmaps are *params* (passed to the accelerator, not memory) — unmarked.
-      * **Compute** is *not* given a space.  Instead the destination-passing
-        invariant is checked: every tile-compute ``call_function`` /
-        ``call_module`` result must be written to a buffer via ``insert``.
-        Control logic (anything ``is_compute_op`` rejects) is exempt.
+        Scratchpad (``MemoryLevel.SRAM``) or DRAM (its level arg), a
+        ``voyager.zeros`` accumulator / semaphore bank is Scratchpad, and a
+        top-level input placeholder or weight ``get_attr`` is DRAM.  A *view* of
+        a buffer — a bank-slot ``select``, a reshape, a loop result — takes the
+        space of what it views, threading through the loop / cond boundary.
+        Codebooks / qmaps are *params* (passed to the accelerator, not memory) —
+        unmarked.  Everything else (DMA, semaphore waits, index arithmetic)
+        names no memory and so carries no space.
+      * **Compute** is *not* given a space; it is *validated*.  The array only
+        reaches Scratchpad, so every tile a compute op reads must be there
+        (bar codebooks and scalars, which it reads whole), and its result must
+        be written back there via ``insert``.
 
     Recurses into ``while_loop`` and ``cond`` bodies, checking every op inside;
     when an op's result is the body's output, the check threads to the users of
@@ -219,6 +225,84 @@ def _stored(node: Node, ctx: tuple) -> bool:
     return True
 
 
+def _space(node):
+    """The memory ``node`` names, or ``None`` if it names none."""
+    return node.meta.get("space") if isinstance(node, Node) else None
+
+
+def _viewed_buffer(node: Node) -> Optional[Node]:
+    """The buffer ``node`` is a view of — a bank slot (``select``), a reshape /
+    cast, or a loop result (``getitem`` of a carried operand) — so it can take
+    that buffer's space.  ``None`` if it names no buffer.
+    """
+    if node.op != "call_function":
+        return None
+    if (
+        node.target is _SELECT
+        or node.target is torch.ops.aten.to.dtype
+        or is_nop(node)
+    ):
+        src = node.args[0]
+        return src if isinstance(src, Node) else None
+    if node.target is operator.getitem:
+        src, index = node.args[0], node.args[1]
+        if (
+            isinstance(src, Node)
+            and src.target is _WHILE_LOOP
+            and isinstance(index, int)
+        ):
+            carried = list(src.args[2])
+            if index < len(carried):
+                return carried[index]
+    return None
+
+
+def _passed_whole(node: Node, codebooks: set) -> bool:
+    """An operand handed to the op whole rather than tiled into a bank, and so
+    exempt from the Scratchpad rule: a codebook / qmap (a *param*, which carries
+    no space at all), or a scalar (read from DRAM).  ``_build_for_untiled``
+    loads neither."""
+    if node in codebooks:
+        return True
+    val = node.meta.get("val", getattr(node, "value", None))
+    return isinstance(val, torch.Tensor) and val.numel() == 1
+
+
+def _validate_compute(node: Node, codebooks: set, ctx: tuple) -> None:
+    """The array only reaches Scratchpad, so every tile a compute op reads must
+    be there, and its result must be stored back there (via ``insert``)."""
+    for inp in node.all_input_nodes:
+        if not _produces_tensor(inp) or _passed_whole(inp, codebooks):
+            continue
+        if _space(inp) != "Scratchpad":
+            raise Exception(
+                f"compute on {_space(inp)}: {node.op} '{node.name}' "
+                f"({node.target}) reads '{inp.name}', which is not a "
+                f"Scratchpad tile"
+            )
+    if not _stored(node, ctx):
+        raise Exception(
+            f"destination-passing violation: result of {node.op} "
+            f"'{node.name}' ({node.target}) is not stored to a buffer "
+            f"via insert (it feeds a non-store consumer)"
+        )
+
+
+def _walk_region(gm, hop, operands, graph_args, codebooks, ctx) -> None:
+    """Walk each body / branch of ``hop`` with its placeholders seeded from the
+    operands bound to them, so a tile view inside resolves to the right
+    buffer."""
+    for graph_arg in graph_args:
+        sub = _subgraph(gm, graph_arg.target)
+        if sub is None:
+            continue
+        phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+        for operand, ph in zip(operands, phs):
+            if (space := _space(operand)) is not None:
+                ph.meta["space"] = space
+        _annotate_and_validate(sub, codebooks, hop, ctx)
+
+
 def _annotate_and_validate(
     gm: GraphModule, codebooks: set, parent_hop, parent_ctx
 ) -> None:
@@ -239,24 +323,35 @@ def _annotate_and_validate(
             node.meta["space"] = (
                 "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
             )
+        elif node.target is _VOYAGER_ZEROS:
+            # A DMA semaphore bank, not a tensor buffer: no space (and so not
+            # the DRAM default below either).
+            pass
         elif node.target is _WHILE_LOOP:
-            body = _subgraph(gm, node.args[1].target)
-            if body is not None:
-                _annotate_and_validate(body, codebooks, node, ctx)
+            operands = list(node.args[2])
+            if len(node.args) > 3:
+                operands += list(node.args[3])
+            _walk_region(gm, node, operands, (node.args[1],), codebooks, ctx)
         elif node.target is _COND:
-            for graph_arg in (node.args[1], node.args[2]):
-                branch = _subgraph(gm, graph_arg.target)
-                if branch is not None:
-                    _annotate_and_validate(branch, codebooks, node, ctx)
+            operands = list(node.args[3]) if len(node.args) > 3 else []
+            _walk_region(gm, node, operands, node.args[1:3], codebooks, ctx)
         elif _is_compute(node):
-            if not _stored(node, ctx):
+            _validate_compute(node, codebooks, ctx)
+        elif node.target is _VOYAGER_INSERT:
+            dst = node.args[1]
+            if _space(dst) != "Scratchpad":
                 raise Exception(
-                    f"destination-passing violation: result of {node.op} "
-                    f"'{node.name}' ({node.target}) is not stored to a buffer "
-                    f"via insert (it feeds a non-store consumer)"
+                    f"tile store violation: '{node.name}' writes '{dst.name}', "
+                    f"which is in {_space(dst)}, not Scratchpad"
                 )
-        else:
+        elif (viewed := _viewed_buffer(node)) is not None:
+            node.meta["space"] = _space(viewed)
+        elif _produces_tensor(node):
+            # A tensor the accelerator does not compute — a host-side ``pad``,
+            # a copy — materializes in DRAM.
             node.meta["space"] = "DRAM"
+        # Anything else — a DMA, a semaphore wait, index arithmetic — names no
+        # memory, so it carries no space.
 
 
 # ---------------------------------------------------------------------------
