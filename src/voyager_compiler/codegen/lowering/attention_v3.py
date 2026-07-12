@@ -240,7 +240,7 @@ class _FA3Pipeline(torch.nn.Module):
         voyager.insert(torch.amax(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(torch.maximum(m, row_tmp), row_tmp)
         voyager.insert(torch.exp(m - row_tmp), alpha)
-        voyager.insert(row_tmp, m)
+        voyager.insert(row_tmp.clone(), m)
         voyager.insert(torch.exp(s_slot - row_tmp), s_slot)
         voyager.insert(torch.sum(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(alpha * l + row_tmp, l)
@@ -260,20 +260,20 @@ class _FA3Pipeline(torch.nn.Module):
 
         # SRAM banks (2 slots each) + per-slot DMA semaphores; the output
         # bank is single-slotted (written once per Q tile).
-        q_bank = voyager.alloc([2, *unit, self.tq, self.d], q.dtype, _SRAM)
-        q_sem = voyager.zeros([2], torch.int64)
-        k_bank = voyager.alloc([2, *unit, self.d, self.tkv], k.dtype, _SRAM)
-        k_sem = voyager.zeros([2], torch.int64)
-        v_bank = voyager.alloc([2, *unit, self.tkv, self.d], v.dtype, _SRAM)
-        v_sem = voyager.zeros([2], torch.int64)
+        q_bank = voyager.alloc([*unit, self.tq, self.d], q.dtype, _SRAM, 2)
+        q_sem = voyager.zeros([], torch.int64, banks=2)
+        k_bank = voyager.alloc([*unit, self.d, self.tkv], k.dtype, _SRAM, 2)
+        k_sem = voyager.zeros([], torch.int64, banks=2)
+        v_bank = voyager.alloc([*unit, self.tkv, self.d], v.dtype, _SRAM, 2)
+        v_sem = voyager.zeros([], torch.int64, banks=2)
         if self.has_mask:
             munit = (1,) * (mask.ndim - 2)
             m_bank = voyager.alloc(
-                [2, *munit, self.tq, self.tkv], mask.dtype, _SRAM
+                [*munit, self.tq, self.tkv], mask.dtype, _SRAM, 2
             )
-            m_sem = voyager.zeros([2], torch.int64)
-        out_bank = voyager.alloc([1, *unit, self.tq, self.d], out.dtype, _SRAM)
-        out_sem = voyager.zeros([1], torch.int64)
+            m_sem = voyager.zeros([], torch.int64, banks=2)
+        out_bank = voyager.alloc([*unit, self.tq, self.d], out.dtype, _SRAM, 1)
+        out_sem = voyager.zeros([], torch.int64, banks=1)
 
         # Running softmax state (single-buffered — see module docstring)
         # and the parity-double-buffered scores/probabilities tile.
@@ -281,7 +281,7 @@ class _FA3Pipeline(torch.nn.Module):
         m = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
         l = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
         o = voyager.alloc([*unit, self.tq, self.d], acc, _SRAM)
-        s_buf = voyager.alloc([2, *unit, self.tq, self.tkv], acc, _SRAM)
+        s_buf = voyager.alloc([*unit, self.tq, self.tkv], acc, _SRAM, 2)
         pv_buf = voyager.alloc([*unit, self.tq, self.d], acc, _SRAM)
         row_tmp = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
         alpha = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)

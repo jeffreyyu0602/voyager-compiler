@@ -40,7 +40,7 @@ for PROTO_FILE in *.proto
 do
     echo "Compiling $PROTO_FILE"
     # Ensure the output path is absolute or correctly relative to the script's execution location
-    $PROTOC --python_out="$OUT_DIR" --cpp_out="$OUT_DIR" "$PROTO_FILE"
+    $PROTOC --python_out="$OUT_DIR" "$PROTO_FILE"
 done
 
 # Optionally, change back to the original directory if needed

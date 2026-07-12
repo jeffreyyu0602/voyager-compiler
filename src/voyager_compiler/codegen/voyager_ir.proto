@@ -1,0 +1,373 @@
+syntax = "proto3";
+
+package voyager;
+
+
+// -----------------------------------------------------------------------------
+// Memory and allocations
+// -----------------------------------------------------------------------------
+
+enum MemoryLevel {
+  MEMORY_LEVEL_UNSPECIFIED = 0;
+  MEMORY_LEVEL_REGISTER = 1;
+  MEMORY_LEVEL_LOCAL_BUFFER = 2;
+  MEMORY_LEVEL_SCRATCHPAD = 3;
+  MEMORY_LEVEL_DRAM = 4;
+}
+
+// A TensorBox has exactly one physical memory location.
+//
+// address may be absent before physical memory mapping. For a banked TensorBox,
+// address is the base address of bank 0.
+message Memory {
+  MemoryLevel level = 1;
+  int32 partition = 2;
+  uint64 address = 3;
+}
+
+// A statically declared storage allocation.
+//
+// shape describes the payload of one bank. Software-pipeline banking is
+// represented by bank_count instead of adding a synthetic dimension to shape.
+//
+// For a mapped banked allocation:
+//
+//   address(bank) = memory.address + bank * bank_stride_bytes
+message TensorBox {
+  string node = 1;
+  repeated int64 shape = 2;
+  string dtype = 3;
+  Memory memory = 4;
+
+  // Absent or 1 means the allocation is not banked.
+  optional uint32 bank_count = 5;
+
+  // Physical byte distance between adjacent banks.
+  optional uint64 bank_stride_bytes = 6;
+}
+
+
+// -----------------------------------------------------------------------------
+// Scalar SSA values
+// -----------------------------------------------------------------------------
+
+enum ScalarType {
+  SCALAR_TYPE_UNSPECIFIED = 0;
+
+  SCALAR_BOOL = 1;
+  SCALAR_I32 = 2;
+  SCALAR_I64 = 3;
+  SCALAR_INDEX = 4;
+  SCALAR_F32 = 5;
+  SCALAR_F64 = 6;
+
+  // An opaque asynchronous dependency token.
+  SCALAR_TOKEN = 7;
+}
+
+// A scalar operand.
+//
+// A scalar can be:
+//
+//   1. A literal value encoded directly in the protobuf.
+//   2. A reference to a dynamically computed scalar SSA value.
+//
+// ref may identify:
+//
+//   - an Operation scalar output;
+//   - a loop induction variable;
+//   - a loop-carried scalar argument.
+message ScalarValue {
+  oneof value {
+    string node = 1;
+    int64 int_value = 2;
+    double float_value = 3;
+    bool bool_value = 4;
+  }
+}
+
+message ScalarValueList {
+  repeated ScalarValue values = 1;
+}
+
+
+// -----------------------------------------------------------------------------
+// References to allocations
+// -----------------------------------------------------------------------------
+
+// A reference to an existing TensorBox allocation.
+//
+// For an unbanked TensorBox, bank is omitted.
+//
+// For a banked TensorBox, bank identifies one bank. It may be either a constant
+// or a reference to a dynamically computed scalar.
+//
+// TensorBoxRef does not own memory and does not carry an address. The effective
+// address is resolved from the referenced TensorBox and the selected bank.
+message TensorBoxRef {
+  // References TensorBox.node.
+  string node = 1;
+
+  // Omitted for an unbanked TensorBox.
+  ScalarValue bank = 2;
+}
+
+message TensorBoxRefList {
+  repeated TensorBoxRef values = 1;
+}
+
+
+// -----------------------------------------------------------------------------
+// Operation arguments and results
+// -----------------------------------------------------------------------------
+
+// An operation operand.
+//
+// Dynamic integer lists, such as offsets containing loop indices, are encoded
+// with ScalarValueList.
+message Argument {
+  oneof arg_type {
+    TensorBoxRef tensor_box = 1;
+    TensorBoxRefList tensor_box_list = 2;
+
+    ScalarValue scalar = 3;
+    ScalarValueList scalar_list = 4;
+
+    string str_value = 5;
+  }
+}
+
+// An operation result.
+//
+// A tensor-producing operation is destination-passing after serialization.
+// Its output names an existing TensorBoxRef that the operation writes.
+//
+// A scalar-producing operation defines a scalar SSA value with the given name
+// and type.
+message Output {
+  // Name of the logical operation result.
+  //
+  // For a scalar result, this is the SSA name referenced by ScalarValue.ref.
+  // For a destination result, this is primarily useful for debugging.
+  string name = 1;
+
+  oneof result_type {
+    // A new buffer value, normally produced by voyager::alloc or
+    // voyager::zeros.
+    TensorBox tensor_box = 2;
+
+    // An existing destination written by a DPS operation.
+    TensorBoxRef destination = 3;
+
+    // A scalar SSA result.
+    ScalarType scalar = 4;
+  }
+}
+
+
+// -----------------------------------------------------------------------------
+// Primitive ops and fused operations
+// -----------------------------------------------------------------------------
+
+// A single operation call.
+//
+// This remains close to the previous OpOverload representation.
+message PrimOp {
+  // Unique name of the node.
+  //
+  // Inside a PrimOpList, this is the name an operand of a later op uses to
+  // refer to the result of an earlier one.
+  string name = 1;
+
+  string op = 2;
+  string target = 3;
+  repeated Argument args = 4;
+  map<string, Argument> kwargs = 5;
+}
+
+// A fused computation: the chain of primitive ops it performs.
+//
+// Its materialized destinations are stored in the enclosing Operation.outputs.
+// Intermediate results inside the fusion have no TensorBox and no address: they
+// never leave the datapath.
+//
+// An operand naming an earlier PrimOp in the same op_list is such an
+// intermediate. It is written as a TensorBoxRef so the operand position stays
+// explicit, but the name resolves to a PrimOp rather than to a TensorBox, and
+// no memory is read or written for it.
+message PrimOpList {
+  repeated PrimOp op_list = 1;
+}
+
+
+// -----------------------------------------------------------------------------
+// Nested regions
+// -----------------------------------------------------------------------------
+
+// An ordered nested sequence of operations.
+//
+// TensorBox allocations are model-scoped and may be referenced inside a region.
+// Scalar values defined outside the region may be referenced lexically.
+//
+// Only scalar values are yielded. Tensor-producing operations write directly
+// to TensorBoxRef destinations and therefore do not need to yield tensors.
+message Region {
+  repeated Operation ops = 1;
+
+  // Scalar values returned to the enclosing control-flow operation.
+  repeated ScalarValue yields = 2;
+}
+
+
+// -----------------------------------------------------------------------------
+// Loops
+// -----------------------------------------------------------------------------
+
+// Scalar state carried across loop iterations.
+message LoopIterArg {
+  // Name visible inside the loop regions.
+  string name = 1;
+
+  ScalarType type = 2;
+
+  // Value used before the first iteration.
+  ScalarValue initial = 3;
+}
+
+// A counted loop.
+//
+// Semantics:
+//
+//   for (iv = start; iv < end; iv += step)
+//
+// body.yields must contain one value for each iter_arg. Those yielded values
+// become the iter_arg values for the next iteration.
+//
+// The enclosing Operation.outputs contains the final iter_arg values.
+message ForLoop {
+  // Scalar induction-variable name visible in body.
+  string iv = 1;
+
+  ScalarValue start = 2;
+  ScalarValue end = 3;
+  ScalarValue step = 4;
+
+  repeated LoopIterArg iter_args = 5;
+
+  Region body = 6;
+}
+
+// A general while loop.
+//
+// condition and body see the current iter_arg values.
+//
+// condition must yield exactly one SCALAR_BOOL.
+//
+// body must yield one value for each iter_arg. Those values become the
+// iter_arg values for the next iteration.
+//
+// The enclosing Operation.outputs contains the final iter_arg values.
+message WhileLoop {
+  repeated LoopIterArg iter_args = 1;
+
+  Region condition = 2;
+  Region body = 3;
+}
+
+message LoopOp {
+  oneof loop_type {
+    ForLoop for_loop = 1;
+    WhileLoop while_loop = 2;
+  }
+}
+
+
+// -----------------------------------------------------------------------------
+// Conditionals
+// -----------------------------------------------------------------------------
+
+// A two-way conditional.
+//
+// If the conditional produces scalar results:
+//
+//   - true_region.yields and false_region.yields must have the same length;
+//   - corresponding yields must have compatible scalar types;
+//   - the enclosing Operation.outputs defines the resulting scalar names.
+//
+// If the branches only perform buffer writes, both regions may yield nothing.
+message CondOp {
+  ScalarValue predicate = 1;
+
+  Region true_region = 2;
+  Region false_region = 3;
+}
+
+
+// -----------------------------------------------------------------------------
+// Existing accelerator tiling metadata
+// -----------------------------------------------------------------------------
+
+enum LoopIndex {
+  LOOP_FX = 0;
+  LOOP_FY = 1;
+  LOOP_OX = 2;
+  LOOP_OY = 3;
+  LOOP_OC = 4;
+  LOOP_IC = 5;
+  LOOP_ON = 6;
+}
+
+message LoopBound {
+  LoopIndex loop = 1;
+  int32 bound = 2;
+}
+
+message LevelTiling {
+  repeated LoopBound loop_bounds = 1;
+}
+
+message LevelAccessCount {
+  uint64 input_access_count = 1;
+  uint64 output_access_count = 2;
+  uint64 weight_access_count = 3;
+}
+
+message Tiling {
+  string name = 1;
+
+  repeated LevelTiling level_tilings = 2;
+  repeated LevelAccessCount level_access_counts = 3;
+}
+
+
+// -----------------------------------------------------------------------------
+// Unified operation
+// -----------------------------------------------------------------------------
+
+message Operation {
+  string name = 1;
+
+  oneof op_type {
+    PrimOp prim = 2;
+    PrimOpList fused = 3;
+    LoopOp loop = 4;
+    CondOp cond = 5;
+  }
+
+  // Materialized destinations or scalar SSA results.
+  repeated Output outputs = 6;
+
+  optional Tiling tiling = 7;
+}
+
+
+// -----------------------------------------------------------------------------
+// Model
+// -----------------------------------------------------------------------------
+
+message Model {
+  repeated TensorBox inputs = 1;
+  repeated TensorBox parameters = 2;
+  repeated TensorBox outputs = 3;
+  repeated Operation ops = 4;
+}

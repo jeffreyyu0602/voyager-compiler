@@ -4,12 +4,33 @@ Loop-aware output generation for bufferized FX graphs.
 Three consumers of the bufferized FX dialect (``while_loop`` + ``voyager.*``
 nodes), grouped here because they share the same traversal concerns:
 
-  * ``gen_code_bufferized``          FX graph -> protobuf ``Model`` (Loop ops)
+  * ``gen_code_bufferized``          FX graph -> ``voyager`` protobuf Model
   * ``gen_compute_graph_bufferized`` FX graph -> graphviz SVG (loop clusters)
   * ``print_bufferized_graph``       FX graph -> indented text
 
-Mirrors ``codegen/mapping.gen_code`` / ``gen_compute_graph`` but understands the
-bufferized dialect.  Opt-in add-on; the default codegen path is untouched.
+The protobuf is the ``voyager`` schema (``voyager_ir.proto``), which models
+this dialect directly and so *replaces* — rather than reuses — the legacy
+``param.proto`` emitter (``codegen/mapping.py``, still used by the
+non-bufferized path).  Three ideas carry the whole translation:
+
+  * **Storage is declared once.**  A ``TensorBox`` — a model input, a weight, a
+    ``voyager.alloc`` / ``voyager.zeros`` — owns an address.  Every *use* of it
+    is a ``TensorBoxRef``: a name, plus a bank index when the buffer is a
+    software-pipeline bank.  So no tile carries an address of its own, and the
+    slot a step writes (``step % num_banks``) stays a *runtime* value.  The
+    ``select`` that picks a slot collapses into the reference.
+  * **Compute is destination-passing.**  ``voyager.insert(src, dst)`` is how the
+    FX dialect emulates a write-to-destination; it is not an instruction.  It is
+    dropped, and ``dst`` becomes the *producing* op's ``Output.destination`` —
+    for a ``torch.cond``, on the producer inside *each* branch.  An ``insert``
+    whose source is another buffer is a genuine move, and is emitted as a
+    ``clone`` into that destination.
+  * **Control logic is emitted**, tagged ``op: "cpu"``: index arithmetic,
+    predicates and ``delinearize_index`` run on the control processor rather
+    than the accelerator datapath, but they are real work the backend schedules.
+    The only thing dropped as structure is the ``while_loop``'s trip test —
+    ``while_loop`` is just how the builders spell a ``for``, and
+    ``ForLoop.start/end/step`` already says it.
 """
 
 import operator
@@ -18,17 +39,33 @@ from typing import Dict, List, Optional
 
 import graphviz
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
+from torch.fx.operator_schemas import normalize_function
 
-from ..mapping_utils import (
-    build_tiling_proto,
-    convert_arg,
-    is_nop,
-    map_node,
-    set_output_field,
-    set_tensor_field,
+import interstellar
+
+from ..mapping_utils import is_nop, save_tensor
+from ..passes.utils import get_arg_value
+from ..voyager_ir_pb2 import (
+    Argument,
+    LevelAccessCount,
+    LevelTiling,
+    LoopBound,
+    MEMORY_LEVEL_DRAM,
+    MEMORY_LEVEL_REGISTER,
+    MEMORY_LEVEL_SCRATCHPAD,
+    Model,
+    Operation,
+    PrimOp,
+    Region,
+    SCALAR_BOOL,
+    SCALAR_F32,
+    SCALAR_INDEX,
+    ScalarValue,
+    TensorBox,
+    TensorBoxRef,
+    Tiling,
 )
-from ..param_pb2 import Model, Operation, Tensor
 from ..shape_prop import ShapeProp
 from .bufferization import _is_compute
 from .ops import oracle_disabled
@@ -36,6 +73,25 @@ from .ops import oracle_disabled
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
 INCREMENT_INDICES = torch.ops.voyager.increment_indices.default
+DELINEARIZE = torch.ops.voyager.delinearize_index.default
+_INSERT = torch.ops.voyager.insert.default
+_ASYNC_COPY = torch.ops.voyager.async_copy.default
+_ASYNC_WAIT = torch.ops.voyager.async_wait.default
+_ALLOC = torch.ops.voyager.alloc.default
+_ZEROS = torch.ops.voyager.zeros.default
+_SELECT = torch.ops.aten.select.int
+_PAD = torch.ops.aten.pad.default
+
+# The ops that *declare* storage; every other tensor node refers to storage one
+# of these owns.
+_ALLOCATORS = (_ALLOC, _ZEROS)
+
+# Ops that run on the control processor rather than the accelerator datapath.
+_CPU_OPS = (DELINEARIZE, INCREMENT_INDICES, _PAD)
+
+# Operand names for the Python builtins the loop control uses (``operator.eq`` /
+# ``and_`` / ``add`` ...), which carry no ATen schema to normalize against.
+_BUILTIN_ARG_NAMES = ("input", "other")
 
 
 def _target_name(target, short: bool = False) -> str:
@@ -76,8 +132,7 @@ def _loop_extents(node) -> List[tuple]:
     """Per-dimension ``(start, end, step)`` for a flattened-grid while_loop.
 
     Builders tag each ``while_loop`` with ``node.meta['loop_extents']`` — the
-    extents of the (possibly multi-dimensional) tile grid it iterates.  A loop
-    with N extents is emitted as N nested ``Loop`` protos.
+    extents of the tile grid it iterates.
     """
     ext = node.meta.get("loop_extents")
     if ext:
@@ -99,233 +154,720 @@ def _trip_str(node) -> str:
     return f" trip=[{', '.join(dims)}]"
 
 
-def _emit_body(gm: GraphModule, ops: List[Operation], output_dir) -> None:
-    """Append each node of an (already shape-propagated) (sub)graph as
-    Operations.  ``gen_code_bufferized``'s recursive ShapeProp has stamped every
-    node — top level and inside every loop / cond body — so we just emit."""
-    named = dict(gm.named_modules(remove_duplicate=False))
-    for node in gm.graph.nodes:
-        _emit_node(node, gm, named, ops, output_dir)
-
-
 # The interstellar architecture here is 4-level (PE / L1 / L2 / DRAM), but the
-# DRAM blocking is already explicit as the emitted ``Loop`` nest, so only L1 and
-# L2 are serialized — the two levels the legacy path emits.
+# DRAM blocking is already explicit as the emitted loop nest, so only L1 and L2
+# are serialized.
 _TILING_NUM_LEVELS = 3
 
 
-def _set_tiling(op: Operation, node) -> None:
-    """Attach the interstellar mapping of a tiled matrix op (stamped on the node
-    by the builder) as the Operation's ``Tiling``."""
-    if "interstellar_tiling" in node.meta:
-        op.tiling.CopyFrom(build_tiling_proto(node, _TILING_NUM_LEVELS))
+def _build_tiling(node) -> Tiling:
+    """The interstellar mapping of a tiled matrix op (stamped on the node by its
+    builder), as a ``Tiling``.  ``LoopIndex`` is numbered like the interstellar
+    loop ids, so they map across directly."""
+    mapping, access_list = node.meta["interstellar_tiling"]
+    tiling = Tiling(name=node.name)
 
-
-def _emit_fused_op(node, named, output_dir) -> Operation:
-    """Emit a body ``call_module`` (a fused GEMM/conv + tail group) as a
-    protobuf ``fused_op`` — an ``OpOverloadList`` of the submodule's compute
-    ops.  The submodule's inner nodes are already shape-propagated (the
-    recursive ShapeProp descends into call_modules), so ``map_node`` reads their
-    ``value`` directly."""
-    sub = named[str(node.target)]
-    op = Operation()
-    op.fused_op.name = node.name
-    for n in sub.graph.nodes:
-        if (
-            n.op == "call_function"
-            and not n.meta.get("fused", False)
-            and not is_nop(n)
-        ):
-            op.fused_op.op_list.append(map_node(n, output_dir))
-    set_output_field(op, node, output_dir)
-    _set_tiling(op, node)
-    return op
-
-
-_INSERT = torch.ops.voyager.insert.default
-_ASYNC_COPY = torch.ops.voyager.async_copy.default
-_ASYNC_WAIT = torch.ops.voyager.async_wait.default
-_ALLOC = torch.ops.voyager.alloc.default
-
-
-def _dump_dir(node, output_dir):
-    """Where ``node``'s tensors are written, or ``None``: a compute op (operand
-    tiles + result — one tiled op replayed alone) and a DRAM buffer (a whole
-    loop replayed).  The machinery between them — DMA, semaphores, banks, index
-    vectors — the run drives itself.
-    """
-    if output_dir is None:
-        return None
-    if _is_compute(node):
-        return output_dir
-    if node.target is _ALLOC and node.meta.get("space") == "DRAM":
-        return output_dir
-    return None
-
-
-def _feeds_tile_index(node, _seen=None) -> bool:
-    """True if ``node`` (transitively) computes a tile DMA block index — it
-    reaches the ``indices`` argument of an ``async_copy`` through
-    a chain of scalar index arithmetic.  Such addressing (a pipelined prefetch's
-    ``j+1``, or a ``delinearize_index(i)`` of the linear counter) is real
-    computation, not loop control, so the whole cone must be emitted rather than
-    dropped."""
-    if _seen is None:
-        _seen = set()
-    for u in node.users:
-        if u in _seen or u.op != "call_function":
-            continue
-        _seen.add(u)
-        if u.target is _ASYNC_COPY:
-            ix = 2  # position of the ``indices`` arg
-            if len(u.args) > ix and node in (u.args[ix] or ()):
-                return True
-        elif not isinstance(
-            getattr(u, "value", None), (torch.Tensor, list, tuple)
-        ):
-            # scalar index arithmetic (add / floordiv / mod / getitem) —
-            # recurse.
-            if _feeds_tile_index(u, _seen):
-                return True
-    return False
-
-
-def _feeds_cond_predicate(node, _seen=None) -> bool:
-    """True if ``node`` (transitively) computes a ``torch.cond`` predicate — it
-    reaches the predicate (``args[0]``) of a ``cond`` through a chain of scalar
-    bool / int arithmetic (``eq`` / ``lt`` / ``bitwise_or`` / ``bitwise_and``,
-    or a ``delinearize_index`` component getitem the comparison reads).  Such a
-    predicate cone is real computation the ``Conditional`` references by name, so
-    it must be emitted rather than dropped as loop control."""
-    if _seen is None:
-        _seen = set()
-    for u in node.users:
-        if u in _seen or u.op != "call_function":
-            continue
-        _seen.add(u)
-        if u.target is COND:
-            if u.args and node is u.args[0]:
-                return True
-        elif not isinstance(
-            getattr(u, "value", None), (torch.Tensor, list, tuple)
-        ):
-            # scalar predicate arithmetic (eq / or / and / getitem) — recurse.
-            if _feeds_cond_predicate(u, _seen):
-                return True
-    return False
-
-
-def _emit_node(node, gm, named, ops: List[Operation], output_dir) -> None:
-    if node.op == "call_module":
-        ops.append(_emit_fused_op(node, named, output_dir))
-        return
-    if node.op != "call_function":
-        return
-
-    if node.target is WHILE_LOOP:
-        ops.append(_emit_loop(node, named, output_dir))
-        return
-
-    if node.target is COND:
-        ops.append(_emit_cond(node, named, output_dir))
-        return
-
-    # getitem usually just unpacks loop results (no compute) — dropped, UNLESS
-    # it extracts a tile-index component (a ``delinearize_index`` output) that a
-    # tile DMA addresses by, which is genuine address-gen and must be emitted.
-    if node.target is operator.getitem:
-        if not (_feeds_tile_index(node) or _feeds_cond_predicate(node)):
-            return
-    elif is_nop(node):
-        return
-    # increment_indices is loop-counter bookkeeping; the nested Loop's
-    # start/end/step already encodes the iteration, so it is not a compute op.
-    elif node.target is INCREMENT_INDICES:
-        return
-    # A side-effecting op (``insert`` / ``async_copy`` write a tile;
-    # ``async_wait`` synchronizes a semaphore) returns ``None`` — the buffer /
-    # semaphore is a closed-over additional input mutated in place — yet each is
-    # a real instruction, always emitted despite its non-tensor value.  A tile
-    # write's output is the tile it writes (set from the dest in
-    # ``set_output_field``); ``async_wait`` has no output.
-    elif node.target not in (_INSERT, _ASYNC_COPY, _ASYNC_WAIT):
-        # A non-tensor call_function is usually integer loop-index carry
-        # arithmetic (k+1, k % num_k, ...) — loop control made explicit by the
-        # Loop structure, so not emitted.  The exception is a value that
-        # *indexes* a tile DMA (a prefetch's ``j+1``, or a ``delinearize_index``
-        # vector): genuine addressing — emit it so the DMA can reference it by
-        # name (``map_node`` serialises it like any op).
-        if not isinstance(
-            getattr(node, "value", None), (torch.Tensor, list, tuple)
-        ):
-            if not (_feeds_tile_index(node) or _feeds_cond_predicate(node)):
-                return
-
-    dump_dir = _dump_dir(node, output_dir)
-    op = Operation()
-    op.op.CopyFrom(map_node(node, dump_dir))
-    set_output_field(op, node, dump_dir)
-    _set_tiling(op, node)
-    ops.append(op)
-
-
-def _emit_loop(node, parent_named, output_dir) -> Operation:
-    body_gm = parent_named[str(node.args[1].target)]
-    placeholders = [n for n in body_gm.graph.nodes if n.op == "placeholder"]
-
-    body_ops: List[Operation] = []
-    _emit_body(body_gm, body_ops, output_dir)
-
-    # One Loop per grid dimension; the first len(extents) carried placeholders
-    # are the per-dim loop indices (used by the body's static tile addressing).
-    extents = _loop_extents(node)
-    loops = []
-    for i, (start, end, step) in enumerate(extents):
-        lop = Operation()
-        lop.loop.node = (
-            placeholders[i].name
-            if i < len(placeholders)
-            else f"{node.name}_d{i}"
+    for level in range(1, _TILING_NUM_LEVELS):  # skip level 0 (the PE)
+        lt = LevelTiling()
+        loop_index = 0
+        while loop_index < interstellar.le.NUM:
+            matched = False
+            for loop in range(interstellar.le.NUM):
+                if mapping.loop_orders[loop][level] == loop_index:
+                    lt.loop_bounds.append(
+                        LoopBound(
+                            loop=loop,
+                            bound=mapping.loop_blockings[loop][level],
+                        )
+                    )
+                    loop_index += 1
+                    matched = True
+                    break
+            if not matched:
+                break
+        tiling.level_tilings.append(lt)
+        tiling.level_access_counts.append(
+            LevelAccessCount(
+                input_access_count=int(access_list[level][0]),
+                output_access_count=int(access_list[level][1]),
+                weight_access_count=int(access_list[level][2]),
+            )
         )
-        lop.loop.start = start
-        lop.loop.end = end
-        lop.loop.step = step
-        loops.append(lop)
-
-    # Nest innermost-first: protobuf ``repeated.append`` copies by value, so
-    # each inner loop must be fully populated before it is appended into its
-    # outer.
-    loops[-1].loop.body.extend(body_ops)
-    for outer, inner in zip(reversed(loops[:-1]), reversed(loops[1:])):
-        outer.loop.body.append(inner)
-    return loops[0]
+    return tiling
 
 
-def _emit_cond(node, parent_named, output_dir) -> Operation:
-    """Emit a ``torch.cond`` as a ``Conditional`` proto (MLIR ``scf.if``).
+# --- small readers over the shape-propagated graph ---------------------------
 
-    ``node.args`` is ``(pred, true_graph, false_graph, operands)`` (the layout
-    the text printer's ``_print_cond`` also reads).  Both branches are already
-    shape-propagated, so each is emitted into its own op list.  The predicate is
-    referenced by name (a bool-valued node) via ``convert_arg``.  A *dummy* false
-    branch (``return 0``) has no compute ops, so ``_emit_body`` appends nothing
-    and ``false_body`` is left empty — the optional ``else`` is simply omitted.
+
+def _value(node):
+    """The value ShapeProp stamped on a node: a tensor, an index vector (a list
+    of ints), or a scalar."""
+    return getattr(node, "value", None)
+
+
+def _is_tensor(node) -> bool:
+    return isinstance(node, Node) and isinstance(_value(node), torch.Tensor)
+
+
+def _is_index_vector(node) -> bool:
+    """A node producing a *tile index* — the list of per-dimension coordinates
+    ``delinearize_index`` returns, which the component ``getitem``s read."""
+    val = _value(node)
+    return isinstance(val, (tuple, list)) and all(
+        isinstance(v, (int, bool)) for v in val
+    )
+
+
+def _dtype_str(node) -> str:
+    """The logical (quantized) dtype the bufferizer derived (``nf4_6``,
+    ``fp8_e5m3``) when there is one, else the physical torch dtype."""
+    dtype = node.meta.get("dtype")
+    if isinstance(dtype, str):
+        return dtype
+    return str(_value(node).dtype).split(".")[1]
+
+
+def _scalar_type(value):
+    if isinstance(value, bool):
+        return SCALAR_BOOL
+    if isinstance(value, float):
+        return SCALAR_F32
+    return SCALAR_INDEX
+
+
+def _placeholders(gm: GraphModule) -> List[Node]:
+    return [n for n in gm.graph.nodes if n.op == "placeholder"]
+
+
+def _outputs_of(gm: GraphModule) -> List:
+    outs = next(n for n in gm.graph.nodes if n.op == "output").args[0]
+    return list(outs) if isinstance(outs, (tuple, list)) else [outs]
+
+
+def _is_view(node) -> bool:
+    """A node that renames storage rather than computing anything: a bank-slot
+    ``select``, a reshape, a same-dtype ``to`` (``is_nop`` catches it).  It is
+    never an instruction — its consumers reference the buffer it views.  A
+    *real* cast is not here: it converts the bytes, so it is an op like any
+    other."""
+    if node.op != "call_function":
+        return False
+    return node.target is _SELECT or is_nop(node)
+
+
+def _in_fused_chain(node) -> bool:
+    """An op a fused group actually performs.  Its views / unpacking are not ops
+    (they name values, they don't compute them)."""
+    return (
+        node.op == "call_function"
+        and not node.meta.get("fused", False)
+        and not _is_view(node)
+        and node.target is not operator.getitem
+    )
+
+
+def _owns_storage(node) -> bool:
+    """``node`` *is* a buffer: a model input, a weight, an explicit
+    ``voyager.alloc`` / ``zeros``, or a tensor the host materializes outside the
+    accelerator (a ``pad`` to the hardware unrolling, a copy) — which the
+    planner gives an address like any other DRAM buffer.  Everything else names
+    storage one of these owns."""
+    if node.op in ("placeholder", "get_attr"):
+        return True
+    if node.op != "call_function":
+        return False
+    return node.target in _ALLOCATORS or "memory" in node.meta
+
+
+def _component_names(node) -> List[str]:
+    """SSA name of each component of an index vector.  A component is named
+    after the ``getitem`` that reads it (so the ``getitem`` itself needs no
+    instruction — it *is* the name), or positionally if nothing reads it."""
+    names = [f"{node.name}_{i}" for i in range(len(_value(node)))]
+    for u in node.users:
+        if u.target is operator.getitem and isinstance(u.args[1], int):
+            names[u.args[1]] = u.name
+    return names
+
+
+# ---------------------------------------------------------------------------
+# The emitter
+# ---------------------------------------------------------------------------
+
+
+class _Emitter:
+    """Walks a bufferized FX graph twice.
+
+    **Bind** resolves identity: which storage every tensor node names (threading
+    each region's placeholders to the operands bound to them), and which op
+    every ``voyager.insert`` is really the store of.
+
+    **Emit** then serializes, reading those two maps.  Splitting them is what
+    lets a destination reach *backwards* into a ``cond`` branch that was already
+    walked, and a bank ``select`` inside a loop body resolve to an ``alloc``
+    declared outside it.
     """
-    true_gm = parent_named[str(node.args[1].target)]
-    false_gm = parent_named[str(node.args[2].target)]
 
-    op = Operation()
-    op.conditional.predicate.CopyFrom(convert_arg(node.args[0], output_dir))
+    def __init__(self, model: GraphModule, dump_dir: Optional[str]):
+        self.model = model
+        self.dump_dir = dump_dir
+        # Per-region lexical scope: a placeholder -> the ref/scalar it is bound
+        # to in the enclosing region.
+        self.envs: Dict[GraphModule, Dict[Node, object]] = {}
+        # Declared storage, and which of it is banked.
+        self.boxes: Dict[str, Node] = {}
+        self.banked: Dict[str, int] = {}
+        # Destination-passing: producer -> {output index: destination}, and the
+        # semaphore an asynchronous producer posts on completion.
+        self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
+        self.sem: Dict[Node, TensorBoxRef] = {}
 
-    true_ops: List[Operation] = []
-    _emit_body(true_gm, true_ops, output_dir)
-    op.conditional.true_body.extend(true_ops)
+    # --- references ------------------------------------------------------
 
-    false_ops: List[Operation] = []
-    _emit_body(false_gm, false_ops, output_dir)
-    if false_ops:
-        op.conditional.false_body.extend(false_ops)
-    return op
+    def _ref(self, node, env, internal=frozenset()) -> TensorBoxRef:
+        """The storage ``node`` names.  Views (bank slots, reshapes, casts) and
+        region boundaries are transparent: they resolve to the box that owns the
+        bytes, plus a bank index when it is a software-pipeline bank.
+
+        ``internal`` is the set of values a fused group computes.  One of those
+        names the ``PrimOp`` that produced it — it has no storage at all
+        (it never leaves the datapath); the reference only says *which* op of
+        the fusion the operand comes from.
+        """
+        if node in internal:
+            return TensorBoxRef(node=node.name)
+
+        if node in env:
+            ref = TensorBoxRef()
+            ref.CopyFrom(env[node])
+            return ref
+
+        if _owns_storage(node):
+            return TensorBoxRef(node=node.name)
+
+        if node.op == "call_function":
+            if node.target is _SELECT:
+                base = self._ref(node.args[0], env, internal)
+                # Slot of a banked buffer -> the bank index of the reference;
+                # any other select is a plain view of the same storage.
+                if node.args[1] == 0 and self.banked.get(base.node):
+                    base.bank.CopyFrom(self._scalar(node.args[2], env))
+                return base
+            if _is_view(node):
+                return self._ref(node.args[0], env, internal)
+            if node.target is operator.getitem:
+                if (dest := self.dest.get(node.args[0])) is not None:
+                    if (ref := dest.get(node.args[1])) is not None:
+                        out = TensorBoxRef()
+                        out.CopyFrom(ref)
+                        return out
+        if (dest := self.dest.get(node)) is not None and None in dest:
+            ref = TensorBoxRef()
+            ref.CopyFrom(dest[None])
+            return ref
+
+        raise ValueError(
+            f"'{node.name}' ({node.target}) is used as a tensor operand but "
+            f"names no storage: it is neither a buffer nor a value written to "
+            f"one by voyager.insert"
+        )
+
+    def _scalar(self, value, env) -> ScalarValue:
+        if isinstance(value, Node):
+            if value in env:
+                out = ScalarValue()
+                out.CopyFrom(env[value])
+                return out
+            return ScalarValue(node=value.name)
+        if isinstance(value, bool):
+            return ScalarValue(bool_value=value)
+        if isinstance(value, int):
+            return ScalarValue(int_value=int(value))
+        if isinstance(value, float):
+            return ScalarValue(float_value=float(value))
+        raise TypeError(f"not a scalar operand: {value!r}")
+
+    def _bind_value(self, value, env):
+        """The ref a region placeholder takes from the operand bound to it."""
+        if _is_tensor(value):
+            return self._ref(value, env)
+        return self._scalar(value, env)
+
+    def _argument(self, value, env, internal=frozenset()) -> Argument:
+        arg = Argument()
+        if isinstance(value, Node):
+            if _is_tensor(value):
+                arg.tensor_box.CopyFrom(self._ref(value, env, internal))
+            elif _is_index_vector(value):
+                # The whole index vector as one operand: its components by name.
+                arg.scalar_list.values.extend(
+                    ScalarValue(node=n) for n in _component_names(value)
+                )
+            else:
+                arg.scalar.CopyFrom(self._scalar(value, env))
+        elif isinstance(value, (list, tuple)):
+            if any(_is_tensor(v) for v in value):
+                arg.tensor_box_list.values.extend(
+                    self._ref(v, env, internal) for v in value
+                )
+            else:
+                arg.scalar_list.values.extend(
+                    self._scalar(v, env) for v in value
+                )
+        elif isinstance(value, str):
+            arg.str_value = value
+        elif isinstance(
+            value,
+            (torch.dtype, torch.layout, torch.device, torch.memory_format),
+        ):
+            arg.str_value = str(value).split(".")[-1]
+        else:
+            arg.scalar.CopyFrom(self._scalar(value, env))
+        return arg
+
+    # --- bind ------------------------------------------------------------
+
+    def bind(self, gm: GraphModule, env: Dict[Node, object]) -> None:
+        self.envs[gm] = env
+        named = dict(gm.named_modules(remove_duplicate=False))
+
+        for node in gm.graph.nodes:
+            if gm is self.model and _is_tensor(node) and _owns_storage(node):
+                self.boxes[node.name] = node
+                if banks := node.meta.get("bank_count", 0):
+                    self.banked[node.name] = banks
+
+            if node.op == "call_module":
+                sub = named[str(node.target)]
+                self.bind(sub, self._child_env(sub, node.args, env))
+            elif node.op == "call_function":
+                if node.target is WHILE_LOOP:
+                    self._bind_loop(node, named, env)
+                elif node.target is COND:
+                    operands = list(node.args[3]) if len(node.args) > 3 else []
+                    for graph_arg in (node.args[1], node.args[2]):
+                        branch = named[str(graph_arg.target)]
+                        self.bind(
+                            branch, self._child_env(branch, operands, env)
+                        )
+                elif node.target is _INSERT:
+                    self._bind_insert(node, gm, env)
+
+    def _child_env(self, sub: GraphModule, operands, env) -> Dict[Node, object]:
+        """Bind a region's placeholders to the operands passed into it, so a
+        reference inside the region resolves to the caller's storage."""
+        return {
+            ph: self._bind_value(operand, env)
+            for ph, operand in zip(_placeholders(sub), operands)
+            if isinstance(operand, Node) or isinstance(operand, (int, float))
+        }
+
+    def _bind_loop(self, node, named, env) -> None:
+        """A loop body's placeholders split in two: the *carried* scalars are
+        the loop's own induction variable and iteration arguments (they keep
+        their body-local SSA names), while the *additional* inputs are buffers
+        the body borrows from the enclosing region."""
+        body = named[str(node.args[1].target)]
+        carried = list(node.args[2])
+        extra = list(node.args[3]) if len(node.args) > 3 else []
+        phs = _placeholders(body)
+
+        child: Dict[Node, object] = {
+            ph: ScalarValue(node=ph.name) for ph in phs[: len(carried)]
+        }
+        child.update(self._child_env_from(phs[len(carried) :], extra, env))
+        self.bind(body, child)
+        # The trip test (``cond_fn``) is loop structure, not a region: the
+        # emitted ForLoop's start/end/step already says it.
+
+    def _child_env_from(self, phs, operands, env) -> Dict[Node, object]:
+        return {
+            ph: self._bind_value(operand, env)
+            for ph, operand in zip(phs, operands)
+            if isinstance(operand, (Node, int, float))
+        }
+
+    def _bind_insert(self, node, gm, env) -> None:
+        """Resolve one destination-passing store: which op(s) actually produce
+        the value, and where it lands."""
+        src, dst = node.args[0], node.args[1]
+        destination = self._ref(dst, env)
+        semaphore = get_arg_value(node, 2, "semaphore")
+
+        producers = self._producers(src, gm, env)
+        if producers is None:
+            # An ``insert`` writes a *computed* value to its destination; with
+            # no op producing it there is nothing to carry the destination.  A
+            # builder moving one buffer into another must say so — the copy is
+            # real data movement, and an ``aten.clone`` gives it a producer.
+            raise ValueError(
+                f"'{node.name}' stores '{getattr(src, 'name', src)}' into "
+                f"'{getattr(dst, 'name', dst)}', but no op produces it: a "
+                f"buffer-to-buffer move must be written as "
+                f"voyager.insert(src.clone(), dst)"
+            )
+
+        for producer, index in producers:
+            self.dest.setdefault(producer, {})[index] = destination
+            if semaphore is not None:
+                self.sem[producer] = self._ref(semaphore, env)
+
+    def _producers(self, node, gm, env, index=None):
+        """The op(s) whose result this store writes, as ``[(node, index)]`` — or
+        ``None`` when the source is a buffer (so the store is a move, not a
+        compute destination).
+
+        A ``cond`` result has one producer *per branch*: both branches write the
+        same destination, so both carry it.
+        """
+        if not isinstance(node, Node):
+            return None
+        if node.op in ("placeholder", "get_attr"):
+            return None
+        if node.op == "call_module":
+            return [(node, index)]
+        if node.op != "call_function":
+            return None
+        if node.target in _ALLOCATORS or node.target is _SELECT:
+            return None  # a buffer handle
+        if _is_view(node):
+            return self._producers(node.args[0], gm, env, index)
+        if node.target is operator.getitem:
+            source, slot = node.args[0], node.args[1]
+            if isinstance(source, Node) and source.target is COND:
+                named = dict(gm.named_modules(remove_duplicate=False))
+                producers = []
+                for graph_arg in (source.args[1], source.args[2]):
+                    branch = named[str(graph_arg.target)]
+                    result = _outputs_of(branch)[slot]
+                    found = self._producers(
+                        result, branch, self.envs[branch], index
+                    )
+                    if found is None:
+                        return None
+                    producers += found
+                return producers
+            return self._producers(source, gm, env, slot)
+        return [(node, index)]
+
+    # --- emit ------------------------------------------------------------
+
+    def _call(self, node, env, internal=frozenset()) -> PrimOp:
+        """One op, serialized kwargs-only: every operand under its canonical
+        schema keyword, so position never carries meaning.
+
+        ``internal`` is the set of values produced *inside* the same fused
+        group.  An operand that is one names the ``PrimOp`` that computed
+        it, not a ``TensorBox``: it never leaves the datapath, so it has no
+        storage and no address — the reference exists only so the backend can
+        see which operand comes from the previous op of the fusion.
+        """
+        call = PrimOp(
+            name=node.name,
+            op=self._op_kind(node),
+            target=_target_name(node.target),
+        )
+        for key, value in self._kwargs(node).items():
+            if value is None:
+                continue  # an unset optional: absent, not null
+            call.kwargs[key].CopyFrom(self._argument(value, env, internal))
+        if (semaphore := self.sem.get(node)) is not None:
+            # This op's store posted a semaphore: with the store gone, the op
+            # itself signals completion (it runs asynchronously).
+            call.kwargs["semaphore"].tensor_box.CopyFrom(semaphore)
+        return call
+
+    def _kwargs(self, node) -> Dict[str, object]:
+        normalized = normalize_function(
+            node.target,
+            node.args,
+            node.kwargs,
+            normalize_to_only_use_kwargs=True,
+        )
+        if normalized is not None:
+            return dict(normalized.kwargs)
+        # A Python builtin (loop-control ``eq`` / ``and_`` / ``add`` ...) has no
+        # schema to normalize against; name its operands like the ATen binaries.
+        kwargs = dict(node.kwargs)
+        for i, arg in enumerate(node.args):
+            name = (
+                _BUILTIN_ARG_NAMES[i]
+                if i < len(_BUILTIN_ARG_NAMES)
+                else f"arg{i}"
+            )
+            kwargs[name] = arg
+        return kwargs
+
+    def _op_kind(self, node) -> str:
+        """Where the op runs: the accelerator datapath, or the control processor
+        that drives it (index arithmetic, predicates, host-side padding)."""
+        if node.target in _CPU_OPS:
+            return "cpu"
+        if _is_tensor(node) or _value(node) is None:
+            return "call_function"  # compute, or a DMA / semaphore wait
+        return "cpu"  # scalar index arithmetic or a predicate
+
+    def _set_outputs(self, op: Operation, node, env) -> None:
+        """An op's results.  An op that *creates* storage declares it; every
+        other tensor result is a destination the op writes (never a value it
+        yields); a scalar result defines an SSA name; a DMA / wait has no result
+        at all."""
+        if node.op == "call_function" and _owns_storage(node):
+            out = op.outputs.add()
+            out.name = node.name
+            out.tensor_box.CopyFrom(self._tensor_box(node))
+            return
+
+        if _is_index_vector(node):
+            for i, name in enumerate(_component_names(node)):
+                out = op.outputs.add()
+                out.name = name
+                out.scalar = _scalar_type(_value(node)[i])
+            return
+
+        value = _value(node)
+        if value is None:
+            return  # async_copy / async_wait: side effect only
+
+        if not isinstance(value, torch.Tensor) and not isinstance(
+            value, (tuple, list)
+        ):
+            out = op.outputs.add()
+            out.name = node.name
+            out.scalar = _scalar_type(value)
+            return
+
+        destinations = self.dest.get(node)
+        if not destinations:
+            raise ValueError(
+                f"destination-passing violation: '{node.name}' "
+                f"({node.target}) produces a tensor but no voyager.insert "
+                f"stores it, so it has nowhere to write"
+            )
+        for index, destination in sorted(
+            destinations.items(), key=lambda kv: (kv[0] is not None, kv[0])
+        ):
+            out = op.outputs.add()
+            out.name = node.name if index is None else f"{node.name}_{index}"
+            out.destination.CopyFrom(destination)
+
+    def _tensor_box(self, node) -> TensorBox:
+        """Declare ``node``'s storage.  A banked buffer records its depth and
+        pitch instead of a leading bank *dimension*, so ``shape`` stays the
+        payload of one bank and slot ``i`` lives at
+        ``address + i * bank_stride_bytes``."""
+        box = TensorBox(node=node.name, dtype=_dtype_str(node))
+        shape = list(_value(node).shape)
+
+        if banks := node.meta.get("bank_count", 0):
+            box.bank_count = banks
+            box.bank_stride_bytes = node.meta["bank_stride"]
+            shape = shape[1:]  # the bank dim is not a tensor dim
+        box.shape.extend(shape)
+
+        box.memory.level = self._memory_level(node)
+        segment = node.meta.get("scratchpad") or node.meta.get("memory")
+        if segment is not None:
+            box.memory.address = int(segment.start)
+        return box
+
+    def _memory_level(self, node):
+        """A semaphore (``voyager.zeros``) names no memory — bufferization gives
+        it no space — because it is a counter the accelerator maps itself, so it
+        is declared at register level with no address."""
+        if node.op == "call_function" and node.target is _ZEROS:
+            return MEMORY_LEVEL_REGISTER
+        if node.meta.get("space") == "Scratchpad":
+            return MEMORY_LEVEL_SCRATCHPAD
+        return MEMORY_LEVEL_DRAM
+
+    def _dump(self, node) -> None:
+        """Write the tensors a hardware run needs to replay this op on its own:
+        a compute op's operand tiles and its result, and a DRAM buffer (which a
+        whole loop is replayed against).  The machinery in between — the DMA,
+        the semaphores, the SRAM banks, the index vectors — the run drives
+        itself, so it is not dumped."""
+        if self.dump_dir is None:
+            return
+        is_dram_buffer = (
+            node.target is _ALLOC and node.meta.get("space") == "DRAM"
+        )
+        if not (_is_compute(node) or is_dram_buffer):
+            return
+        for n in list(node.all_input_nodes) + [node]:
+            if _is_tensor(n):
+                save_tensor(
+                    n.value, os.path.join(self.dump_dir, f"{n.name}.bin")
+                )
+
+    def emit_region(self, gm: GraphModule, ops) -> None:
+        env = self.envs[gm]
+        named = dict(gm.named_modules(remove_duplicate=False))
+        for node in gm.graph.nodes:
+            self._emit(node, gm, named, env, ops)
+
+    def _emit(self, node, gm, named, env, ops) -> None:
+        if node.op == "call_module":
+            ops.append(self._fused(node, named, env))
+            return
+        if node.op != "call_function":
+            return
+
+        if node.target is WHILE_LOOP:
+            ops.append(self._loop(node, named, env))
+            return
+        if node.target is COND:
+            ops.append(self._cond(node, named, env))
+            return
+        if node.target is _INSERT:
+            return  # a destination-passing store is not an instruction
+        if _is_view(node) or node.target is operator.getitem:
+            return  # a name for storage someone else owns, not an instruction
+
+        self._dump(node)
+        op = Operation(name=node.name)
+        op.prim.CopyFrom(self._call(node, env))
+        self._set_outputs(op, node, env)
+        if "interstellar_tiling" in node.meta:
+            op.tiling.CopyFrom(_build_tiling(node))
+        ops.append(op)
+
+    def _fused(self, node, named, env) -> Operation:
+        """A fused group (a GEMM / conv plus its tail) is one instruction: the
+        ops it chains, and the destination(s) the chain writes.  Its
+        intermediate values have no storage — they never leave the datapath."""
+        sub = named[str(node.target)]
+        sub_env = self.envs[sub]
+        self._dump(node)
+
+        # The ops the fusion chains.  Their results are its transients: an
+        # operand naming one names that ``PrimOp``, not storage (a view
+        # over one is transparent, and resolves to the same ``PrimOp``).
+        chain = [n for n in sub.graph.nodes if _in_fused_chain(n)]
+        internal = frozenset(chain)
+
+        op = Operation(name=node.name)
+        for inner in chain:
+            op.fused.op_list.append(self._call(inner, sub_env, internal))
+        self._set_outputs(op, node, env)
+        if "interstellar_tiling" in node.meta:
+            op.tiling.CopyFrom(_build_tiling(node))
+        return op
+
+    def _loop(self, node, named, env) -> Operation:
+        """A ``while_loop`` over a flattened tile grid is a counted ``for``: the
+        builders emulate one with a step counter and a trip test.  The step is
+        the induction variable; the remaining carried values are scalar
+        iteration arguments (the software pipeline's producer / consumer
+        cursors).  Buffers are *not* carried — they are referenced by name — so
+        nothing but scalars is yielded."""
+        extents = _loop_extents(node)
+        if len(extents) != 1:
+            raise ValueError(
+                f"'{node.name}' has {len(extents)} grid extents; the builders "
+                f"flatten the grid into a single counted loop"
+            )
+        start, end, step = extents[0]
+
+        body = named[str(node.args[1].target)]
+        carried = list(node.args[2])
+        phs = _placeholders(body)
+        results = _outputs_of(body)
+
+        op = Operation(name=node.name)
+        loop = op.loop.for_loop
+        loop.iv = phs[0].name
+        loop.start.int_value = start
+        loop.end.int_value = end
+        loop.step.int_value = step
+
+        for i in range(1, len(carried)):
+            iter_arg = loop.iter_args.add()
+            iter_arg.name = phs[i].name
+            iter_arg.type = _scalar_type(_value(phs[i]))
+            iter_arg.initial.CopyFrom(self._scalar(carried[i], env))
+
+        self.emit_region(body, loop.body.ops)
+        body_env = self.envs[body]
+        for i in range(1, len(carried)):
+            loop.body.yields.append(self._scalar(results[i], body_env))
+
+        # The final value of each iteration argument, named by the handle the
+        # enclosing region reads it through.
+        for i in range(1, len(carried)):
+            out = op.outputs.add()
+            out.name = self._result_name(node, i)
+            out.scalar = _scalar_type(_value(phs[i]))
+        return op
+
+    def _result_name(self, node, index: int) -> str:
+        for user in node.users:
+            if user.target is operator.getitem and user.args[1] == index:
+                return user.name
+        return f"{node.name}_{index}"
+
+    def _cond(self, node, named, env) -> Operation:
+        """A ``torch.cond`` is a two-way region.  Its *tensor* result is not a
+        value it yields: both branches write the same destination (the store
+        that consumed the cond was pushed into each branch), so a branch that
+        only writes buffers yields nothing."""
+        op = Operation(name=node.name)
+        op.cond.predicate.CopyFrom(self._scalar(node.args[0], env))
+
+        branches = (
+            (named[str(node.args[1].target)], op.cond.true_region),
+            (named[str(node.args[2].target)], op.cond.false_region),
+        )
+        yielded = self._yielded_scalars(node, branches[0][0])
+        for branch, region in branches:
+            self.emit_region(branch, region.ops)
+            results = _outputs_of(branch)
+            for i in yielded:
+                region.yields.append(
+                    self._scalar(results[i], self.envs[branch])
+                )
+
+        for i in yielded:
+            out = op.outputs.add()
+            out.name = self._result_name(node, i)
+            out.scalar = _scalar_type(_value(_outputs_of(branches[0][0])[i]))
+        return op
+
+    def _yielded_scalars(self, node, branch) -> List[int]:
+        """The branch result slots the enclosing region actually reads *as
+        scalars*.  A tensor slot is a destination (already threaded into the
+        branches), and the ``1`` / ``0`` a guard branch returns is dead."""
+        yielded = []
+        for user in node.users:
+            if user.target is not operator.getitem:
+                continue
+            slot = user.args[1]
+            if _is_tensor(user) or not user.users:
+                continue
+            yielded.append(slot)
+        return sorted(set(yielded))
+
+    # --- entry point -----------------------------------------------------
+
+    def build(self) -> Model:
+        self.bind(self.model, {})
+
+        model = Model()
+        for node in self.model.graph.nodes:
+            if node.op == "placeholder" and _is_tensor(node):
+                model.inputs.append(self._tensor_box(node))
+            elif node.op == "get_attr" and _is_tensor(node):
+                model.parameters.append(self._tensor_box(node))
+
+        self.emit_region(self.model, model.ops)
+
+        env = self.envs[self.model]
+        for result in _outputs_of(self.model):
+            if _is_tensor(result):
+                owner = self.boxes.get(self._ref(result, env).node)
+                if owner is not None:
+                    model.outputs.append(self._tensor_box(owner))
+        return model
 
 
 def compute_op_names(model: GraphModule) -> List[str]:
@@ -362,17 +904,13 @@ def compute_op_names(model: GraphModule) -> List[str]:
 
 
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
-    """
-    Generate a protobuf ``Model`` from a bufferized FX graph, emitting ``Loop``
-    operations for ``while_loop`` nodes (recursively) and ``voyager.*`` / aten
-    ops as ordinary operations.
-    """
+    """Generate a ``voyager`` protobuf Model from a bufferized FX graph."""
     if output_dir is not None:
         os.makedirs(output_dir, exist_ok=True)
 
     # One recursive pass stamps every node — top level and inside every
     # while_loop / cond body + fused call_module — with a ``.value``, so the
-    # emit helpers below just read it (no per-body ShapeProp).  oracle_disabled:
+    # emitter below just reads it (no per-body ShapeProp).  oracle_disabled:
     # bodies are walked a single iteration, where a wait may precede its copy.
     with oracle_disabled():
         ShapeProp(model, recurse=True).propagate(*args)
@@ -384,30 +922,7 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     if output_dir is not None:
         ShapeProp(model).propagate(*args)
 
-    named_modules = dict(model.named_modules(remove_duplicate=False))
-    model_params = Model()
-
-    for node in model.graph.nodes:
-        if node.op == "placeholder":
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir)
-            model_params.inputs.append(tensor)
-            continue
-        if node.op == "get_attr":
-            mod = getattr(model, str(node.target), None)
-            # Skip cond/body subgraphs, and a codebook / qmap / scale: it
-            # reaches its op as a loop operand, so the proto names the body
-            # placeholder it binds to, not this.
-            if isinstance(mod, GraphModule) or "memory" not in node.meta:
-                continue
-            tensor = Tensor()
-            set_tensor_field(tensor, node, output_dir)
-            model_params.parameters.append(tensor)
-            continue
-
-        _emit_node(node, model, named_modules, model_params.ops, output_dir)
-
-    return model_params
+    return _Emitter(model, output_dir).build()
 
 
 # ===========================================================================

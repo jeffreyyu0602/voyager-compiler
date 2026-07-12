@@ -114,7 +114,7 @@ def _flash_attention_kernel(
         voyager.insert(torch.exp(m - row_tmp), alpha)
         # Pass 4b: update the running max (m := m_new).  Read after pass 4's
         # old-m read; pass 5 uses row_tmp (still m_new), so m is not re-read.
-        voyager.insert(row_tmp, m)
+        voyager.insert(row_tmp.clone(), m)
         # Pass 5: s_buf := P = exp(S − m_new).
         voyager.insert(torch.exp(s_buf - row_tmp), s_buf)
         # Pass 6: row_tmp := blk_sum = rowsum(P).

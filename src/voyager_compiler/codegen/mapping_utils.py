@@ -579,7 +579,7 @@ def is_prunable_op(node: Node) -> bool:
     if node.target == torch.ops.aten.to.dtype:
         dtype = get_arg_value(node, 1, "dtype")
         inp = node.args[0]
-        val = getattr(inp, "value", inp.meta["val"])
+        val = getattr(inp, "value", inp.meta.get("val"))
         return isinstance(val, torch.Tensor) and dtype == val.dtype
 
     return False
@@ -646,26 +646,3 @@ def is_addressing_op(node: Node) -> bool:
         return len(node.args) == 1 or node.args[1] == 0
 
     return False
-
-
-def is_memory_op(node: Node) -> bool:
-    """
-    The following operators requires explicit data movement and thus require
-    additional handling. Note that some operators are storage-preserving
-    in PyTorch. However, the current compiler hasn't implemented handling for
-    storage-preserving operators that change the number of elements in the
-    tensor. For example, ``torch.ops.aten.expand.default`` may increase the
-    number of elements in the tensor. We will add support in the future.
-    """
-    if node.op != "call_function" or is_nop(node):
-        return False
-
-    return node.target in [
-        torch.ops.aten.clone.default,
-        torch.ops.aten.copy_.default,
-        torch.ops.aten.embedding.default,
-        torch.ops.aten.expand.default,
-        torch.ops.aten.index_copy_.default,
-        torch.ops.aten.slice.Tensor,
-        torch.ops.aten.to.dtype,
-    ]

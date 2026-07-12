@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 import torch
 
 from voyager_compiler.codegen.lowering import ops
+from voyager_compiler.codegen.mapping_utils import is_compute_op, is_nop
 
 voyager = torch.ops.voyager
 
@@ -237,17 +238,22 @@ def _fuse_tail_in_body(
     exported ``while_loop`` body) into a nested ``call_module``, so the proto
     codegen emits them as one ``fused_op`` (L1: one accelerator pass).
 
-    The group is found by *forward reachability* from the anchor (like
-    mapping.py's ``find_sequential_nodes_``), not by op target: from the lone
-    anchor walk *down* through ``.users``, collecting the compute cone, and stop
-    at the output store (``insert``) — excluding the write-out wrappers (a
-    ``clone`` / multi-output ``getitem`` that only feed that store).  The tail's
-    operand loads (residual / scale ``select`` reads) are *inputs* to the tail
-    ops, not descendants of the anchor, so they fall outside the cone and become
-    the call_module's args; the per-slot DMA / loop machinery is likewise never
-    reached.  A multi-output op (``quantize_mx``) ends the cone with its
-    ``getitem`` users left outside, rewired to the call_module.  Recurses into
-    nested ``while_loop`` / ``cond`` bodies.
+    The group is found by *reachability* from the anchor (like mapping.py's
+    ``find_sequential_nodes_``), not by op target — in both directions:
+
+      * **down** through ``.users``, collecting the compute cone and stopping at
+        the output store (``insert``) and its write-out wrappers (a ``clone`` /
+        multi-output ``getitem`` that only feed that store);
+      * **up** through the operands, taking the compute a fused operand needs
+        before it is consumed (a quantized residual's ``dequantize``) when the
+        group is its only consumer.
+
+    So the tail's operand *loads* (residual / scale ``select`` reads) stay
+    outside and become the call_module's args, while compute on that path comes
+    in; the per-slot DMA / loop machinery is never reached either way.  A
+    multi-output op (``quantize_mx``) ends the cone with its ``getitem`` users
+    left outside, rewired to the call_module.  Recurses into nested
+    ``while_loop`` / ``cond`` bodies.
 
     Two modes, by ``fuse_anchor_with_tail``:
 
@@ -296,11 +302,11 @@ def _fuse_tail_in_body(
             and all(u.target is insert for u in n.users)
         )
 
-    # Forward cone from the anchor, halting at the store and its write-out
-    # wrappers — exactly the anchor + bias + fused compute ops.
+    # Grow the group from the anchor in both directions until it closes.
     group, stack = {anchor}, [anchor]
     while stack:
-        for u in stack.pop().users:
+        node = stack.pop()
+        for u in node.users:
             if (
                 u in group
                 or u.op != "call_function"
@@ -311,7 +317,25 @@ def _fuse_tail_in_body(
             group.add(u)
             stack.append(u)
 
-    if len(group) < 2:
+        for inp in node.all_input_nodes:
+            if (
+                inp in group
+                or inp.op != "call_function"
+                or not is_compute_op(inp)
+                or any(u not in group for u in inp.users)
+            ):
+                continue
+            group.add(inp)
+            stack.append(inp)
+
+    # A view (a reshape, a same-dtype ``to``) and a multi-output ``getitem`` are
+    # no work — the code generator drops them from the fused op list — so count
+    # only the ops that actually compute.  Fusing a lone anchor with a view
+    # would wrap one op in a group that says it is several.
+    real = [
+        n for n in group if not is_nop(n) and n.target is not operator.getitem
+    ]
+    if len(real) < 2:
         return  # bare anchor — nothing fused into this body
 
     _create_and_insert_subgraph(list(group), gm)
@@ -350,7 +374,6 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     multi-output ``getitem`` that match the skip branch's metadata), so the
     group is its non-NOP ops; a single-op tail needs no fusing."""
     from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
-    from voyager_compiler.codegen.mapping_utils import is_nop
 
     cond = torch.ops.higher_order.cond
     insert = voyager.insert.default
@@ -374,14 +397,16 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     if anchor_cond is None:
         return
 
-    # 1a. Fuse the accumulate branch (anchor + cast + the ``+ scratch`` add) into
-    #     one ``fused_op``.  The cond is ``torch.cond(coord == 0, init,
-    #     accumulate)``: the true branch (``args[1]``) is ``init`` — just the
-    #     anchor, whose result is stored directly (through at most a nop cast) —
-    #     so only the false branch (``args[2]``, ``accumulate``) has the add.
-    accum_branch = getattr(gm, str(anchor_cond.args[2].target), None)
-    if isinstance(accum_branch, torch.fx.GraphModule):
-        _fuse_tail_in_body(accum_branch, target)
+    # 1a. Fuse each branch of the reduction cond ``torch.cond(coord == 0, init,
+    #     accumulate)`` into one ``fused_op``: *init* is the anchor (plus the
+    #     accumulator cast under fp32 accumulation), *accumulate* is that plus
+    #     the ``+ scratch`` add.  The cast belongs to the pass that produces the
+    #     value — it converts on the way out of the datapath, and stores nothing
+    #     of its own.
+    for graph_arg in (anchor_cond.args[1], anchor_cond.args[2]):
+        cond_branch = getattr(gm, str(graph_arg.target), None)
+        if isinstance(cond_branch, torch.fx.GraphModule):
+            _fuse_tail_in_body(cond_branch, target)
 
     # 2. The scratch ref = the dest of the ``insert`` fed by the accumulate
     #    cond's result (through the cond's ``getitem`` unpacking).
@@ -405,11 +430,13 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
         return
 
     # 4. The tail branch is ``fused_gm`` + the finalize wrappers (a multi-output
-    #    ``getitem``, a dense-view ``as_strided``, a dtype ``to`` — added so the
-    #    finalize and skip branches share output metadata).  Group ``fused_gm``:
-    #    the branch's non-NOP ops.  ``getitem`` and ``to`` aren't caught by
-    #    ``is_nop`` (getitem never is; ``to`` only when the dtype is unchanged —
-    #    under fp32 accumulation it is a real cast), so exclude them explicitly.
+    #    ``getitem``, a dense-view ``as_strided`` — added so the finalize and
+    #    skip branches share output metadata).  Group ``fused_gm``: the branch's
+    #    non-NOP ops.  ``getitem`` is never ``is_nop``, so exclude it explicitly.
+    #    A ``to`` *is* caught by ``is_nop`` when the dtype is unchanged; under
+    #    fp32 accumulation it is a real cast, and then it belongs in the group —
+    #    it converts the completed accumulator on the way out, storing nothing of
+    #    its own.
     branch = true_branch(finalize_cond)
     ops = [
         n
@@ -417,7 +444,6 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
         if (
             n.op == "call_function"
             and n.target is not operator.getitem
-            and n.target is not torch.ops.aten.to.dtype
             and n.target is not insert
             and not is_nop(n)
         )

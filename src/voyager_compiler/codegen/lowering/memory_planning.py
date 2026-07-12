@@ -10,21 +10,23 @@ those space-annotated buffers/tiles into a concrete map:
     greedy best-fit, shared-object allocator that reuses a slot whose lifetime
     is disjoint and whose size is closest (least fragmentation).
   * **Scratchpad** — every on-chip buffer is likewise an explicit
-    ``voyager.alloc(SRAM)`` (the input / output banks — each a ``[num_banks,
-    tile...]`` alloc — and the reduction scratch), so it is packed with the same
-    greedy best-fit allocator as DRAM: a buffer reuses the slot of one whose
-    lifetime is already dead, across region boundaries.  Bank separation is
-    *structural* — distinct banks are distinct allocs, so simultaneously-live
-    banks get distinct addresses automatically; no per-op banking strategy is
-    needed.
+    ``voyager.alloc(SRAM)`` (the input / output banks — each a ``banks``-deep
+    alloc — and the reduction scratch), so it is packed with the same greedy
+    best-fit allocator as DRAM: a buffer reuses the slot of one whose lifetime
+    is already dead, across region boundaries.  A software-pipeline bank is one
+    buffer of ``banks`` slots, laid out contiguously: slot ``i`` sits at
+    ``base + i * bank_stride``, so the slot a step writes can stay a *runtime*
+    index.
 
 The planner does not move values between DRAM and Scratchpad (that is fixed by
-bufferization); it only decides addresses, reuse, and pool sizes.  Results are
-written into ``node.meta['memory']`` (DRAM) and ``node.meta['scratchpad']``
-(Scratchpad) as ``Segment``s, which the proto emitter (``set_tensor_field``)
-reads directly.  See the roadmap in the design doc for the optimizing passes
-that build on this baseline (intra-region reuse, store->load elision, double
-buffering, the interstellar schedule).
+bufferization); it only decides addresses, reuse, and pool sizes.  Addresses are
+written as ``Segment``s onto each buffer *root* — ``node.meta['memory']``
+(DRAM) / ``node.meta['scratchpad']`` (Scratchpad), plus ``meta['bank_count']``
+and ``meta['bank_stride']`` on a banked one.  A tile is not given an address of
+its own: it is named by the buffer it lives in, which is what the code generator
+serializes (a ``TensorBoxRef``, plus a bank index).  See the roadmap in the
+design doc for the optimizing passes that build on this baseline (intra-region
+reuse, store->load elision, double buffering, the interstellar schedule).
 """
 
 import logging
@@ -39,16 +41,21 @@ from torch.fx import GraphModule, Node
 from ..banking import require_allocation
 from .bufferization import _viewed_buffer
 from ..memory import MemorySpace, Segment, _align_size
+from ..passes.utils import get_arg_value
 from ...pt2e_utils import dtype_byte_size
+from .ops import UNBANKED
 
 logger = logging.getLogger(__name__)
 
 voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
 _ZERO = voyager.zeros.default
-_INCR = voyager.increment_indices.default
 _WHILE = torch.ops.higher_order.while_loop
 _GETITEM = operator.getitem
+
+# Position of ``banks`` in each allocation primitive's schema:
+# ``alloc(size, dtype, space, banks)`` / ``zeros(size, dtype, banks)``.
+_BANKS_ARG = {_ALLOC: 3, _ZERO: 2}
 
 
 # ---------------------------------------------------------------------------
@@ -66,12 +73,36 @@ def _val(node) -> Optional[torch.Tensor]:
     return v if isinstance(v, torch.Tensor) else None
 
 
+def _banks(node) -> int:
+    """The software-pipeline depth of an ``alloc`` / ``zeros`` — how many banks
+    its leading dimension holds.  ``UNBANKED`` (0) for every other node."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return UNBANKED
+    index = _BANKS_ARG.get(node.target)
+    if index is None:
+        return UNBANKED
+    return int(get_arg_value(node, index, "banks", UNBANKED))
+
+
+def _bank_stride(node, bank_width=None) -> int:
+    """Byte distance between adjacent banks of a banked buffer: the aligned size
+    of *one* bank's payload.  The bank dimension leads the tensor, so the
+    payload is the remaining ``numel // banks`` elements."""
+    t = _val(node)
+    dtype = node.meta.get("dtype") or t.dtype
+    per_bank = math.ceil(t.numel() / _banks(node) * dtype_byte_size(dtype))
+    return int(_align_size(per_bank, bank_width))
+
+
 def _nbytes(node, bank_width=None) -> int:
     """Byte size of a node's tensor, using the logical (quantized) dtype when
-    set and aligning to ``bank_width``."""
+    set and aligning to ``bank_width``.  A banked buffer is ``banks`` aligned
+    payloads, so each bank starts on an aligned boundary."""
     t = _val(node)
     if t is None:
         raise ValueError(f"{node} has no sized value to allocate memory for")
+    if _banks(node):
+        return _banks(node) * _bank_stride(node, bank_width)
     dtype = node.meta.get("dtype") or t.dtype
     size = math.ceil(t.numel() * dtype_byte_size(dtype))
     return int(_align_size(size, bank_width))
@@ -145,10 +176,26 @@ def _is_param(node: Node, gm: GraphModule) -> bool:
     return require_allocation(node)
 
 
+def _materializes_dram(node: Node) -> bool:
+    """A tensor the *host* produces rather than the accelerator — a ``pad`` to
+    the hardware unrolling, a copy.  Bufferization leaves it in DRAM (it is no
+    tile, and no ``insert`` stores it); the loop then loads tiles straight out
+    of it, so it is a DRAM buffer and needs an address like any other.  A view
+    of a buffer is excluded: it owns no bytes of its own.
+    """
+    return (
+        node.op == "call_function"
+        and node.target not in (_ALLOC, _ZERO)
+        and node.meta.get("space") == "DRAM"
+        and _val(node) is not None
+        and _viewed_buffer(node) is None
+    )
+
+
 def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
-    ``meta['memory']`` on each DRAM buffer root (threaded onto aliases later).
+    ``meta['memory']`` on each DRAM buffer root.
     """
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
@@ -171,10 +218,13 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
             buffer_of[n] = n  # weight / codebook
             persistent.append(n)
         elif n.op == "call_function":
-            if n.target is _ALLOC:
+            if n.target is _ALLOC or _materializes_dram(n):
                 if n.meta.get("space") == "Scratchpad":
                     continue
-                buffer_of[n] = n  # new activation buffer
+                # A new activation buffer, or a tensor the host materializes
+                # outside the accelerator (a ``pad`` to the hardware unrolling)
+                # and the loop then loads tiles from: both are DRAM buffers.
+                buffer_of[n] = n
                 reusable.append(n)
             elif n.target is _GETITEM:  # alias: loop result -> carried buffer
                 src, idx = n.args[0], n.args[1]
@@ -423,109 +473,22 @@ def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
 
 
 # ---------------------------------------------------------------------------
-# Thread Segments across loop / module boundaries onto the actual tile sites
+# Banking metadata
 # ---------------------------------------------------------------------------
 
 
-def _thread_segments(model: GraphModule) -> None:
-    """Propagate ``meta['memory']`` / ``meta['scratchpad']`` from buffer roots
-    onto the body placeholders bound to them and onto in-place compute tiles, so
-    every ``insert`` / ``async_copy`` tile and op tile resolves to an
-    address.
-    Mirrors the space-threading recursion of ``annotate_tensor_spaces``.
+def _stamp_banking(model: GraphModule, bank_width: Optional[int]) -> None:
+    """Record each banked buffer's depth and bank pitch on its ``alloc`` /
+    ``zeros`` node, so the code generator can serialize the bank dimension as
+    ``bank_count`` / ``bank_stride_bytes`` rather than as a tensor dimension.
+    A slot is then addressed ``base + bank * bank_stride_bytes``, which is what
+    lets a runtime slot index (``step % num_banks``) stay a runtime value.
     """
-
-    def seg_of(n):
-        if not isinstance(n, Node):
-            return None
-        return n.meta.get("scratchpad") or n.meta.get("memory")
-
-    def walk(gm: GraphModule, bound: Dict[Node, Segment]):
-        local: Dict[Node, Segment] = {}
-
-        def get(n):
-            return local.get(n) or seg_of(n)
-
-        for node in gm.graph.nodes:
-            if node.op == "placeholder":
-                if (
-                    node in bound
-                    and "scratchpad" not in node.meta
-                    and "memory" not in node.meta
-                ):
-                    local[node] = bound[node]
-                    key = (
-                        "scratchpad"
-                        if bound[node].memory_space == MemorySpace.SCRATCHPAD
-                        else "memory"
-                    )
-                    node.meta[key] = bound[node]
-            elif node.op == "call_function":
-                if node.target is _WHILE:
-                    operands = list(node.args[2])
-                    if len(node.args) > 3:
-                        operands += list(node.args[3])
-                    body = _submodule(gm, node.args[1].target)
-                    if body is not None:
-                        phs = [
-                            p for p in body.graph.nodes if p.op == "placeholder"
-                        ]
-                        child = {
-                            ph: get(o)
-                            for ph, o in zip(phs, operands)
-                            if get(o) is not None
-                        }
-                        walk(body, child)
-                elif node.target is _GETITEM:
-                    src, idx = node.args[0], node.args[1]
-                    if (
-                        isinstance(src, Node)
-                        and src.target is _WHILE
-                        and isinstance(idx, int)
-                    ):
-                        carried = list(src.args[2])
-                        if idx < len(carried) and get(carried[idx]) is not None:
-                            _set(node, get(carried[idx]), local)
-                elif (
-                    node.target not in (_ZERO, _INCR, _ALLOC)
-                    and _viewed_buffer(node) is None
-                ):
-                    # In-place compute tile: inherit the segment of its first
-                    # scratchpad input (e.g. accumulate-add reuses the
-                    # accumulator).  A view gets no address at all — a bank slot
-                    # is indexed at runtime, so it has none to give.
-                    if (
-                        node.meta.get("space") == "Scratchpad"
-                        and "scratchpad" not in node.meta
-                    ):
-                        for inp in node.all_input_nodes:
-                            s = get(inp)
-                            if (
-                                s is not None
-                                and s.memory_space == MemorySpace.SCRATCHPAD
-                            ):
-                                _set(node, s, local)
-                                break
-            elif node.op == "call_module":
-                sub = _submodule(gm, node.target)
-                if sub is not None:
-                    phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
-                    child = {
-                        ph: get(a)
-                        for ph, a in zip(phs, node.args)
-                        if get(a) is not None
-                    }
-                    walk(sub, child)
-
-    walk(model, {})
-
-
-def _set(node: Node, seg: Segment, local: Dict[Node, Segment]) -> None:
-    local[node] = seg
-    key = (
-        "scratchpad" if seg.memory_space == MemorySpace.SCRATCHPAD else "memory"
-    )
-    node.meta.setdefault(key, seg)
+    for node in _walk(model):
+        if not (banks := _banks(node)):
+            continue
+        node.meta["bank_count"] = banks
+        node.meta["bank_stride"] = _bank_stride(node, bank_width)
 
 
 # ---------------------------------------------------------------------------
@@ -607,10 +570,14 @@ def plan_memory(
 ) -> MemoryPlan:
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
 
-    Writes ``meta['memory']`` (DRAM) and ``meta['scratchpad']`` (Scratchpad)
-    ``Segment``s, threading them onto loop-body tile sites; returns the pool
-    sizes. Warns, listing the buffers live at the peak, if the scratchpad
-    plan exceeds ``cache_size``.
+    Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
+    ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —
+    plus ``meta['bank_count']`` / ``meta['bank_stride']`` on a banked one, and
+    returns the pool sizes.  Nothing is threaded onto the tile sites: a tile is
+    named by the buffer it lives in (and, for a bank, a runtime slot index), so
+    the address belongs to the buffer, not to every reference to it.  Warns,
+    listing the buffers live at the peak, if the scratchpad plan exceeds
+    ``cache_size``.
     """
     unroll_dim = unroll_dims[1] if unroll_dims else None
 
@@ -628,7 +595,7 @@ def plan_memory(
             model, uf, bufs, cache_size, num_banks, bank_width, unroll_dim
         )
 
-    _thread_segments(model)
+    _stamp_banking(model, bank_width)
     _check_invariants(model, bufs)
 
     if cache_size is not None and scratchpad_bytes > cache_size:

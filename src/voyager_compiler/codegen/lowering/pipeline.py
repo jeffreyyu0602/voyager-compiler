@@ -149,7 +149,7 @@ class _BufferedRef:
         # once-per-block-guarded wait consumes it, so the copy->wait dependency
         # rides the shared semaphore.  Never referenced outside this ref, so it
         # is allocated here rather than threaded through ``forward``.
-        self.sem = voyager.zeros([num_banks], torch.int64)
+        self.sem = voyager.zeros([], torch.int64, banks=num_banks)
 
     # --- addressing (shared by both kinds) ----------------------------------
 
@@ -515,7 +515,7 @@ class PipelinedKernel(torch.nn.Module):
 
     def _alloc_in_bank(self, num_banks, tile_sizes, dtype):
         """One SRAM input bank: ``num_banks`` slots, leading bank dim."""
-        return voyager.alloc([num_banks] + list(tile_sizes), dtype, _SRAM)
+        return voyager.alloc(tile_sizes, dtype, _SRAM, banks=num_banks)
 
     def _alloc_out_bank(self, num_banks, tile_sizes, dtype):
         """One SRAM output bank: ``num_banks`` slots, leading bank dim.  The
@@ -523,7 +523,7 @@ class PipelinedKernel(torch.nn.Module):
         tile that slot is stored while the next tile accumulates into the other
         slot (store / compute overlap).
         """
-        return voyager.alloc([num_banks] + list(tile_sizes), dtype, _SRAM)
+        return voyager.alloc(tile_sizes, dtype, _SRAM, banks=num_banks)
 
     def forward(self, *inputs):
         # Pallas-style software pipelining (depth ``num_banks``, ``D =
@@ -1066,6 +1066,32 @@ def _reduction_fused_kernel(
     return kernel
 
 
+def _reduction_inplace_kernel(compute: Callable, reduction_dim: int):
+    """Kernel for a reduction with nothing left to do once it completes — no
+    cast (the accumulator's dtype is the output's) and no fused tail.  It
+    accumulates straight into the output bank, so there is no scratch ref and no
+    finalize step: the completed tile is already in the slot the store reads.
+
+    ``_reduction_fused_kernel`` is the general case, where a cast or a tail must
+    map the accumulator into the bank and so needs one of its own.
+    """
+
+    def kernel(grid_index, *args):
+        *in_tiles, bank = args
+
+        def init():
+            return compute(in_tiles, True)
+
+        def accumulate(prev=bank):
+            return compute(in_tiles, False) + prev
+
+        voyager.insert(
+            torch.cond(grid_index[reduction_dim] == 0, init, accumulate), bank
+        )
+
+    return kernel
+
+
 def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
     """A >1-tile reduction writes / consumes these operands only on the last K
     step — the output (``post_process``) and the fused post-op operands — so
@@ -1317,10 +1343,16 @@ def build_conv2d(
             return info.fused_gm(result, *[in_tiles[i] for i in fused_idx])
         return result
 
-    if num_k > 1:
+    acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
+    if num_k == 1:
+        scratch_specs = []
+        kernel = _map_kernel(compute, len(out_specs))
+    elif info is None and acc_dtype == out.dtype:
+        scratch_specs = []
+        kernel = _reduction_inplace_kernel(conv2d_kernel, reduction_dim=4)
+    else:
         if single_buffer_tail:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
-        acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
         scratch_specs = [
             _ScratchSpec(_project((tn, tk, toh, tow), out_dims), acc_dtype)
         ]
@@ -1333,9 +1365,6 @@ def build_conv2d(
             fused_gm=info.fused_gm if info is not None else None,
             fused_operand_indices=fused_idx,
         )
-    else:
-        scratch_specs = []
-        kernel = _map_kernel(compute, len(out_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,
@@ -1600,10 +1629,16 @@ def build_gemm(
             return info.fused_gm(result, *[in_tiles[i] for i in fused_idx])
         return result
 
-    if num_k > 1:
+    acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
+    if num_k == 1:
+        scratch_specs = []
+        kernel = _map_kernel(compute, len(out_specs))
+    elif info is None and acc_dtype == out.dtype:
+        scratch_specs = []
+        kernel = _reduction_inplace_kernel(gemm_kernel, reduction_dim=gk)
+    else:
         if single_buffer_tail:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
-        acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
         scratch_specs = [_ScratchSpec(tuple(tb) + (tm, tn), acc_dtype)]
         kernel = _reduction_fused_kernel(
             gemm_kernel,
@@ -1614,9 +1649,6 @@ def build_gemm(
             fused_gm=info.fused_gm if info is not None else None,
             fused_operand_indices=fused_idx,
         )
-    else:
-        scratch_specs = []
-        kernel = _map_kernel(compute, len(out_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

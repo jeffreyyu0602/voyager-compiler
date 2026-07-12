@@ -29,10 +29,8 @@ from ..mapping_utils import (
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
-    is_memory_op,
     is_nop,
     is_pooling,
-    is_reshape_op,
     is_shape_changing_nop,
 )
 from .ops import MemoryLevel, oracle_disabled
@@ -232,8 +230,12 @@ def _space(node):
 
 def _viewed_buffer(node: Node) -> Optional[Node]:
     """The buffer ``node`` is a view of — a bank slot (``select``), a reshape /
-    cast, or a loop result (``getitem`` of a carried operand) — so it can take
-    that buffer's space.  ``None`` if it names no buffer.
+    cast, a loop result (``getitem`` of a carried operand), or a ``cond`` result
+    — so it can take that buffer's space.  ``None`` if it names no buffer.
+
+    A ``cond`` is a *compute* (both branches compute into the destination its
+    ``insert`` names), so like any compute it owns no space; the ``getitem``
+    unpacking it owns none either.
     """
     if node.op != "call_function":
         return None
@@ -246,14 +248,14 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
         return src if isinstance(src, Node) else None
     if node.target is operator.getitem:
         src, index = node.args[0], node.args[1]
-        if (
-            isinstance(src, Node)
-            and src.target is _WHILE_LOOP
-            and isinstance(index, int)
-        ):
+        if not isinstance(src, Node) or not isinstance(index, int):
+            return None
+        if src.target is _WHILE_LOOP:
             carried = list(src.args[2])
             if index < len(carried):
                 return carried[index]
+        if src.target is _COND:
+            return src
     return None
 
 
@@ -346,6 +348,12 @@ def _annotate_and_validate(
                 )
         elif (viewed := _viewed_buffer(node)) is not None:
             node.meta["space"] = _space(viewed)
+        elif _produces_tensor(node) and _stored(node, ctx):
+            # A value the datapath produces and writes to a buffer via
+            # ``insert`` — an explicit tile copy, ``insert(x.clone(), dst)``.
+            # Like the compute above it names no memory of its own: it lives in
+            # the buffer it is stored to.
+            pass
         elif _produces_tensor(node):
             # A tensor the accelerator does not compute — a host-side ``pad``,
             # a copy — materializes in DRAM.
@@ -498,8 +506,6 @@ def propagate_logical_dtypes(
             d = _dtype_of(node.args[0])
             _set_dtype(node.args[1], d)
             _set_dtype(_buffer_of(node.args[1]), d)
-        elif t is _SELECT:
-            _set_dtype(node, _dtype_of(node.args[0]))  # bank slot
         elif t is operator.getitem:
             sdt = _dtype_of(node.args[0])
             i = node.args[1]
@@ -509,7 +515,7 @@ def propagate_logical_dtypes(
                 and i < len(sdt)
             ):
                 _set_dtype(node, sdt[i])
-        elif is_nop(node):
+        elif not is_compute_op(node) and t is not torch.ops.aten.to.dtype:
             first = next((a for a in node.args if isinstance(a, Node)), None)
             _set_dtype(node, _dtype_of(first))
 

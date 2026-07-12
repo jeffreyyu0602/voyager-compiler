@@ -36,9 +36,28 @@ class MemoryLevel(IntEnum):
     buffer's level is needed."""
 
     REGISTER = 0  # PE register file
-    LOCAL = 1  # local (per-PE / line) buffers
-    SRAM = 2  # on-chip scratchpad / SRAM
-    DRAM = 3  # main system memory (e.g., DDR)
+    LOCAL = 1     # local buffers (input and weight buffers)
+    SRAM = 2      # on-chip scratchpad / SRAM
+    DRAM = 3      # main system memory (e.g., DDR)
+
+
+# ---------------------------------------------------------------------------
+# Software-pipeline banking.
+#
+# ``alloc`` / ``zeros`` take a ``banks`` count.  ``banks == 0`` is an unbanked
+# storage object: the tensor has exactly ``size``.  ``banks >= 1`` prepends a
+# bank dimension (``[banks, *size]``), so ``size`` stays the payload of *one*
+# bank and ``buf[slot]`` reads/writes a slot.  The distinction matters to the
+# code generator: a bank dimension is not a tensor dimension — it is serialized
+# as ``TensorBox.bank_count`` and the ``select`` that picks a slot collapses
+# into the operand's ``TensorBoxRef.bank``.  A single-slot bank (``banks == 1``)
+# still keeps its dimension, so ``buf[0]`` addresses it uniformly.
+# ---------------------------------------------------------------------------
+UNBANKED = 0
+
+
+def _banked_size(size, banks: int):
+    return list(size) if banks == UNBANKED else [banks] + list(size)
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +70,19 @@ class MemoryLevel(IntEnum):
 # ---------------------------------------------------------------------------
 # ``space`` default 3 == ``MemoryLevel.DRAM``.
 voyager_lib.define(
-    "alloc(SymInt[] size, ScalarType dtype, int space=3) -> Tensor"
+    "alloc(SymInt[] size, ScalarType dtype, int space=3, int banks=0) "
+    "-> Tensor"
 )
 
 
 @impl(voyager_lib, "alloc", "CompositeExplicitAutograd")
 def alloc(
-    size: Tuple[int, ...], dtype: torch.dtype, space: int = MemoryLevel.DRAM
+    size: Tuple[int, ...],
+    dtype: torch.dtype,
+    space: int = MemoryLevel.DRAM,
+    banks: int = UNBANKED,
 ) -> torch.Tensor:
+    size = _banked_size(size, banks)
     if dtype.is_floating_point:
         return torch.randn(size).to(dtype)
     return torch.zeros(size, dtype=dtype)
@@ -66,9 +90,12 @@ def alloc(
 
 @torch.library.register_fake("voyager::alloc")
 def _alloc_fake(
-    size: Tuple[int, ...], dtype: torch.dtype, space: int = MemoryLevel.DRAM
+    size: Tuple[int, ...],
+    dtype: torch.dtype,
+    space: int = MemoryLevel.DRAM,
+    banks: int = UNBANKED,
 ) -> torch.Tensor:
-    return torch.empty(size, dtype=dtype)
+    return torch.empty(_banked_size(size, banks), dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -77,17 +104,23 @@ def _alloc_fake(
 # ``aten.zeros``) so the bufferizer can tell a control/semaphore zero-init from
 # a genuine ``aten.zeros`` compute op.
 # ---------------------------------------------------------------------------
-voyager_lib.define("zeros(SymInt[] size, ScalarType dtype) -> Tensor")
+voyager_lib.define(
+    "zeros(SymInt[] size, ScalarType dtype, int banks=0) -> Tensor"
+)
 
 
 @impl(voyager_lib, "zeros", "CompositeExplicitAutograd")
-def zeros(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    return torch.zeros(size, dtype=dtype)
+def zeros(
+    size: Tuple[int, ...], dtype: torch.dtype, banks: int = UNBANKED
+) -> torch.Tensor:
+    return torch.zeros(_banked_size(size, banks), dtype=dtype)
 
 
 @torch.library.register_fake("voyager::zeros")
-def _zeros_fake(size: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-    return torch.zeros(size, dtype=dtype)
+def _zeros_fake(
+    size: Tuple[int, ...], dtype: torch.dtype, banks: int = UNBANKED
+) -> torch.Tensor:
+    return torch.zeros(_banked_size(size, banks), dtype=dtype)
 
 
 voyager_lib.define(
