@@ -358,6 +358,17 @@ message Operation {
   repeated Output outputs = 6;
 
   optional Tiling tiling = 7;
+
+  // The semaphore this operation signals when it completes, if it runs
+  // asynchronously: a DMA (voyager.async_copy), or a matrix-unit op whose
+  // result another unit must wait for.  A consumer waits on it with
+  // voyager.async_wait, which takes it as an ordinary operand -- a wait
+  // consumes a semaphore, it does not post one.
+  //
+  // It belongs to the operation rather than to a primitive inside it: a fused
+  // group is one instruction, and what the signal announces is that the whole
+  // group has retired.
+  optional TensorBoxRef semaphore = 8;
 }
 
 

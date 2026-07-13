@@ -24,7 +24,9 @@ non-bufferized path).  Three ideas carry the whole translation:
     dropped, and ``dst`` becomes the *producing* op's ``Output.destination`` —
     for a ``torch.cond``, on the producer inside *each* branch.  An ``insert``
     whose source is another buffer is a genuine move, and is emitted as a
-    ``clone`` into that destination.
+    ``clone`` into that destination.  A semaphore it carried folds onto the
+    producer as ``Operation.semaphore``: what that operation signals when it
+    completes.  A DMA's post lives there too, so the backend has one rule.
   * **Control logic is emitted**, tagged ``op: "cpu"``: index arithmetic,
     predicates and ``delinearize_index`` run on the control processor rather
     than the accelerator datapath, but they are real work the backend schedules.
@@ -76,6 +78,7 @@ _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
 _SUBVIEW = torch.ops.voyager.subview.default
+_ASYNC_COPY = torch.ops.voyager.async_copy.default
 
 # The ops that *declare* storage; every other tensor node refers to storage one
 # of these owns.
@@ -320,9 +323,11 @@ class _Emitter:
         self.envs: Dict[GraphModule, Dict[Node, object]] = {}
         # Declared storage.
         self.boxes: Dict[str, Node] = {}
-        # Destination-passing: producer -> {output index: destination}, and the
-        # semaphore an asynchronous producer posts on completion.
+        # Destination-passing: producer -> {output index: destination}.
         self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
+        # The semaphore an asynchronous op posts when it completes: a DMA, or a
+        # producer whose store carried one.  Read back at the *operation* level,
+        # so a fused group signals when the whole group retires.
         self.sem: Dict[Node, TensorBoxRef] = {}
 
     # --- references ------------------------------------------------------
@@ -451,6 +456,11 @@ class _Emitter:
                         )
                 elif node.target is _INSERT:
                     self._bind_insert(node, gm, env)
+                elif node.target is _ASYNC_COPY:
+                    # A DMA posts on completion, exactly like a producer whose
+                    # store carried a semaphore -- one rule for the backend.
+                    sem = get_arg_value(node, 4, "semaphore")
+                    self.sem[node] = self._ref(sem, env)
 
     def _child_env(self, sub: GraphModule, operands, env) -> Dict[Node, object]:
         """Bind a region's placeholders to the operands passed into it, so a
@@ -508,8 +518,14 @@ class _Emitter:
 
         for producer, index in producers:
             self.dest.setdefault(producer, {})[index] = destination
-            if semaphore is not None:
-                self.sem[producer] = self._ref(semaphore, env)
+            if semaphore is None:
+                continue
+            ref = self._ref(semaphore, env)
+            if self.sem.setdefault(producer, ref) != ref:
+                raise ValueError(
+                    f"'{producer.name}' posts two different semaphores: an "
+                    f"operation signals once, when it completes"
+                )
 
     def _producers(self, node, gm, env, index=None):
         """The op(s) whose result this store writes, as ``[(node, index)]`` — or
@@ -569,11 +585,9 @@ class _Emitter:
         for key, value in self._kwargs(node).items():
             if value is None:
                 continue  # an unset optional: absent, not null
+            if key == "semaphore" and node.target is _ASYNC_COPY:
+                continue  # what it *posts* -- on the Operation, not an operand
             call.kwargs[key].CopyFrom(self._argument(value, env, internal))
-        if (semaphore := self.sem.get(node)) is not None:
-            # This op's store posted a semaphore: with the store gone, the op
-            # itself signals completion (it runs asynchronously).
-            call.kwargs["semaphore"].tensor_box.CopyFrom(semaphore)
         return call
 
     def _kwargs(self, node) -> Dict[str, object]:
@@ -647,6 +661,15 @@ class _Emitter:
             out = op.outputs.add()
             out.name = node.name if index is None else f"{node.name}_{index}"
             out.destination.CopyFrom(destination)
+
+    def _set_semaphore(self, op: Operation, node) -> None:
+        """The semaphore this operation signals when it completes: a DMA's own,
+        or the one its ``insert`` carried (with the store gone, the op that
+        produced the value is what runs asynchronously).  It hangs on the
+        *operation*, so a fused group signals when the whole group retires --
+        there is no op inside it that the signal belongs to."""
+        if (semaphore := self.sem.get(node)) is not None:
+            op.semaphore.CopyFrom(semaphore)
 
     def _tensor_box(self, node) -> TensorBox:
         """Declare ``node``'s storage.  A banked buffer records its depth and
@@ -727,6 +750,7 @@ class _Emitter:
         op = Operation(name=node.name)
         op.prim.CopyFrom(self._call(node, env))
         self._set_outputs(op, node, env)
+        self._set_semaphore(op, node)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
         ops.append(op)
@@ -753,6 +777,7 @@ class _Emitter:
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
         self._set_outputs(op, node, env)
+        self._set_semaphore(op, node)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
         return op
