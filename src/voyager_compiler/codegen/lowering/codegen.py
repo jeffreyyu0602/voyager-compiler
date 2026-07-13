@@ -67,27 +67,19 @@ from ..voyager_ir_pb2 import (
     Tiling,
 )
 from ..shape_prop import ShapeProp
-from .bufferization import _is_compute
+from .bufferization import _is_compute, _viewed_buffer
 from .ops import oracle_disabled
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
-INCREMENT_INDICES = torch.ops.voyager.increment_indices.default
-DELINEARIZE = torch.ops.voyager.delinearize_index.default
 _INSERT = torch.ops.voyager.insert.default
-_ASYNC_COPY = torch.ops.voyager.async_copy.default
-_ASYNC_WAIT = torch.ops.voyager.async_wait.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
 _SELECT = torch.ops.aten.select.int
-_PAD = torch.ops.aten.pad.default
 
 # The ops that *declare* storage; every other tensor node refers to storage one
 # of these owns.
 _ALLOCATORS = (_ALLOC, _ZEROS)
-
-# Ops that run on the control processor rather than the accelerator datapath.
-_CPU_OPS = (DELINEARIZE, INCREMENT_INDICES, _PAD)
 
 # Operand names for the Python builtins the loop control uses (``operator.eq`` /
 # ``and_`` / ``add`` ...), which carry no ATen schema to normalize against.
@@ -244,34 +236,34 @@ def _outputs_of(gm: GraphModule) -> List:
     return list(outs) if isinstance(outs, (tuple, list)) else [outs]
 
 
-def _is_view(node) -> bool:
-    """A node that renames storage rather than computing anything: a bank-slot
-    ``select``, a reshape, a same-dtype ``to`` (``is_nop`` catches it).  It is
-    never an instruction — its consumers reference the buffer it views.  A
-    *real* cast is not here: it converts the bytes, so it is an op like any
-    other."""
-    if node.op != "call_function":
-        return False
-    return node.target is _SELECT or is_nop(node)
-
-
-def _in_fused_chain(node) -> bool:
-    """An op a fused group actually performs.  Its views / unpacking are not ops
-    (they name values, they don't compute them)."""
+def _is_bank_select(node) -> bool:
+    """A ``select`` that picks a bank out of a software-pipeline bank, which
+    bufferization already told apart from a slice of a sub-tensor (only the bank
+    is a view; the slice reads bytes of its own)."""
     return (
         node.op == "call_function"
-        and not node.meta.get("fused", False)
-        and not _is_view(node)
-        and node.target is not operator.getitem
+        and node.target is _SELECT
+        and _viewed_buffer(node) is not None
     )
+
+
+def _is_view(node) -> bool:
+    """A node that renames storage rather than computing anything: a bank
+    ``select``, a reshape, a size-1 ``select`` or a same-dtype ``to``
+    (``is_nop`` catches those two).  It is never an instruction — its consumers
+    reference the buffer it views.  A *real* slice and a *real* cast are not
+    here: each writes a tensor of its own, so each is an op like any other."""
+    if node.op != "call_function":
+        return False
+    return is_nop(node) or _is_bank_select(node)
 
 
 def _owns_storage(node) -> bool:
     """``node`` *is* a buffer: a model input, a weight, an explicit
     ``voyager.alloc`` / ``zeros``, or a tensor the host materializes outside the
-    accelerator (a ``pad`` to the hardware unrolling, a copy) — which the
-    planner gives an address like any other DRAM buffer.  Everything else names
-    storage one of these owns."""
+    accelerator (a ``pad`` to the hardware unrolling, a slice, a cast) — which
+    the planner gives an address like any other DRAM buffer.  Everything else
+    names storage one of these owns."""
     if node.op in ("placeholder", "get_attr"):
         return True
     if node.op != "call_function":
@@ -314,9 +306,8 @@ class _Emitter:
         # Per-region lexical scope: a placeholder -> the ref/scalar it is bound
         # to in the enclosing region.
         self.envs: Dict[GraphModule, Dict[Node, object]] = {}
-        # Declared storage, and which of it is banked.
+        # Declared storage.
         self.boxes: Dict[str, Node] = {}
-        self.banked: Dict[str, int] = {}
         # Destination-passing: producer -> {output index: destination}, and the
         # semaphore an asynchronous producer posts on completion.
         self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
@@ -346,21 +337,19 @@ class _Emitter:
             return TensorBoxRef(node=node.name)
 
         if node.op == "call_function":
-            if node.target is _SELECT:
+            if _is_bank_select(node):
                 base = self._ref(node.args[0], env, internal)
-                # Slot of a banked buffer -> the bank index of the reference;
-                # any other select is a plain view of the same storage.
-                if node.args[1] == 0 and self.banked.get(base.node):
-                    base.bank.CopyFrom(self._scalar(node.args[2], env))
+                base.bank.CopyFrom(self._scalar(node.args[2], env))
                 return base
             if _is_view(node):
                 return self._ref(node.args[0], env, internal)
             if node.target is operator.getitem:
-                if (dest := self.dest.get(node.args[0])) is not None:
-                    if (ref := dest.get(node.args[1])) is not None:
-                        out = TensorBoxRef()
-                        out.CopyFrom(ref)
-                        return out
+                ref = self.dest.get(node.args[0], {}).get(node.args[1])
+                if ref is not None:
+                    out = TensorBoxRef()
+                    out.CopyFrom(ref)
+                    return out
+
         if (dest := self.dest.get(node)) is not None and None in dest:
             ref = TensorBoxRef()
             ref.CopyFrom(dest[None])
@@ -434,8 +423,6 @@ class _Emitter:
         for node in gm.graph.nodes:
             if gm is self.model and _is_tensor(node) and _owns_storage(node):
                 self.boxes[node.name] = node
-                if banks := node.meta.get("bank_count", 0):
-                    self.banked[node.name] = banks
 
             if node.op == "call_module":
                 sub = named[str(node.target)]
@@ -599,13 +586,11 @@ class _Emitter:
         return kwargs
 
     def _op_kind(self, node) -> str:
-        """Where the op runs: the accelerator datapath, or the control processor
-        that drives it (index arithmetic, predicates, host-side padding)."""
-        if node.target in _CPU_OPS:
-            return "cpu"
-        if _is_tensor(node) or _value(node) is None:
-            return "call_function"  # compute, or a DMA / semaphore wait
-        return "cpu"  # scalar index arithmetic or a predicate
+        """Where the op runs.  Only compute runs on the accelerator datapath;
+        everything else is driven by the control processor — index arithmetic,
+        predicates, a host-side pad or slice, the DMA and its semaphores.  (The
+        latter deserve classes of their own; that is future work.)"""
+        return "call_function" if _is_compute(node) else "cpu"
 
     def _set_outputs(self, op: Operation, node, env) -> None:
         """An op's results.  An op that *creates* storage declares it; every
@@ -684,17 +669,19 @@ class _Emitter:
     def _dump(self, node) -> None:
         """Write the tensors a hardware run needs to replay this op on its own:
         a compute op's operand tiles and its result, and a DRAM buffer (which a
-        whole loop is replayed against).  The machinery in between — the DMA,
-        the semaphores, the SRAM banks, the index vectors — the run drives
-        itself, so it is not dumped."""
+        whole loop is replayed against) — an ``alloc``, or a tensor the host
+        materializes and the loop then loads tiles out of (a ``pad``, a slice).
+        The machinery in between — the DMA, the semaphores, the SRAM banks, the
+        index vectors — the run drives itself, so it is not dumped."""
         if self.dump_dir is None:
             return
-        is_dram_buffer = (
-            node.target is _ALLOC and node.meta.get("space") == "DRAM"
-        )
-        if not (_is_compute(node) or is_dram_buffer):
+        if _is_compute(node):
+            tensors = list(node.all_input_nodes) + [node]
+        elif _owns_storage(node) and node.meta.get("space") == "DRAM":
+            tensors = [node]  # a buffer: its own bytes
+        else:
             return
-        for n in list(node.all_input_nodes) + [node]:
+        for n in tensors:
             if _is_tensor(n):
                 save_tensor(
                     n.value, os.path.join(self.dump_dir, f"{n.name}.bin")
@@ -743,7 +730,11 @@ class _Emitter:
         # The ops the fusion chains.  Their results are its transients: an
         # operand naming one names that ``PrimOp``, not storage (a view
         # over one is transparent, and resolves to the same ``PrimOp``).
-        chain = [n for n in sub.graph.nodes if _in_fused_chain(n)]
+        chain = [
+            n
+            for n in sub.graph.nodes
+            if not is_nop(n) and n.op == "call_function"
+        ]
         internal = frozenset(chain)
 
         op = Operation(name=node.name)

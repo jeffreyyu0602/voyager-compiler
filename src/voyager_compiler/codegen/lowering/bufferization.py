@@ -33,6 +33,7 @@ from ..mapping_utils import (
     is_pooling,
     is_shape_changing_nop,
 )
+from ..passes.utils import get_arg_value
 from .ops import MemoryLevel, oracle_disabled
 
 logger = logging.getLogger(__name__)
@@ -228,28 +229,45 @@ def _space(node):
     return node.meta.get("space") if isinstance(node, Node) else None
 
 
-def _viewed_buffer(node: Node) -> Optional[Node]:
-    """The buffer ``node`` is a view of — a bank slot (``select``), a reshape /
-    cast, a loop result (``getitem`` of a carried operand), or a ``cond`` result
-    — so it can take that buffer's space.  ``None`` if it names no buffer.
+# Position of ``banks`` in each allocation primitive's schema:
+# ``alloc(size, dtype, space, banks)`` / ``zeros(size, dtype, banks)``.
+_BANKS_ARG = {_VOYAGER_ALLOC: 3, _VOYAGER_ZEROS: 2}
 
-    A ``cond`` is a *compute* (both branches compute into the destination its
-    ``insert`` names), so like any compute it owns no space; the ``getitem``
-    unpacking it owns none either.
+
+def _viewed_buffer(node: Node) -> Optional[Node]:
+    """The buffer whose bytes ``node`` names, or ``None`` if ``node`` writes
+    bytes of its own.
+
+    Some nodes allocate nothing: they are a second name for a buffer that
+    already exists, and so take its space rather than a space of their own.
+
+      * a NOP (``reshape``, ``view``, a same-dtype ``to``) — the same bytes;
+      * a ``select`` picking a bank out of a banked ``alloc`` — the bank dim is
+        not a tensor dim, so the pick addresses nothing;
+      * ``getitem`` of a ``while_loop`` — the loop wrote the carried buffer in
+        place, so its result *is* that buffer;
+      * ``getitem`` of a ``cond`` — the ``cond``, which computes into the
+        destination its ``insert`` names and so owns no space either.
+
+    Everything else writes a tensor of its own and owns it — including a
+    ``select`` that reads a sub-tensor, and a ``to.dtype`` that really converts.
     """
-    if node.op != "call_function":
-        return None
-    if (
-        node.target is _SELECT
-        or node.target is torch.ops.aten.to.dtype
-        or is_nop(node)
-    ):
-        src = node.args[0]
-        return src if isinstance(src, Node) else None
+    if is_nop(node):
+        return node.args[0]
+
+    if node.target is _SELECT:
+        src, seen = node.args[0], set()
+        while src not in seen and "source_node" in src.meta:
+            seen.add(src)
+            src = src.meta["source_node"]
+        num_banks = 0
+        if (index := _BANKS_ARG.get(src.target)) is not None:
+            num_banks = get_arg_value(src, index, "banks", 0)
+        is_bank_select = node.args[1] == 0 and num_banks > 0
+        return src if (is_bank_select or is_nop(node)) else None
+
     if node.target is operator.getitem:
         src, index = node.args[0], node.args[1]
-        if not isinstance(src, Node) or not isinstance(index, int):
-            return None
         if src.target is _WHILE_LOOP:
             carried = list(src.args[2])
             if index < len(carried):
@@ -302,6 +320,8 @@ def _walk_region(gm, hop, operands, graph_args, codebooks, ctx) -> None:
         for operand, ph in zip(operands, phs):
             if (space := _space(operand)) is not None:
                 ph.meta["space"] = space
+            if isinstance(operand, Node):
+                ph.meta["source_node"] = operand
         _annotate_and_validate(sub, codebooks, hop, ctx)
 
 
