@@ -97,6 +97,24 @@ class _StepCtx:
     windows: dict  # num_banks -> _Window
 
 
+def select_bank(buf, slot):
+    """One bank of a banked buffer (``[num_banks, *tile]``), as an explicit
+    ``voyager.subview``: offset ``slot`` along the bank dim, the whole tile along
+    the rest.  ``slot`` may be a runtime value (``step % num_banks``).
+
+    Said with ``buf[slot]`` this would be an ``aten.select``, indistinguishable
+    from a model slicing a tensor — and the two mean opposite things: a bank pick
+    renames storage (it folds into the operand's ``TensorBoxRef.bank``), while a
+    slice reads bytes of its own.  The bank dim is not a tensor dim, so it is
+    squeezed back off.
+    """
+    shape = list(buf.shape)
+    offsets = [slot] + [0] * (len(shape) - 1)
+    sizes = [1] + shape[1:]
+    strides = [1] * len(shape)
+    return voyager.subview(buf, offsets, sizes, strides).squeeze(0)
+
+
 def _guarded_wait(sem, pred=None):
     """``async_wait(sem)`` guarded by ``pred``, so each slot's semaphore is
     waited exactly once per signaling copy (a counting semaphore underflows on a
@@ -343,7 +361,12 @@ class _BufferedRef:
             idx = self._unravel(p)
             if p == 0 or self._indices_differ(prev_idx, idx):
                 slot = num_copies % self.num_banks
-                self._load_tile(src, self.bank[slot], idx, self.sem[slot])
+                self._load_tile(
+                    src,
+                    select_bank(self.bank, slot),
+                    idx,
+                    select_bank(self.sem, slot),
+                )
                 num_copies += 1
             prev_idx = idx
         if self._advances_every_step():
@@ -379,10 +402,10 @@ class _BufferedRef:
         torch._check(copy_slot < self.bank.size(0))
         self._copy_in(
             src,
-            self.bank[copy_slot],
+            select_bank(self.bank, copy_slot),
             w.fetch_idx,
             should_copy,
-            self.sem[copy_slot],
+            select_bank(self.sem, copy_slot),
         )
         return next_count
 
@@ -406,8 +429,8 @@ class _BufferedRef:
             else:
                 pred = (ctx.step == 0) | self._indices_differ(ctx.prev, ctx.cur)
         torch._check(rs < self.bank.size(0))
-        _guarded_wait(self.sem[rs], pred)
-        return self.bank[rs]
+        _guarded_wait(select_bank(self.sem, rs), pred)
+        return select_bank(self.bank, rs)
 
     def advance_consumer(self, ctx, wait_count):
         """Phase 6 (guarded inputs) — the current block is done when it changes
@@ -438,8 +461,8 @@ class _BufferedRef:
         else:
             changed = self._indices_differ(ctx.prev, ctx.cur)
         pred = changed & (store_count >= self.num_banks)
-        _guarded_wait(self.sem[slot], pred)
-        return self.bank[slot], slot
+        _guarded_wait(select_bank(self.sem, slot), pred)
+        return select_bank(self.bank, slot), slot
 
     def copy_out(self, ctx, dst, store_count, out_slot, slot_idx):
         """Phase 5 — store the completed output tile ``out_slot`` to DRAM
@@ -453,7 +476,7 @@ class _BufferedRef:
             ctx.cur,
             ctx.next,
             ctx.last,
-            self.sem[slot_idx],
+            select_bank(self.sem, slot_idx),
         )
 
     def drain(self, final_store_count):
@@ -462,7 +485,7 @@ class _BufferedRef:
         final_store_count`` (a small grid leaves the rest un-signaled).
         """
         for j in range(self.num_banks):
-            _guarded_wait(self.sem[j], j < final_store_count)
+            _guarded_wait(select_bank(self.sem, j), j < final_store_count)
 
 
 class PipelinedKernel(torch.nn.Module):

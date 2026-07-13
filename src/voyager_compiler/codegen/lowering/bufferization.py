@@ -33,7 +33,6 @@ from ..mapping_utils import (
     is_pooling,
     is_shape_changing_nop,
 )
-from ..passes.utils import get_arg_value
 from .ops import MemoryLevel, oracle_disabled
 
 logger = logging.getLogger(__name__)
@@ -123,6 +122,7 @@ def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
 
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
 _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
+_SUBVIEW = torch.ops.voyager.subview.default
 
 
 def annotate_tensor_spaces(gm: GraphModule) -> None:
@@ -229,11 +229,6 @@ def _space(node):
     return node.meta.get("space") if isinstance(node, Node) else None
 
 
-# Position of ``banks`` in each allocation primitive's schema:
-# ``alloc(size, dtype, space, banks)`` / ``zeros(size, dtype, banks)``.
-_BANKS_ARG = {_VOYAGER_ALLOC: 3, _VOYAGER_ZEROS: 2}
-
-
 def _viewed_buffer(node: Node) -> Optional[Node]:
     """The buffer whose bytes ``node`` names, or ``None`` if ``node`` writes
     bytes of its own.
@@ -241,30 +236,20 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
     Some nodes allocate nothing: they are a second name for a buffer that
     already exists, and so take its space rather than a space of their own.
 
+      * a ``voyager.subview`` — a window onto a buffer (the bank a step reads);
       * a NOP (``reshape``, ``view``, a same-dtype ``to``) — the same bytes;
-      * a ``select`` picking a bank out of a banked ``alloc`` — the bank dim is
-        not a tensor dim, so the pick addresses nothing;
       * ``getitem`` of a ``while_loop`` — the loop wrote the carried buffer in
         place, so its result *is* that buffer;
       * ``getitem`` of a ``cond`` — the ``cond``, which computes into the
         destination its ``insert`` names and so owns no space either.
 
-    Everything else writes a tensor of its own and owns it — including a
-    ``select`` that reads a sub-tensor, and a ``to.dtype`` that really converts.
+    Everything else writes a tensor of its own and owns it — including an
+    ``aten.select`` that reads a sub-tensor (a *bank* is a ``subview``, so a
+    select here is a model slicing a tensor) and a ``to.dtype`` that really
+    converts.
     """
-    if is_nop(node):
+    if node.target is _SUBVIEW or is_nop(node):
         return node.args[0]
-
-    if node.target is _SELECT:
-        src, seen = node.args[0], set()
-        while src not in seen and "source_node" in src.meta:
-            seen.add(src)
-            src = src.meta["source_node"]
-        num_banks = 0
-        if (index := _BANKS_ARG.get(src.target)) is not None:
-            num_banks = get_arg_value(src, index, "banks", 0)
-        is_bank_select = node.args[1] == 0 and num_banks > 0
-        return src if (is_bank_select or is_nop(node)) else None
 
     if node.target is operator.getitem:
         src, index = node.args[0], node.args[1]
@@ -320,8 +305,6 @@ def _walk_region(gm, hop, operands, graph_args, codebooks, ctx) -> None:
         for operand, ph in zip(operands, phs):
             if (space := _space(operand)) is not None:
                 ph.meta["space"] = space
-            if isinstance(operand, Node):
-                ph.meta["source_node"] = operand
         _annotate_and_validate(sub, codebooks, hop, ctx)
 
 
@@ -387,9 +370,6 @@ def _annotate_and_validate(
 # ---------------------------------------------------------------------------
 
 
-_SELECT = torch.ops.aten.select.int
-
-
 def _dtype_of(n):
     return n.meta.get("dtype") if isinstance(n, Node) else None
 
@@ -411,7 +391,7 @@ def _buffer_of(node):
         seen.add(node)
         if node.target is _VOYAGER_ALLOC or node.op == "placeholder":
             break
-        if node.target is _SELECT or is_nop(node):
+        if node.target is _SUBVIEW or is_nop(node):
             node = node.args[0]
             continue
         break

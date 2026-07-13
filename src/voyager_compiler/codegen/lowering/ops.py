@@ -10,6 +10,7 @@ Primitives
 ----------
 ``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
 ``voyager.zeros(size, dtype)``       zero-initialised tile / bank (accumulator, semaphore).
+``voyager.subview(src, o, s, st)``   strided window onto a buffer (a bank slot).
 ``voyager.insert(src, dst, sem)``    destination-passing compute-result write.
 ``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
 ``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
@@ -36,9 +37,9 @@ class MemoryLevel(IntEnum):
     buffer's level is needed."""
 
     REGISTER = 0  # PE register file
-    LOCAL = 1     # local buffers (input and weight buffers)
-    SRAM = 2      # on-chip scratchpad / SRAM
-    DRAM = 3      # main system memory (e.g., DDR)
+    LOCAL = 1  # local buffers (input and weight buffers)
+    SRAM = 2  # on-chip scratchpad / SRAM
+    DRAM = 3  # main system memory (e.g., DDR)
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,42 @@ def _zeros_fake(
     size: Tuple[int, ...], dtype: torch.dtype, banks: int = UNBANKED
 ) -> torch.Tensor:
     return torch.zeros(_banked_size(size, banks), dtype=dtype)
+
+
+# ---------------------------------------------------------------------------
+# voyager.subview — a strided window onto a buffer, after MLIR's memref.subview:
+# ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim, so
+# the result has the source's rank.  It names no storage of its own; the code
+# generator folds it into the reference to the buffer it views (a bank pick
+# becomes ``TensorBoxRef.bank``).
+#
+# It must return a genuine *view*: a bank slot is a write destination
+# (``insert(src, bank_slot)``), and the FX graph stays executable, so a copy
+# would land the write in a throwaway tensor.  ``as_strided`` gives the view and
+# keeps the result's shape static -- only its storage offset is dynamic, which is
+# what lets the slot index (``step % num_banks``) stay a runtime value.
+# ---------------------------------------------------------------------------
+voyager_lib.define(
+    "subview(Tensor(a) source, SymInt[] offsets, SymInt[] sizes, "
+    "SymInt[] strides) -> Tensor(a)"
+)
+
+
+def _subview(
+    source: torch.Tensor,
+    offsets: Tuple[int, ...],
+    sizes: Tuple[int, ...],
+    strides: Tuple[int, ...],
+) -> torch.Tensor:
+    window = [source.stride(d) * s for d, s in enumerate(strides)]
+    offset = source.storage_offset() + sum(
+        o * source.stride(d) for d, o in enumerate(offsets)
+    )
+    return torch.as_strided(source, sizes, window, offset)
+
+
+impl(voyager_lib, "subview", "CompositeExplicitAutograd")(_subview)
+torch.library.register_fake("voyager::subview")(_subview)
 
 
 voyager_lib.define(

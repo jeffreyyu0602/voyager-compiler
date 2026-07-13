@@ -67,7 +67,7 @@ from ..voyager_ir_pb2 import (
     Tiling,
 )
 from ..shape_prop import ShapeProp
-from .bufferization import _is_compute, _viewed_buffer
+from .bufferization import _is_compute
 from .ops import oracle_disabled
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -75,7 +75,7 @@ COND = torch.ops.higher_order.cond
 _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
-_SELECT = torch.ops.aten.select.int
+_SUBVIEW = torch.ops.voyager.subview.default
 
 # The ops that *declare* storage; every other tensor node refers to storage one
 # of these owns.
@@ -236,26 +236,38 @@ def _outputs_of(gm: GraphModule) -> List:
     return list(outs) if isinstance(outs, (tuple, list)) else [outs]
 
 
-def _is_bank_select(node) -> bool:
-    """A ``select`` that picks a bank out of a software-pipeline bank, which
-    bufferization already told apart from a slice of a sub-tensor (only the bank
-    is a view; the slice reads bytes of its own)."""
-    return (
-        node.op == "call_function"
-        and node.target is _SELECT
-        and _viewed_buffer(node) is not None
+def _bank(node):
+    """The bank a ``voyager.subview`` picks, or ``None`` if it is not a bank
+    pick: an offset along the leading (bank) dim, one bank deep, the whole tile
+    along the rest.  Anything else is a strided window into the payload, and a
+    ``TensorBoxRef`` names a whole buffer plus a bank — it has nowhere to put an
+    offset (see the address-aliasing work, not done)."""
+    source, offsets, sizes, strides = node.args
+    shape = list(_value(source).shape)
+    if (
+        list(offsets[1:]) == [0] * (len(shape) - 1)
+        and list(sizes) == [1] + shape[1:]
+        and list(strides) == [1] * len(shape)
+    ):
+        return offsets[0]
+    raise ValueError(
+        f"'{node.name}' is a strided window onto '{source.name}' "
+        f"(offsets={list(offsets)}, sizes={list(sizes)}, "
+        f"strides={list(strides)}), not a bank: a TensorBoxRef names a whole "
+        f"buffer plus a bank, so the window has nowhere to go"
     )
 
 
 def _is_view(node) -> bool:
-    """A node that renames storage rather than computing anything: a bank
-    ``select``, a reshape, a size-1 ``select`` or a same-dtype ``to``
-    (``is_nop`` catches those two).  It is never an instruction — its consumers
-    reference the buffer it views.  A *real* slice and a *real* cast are not
-    here: each writes a tensor of its own, so each is an op like any other."""
+    """A node that renames storage rather than computing anything: a
+    ``voyager.subview`` (the bank a step reads), a reshape, a size-1 ``select``
+    or a same-dtype ``to`` (``is_nop`` catches the last two).  It is never an
+    instruction — its consumers reference the buffer it views.  A *real* slice
+    and a *real* cast are not here: each writes a tensor of its own, so each is
+    an op like any other."""
     if node.op != "call_function":
         return False
-    return is_nop(node) or _is_bank_select(node)
+    return is_nop(node) or node.target is _SUBVIEW
 
 
 def _owns_storage(node) -> bool:
@@ -337,9 +349,9 @@ class _Emitter:
             return TensorBoxRef(node=node.name)
 
         if node.op == "call_function":
-            if _is_bank_select(node):
+            if node.target is _SUBVIEW:
                 base = self._ref(node.args[0], env, internal)
-                base.bank.CopyFrom(self._scalar(node.args[2], env))
+                base.bank.CopyFrom(self._scalar(_bank(node), env))
                 return base
             if _is_view(node):
                 return self._ref(node.args[0], env, internal)
@@ -515,7 +527,7 @@ class _Emitter:
             return [(node, index)]
         if node.op != "call_function":
             return None
-        if node.target in _ALLOCATORS or node.target is _SELECT:
+        if node.target in _ALLOCATORS or node.target is _SUBVIEW:
             return None  # a buffer handle
         if _is_view(node):
             return self._producers(node.args[0], gm, env, index)

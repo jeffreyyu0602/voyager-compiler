@@ -33,7 +33,7 @@ from .scheduler import ResourceState
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
-_SELECT = torch.ops.aten.select.int
+_SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
 _INSERT = torch.ops.voyager.insert.default
@@ -79,7 +79,7 @@ def _should_eval(node: Node) -> bool:
     tensor and not a pure buffer op)."""
     return (
         node.op == "call_function"
-        and node.target not in (_ALLOC, _ZEROS, _SELECT)
+        and node.target not in (_ALLOC, _ZEROS, _SUBVIEW)
         and not _is_tensor(node)
     )
 
@@ -99,13 +99,13 @@ def _defining(node, bind: Dict[Node, Node]):
 
 
 def _root(node, bind: Dict[Node, Node]):
-    """Follow placeholder bindings and tile ``select`` / ``getitem`` indexing to
+    """Follow placeholder bindings and tile ``subview`` / ``getitem`` indexing to
     the root buffer node (the top-level alloc / input that carries
     ``meta['space']``)."""
     while isinstance(node, Node):
         if node in bind:
             node = bind[node]
-        elif node.op == "call_function" and node.target is _SELECT:
+        elif node.op == "call_function" and node.target is _SUBVIEW:
             node = node.args[0]
         elif (
             node.op == "call_function"
@@ -271,20 +271,25 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
 def _sem_key(sem_arg, env, bind):
     """``(bank_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
 
-    The arg is a ``select(bank, 0, slot)`` — possibly reached through a chain of
-    placeholder bindings when the select sits outside a ``cond`` that the DMA
-    lives in.  ``slot`` is resolved against the shared ``env`` (the slot index,
-    e.g. ``step % num_banks``, was computed in that outer scope), so an
-    ``async_copy`` into a slot and its matching ``async_wait`` hash equal.
+    The arg is a ``subview(bank, [slot], [1], [1])`` behind the NOP that squeezes
+    the bank dim off — possibly reached through a chain of placeholder bindings
+    when the pick sits outside a ``cond`` that the DMA lives in.  ``slot`` is
+    resolved against the shared ``env`` (the slot index, e.g.
+    ``step % num_banks``, was computed in that outer scope), so an ``async_copy``
+    into a slot and its matching ``async_wait`` hash equal.
     """
     node = _defining(sem_arg, bind)
+    while (
+        isinstance(node, Node) and node.op == "call_function" and is_nop(node)
+    ):
+        node = _defining(node.args[0], bind)
     if (
         isinstance(node, Node)
         and node.op == "call_function"
-        and node.target is _SELECT
+        and node.target is _SUBVIEW
     ):
         bank = _defining(node.args[0], bind)
-        return (id(bank), _resolve(node.args[2], env))
+        return (id(bank), _resolve(node.args[1][0], env))
     return (id(node), 0)
 
 

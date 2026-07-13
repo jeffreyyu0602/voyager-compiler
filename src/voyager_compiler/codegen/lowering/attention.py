@@ -156,11 +156,17 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
             if isinstance(sub, torch.fx.GraphModule):
                 _fuse_passes(sub)
 
-    # A node absorbable into a pass's compute cone.  ``select.int`` is the
-    # bank-slot tile read (``bank[step % num_banks]``) — the load boundary, not
-    # compute; stopping there keeps its integer slot index out of the group's
-    # inputs (it would break the fused submodule's tensor-only ShapeProp).
-    _boundary = (_INSERT, operator.getitem, torch.ops.aten.select.int)
+    # A node absorbable into a pass's compute cone.  A bank read — the slot a
+    # step consumes, ``voyager.subview`` and the ``squeeze`` that drops the bank
+    # dim — is the load boundary, not compute: stopping there keeps its integer
+    # slot index out of the group's inputs (it would break the fused
+    # submodule's tensor-only ShapeProp).
+    _boundary = (
+        _INSERT,
+        operator.getitem,
+        torch.ops.voyager.subview.default,
+        torch.ops.aten.squeeze.dim,
+    )
 
     def _is_compute(n):
         return (

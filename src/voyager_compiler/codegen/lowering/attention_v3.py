@@ -95,7 +95,10 @@ from voyager_compiler.codegen.lowering.attention import (
     _fuse_passes,
 )
 from voyager_compiler.codegen.lowering.ops import MemoryLevel, oracle_disabled
-from voyager_compiler.codegen.lowering.pipeline import _guarded_wait
+from voyager_compiler.codegen.lowering.pipeline import (
+    _guarded_wait,
+    select_bank,
+)
 from voyager_compiler.codegen.lowering.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
@@ -180,7 +183,12 @@ class _FA3Pipeline(torch.nn.Module):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
         voyager.async_copy(
-            q, bank[slot], idx, unit + (self.tq, self.d), sem[slot], dims
+            q,
+            select_bank(bank, slot),
+            idx,
+            unit + (self.tq, self.d),
+            select_bank(sem, slot),
+            dims,
         )
 
     def _load_k(self, k, bank, slot, sem, coords):
@@ -190,10 +198,10 @@ class _FA3Pipeline(torch.nn.Module):
         unit = (1,) * self.nb
         voyager.async_copy(
             k,
-            bank[slot],
+            select_bank(bank, slot),
             idx,
             unit + (self.d, self.tkv),
-            sem[slot],
+            select_bank(sem, slot),
             dims,
             None,
             True,
@@ -203,7 +211,12 @@ class _FA3Pipeline(torch.nn.Module):
         dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
         unit = (1,) * self.nb
         voyager.async_copy(
-            v, bank[slot], idx, unit + (self.tkv, self.d), sem[slot], dims
+            v,
+            select_bank(bank, slot),
+            idx,
+            unit + (self.tkv, self.d),
+            select_bank(sem, slot),
+            dims,
         )
 
     def _load_mask(self, mask, bank, slot, sem, coords):
@@ -211,14 +224,19 @@ class _FA3Pipeline(torch.nn.Module):
         idx = [coords[g] for _, g in self.mask_dyn]
         munit = (1,) * (mask.ndim - 2)
         voyager.async_copy(
-            mask, bank[slot], idx, munit + (self.tq, self.tkv), sem[slot], dims
+            mask,
+            select_bank(bank, slot),
+            idx,
+            munit + (self.tq, self.tkv),
+            select_bank(sem, slot),
+            dims,
         )
 
     def _store_out(self, tile, out, sem, coords):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
         voyager.async_copy(
-            tile, out, idx, unit + (self.tq, self.d), sem[0], dims
+            tile, out, idx, unit + (self.tq, self.d), select_bank(sem, 0), dims
         )
 
     # --- compute helpers (shared by prologue / loop / epilogue) ---------
@@ -309,18 +327,18 @@ class _FA3Pipeline(torch.nn.Module):
         self._load_v(v, v_bank, 1 % 2, v_sem, c0)
 
         self._reset(m, l, o)
-        voyager.async_wait(q_sem[0])
-        voyager.async_wait(k_sem[0])
+        voyager.async_wait(select_bank(q_sem, 0))
+        voyager.async_wait(select_bank(k_sem, 0))
         if self.has_mask:
-            voyager.async_wait(m_sem[0])
+            voyager.async_wait(select_bank(m_sem, 0))
         self._gemm_a(
-            q_bank[0],
-            k_bank[0],
-            m_bank[0] if self.has_mask else None,
-            s_buf[0],
+            select_bank(q_bank, 0),
+            select_bank(k_bank, 0),
+            select_bank(m_bank, 0) if self.has_mask else None,
+            select_bank(s_buf, 0),
             sem_scores,
         )
-        self._softmax(s_buf[0], m, l, row_tmp, alpha, sem_scores)
+        self._softmax(select_bank(s_buf, 0), m, l, row_tmp, alpha, sem_scores)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
         def cond_fn(step):
@@ -364,19 +382,19 @@ class _FA3Pipeline(torch.nn.Module):
             # S GEMM here; V only later, right before the P@V GEMM — so
             # the S GEMM can issue while V's DMA is still in flight.  Q is
             # waited once per sweep, at its first iteration.
-            voyager.async_wait(k_sem[cur_slot])
+            voyager.async_wait(select_bank(k_sem, cur_slot))
             if self.has_mask:
-                voyager.async_wait(m_sem[cur_slot])
+                voyager.async_wait(select_bank(m_sem, cur_slot))
             q_slot = (step // N) % 2
             torch._check(q_slot < 2)
-            _guarded_wait(q_sem[q_slot], kv == 0)
+            _guarded_wait(select_bank(q_sem, q_slot), kv == 0)
 
             # [A] current block's scores on the matrix unit.
             self._gemm_a(
-                q_bank[q_slot],
-                k_bank[cur_slot],
-                m_bank[cur_slot] if self.has_mask else None,
-                s_buf[cur_slot],
+                select_bank(q_bank, q_slot),
+                select_bank(k_bank, cur_slot),
+                select_bank(m_bank, cur_slot) if self.has_mask else None,
+                select_bank(s_buf, cur_slot),
                 sem_scores,
             )
 
@@ -385,9 +403,11 @@ class _FA3Pipeline(torch.nn.Module):
             # pv_buf.
             prev_slot = (step - 1) % 2
             torch._check(prev_slot < 2)
-            voyager.async_wait(v_sem[cur_slot])
+            voyager.async_wait(select_bank(v_sem, cur_slot))
             voyager.insert(
-                torch.matmul(s_buf[prev_slot], v_bank[cur_slot]),
+                torch.matmul(
+                    select_bank(s_buf, prev_slot), select_bank(v_bank, cur_slot)
+                ),
                 pv_buf,
                 semaphore=sem_pv,
             )
@@ -400,9 +420,11 @@ class _FA3Pipeline(torch.nn.Module):
                 voyager.insert(o + pv_buf, o)
                 # Drain the previous boundary's store before overwriting
                 # the bank (no prior store exists at the first boundary).
-                _guarded_wait(out_sem[0], step >= 2 * N)
-                voyager.insert((o / l).to(self.out_dtype), out_bank[0])
-                self._store_out(out_bank[0], out, out_sem, prev)
+                _guarded_wait(select_bank(out_sem, 0), step >= 2 * N)
+                voyager.insert(
+                    (o / l).to(self.out_dtype), select_bank(out_bank, 0)
+                )
+                self._store_out(select_bank(out_bank, 0), out, out_sem, prev)
                 self._reset(m, l, o)
                 return 1
 
@@ -410,7 +432,9 @@ class _FA3Pipeline(torch.nn.Module):
 
             # [C] softmax of the current block on the vector unit — runs
             # (synchronously) while the matrix [B] GEMM is still in flight.
-            self._softmax(s_buf[cur_slot], m, l, row_tmp, alpha, sem_scores)
+            self._softmax(
+                select_bank(s_buf, cur_slot), m, l, row_tmp, alpha, sem_scores
+            )
 
             # [E] deferred rescale fused with the P@V accumulate: o = alpha·(o
             # + pv).  Runs after softmax (kv >= 1 only) so the vector unit
@@ -429,9 +453,12 @@ class _FA3Pipeline(torch.nn.Module):
         c_last = _unravel(num_steps - 1, grid)
         v_slot = num_steps % 2
         # [B] the final block's P@V on the matrix unit.
-        voyager.async_wait(v_sem[v_slot])
+        voyager.async_wait(select_bank(v_sem, v_slot))
         voyager.insert(
-            torch.matmul(s_buf[(num_steps - 1) % 2], v_bank[v_slot]),
+            torch.matmul(
+                select_bank(s_buf, (num_steps - 1) % 2),
+                select_bank(v_bank, v_slot),
+            ),
             pv_buf,
             semaphore=sem_pv,
         )
@@ -439,10 +466,10 @@ class _FA3Pipeline(torch.nn.Module):
         voyager.async_wait(sem_pv)
         voyager.insert(o + pv_buf, o)
         if num_steps > N:  # a prior boundary store exists (static)
-            voyager.async_wait(out_sem[0])
-        voyager.insert((o / l).to(self.out_dtype), out_bank[0])
-        self._store_out(out_bank[0], out, out_sem, c_last)
-        voyager.async_wait(out_sem[0])  # drain
+            voyager.async_wait(select_bank(out_sem, 0))
+        voyager.insert((o / l).to(self.out_dtype), select_bank(out_bank, 0))
+        self._store_out(select_bank(out_bank, 0), out, out_sem, c_last)
+        voyager.async_wait(select_bank(out_sem, 0))  # drain
         return out
 
 
