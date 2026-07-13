@@ -51,6 +51,7 @@ voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
 _ZERO = voyager.zeros.default
 _WHILE = torch.ops.higher_order.while_loop
+_COND = torch.ops.higher_order.cond
 _GETITEM = operator.getitem
 
 # Position of ``banks`` in each allocation primitive's schema:
@@ -276,14 +277,22 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
 
 
 def _walk(gm: GraphModule):
-    """Yield every node in execution order, descending into a ``while_loop``
-    body at the loop's position and into a fused ``call_module`` submodule."""
+    """Yield every node in execution order, descending at its position into a
+    ``while_loop`` body, both branches of a ``cond``, and a fused
+    ``call_module``.  ``_buffer_identity`` must know every region this descends
+    into: a node it reaches but the union-find does not merge would look like a
+    buffer of its own."""
     for n in gm.graph.nodes:
         yield n
         if n.op == "call_function" and n.target is _WHILE:
             body = _submodule(gm, n.args[1].target)
             if body is not None:
                 yield from _walk(body)
+        elif n.op == "call_function" and n.target is _COND:
+            for branch in (n.args[1], n.args[2]):
+                sub = _submodule(gm, branch.target)
+                if sub is not None:
+                    yield from _walk(sub)
         elif n.op == "call_module":
             sub = _submodule(gm, n.target)
             if sub is not None:
@@ -316,18 +325,31 @@ class _UnionFind:
 
 
 def _buffer_identity(model: GraphModule) -> _UnionFind:
-    """Merge the FX nodes that name the *same* physical buffer.  A value carried
-    through a ``while_loop`` is one buffer — its carried operand, the body
-    placeholder it binds, the body's returned value for that slot, and the
-    loop-result ``getitem`` all collapse together.  So a scratch ``alloc``
-    accumulator threaded through the reduction loop (alloc -> body arg ->
-    accumulate-add -> getitem) becomes one buffer with one lifetime, instead of
-    several co-live aliases."""
+    """Merge the FX nodes that name the *same* physical buffer.
+
+    A buffer takes a new name every time it crosses a region boundary or is
+    viewed, and each name would otherwise look like a buffer of its own, co-live
+    with the rest.  Two rules merge them:
+
+      * a **view** names the buffer it views — a bank slot, a reshape, the
+        ``getitem`` handle of a loop result;
+      * a **region** binds its operands to its placeholders — a ``while_loop``
+        (which also returns each carried buffer, written in place), a ``cond``
+        (whose two branches share one operand list), a fused ``call_module``.
+
+    So a scratch ``alloc`` accumulator threaded through the reduction loop
+    (alloc -> body arg -> accumulate-add -> getitem) becomes one buffer with one
+    lifetime, and the bank a ``cond`` branch writes through a slot ``select`` is
+    the bank itself, not a tile beside it.
+    """
     uf = _UnionFind()
 
     def walk(gm: GraphModule):
         for n in gm.graph.nodes:
             uf.find(n)
+            if (viewed := _viewed_buffer(n)) is not None:
+                uf.union(viewed, n)
+
             if n.op == "call_function" and n.target is _WHILE:
                 body = _submodule(gm, n.args[1].target)
                 if body is None:
@@ -352,16 +374,17 @@ def _buffer_identity(model: GraphModule) -> _UnionFind:
                     ):
                         uf.union(c, outs[i])
                 walk(body)
-            elif n.op == "call_function" and n.target is _GETITEM:
-                src, idx = n.args[0], n.args[1]
-                if (
-                    isinstance(src, Node)
-                    and src.target is _WHILE
-                    and isinstance(idx, int)
-                ):
-                    carried = list(src.args[2])
-                    if idx < len(carried) and isinstance(carried[idx], Node):
-                        uf.union(n, carried[idx])
+            elif n.op == "call_function" and n.target is _COND:
+                operands = list(n.args[3]) if len(n.args) > 3 else []
+                for branch in (n.args[1], n.args[2]):
+                    sub = _submodule(gm, branch.target)
+                    if sub is None:
+                        continue
+                    phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+                    for ph, o in zip(phs, operands):
+                        if isinstance(o, Node):
+                            uf.union(o, ph)
+                    walk(sub)
             elif n.op == "call_module":
                 sub = _submodule(gm, n.target)
                 if sub is None:
@@ -395,8 +418,10 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
 
     bufs: Dict[Node, _Buf] = {}
     for root, mem in members.items():
-        # A view (a bank slot, a reshape) names memory another buffer owns, so
-        # it is planned no region of its own.
+        # The members that own the bytes.  A view is in the group (it names this
+        # buffer) but must not size it or start its life: a slot ``select`` is
+        # one tile of a bank several tiles deep.  It still *ends* its life --
+        # the death scan below reads every member.
         tiles = [
             m
             for m in mem
