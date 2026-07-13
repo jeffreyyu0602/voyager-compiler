@@ -343,17 +343,18 @@ class _Emitter:
         )
 
     def _window(self, node, env, internal) -> TensorBoxRef:
-        """A ``voyager.subview`` is not an instruction: it *is* the reference the
-        operand makes to the buffer it windows.  Its arguments pass straight
+        """A ``voyager.subview`` is not an instruction: it *is* the reference
+        the operand makes to the buffer it windows.  Its arguments pass straight
         through — an offset may be a runtime scalar (the bank a step writes),
         while sizes and strides are static.
 
         The referenced dims of a banked buffer are ``[bank_count, *shape]``, so
         dim 0 offsets the bank and the backend pitches it by
         ``bank_stride_bytes``.  A window over the *whole* referenced buffer is
-        the buffer, and is left off.
+        the buffer, and is left off.  ``squeeze_dim`` is not addressing — it is
+        the rank the *tensor* takes, and the bytes it names are the same.
         """
-        source, offsets, sizes, strides = node.args
+        source, offsets, sizes, strides = node.args[:4]
         ref = self._ref(source, env, internal)
         if ref.offsets:
             raise ValueError(

@@ -99,21 +99,20 @@ class _StepCtx:
 
 def select_bank(buf, slot):
     """One bank of a banked buffer (``[num_banks, *tile]``), as an explicit
-    ``voyager.subview``: offset ``slot`` along the bank dim, the whole tile along
-    the rest.  ``slot`` may be a runtime value (``step % num_banks``).
+    ``voyager.subview``: offset ``slot`` along the bank dim, the whole tile
+    along the rest, and the bank dim dropped — it is not a tensor dim.  ``slot``
+    may be a runtime value (``step % num_banks``).
 
     Said with ``buf[slot]`` this would be an ``aten.select``, indistinguishable
-    from a model slicing a tensor — and the two mean opposite things: a bank pick
-    renames storage (it folds into the operand's ``TensorBoxRef`` as the window
-    that reference makes), while a
-    slice reads bytes of its own.  The bank dim is not a tensor dim, so it is
-    squeezed back off.
+    from a model slicing a tensor — and the two mean opposite things: a bank
+    pick renames storage (it folds into the operand's ``TensorBoxRef``, as the
+    window that reference makes), while a slice reads bytes of its own.
     """
     shape = list(buf.shape)
     offsets = [slot] + [0] * (len(shape) - 1)
     sizes = [1] + shape[1:]
     strides = [1] * len(shape)
-    return voyager.subview(buf, offsets, sizes, strides).squeeze(0)
+    return voyager.subview(buf, offsets, sizes, strides, squeeze_dim=[0])
 
 
 def _guarded_wait(sem, pred=None):

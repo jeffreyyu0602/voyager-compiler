@@ -127,20 +127,22 @@ def _zeros_fake(
 
 # ---------------------------------------------------------------------------
 # voyager.subview — a strided window onto a buffer, after MLIR's memref.subview:
-# ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim, so
-# the result has the source's rank.  It names no storage of its own; the code
-# generator folds it into the operand's ``TensorBoxRef``: the window that
-# reference makes onto the buffer.
+# ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim.
+# ``squeeze_dim`` names the windowed dims to drop from the result (each of size
+# 1), which is how memref.subview reduces rank — a bank dim is not a tensor dim,
+# so a bank pick drops it.  It names no storage of its own; the code generator
+# folds it into the operand's ``TensorBoxRef``: the window that reference makes
+# onto the buffer.
 #
 # It must return a genuine *view*: a bank slot is a write destination
 # (``insert(src, bank_slot)``), and the FX graph stays executable, so a copy
 # would land the write in a throwaway tensor.  ``as_strided`` gives the view and
-# keeps the result's shape static -- only its storage offset is dynamic, which is
-# what lets the slot index (``step % num_banks``) stay a runtime value.
+# keeps the result's shape static -- only its storage offset is dynamic, which
+# is what lets the slot index (``step % num_banks``) stay a runtime value.
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "subview(Tensor(a) source, SymInt[] offsets, SymInt[] sizes, "
-    "SymInt[] strides) -> Tensor(a)"
+    "SymInt[] strides, int[] squeeze_dim=[]) -> Tensor(a)"
 )
 
 
@@ -149,12 +151,19 @@ def _subview(
     offsets: Tuple[int, ...],
     sizes: Tuple[int, ...],
     strides: Tuple[int, ...],
+    squeeze_dim: Tuple[int, ...] = (),
 ) -> torch.Tensor:
     window = [source.stride(d) * s for d, s in enumerate(strides)]
     offset = source.storage_offset() + sum(
         o * source.stride(d) for d, o in enumerate(offsets)
     )
-    return torch.as_strided(source, sizes, window, offset)
+    kept = [d for d in range(len(sizes)) if d not in squeeze_dim]
+    return torch.as_strided(
+        source,
+        [sizes[d] for d in kept],
+        [window[d] for d in kept],
+        offset,
+    )
 
 
 impl(voyager_lib, "subview", "CompositeExplicitAutograd")(_subview)
