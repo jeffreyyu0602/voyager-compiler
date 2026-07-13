@@ -134,8 +134,8 @@ class ResourceState:
             end_eid = (self.now, self.last_now_eid)
         self.sem_fifos.setdefault(sem_key, deque()).append(end_eid)
 
-    def async_copy(
-        self, node, n_bytes: int, is_load: bool, sem_key, path, category=""
+    def _dram_event(
+        self, node, n_bytes: int, is_read: bool, category, path, sync: bool
     ) -> TimingRecord:
         eid = self._eid()
         start = max(self.now, self.dram_free)
@@ -144,31 +144,57 @@ class ResourceState:
         rec = TimingRecord(
             eid=eid,
             node_name=node.name,
-            kind="load" if is_load else "store",
+            kind="load" if is_read else "store",
             resource=("dram",),
             start=start,
             end=end,
             iteration_path=tuple(path),
             loop_uid=self.cur_loop,
             bytes=n_bytes,
-            is_read=is_load,
+            is_read=is_read,
             category=category,
             start_deps=deps,
             latency_kind="dram",
             latency_ref=n_bytes,
         )
         self.records.append(rec)
-        # DMA occupies the DRAM resource but does NOT advance the program clock.
         self.dram_free = end
         self.last_dram_eid = eid
-        if is_load:
+        if sync:
+            self.now = end
+            self.last_now_eid = eid
+        if is_read:
             self.read_bytes += n_bytes
         else:
             self.write_bytes += n_bytes
         if category in self.cat_bytes:
             self.cat_bytes[category] += n_bytes
-        self.sem_fifos.setdefault(sem_key, deque()).append((end, eid))
         return rec
+
+    def async_copy(
+        self, node, n_bytes: int, is_load: bool, sem_key, path, category=""
+    ) -> TimingRecord:
+        # A DMA occupies DRAM but does NOT advance the program clock: its
+        # matching async_wait is what reconciles it.
+        rec = self._dram_event(
+            node, n_bytes, is_load, category, path, sync=False
+        )
+        self.sem_fifos.setdefault(sem_key, deque()).append((rec.end, rec.eid))
+        return rec
+
+    def dram_copy(self, node, reads, write, path) -> TimingRecord:
+        """A DRAM->DRAM materialization (``pad`` / ``expand`` / ``cat``): read
+        every input, then write the output.  Each ``(bytes, category)`` side is
+        sized from its own tensor, so a copy that reads a weight and writes an
+        activation lands in both buckets.
+
+        It carries no semaphore, so nothing can wait on it and it cannot be
+        overlapped -- it is synchronous and stalls the program clock.
+        """
+        for n_bytes, category in reads:
+            self._dram_event(node, n_bytes, True, category, path, sync=True)
+        n_bytes, category = write
+        return self._dram_event(node, n_bytes, False, category, path, sync=True)
 
     def async_wait(self, node, sem_key, path) -> TimingRecord:
         eid = self._eid()

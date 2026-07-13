@@ -101,7 +101,7 @@ def _flash_attention_kernel(
         if has_mask:
             mask = in_tiles[3]  # attn_mask is the 4th SDPA operand
             if mask_is_bool:
-                s = torch.where(mask, s, torch.full_like(s, _MASK_FILL))
+                s = torch.where(mask, s, _MASK_FILL)
             else:
                 s = s + mask
         voyager.insert(s, s_buf)

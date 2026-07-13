@@ -25,15 +25,18 @@ from torch.fx import GraphModule, Node
 
 from ...mapping_utils import is_compute_op, is_nop
 from ...passes.utils import get_arg_value
-from ..codegen import _loop_extents, _norm_extent
-from .classify import INSERT, classify
-from .cost import _val, tile_bytes
+from ..bufferization import _produces_tensor, _viewed_buffer
+from ..codegen import COND, WHILE_LOOP, _loop_extents, _norm_extent
+from .cost import _shape, _val, tile_bytes
 from .model import CostParams, ScheduleResult
 from .scheduler import ResourceState
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
 _SELECT = torch.ops.aten.select.int
+_ASYNC_COPY = torch.ops.voyager.async_copy.default
+_ASYNC_WAIT = torch.ops.voyager.async_wait.default
+_INSERT = torch.ops.voyager.insert.default
 
 
 def _feeds_sem_insert(node: Node) -> bool:
@@ -42,7 +45,7 @@ def _feeds_sem_insert(node: Node) -> bool:
     """
     return any(
         u.op == "call_function"
-        and u.target is INSERT
+        and u.target is _INSERT
         and get_arg_value(u, 2, "semaphore") is not None
         for u in node.users
     )
@@ -149,9 +152,7 @@ def _is_cache_attr(node) -> bool:
     if not isinstance(node, Node) or node.op != "get_attr":
         return False
     low = f"{node.name} {node.target}".lower()
-    return "cache" in low and (
-        "key" in low or "value" in low or "kv" in low
-    )
+    return "cache" in low and ("key" in low or "value" in low or "kv" in low)
 
 
 # Compute ops a source trace still walks through: they re-encode a tensor
@@ -206,6 +207,67 @@ def _buf_category(buf, bind: Dict[Node, Node]) -> str:
     return "activation"
 
 
+def _is_dram_copy(node: Node) -> bool:
+    """A tensor the accelerator does not compute but must still materialize in
+    DRAM -- a ``pad`` / ``expand`` / ``cat`` / ``permute``.  These are exactly
+    the nodes bufferization gives ``space='DRAM'`` *itself* (rather than
+    inheriting it): an ``alloc`` names a buffer without filling it, and a view
+    (``reshape`` / ``getitem`` / ``select``) borrows its source's space without
+    moving a byte.
+    """
+    return (
+        node.meta.get("space") == "DRAM"
+        and node.target is not _ALLOC
+        and _viewed_buffer(node) is None
+    )
+
+
+def _is_scratchpad_op(node: Node, bind: Dict[Node, Node]) -> bool:
+    """On-chip work the datapath performs but ``is_compute_op`` does not name --
+    a tile copy (``insert(x.clone(), dst)``) or a tile fill (the ``full_like`` /
+    ``zeros_like`` that reset an accumulator).  Both sweep the tile through the
+    vector unit, so both are costed like any vector op rather than as free
+    control.  Only its *inputs* say where it lives: a value stored via
+    ``insert`` carries no space of its own.
+    """
+    if node.target is _ALLOC or _viewed_buffer(node) is not None:
+        return False
+    ins = [i for i in node.all_input_nodes if _is_tensor(i)]
+    return bool(ins) and all(
+        _root(i, bind).meta.get("space") == "Scratchpad" for i in ins
+    )
+
+
+def _copy_traffic(node: Node, bind: Dict[Node, Node]):
+    """``(reads, write)`` for a DRAM materialization -- every tensor input is
+    read, the output is written.  ``cat`` / ``stack`` simply have several reads.
+
+    A read is capped at the output size: a copy never reads more than it writes.
+    ``pad`` / ``stack`` / ``permute`` do sweep their whole source, but one that
+    keeps only part of it does not -- a ``slice`` reads just the slice, and an
+    ``embedding`` just the rows it gathers.  Uncapped, a 512-token lookup would
+    charge the entire embedding table (1 GB for 4 MB of rows).  The cap is a
+    heuristic, not a law: it is exact for every op we lower today, but an op
+    that genuinely re-reads its source would need its own rule.
+    """
+    out_bytes = tile_bytes(node, _shape(node))
+    reads = []
+    for inp in node.all_input_nodes:
+        if not _is_tensor(inp):
+            continue
+        root = _root(inp, bind)
+        space = root.meta.get("space") if isinstance(root, Node) else None
+        if space != "DRAM":
+            raise ValueError(
+                f"{node.name}: input {inp.name} roots in {space!r}, not DRAM "
+                f"-- a Scratchpad source would be an async_copy"
+            )
+        n_bytes = min(tile_bytes(inp, _shape(inp)), out_bytes)
+        reads.append((n_bytes, _buf_category(inp, bind)))
+    write = (out_bytes, _buf_category(node, bind))
+    return reads, write
+
+
 def _sem_key(sem_arg, env, bind):
     """``(bank_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
 
@@ -246,14 +308,14 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         if node.op == "output":
             return _resolve(node.args[0], env)
 
-        kind = classify(node)
-        if kind == "while_loop":
-            env[node] = _run_loop(node, gm, env, ctx, path)
-        elif kind == "cond":
-            env[node] = _run_cond(node, gm, env, ctx, path)
-        elif kind == "compute":
+        t = node.target
+        if node.op == "call_module":
             ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
-        elif kind == "async_copy":
+        elif t is WHILE_LOOP:
+            env[node] = _run_loop(node, gm, env, ctx, path)
+        elif t is COND:
+            env[node] = _run_cond(node, gm, env, ctx, path)
+        elif t is _ASYNC_COPY:
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
             key = _sem_key(node.args[4], env, ctx.bind)
@@ -265,15 +327,22 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
                 path,
                 _buf_category(buf, ctx.bind),
             )
-        elif kind == "async_wait":
+        elif t is _ASYNC_WAIT:
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
-        elif kind == "insert":
+        elif t is _INSERT:
             # Destination-passing write: zero-time itself, but a semaphore posts
             # the producing compute's completion so async_wait can consume it.
             sem = get_arg_value(node, 2, "semaphore")
             if sem is not None:
                 key = _sem_key(sem, env, ctx.bind)
                 ctx.rs.post_semaphore(key, node.args[0])
+        elif _produces_tensor(node) and is_compute_op(node):
+            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
+        elif _is_dram_copy(node):
+            reads, write = _copy_traffic(node, ctx.bind)
+            ctx.rs.dram_copy(node, reads, write, path)
+        elif _is_scratchpad_op(node, ctx.bind):
+            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
         elif _should_eval(node):
             env[node] = _eval(node, env)
     return None

@@ -228,7 +228,7 @@ class _FA3Pipeline(torch.nn.Module):
         s = torch.matmul(q_tile, k_tile) * self.scale
         if self.has_mask:
             if self.mask_is_bool:
-                s = torch.where(mask_tile, s, torch.full_like(s, _MASK_FILL))
+                s = torch.where(mask_tile, s, _MASK_FILL)
             else:
                 s = s + mask_tile
         voyager.insert(s, s_slot, semaphore=sem_scores)
