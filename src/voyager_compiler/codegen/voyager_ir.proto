@@ -95,21 +95,22 @@ message ScalarValueList {
 // References to allocations
 // -----------------------------------------------------------------------------
 
-// A reference to an existing TensorBox allocation.
+// A reference to an existing TensorBox, optionally a strided window onto it
+// (voyager::subview). It owns no memory and carries no address.
 //
-// For an unbanked TensorBox, bank is omitted.
+// offsets, sizes and strides have one entry per referenced dimension and are
+// omitted together to reference the whole allocation. An offset may be a
+// dynamic scalar; sizes and strides are static.
 //
-// For a banked TensorBox, bank identifies one bank. It may be either a constant
-// or a reference to a dynamically computed scalar.
-//
-// TensorBoxRef does not own memory and does not carry an address. The effective
-// address is resolved from the referenced TensorBox and the selected bank.
+// The referenced dimensions of a banked TensorBox are [bank_count, *shape]:
+// dimension 0 selects the bank, pitched by bank_stride_bytes.
 message TensorBoxRef {
   // References TensorBox.node.
   string node = 1;
 
-  // Omitted for an unbanked TensorBox.
-  ScalarValue bank = 2;
+  repeated ScalarValue offsets = 2;
+  repeated int64 sizes = 3;
+  repeated int64 strides = 4;
 }
 
 message TensorBoxRefList {
@@ -359,15 +360,10 @@ message Operation {
 
   optional Tiling tiling = 7;
 
-  // The semaphore this operation signals when it completes, if it runs
-  // asynchronously: a DMA (voyager.async_copy), or a matrix-unit op whose
-  // result another unit must wait for.  A consumer waits on it with
-  // voyager.async_wait, which takes it as an ordinary operand -- a wait
-  // consumes a semaphore, it does not post one.
-  //
-  // It belongs to the operation rather than to a primitive inside it: a fused
-  // group is one instruction, and what the signal announces is that the whole
-  // group has retired.
+  // Signaled when this operation completes, if it runs asynchronously: a DMA,
+  // or a compute op another unit waits on. A fused operation signals once, on
+  // retirement. voyager::async_wait consumes a semaphore and takes it as an
+  // operand instead.
   optional TensorBoxRef semaphore = 8;
 }
 

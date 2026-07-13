@@ -24,7 +24,7 @@ written as ``Segment``s onto each buffer *root* — ``node.meta['memory']``
 (DRAM) / ``node.meta['scratchpad']`` (Scratchpad), plus ``meta['bank_count']``
 and ``meta['bank_stride']`` on a banked one.  A tile is not given an address of
 its own: it is named by the buffer it lives in, which is what the code generator
-serializes (a ``TensorBoxRef``, plus a bank index).  See the roadmap in the
+serializes (a ``TensorBoxRef``, windowed at the bank it reads).  See the roadmap in the
 design doc for the optimizing passes that build on this baseline (intra-region
 reuse, store->load elision, double buffering, the interstellar schedule).
 """

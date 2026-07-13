@@ -50,9 +50,10 @@ class MemoryLevel(IntEnum):
 # bank dimension (``[banks, *size]``), so ``size`` stays the payload of *one*
 # bank and ``buf[slot]`` reads/writes a slot.  The distinction matters to the
 # code generator: a bank dimension is not a tensor dimension — it is serialized
-# as ``TensorBox.bank_count`` and the ``select`` that picks a slot collapses
-# into the operand's ``TensorBoxRef.bank``.  A single-slot bank (``banks == 1``)
-# still keeps its dimension, so ``buf[0]`` addresses it uniformly.
+# as ``TensorBox.bank_count`` / ``bank_stride_bytes``, and the slot a step picks
+# is the leading offset of the operand's window.  A single-slot bank
+# (``banks == 1``) still keeps its dimension, so ``buf[0]`` addresses it
+# uniformly.
 # ---------------------------------------------------------------------------
 UNBANKED = 0
 
@@ -128,8 +129,8 @@ def _zeros_fake(
 # voyager.subview — a strided window onto a buffer, after MLIR's memref.subview:
 # ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim, so
 # the result has the source's rank.  It names no storage of its own; the code
-# generator folds it into the reference to the buffer it views (a bank pick
-# becomes ``TensorBoxRef.bank``).
+# generator folds it into the operand's ``TensorBoxRef``: the window that
+# reference makes onto the buffer.
 #
 # It must return a genuine *view*: a bank slot is a write destination
 # (``insert(src, bank_slot)``), and the FX graph stays executable, so a copy

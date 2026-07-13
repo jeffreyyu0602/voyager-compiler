@@ -15,10 +15,10 @@ non-bufferized path).  Three ideas carry the whole translation:
 
   * **Storage is declared once.**  A ``TensorBox`` — a model input, a weight, a
     ``voyager.alloc`` / ``voyager.zeros`` — owns an address.  Every *use* of it
-    is a ``TensorBoxRef``: a name, plus a bank index when the buffer is a
-    software-pipeline bank.  So no tile carries an address of its own, and the
-    slot a step writes (``step % num_banks``) stays a *runtime* value.  The
-    ``select`` that picks a slot collapses into the reference.
+    is a ``TensorBoxRef``: a name, plus the window it reads — a
+    ``voyager.subview``, which for a software-pipeline bank is the slot a step
+    picks.  So no tile carries an address of its own, the slot stays a *runtime*
+    offset, and the ``subview`` collapses into the reference.
   * **Compute is destination-passing.**  ``voyager.insert(src, dst)`` is how the
     FX dialect emulates a write-to-destination; it is not an instruction.  It is
     dropped, and ``dst`` becomes the *producing* op's ``Output.destination`` —
@@ -239,40 +239,6 @@ def _outputs_of(gm: GraphModule) -> List:
     return list(outs) if isinstance(outs, (tuple, list)) else [outs]
 
 
-def _bank(node):
-    """The bank a ``voyager.subview`` picks, or ``None`` if it is not a bank
-    pick: an offset along the leading (bank) dim, one bank deep, the whole tile
-    along the rest.  Anything else is a strided window into the payload, and a
-    ``TensorBoxRef`` names a whole buffer plus a bank — it has nowhere to put an
-    offset (see the address-aliasing work, not done)."""
-    source, offsets, sizes, strides = node.args
-    shape = list(_value(source).shape)
-    if (
-        list(offsets[1:]) == [0] * (len(shape) - 1)
-        and list(sizes) == [1] + shape[1:]
-        and list(strides) == [1] * len(shape)
-    ):
-        return offsets[0]
-    raise ValueError(
-        f"'{node.name}' is a strided window onto '{source.name}' "
-        f"(offsets={list(offsets)}, sizes={list(sizes)}, "
-        f"strides={list(strides)}), not a bank: a TensorBoxRef names a whole "
-        f"buffer plus a bank, so the window has nowhere to go"
-    )
-
-
-def _is_view(node) -> bool:
-    """A node that renames storage rather than computing anything: a
-    ``voyager.subview`` (the bank a step reads), a reshape, a size-1 ``select``
-    or a same-dtype ``to`` (``is_nop`` catches the last two).  It is never an
-    instruction — its consumers reference the buffer it views.  A *real* slice
-    and a *real* cast are not here: each writes a tensor of its own, so each is
-    an op like any other."""
-    if node.op != "call_function":
-        return False
-    return is_nop(node) or node.target is _SUBVIEW
-
-
 def _owns_storage(node) -> bool:
     """``node`` *is* a buffer: a model input, a weight, an explicit
     ``voyager.alloc`` / ``zeros``, or a tensor the host materializes outside the
@@ -335,7 +301,7 @@ class _Emitter:
     def _ref(self, node, env, internal=frozenset()) -> TensorBoxRef:
         """The storage ``node`` names.  Views (bank slots, reshapes, casts) and
         region boundaries are transparent: they resolve to the box that owns the
-        bytes, plus a bank index when it is a software-pipeline bank.
+        bytes, plus the window a ``voyager.subview`` reads of them.
 
         ``internal`` is the set of values a fused group computes.  One of those
         names the ``PrimOp`` that produced it — it has no storage at all
@@ -355,10 +321,8 @@ class _Emitter:
 
         if node.op == "call_function":
             if node.target is _SUBVIEW:
-                base = self._ref(node.args[0], env, internal)
-                base.bank.CopyFrom(self._scalar(_bank(node), env))
-                return base
-            if _is_view(node):
+                return self._window(node, env, internal)
+            if is_nop(node):
                 return self._ref(node.args[0], env, internal)
             if node.target is operator.getitem:
                 ref = self.dest.get(node.args[0], {}).get(node.args[1])
@@ -377,6 +341,38 @@ class _Emitter:
             f"names no storage: it is neither a buffer nor a value written to "
             f"one by voyager.insert"
         )
+
+    def _window(self, node, env, internal) -> TensorBoxRef:
+        """A ``voyager.subview`` is not an instruction: it *is* the reference the
+        operand makes to the buffer it windows.  Its arguments pass straight
+        through — an offset may be a runtime scalar (the bank a step writes),
+        while sizes and strides are static.
+
+        The referenced dims of a banked buffer are ``[bank_count, *shape]``, so
+        dim 0 offsets the bank and the backend pitches it by
+        ``bank_stride_bytes``.  A window over the *whole* referenced buffer is
+        the buffer, and is left off.
+        """
+        source, offsets, sizes, strides = node.args
+        ref = self._ref(source, env, internal)
+        if ref.offsets:
+            raise ValueError(
+                f"'{node.name}' windows '{source.name}', which is already a "
+                f"window of '{ref.node}': a TensorBoxRef carries one window, "
+                f"so the two would have to be composed"
+            )
+        shape = list(_value(source).shape)
+        if (
+            all(o == 0 for o in offsets)
+            and list(sizes) == shape
+            and all(s == 1 for s in strides)
+        ):
+            return ref  # the whole buffer
+
+        ref.offsets.extend(self._scalar(o, env) for o in offsets)
+        ref.sizes.extend(int(s) for s in sizes)
+        ref.strides.extend(int(s) for s in strides)
+        return ref
 
     def _scalar(self, value, env) -> ScalarValue:
         if isinstance(value, Node):
@@ -545,7 +541,7 @@ class _Emitter:
             return None
         if node.target in _ALLOCATORS or node.target is _SUBVIEW:
             return None  # a buffer handle
-        if _is_view(node):
+        if is_nop(node):
             return self._producers(node.args[0], gm, env, index)
         if node.target is operator.getitem:
             source, slot = node.args[0], node.args[1]
@@ -743,8 +739,14 @@ class _Emitter:
             return
         if node.target is _INSERT:
             return  # a destination-passing store is not an instruction
-        if _is_view(node) or node.target is operator.getitem:
-            return  # a name for storage someone else owns, not an instruction
+        if (
+            is_nop(node)
+            or node.target is _SUBVIEW
+            or node.target is operator.getitem
+        ):
+            # A name for storage someone else owns — a ``subview`` window, a
+            # reshape, the unpacking of a multi-output op — not an instruction.
+            return
 
         self._dump(node)
         op = Operation(name=node.name)

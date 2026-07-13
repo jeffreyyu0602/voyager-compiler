@@ -104,7 +104,8 @@ def select_bank(buf, slot):
 
     Said with ``buf[slot]`` this would be an ``aten.select``, indistinguishable
     from a model slicing a tensor — and the two mean opposite things: a bank pick
-    renames storage (it folds into the operand's ``TensorBoxRef.bank``), while a
+    renames storage (it folds into the operand's ``TensorBoxRef`` as the window
+    that reference makes), while a
     slice reads bytes of its own.  The bank dim is not a tensor dim, so it is
     squeezed back off.
     """
