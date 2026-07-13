@@ -238,6 +238,19 @@ def _is_scratchpad_op(node: Node, bind: Dict[Node, Node]) -> bool:
     )
 
 
+# An op that writes *into* an existing tensor rather than producing a new one.
+# Arg 0 is its destination: written through, not read, and its output is that
+# whole destination however little of it the op touches.  The value is the
+# argument whose size is what the op really moves -- ``None`` when the op
+# overwrites the whole destination, so its output already sizes it.  The
+# KV-cache write ``index_copy_(cache, dim, pos, kv)`` is why this exists: sized
+# by its output it would charge the whole cache to store a single token.
+_INPLACE_SRC = {
+    torch.ops.aten.index_copy_.default: 3,
+    torch.ops.aten.copy_.default: None,
+}
+
+
 def _copy_traffic(node: Node, bind: Dict[Node, Node]):
     """``(reads, write)`` for a DRAM materialization -- every tensor input is
     read, the output is written.  ``cat`` / ``stack`` simply have several reads.
@@ -249,11 +262,18 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
     charge the entire embedding table (1 GB for 4 MB of rows).  The cap is a
     heuristic, not a law: it is exact for every op we lower today, but an op
     that genuinely re-reads its source would need its own rule.
+
+    An in-place write (``_INPLACE_SRC``) does not read the destination it
+    overwrites, and one that scatters is sized by the tensor it scatters rather
+    than by its output.
     """
-    out_bytes = tile_bytes(node, _shape(node))
+    src = _INPLACE_SRC.get(node.target)
+    dest = node.args[0] if node.target in _INPLACE_SRC else None
+    written = node.args[src] if src is not None else node
+    out_bytes = tile_bytes(written, _shape(written))
     reads = []
     for inp in node.all_input_nodes:
-        if not _is_tensor(inp):
+        if not _is_tensor(inp) or inp is dest:
             continue
         root = _root(inp, bind)
         space = root.meta.get("space") if isinstance(root, Node) else None
