@@ -169,7 +169,6 @@ def transform(
     # array dimensions, etc.) to ensure efficient execution.
     if unroll_dims is not None:
         pad_matrix_op_dimensions(model, *unroll_dims)
-        pad_vector_op_dimensions(model, unroll_dims[1])
 
     # -------------------------------------------------------------------------
     # 3. Matrix Operation Tiling
@@ -215,6 +214,9 @@ def transform(
 
     if split_spmm:
         split_dense_spmm_node(model)
+
+    if unroll_dims is not None:
+        pad_vector_op_dimensions(model, unroll_dims[1])
 
     # Apply L2 tiling logic for vector-based operations.
     if cache_size is not None:

@@ -646,16 +646,15 @@ def _base_name(name: str) -> str:
 
 
 def _keeps_scope(gm: GraphModule) -> set:
-    """The nodes of ``gm`` a layer name is worth spending on — the ones
-    ``codegen._dump_dir`` writes a file for: the compute ops, the tiles they
-    read, and the DRAM buffers.  A submodule placeholder is excluded: codegen
-    redirects it through ``meta['source_node']``, so its own name is never used.
+    """The nodes of ``gm`` a layer name is worth spending on: the compute ops,
+    and the DRAM buffers a whole loop is replayed against.  A tile a compute op
+    reads is not one — it is a ``subview`` of a bank, and it says which bank it
+    reads, so the layer it belongs to is already there to follow.
     """
     keep = set()
     for n in gm.graph.nodes:
         if _is_compute(n):
             keep.add(n)
-            keep.update(a for a in n.all_input_nodes if a.op != "placeholder")
         elif n.target is _VOYAGER_ALLOC and n.meta.get("space") == "DRAM":
             keep.add(n)
     return keep
@@ -699,6 +698,9 @@ def rename_nest_nodes(model: GraphModule) -> None:
             candidate = (
                 scope + _FUSED_SUFFIX if fuses_anchor else f"{scope}_{n.name}"
             )
+        elif (source := n.meta.get("source_node")) is not None:
+            n._rename(source.name)
+            return
         elif n.target is anchor_target:
             candidate = scope
         elif n in keep:
