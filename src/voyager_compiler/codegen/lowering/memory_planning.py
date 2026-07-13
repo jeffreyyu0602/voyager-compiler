@@ -31,7 +31,6 @@ reuse, store->load elision, double buffering, the interstellar schedule).
 
 import logging
 import math
-import operator
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -52,7 +51,6 @@ _ALLOC = voyager.alloc.default
 _ZERO = voyager.zeros.default
 _WHILE = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
-_GETITEM = operator.getitem
 
 # Position of ``banks`` in each allocation primitive's schema:
 # ``alloc(size, dtype, space, banks)`` / ``zeros(size, dtype, banks)``.
@@ -193,7 +191,7 @@ def _materializes_dram(node: Node) -> bool:
     )
 
 
-def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
+def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
     ``meta['memory']`` on each DRAM buffer root.
@@ -201,52 +199,35 @@ def _plan_dram(model: GraphModule, bank_width: Optional[int]) -> int:
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
 
-    # Walk every node and collect the DRAM tensors, split into two pools:
+    # The DRAM buffers, split into two pools:
     #   persistent -- inputs + weights, live the whole run (placed once)
-    #   reusable   -- alloc activation buffers, recycled once dead
-    # ``buffer_of`` maps each DRAM node to the node owning its buffer.  Several
-    # nodes can name the same physical buffer: an ``alloc`` owns itself, while a
-    # ``getitem``/``insert`` is just another handle to the buffer it pulls
-    # out of a loop / writes to, so it resolves back to that owner.
-    buffer_of: Dict[Node, Node] = {}
+    #   reusable   -- activation buffers, recycled once dead: an ``alloc``, or a
+    #                 tensor the host materializes outside the accelerator (a
+    #                 ``pad`` to the hardware unrolling) that the loop then loads
+    #                 tiles from.
     persistent: List[Node] = []
     reusable: List[Node] = []
     for n in nodes:
         if n.op == "placeholder" and _val(n) is not None:
-            buffer_of[n] = n  # model input
-            persistent.append(n)
+            persistent.append(n)  # model input
         elif _is_param(n, model) and _val(n) is not None:
-            buffer_of[n] = n  # weight / codebook
-            persistent.append(n)
-        elif n.op == "call_function":
-            if n.target is _ALLOC or _materializes_dram(n):
-                if n.meta.get("space") == "Scratchpad":
-                    continue
-                # A new activation buffer, or a tensor the host materializes
-                # outside the accelerator (a ``pad`` to the hardware unrolling)
-                # and the loop then loads tiles from: both are DRAM buffers.
-                buffer_of[n] = n
+            persistent.append(n)  # weight / codebook
+        elif n.op == "call_function" and (
+            n.target is _ALLOC or _materializes_dram(n)
+        ):
+            if n.meta.get("space") != "Scratchpad":
                 reusable.append(n)
-            elif n.target is _GETITEM:  # alias: loop result -> carried buffer
-                src, idx = n.args[0], n.args[1]
-                if (
-                    isinstance(src, Node)
-                    and src.target is _WHILE
-                    and isinstance(idx, int)
-                ):
-                    carried = list(src.args[2])
-                    if idx < len(carried) and isinstance(carried[idx], Node):
-                        buffer_of[n] = buffer_of.get(carried[idx])
 
-    # Lifetime of each buffer: from its def to the last top-level node consuming
-    # it (or an alias).  A while_loop consuming a buffer keeps it live for the
-    # loop.
-    def_t = {b: pos[b] for b in set(buffer_of.values()) if b is not None}
+    # Lifetime of each buffer: from its def to the last top-level node reading it
+    # — through ``buffer_of``, so a read through a *name* of the buffer (a
+    # reshape, the getitem handle of a loop result) is a read of the buffer, and
+    # keeps it alive.  A while_loop reading one keeps it live for the loop.
+    def_t = {b: pos[b] for b in persistent + reusable}
     last_t = dict(def_t)
     for n in nodes:
         for inp in n.all_input_nodes:
-            root = buffer_of.get(inp)
-            if root is not None:
+            root = buffer_of.get(inp, inp)
+            if root in last_t:
                 last_t[root] = max(last_t[root], pos[n])
 
     # Persistent region first (params + inputs), linear, no reuse.
@@ -305,50 +286,45 @@ def _timestamps(model: GraphModule) -> Dict[Node, int]:
     return {n: i for i, n in enumerate(_walk(model))}
 
 
-class _UnionFind:
-    def __init__(self):
-        self.parent: Dict[Node, Node] = {}
-
-    def find(self, x: Node) -> Node:
-        self.parent.setdefault(x, x)
-        root = x
-        while self.parent[root] is not root:
-            root = self.parent[root]
-        while self.parent[x] is not root:
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, a: Node, b: Node) -> None:
-        ra, rb = self.find(a), self.find(b)
-        if ra is not rb:
-            self.parent[rb] = ra
-
-
-def _buffer_identity(model: GraphModule) -> _UnionFind:
-    """Merge the FX nodes that name the *same* physical buffer.
+def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
+    """The buffer each FX node names — a node absent from the map names itself.
 
     A buffer takes a new name every time it crosses a region boundary or is
     viewed, and each name would otherwise look like a buffer of its own, co-live
-    with the rest.  Two rules merge them:
+    with the rest.  Two rules resolve a name back to its buffer:
 
-      * a **view** names the buffer it views — a bank slot, a reshape, the
+      * a **view** names the buffer it views — a bank ``subview``, a reshape, the
         ``getitem`` handle of a loop result;
       * a **region** binds its operands to its placeholders — a ``while_loop``
         (which also returns each carried buffer, written in place), a ``cond``
         (whose two branches share one operand list), a fused ``call_module``.
 
+    Every one of those points from a *new* name to an *older* one, and ``_walk``
+    is program order, so the source is always resolved by the time a name needs
+    it — one pass, no fixpoint.
+
     So a scratch ``alloc`` accumulator threaded through the reduction loop
-    (alloc -> body arg -> accumulate-add -> getitem) becomes one buffer with one
-    lifetime, and the bank a ``cond`` branch writes through a slot ``select`` is
+    (alloc -> body arg -> accumulate-add -> getitem) is one buffer with one
+    lifetime, and the bank a ``cond`` branch writes through a slot ``subview`` is
     the bank itself, not a tile beside it.
     """
-    uf = _UnionFind()
+    buffer_of: Dict[Node, Node] = {}
+
+    def bind(alias: Node, source) -> None:
+        """``alias`` is another name for the buffer ``source`` names."""
+        if not isinstance(source, Node):
+            return
+        owner = buffer_of.get(source, source)
+        if buffer_of.setdefault(alias, owner) is not owner:
+            raise ValueError(
+                f"'{alias.name}' names two buffers, '{buffer_of[alias].name}' "
+                f"and '{owner.name}': they would have to be one"
+            )
 
     def walk(gm: GraphModule):
         for n in gm.graph.nodes:
-            uf.find(n)
             if (viewed := _viewed_buffer(n)) is not None:
-                uf.union(viewed, n)
+                bind(n, viewed)
 
             if n.op == "call_function" and n.target is _WHILE:
                 body = _submodule(gm, n.args[1].target)
@@ -364,15 +340,10 @@ def _buffer_identity(model: GraphModule) -> _UnionFind:
                 ).args[0]
                 outs = list(out) if isinstance(out, (list, tuple)) else [out]
                 for ph, o in zip(phs, operands):
-                    if isinstance(o, Node):
-                        uf.union(o, ph)
+                    bind(ph, o)
                 for i, c in enumerate(carried):
-                    if (
-                        isinstance(c, Node)
-                        and i < len(outs)
-                        and isinstance(outs[i], Node)
-                    ):
-                        uf.union(c, outs[i])
+                    if isinstance(c, Node) and i < len(outs):
+                        bind(outs[i], c)
                 walk(body)
             elif n.op == "call_function" and n.target is _COND:
                 operands = list(n.args[3]) if len(n.args) > 3 else []
@@ -382,8 +353,7 @@ def _buffer_identity(model: GraphModule) -> _UnionFind:
                         continue
                     phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
                     for ph, o in zip(phs, operands):
-                        if isinstance(o, Node):
-                            uf.union(o, ph)
+                        bind(ph, o)
                     walk(sub)
             elif n.op == "call_module":
                 sub = _submodule(gm, n.target)
@@ -391,12 +361,11 @@ def _buffer_identity(model: GraphModule) -> _UnionFind:
                     continue
                 phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
                 for ph, a in zip(phs, n.args):
-                    if isinstance(a, Node):
-                        uf.union(a, ph)
+                    bind(ph, a)
                 walk(sub)
 
     walk(model)
-    return uf
+    return buffer_of
 
 
 @dataclass
@@ -407,14 +376,13 @@ class _Buf:
     members: List[Node]
 
 
-def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
-    """Per scratchpad buffer (a union-find root): byte size, birth, and last
-    use.  Death follows the alias chain — a use of *any* member (e.g. the
-    getitem of a carried accumulator, or the bias-add that reads it) extends the
-    lifetime."""
+def _buffer_lifetimes(model, buffer_of, order, bank_width) -> Dict[Node, _Buf]:
+    """Per scratchpad buffer: byte size, birth, and last use.  Death follows the
+    names — a use of *any* of them (the getitem of a carried accumulator, the
+    bias-add that reads it) extends the lifetime."""
     members: Dict[Node, List[Node]] = {}
     for n in _walk(model):
-        members.setdefault(uf.find(n), []).append(n)
+        members.setdefault(buffer_of.get(n, n), []).append(n)
 
     bufs: Dict[Node, _Buf] = {}
     for root, mem in members.items():
@@ -442,7 +410,6 @@ def _buffer_lifetimes(model, uf, order, bank_width) -> Dict[Node, _Buf]:
 
 def _plan_scratchpad(
     model: GraphModule,
-    uf: "_UnionFind",
     bufs: Dict[Node, "_Buf"],
     cache_size: int,
     num_banks: Optional[int],
@@ -606,18 +573,18 @@ def plan_memory(
     """
     unroll_dim = unroll_dims[1] if unroll_dims else None
 
-    dram_bytes = _plan_dram(model, bank_width)
-
-    # Global schedule + per-buffer lifetimes drive scratchpad allocation and the
-    # co-liveness check; compute them once.
-    uf = _buffer_identity(model)
-    bufs = _buffer_lifetimes(model, uf, _timestamps(model), bank_width)
+    # Which buffer every name denotes, and the global schedule: both arenas need
+    # them (a buffer dies at the last read of *any* of its names), so compute
+    # them once.
+    buffer_of = _buffer_identity(model)
+    dram_bytes = _plan_dram(model, buffer_of, bank_width)
+    bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), bank_width)
 
     scratchpad_bytes = 0
     peak_region = None
     if cache_size is not None:
         scratchpad_bytes, peak_region = _plan_scratchpad(
-            model, uf, bufs, cache_size, num_banks, bank_width, unroll_dim
+            model, bufs, cache_size, num_banks, bank_width, unroll_dim
         )
 
     _stamp_banking(model, bank_width)
