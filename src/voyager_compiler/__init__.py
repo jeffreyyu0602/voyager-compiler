@@ -159,7 +159,7 @@ def transform(
         convert_cat_and_stack_as_stack_on_dim0(model)
         convert_cat_with_mismatched_shapes_to_stack(model)
 
-    fuse_quantize_dequantize_with_previous_op(model)
+    fuse_quantize_dequantize_with_previous_op(model, bufferize)
 
     # -------------------------------------------------------------------------
     # 2. Hardware Alignment (Padding)

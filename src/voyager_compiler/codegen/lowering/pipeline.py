@@ -990,7 +990,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     multi_outputs = isinstance(node.value, (list, tuple))
     vals = list(node.value) if multi_outputs else [node.value]
     full_shapes = [tuple(v.shape) for v in vals]
-    if out_tiling is None:
+    if out_tiling is None and is_bmm(anchor):
+        tiled_shape = [(1,) * (len(s) - 2) + tuple(s[-2:]) for s in full_shapes]
+    elif out_tiling is None:
         tiled_shape = full_shapes  # untiled -> tile == full tensor (trip-1)
     else:
         tiled_shape = compute_output_tiled_shapes(node, out_tiling)
@@ -1438,33 +1440,45 @@ def build_conv2d(
 
 
 def _peel_weight(node: torch.fx.Node):
-    """Resolve a GEMM weight operand through the relayouts fused onto it — a
-    last-two-dim transpose and/or a grouped-query broadcast — to the external
-    operand they read.
+    """Resolve a GEMM weight operand through the ops fused onto it — a
+    last-two-dim transpose, a grouped-query broadcast, a dequantize — to the
+    external operand they read.
 
-    Returns ``(node, transposed, repeat)``.  An attention ``Q @ Kᵀ`` fuses
-    ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that turns
-    8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the DMA
-    (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile into
-    the bank), ``repeat`` into the block index (``grid_index // repeat[d]``, so
-    four query heads share one KV tile).  Only relayouts of an external operand
-    — a placeholder, i.e. something the fused submodule is handed rather than
-    computes — peel; anything else comes back unchanged.
+    Returns ``(node, transposed, repeat, dequant)``.  An attention ``Q @ Kᵀ``
+    fuses ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that
+    turns 8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the
+    DMA (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile
+    into the bank), ``repeat`` into the block index (``grid_index // repeat[d]``,
+    so four query heads share one KV tile).
+
+    A ``dequantize`` -- a KIVI KV cache, packed in DRAM -- does *not* fold into
+    the addressing, because it computes: it comes back for the builder to run on
+    the fetched tile, which is what lets the cache stay packed all the way into
+    the bank.
+
+    Only ops over an external operand — a placeholder, i.e. something the fused
+    submodule is handed rather than computes — peel; anything else comes back
+    unchanged.
     """
     transposed = swaps_last_two_dims(node)
     inner = node.args[0] if transposed else node
     if not isinstance(inner, torch.fx.Node):
-        return node, False, None
+        return node, False, None, None
+
+    dequant = None
+    if inner.target is torch.ops.quantized_ops.dequantize.default:
+        dequant = inner
+        inner = inner.args[0]
 
     if inner.op == "placeholder":
-        return inner, transposed, None
+        return inner, transposed, None, dequant
 
     found = repeat_of(inner)
     if found is not None and found[0].op == "placeholder":
         source, _, repeat = found
-        return source, transposed, repeat
+        return source, transposed, repeat, dequant
 
-    return node, False, None
+    return node, False, None, None
 
 
 def build_gemm(
@@ -1504,8 +1518,14 @@ def build_gemm(
 
     # The weight's fused relayouts (attention's ``Kᵀ``, GQA's head repeat) are
     # folded into how its tile is addressed rather than emitted; the spec itself
-    # stays in the matmul (Kᵀ) layout.
-    weight_node, transposed, weight_repeat = _peel_weight(anchor.args[1])
+    # stays in the matmul (Kᵀ) layout.  A fused ``dequantize`` (a packed KV
+    # cache) is compute, so it runs on the fetched tile instead.
+    weight_node, transposed, weight_repeat, dequant = _peel_weight(
+        anchor.args[1]
+    )
+    assert not (
+        transposed and dequant is not None
+    ), "a dequantized weight fetched transposed would block along swapped axes"
 
     act = anchor.args[0].value.clone()
     weight = weight_node.value.clone()
@@ -1627,7 +1647,7 @@ def build_gemm(
             return
         # A scale wears the same relayouts as the tensor it scales, so it peels
         # the same way.
-        v, transposed, repeat = _peel_weight(v)
+        v, transposed, repeat, _ = _peel_weight(v)
         if spec is not None:
             spec.transposed = transposed
             spec.repeat = repeat
@@ -1650,6 +1670,35 @@ def build_gemm(
         add_kw_input("input_code", None)
         add_kw_input("weight_code", None)
 
+    # A packed KV cache reaches the GEMM through a ``dequantize``, which decodes
+    # the weight *tile* in the kernel -- so the cache is fetched, and paid for,
+    # packed.  Its scale / zero point block along one of the weight's own axes,
+    # so they dice with it, that axis divided by the block; the codebook, indexed
+    # by value rather than by position, loads whole.
+    dq_nodes = {}
+    if dequant is not None:
+        dq_axes = {a % weight.ndim for a in get_arg_value(dequant, 3, "axes")}
+        dq_bs = get_arg_value(dequant, 4, "block_size")
+        k_dim, n_dim = (
+            (weight.ndim - 2, weight.ndim - 1)
+            if ck
+            else (weight.ndim - 1, weight.ndim - 2)
+        )
+        dq_tile = _proj(
+            tn // dq_bs if n_dim in dq_axes else tn,
+            tk // dq_bs if k_dim in dq_axes else tk,
+        )
+        tables = quant_table_arg_nodes(dequant)
+        for i, v in enumerate(dequant.args):
+            if i == 0 or not isinstance(v, torch.fx.Node):
+                continue
+            spec = None
+            if v not in tables:
+                spec = _spec(v.value.shape, dq_tile, _proj(gn, gk))
+                spec.repeat = weight_repeat
+            dq_nodes[i] = src(v)
+            node_to_spec[src(v)] = (v.value.clone(), spec)
+
     # Fused post-op operands (residual, scale, …), keyed by their outer node.
     if info is not None:
         for s, val, spec in zip(
@@ -1668,6 +1717,20 @@ def build_gemm(
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
     fused_idx = [order[s] for s in info.in_sources] if info is not None else []
 
+    # The kernel body is traced, and dynamo refuses to look inside an FX node
+    # there — so read the dequantize's call apart here: its scalar args as plain
+    # Python, and the tile slot each of its tensor args comes from.
+    dq_idx = {i: order[n] for i, n in dq_nodes.items()}
+    dq_target = dequant.target if dequant is not None else None
+    dq_args = [
+        (
+            None
+            if isinstance(a, torch.fx.Node)
+            else tuple(a) if isinstance(a, (list, tuple)) else a
+        )
+        for a in (dequant.args if dequant is not None else ())
+    ]
+
     op = anchor.target
     num_k = K // tk  # reduction tiles (grid extent along ``gk``)
 
@@ -1678,6 +1741,15 @@ def build_gemm(
         """
         act_tile = in_tiles[act_idx]
         weight_tile = in_tiles[weight_idx]
+        if dq_target is not None:
+            # Decode the packed tile in place of the weight -- the same call the
+            # graph made, on tiles.  The group fuses it into the GEMM's kernel,
+            # so it stores nothing of its own.
+            args = list(dq_args)
+            args[0] = weight_tile
+            for i, j in dq_idx.items():
+                args[i] = in_tiles[j]
+            weight_tile = dq_target(*args)
         kw = {name: in_tiles[i] for name, i in kw_idx.items()}
         kw.update(scalar_kwargs)  # block_size / weight_layout / ...
         if bias_idx is None:
@@ -1721,7 +1793,10 @@ def build_gemm(
         scratch_specs=scratch_specs,
         num_banks=num_banks,
     )
-    if num_k > 1 or info is not None:
+    # A weight dequantize is compute the GEMM's kernel has to own: an op left
+    # standing alone is given a store of its own, and this one only decodes a
+    # tile the GEMM is about to read.
+    if num_k > 1 or info is not None or dequant is not None:
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
         )

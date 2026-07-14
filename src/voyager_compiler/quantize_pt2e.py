@@ -1210,7 +1210,9 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     return True
 
 
-def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
+def fuse_quantize_dequantize_with_previous_op(
+    model: GraphModule, bufferize: bool = False
+):
     """Move each quantize / dequantize up the graph to sit directly after the
     op that computed its input, so the two can fuse into one kernel.
 
@@ -1220,6 +1222,10 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
     data.  A microscaling ``quantize_mx`` also blocks along an axis and returns
     a scale beside its value, so it takes the ``_hoist_microscaling`` route;
     the rest share the walk but fork over a concat.
+
+    Only the bufferized backend can lower a ``quantize_mx`` that has moved --
+    it fuses onto the store of the GEMM it lands on -- so ``bufferize`` says
+    whether to lift one at all.
     """
     graph = model.graph
 
@@ -1227,7 +1233,8 @@ def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
         if node.target not in _QUANTIZE_OPS:
             continue
         if node.target is _QUANTIZE_MX:
-            _hoist_microscaling(model, node)
+            if bufferize:
+                _hoist_microscaling(model, node)
             continue
         # A blocked plain quantize would need the same axis bookkeeping as
         # quantize_mx, which it does not have; only per-tensor is lifted.
