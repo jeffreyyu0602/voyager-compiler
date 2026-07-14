@@ -35,6 +35,7 @@ from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
 from .codegen.passes.utils import get_arg_value
 from .codegen.mapping_utils import (
     is_gemm_op,
+    is_mha_qkv_permute,
     is_nop,
     is_reshape_op,
     is_conv2d,
@@ -793,7 +794,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 add_node.replace_input_with(add_node, mx_op_node)
 
 
-def _replace_observer_with_group_wise_affine_quantize_dequantize_node_decomposed(
+def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
     model: torch.fx.GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
 ):
     graph = model.graph
@@ -896,8 +897,9 @@ def _eliminate_dequantize_with_no_effect(model: GraphModule):
     return model
 
 
-# Ops a quantize / dequantize can be hoisted past: they move data without
-# computing on it, and take a single tensor input.
+# Ops a quantize can be lifted over: each only moves data, and takes a single
+# tensor to do it.  ``expand`` is the one that earns its keep here -- lifting a
+# quantize over GQA's ``repeat_kv`` is what stops it quantizing 4x the heads.
 _HOISTABLE_OPS = (
     torch.ops.aten.slice.Tensor,
     torch.ops.aten.select.int,
@@ -905,112 +907,297 @@ _HOISTABLE_OPS = (
     torch.ops.aten.repeat.default,
 )
 
+# MHA head splitting rejoins the per-head results with one of these, so a
+# quantize lifted over it has to be duplicated onto every branch.
+_FORK_OPS = (
+    torch.ops.aten.stack.default,
+    torch.ops.aten.cat.default,
+)
 
-def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
+_QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+_QUANTIZE_OPS = (
+    torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.dequantize.default,
+    _QUANTIZE_MX,
+)
+
+# ``quantize_mx`` returns ``(scale, value)``.  The value inherits the relayout
+# ops the quantize was lifted over; the scale gets a replayed copy of them.
+_MX_VALUE = 1
+
+
+def _is_relayout(node) -> bool:
+    return (
+        isinstance(node, Node)
+        and (
+            is_nop(node) or is_reshape_op(node) or node.target in _HOISTABLE_OPS
+        )
+        and len(node.all_input_nodes) == 1
+    )
+
+
+def _axes_above(node: Node, axes: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
+    """``axes`` -- the axes a microscaling quantize blocks along, read against
+    ``node``'s output -- restated against its input.  ``None`` if the blocks do
+    not survive ``node``, which is then as far as the quantize can be lifted.
+
+    Axes count from the end, so an op that only rearranges dims to the *left*
+    of a block axis leaves it alone: that covers every op on the ``repeat_kv``
+    path (``unsqueeze``, ``expand``, the head-flattening ``reshape``).  A
+    transpose or a permute genuinely moves the axis, so it is remapped.  A
+    per-tensor quantize passes ``()`` and is unaffected.
     """
-    Move quantize and dequantize nodes up the graph and place them after the
-    previous operation (e.g. matmul, conv2d, etc.), so that the quantize and
-    dequantize can be fused with the previous operation.
+    out_shape = tuple(node.value.shape)
+    in_shape = tuple(node.args[0].value.shape)
+    rank = len(out_shape)
+
+    if node.target is torch.ops.aten.transpose.int:
+        a, b = (int(d) % rank - rank for d in node.args[1:3])
+        swap = {a: b, b: a}
+        return tuple(swap.get(x, x) for x in axes)
+
+    if node.target is torch.ops.aten.permute.default:
+        perm = [int(p) % rank for p in node.args[1]]  # out dim i <- in perm[i]
+        return tuple(perm[x + rank] - rank for x in axes)
+
+    if any(in_shape[x:] != out_shape[x:] for x in axes):
+        return None
+    return axes
+
+
+def _relayout_path(start, axes: Tuple[int, ...], keep_head_permute=False):
+    """Walk up from ``start`` over relayout ops, restating ``axes`` at each.
+
+    Returns ``(src, path, axes_at, src_axes)``: ``path`` is the ops crossed,
+    nearest ``start`` first; ``src`` the node that actually computed the data;
+    ``axes_at[k]`` the block axes as seen at ``path[k]``'s output; ``src_axes``
+    those at ``src``.  The walk stops at the first node that computes, that
+    someone else also reads, or that the blocks would not survive.
+
+    ``keep_head_permute`` also stops it at an MHA head permute.  Only a
+    multi-output quantize needs that: lifted past one, it leaves a ``getitem``
+    between the projection and the permute, and the permute can no longer be
+    fused into the store it belongs to (``fuse_reshape_with_output`` crosses
+    NOPs, and a ``getitem`` is not one).  A single-output quantize has no
+    ``getitem`` and steps over freely.
+    """
+    path, axes_at = [], []
+    src = start
+    while (
+        _is_relayout(src)
+        and len(src.users) == 1
+        and not (keep_head_permute and is_mha_qkv_permute(src))
+    ):
+        above = _axes_above(src, axes)
+        if above is None:
+            break
+        path.append(src)
+        axes_at.append(axes)
+        axes = above
+        src = src.args[0]
+    return src, path, axes_at, axes
+
+
+def _copy_quantize_above(model: GraphModule, node: Node, src: Node, axes):
+    """A copy of quantize ``node`` reading ``src``, inserted right after it."""
+    from .pt2e_utils import propagate_shape
+
+    graph = model.graph
+    remap = {node.args[0]: src}
+    with graph.inserting_before(src.next):
+        for n in node.all_input_nodes:
+            if n not in remap:
+                remap[n] = graph.node_copy(n)
+        new = graph.node_copy(node, lambda n: remap[n])
+
+    if node.target is _QUANTIZE_MX:
+        args = list(new.args)
+        args[2] = list(axes)
+        new.args = tuple(args)
+
+    for n in list(remap.values()) + [new]:
+        propagate_shape(n, model)
+    new.meta = {
+        k: copy.deepcopy(v) if k != "val" else v.clone()
+        for k, v in node.meta.items()
+    }
+    return new
+
+
+def _replay_relayout(graph: Graph, node: Node, src: Node, axes) -> Node:
+    """Copy relayout ``node`` onto ``src``.  ``src`` is the scale of a hoisted
+    ``quantize_mx``, so along ``axes`` it holds one element per *block* where
+    the original input held one per element -- a shape argument is rebuilt from
+    ``src``'s own sizes there.  Every other dim is untouched: ``_axes_above``
+    already proved the block axis and everything right of it survive.
+    """
+    new = graph.node_copy(node, lambda n: src if n is node.args[0] else n)
+    out_shape = tuple(node.value.shape)
+
+    if node.target in (
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+    ):
+        shape = list(out_shape)
+        for a in axes:
+            shape[a] = src.value.shape[a]
+        new.args = (src, shape)
+    elif node.target is torch.ops.aten.expand.default:
+        # ``-1`` keeps a dim, so naming only the dims this expand actually grows
+        # makes the sizes independent of how long the block axis is.
+        in_shape = tuple(node.args[0].value.shape)
+        new.args = (
+            src,
+            [
+                out_shape[d] if out_shape[d] != in_shape[d] else -1
+                for d in range(len(out_shape))
+            ],
+        )
+    return new
+
+
+def _annotate(path, source: Node) -> None:
+    """The relayout ops now sit *below* the quantize, so they carry the dtype of
+    the tensor that flows through them -- or none at all, once a dequantize has
+    put it back in the clear.  ``source`` is that tensor: the quantize itself,
+    or, for a multi-output one, the single output the path was rewired onto (not
+    the op, whose ``dtype`` is the pair it returns).
+    """
+    is_dequantize = source.target is torch.ops.quantized_ops.dequantize.default
+    for n in path:
+        if is_dequantize:
+            n.meta.pop("dtype", None)
+        else:
+            n.meta["dtype"] = source.meta.get("dtype", None)
+
+
+def _hoist_forked(model: GraphModule, node: Node) -> bool:
+    """Lift a single-output quantize over the relayout ops feeding it.
+
+    A ``stack`` / ``cat`` on the way up (MHA head splitting rejoining its heads)
+    forks the walk: every branch is quantized on its own, and the concat then
+    joins pieces that are already quantized.
+    """
+    graph = model.graph
+    on_path, moved = [], False
+    todo = [(node.args[0], node)]  # (tensor to lift over, the node reading it)
+
+    while todo:
+        start, reader = todo.pop()
+        src, path, _, _ = _relayout_path(start, ())
+        on_path.extend(path)
+        if path:
+            reader = path[-1]
+
+        if src.target in _FORK_OPS and len(src.users) == 1:
+            on_path.append(src)
+            todo.extend((a, src) for a in src.all_input_nodes)
+            continue
+
+        if not path and reader is node:
+            continue  # already sitting on its producer
+
+        new = _copy_quantize_above(model, node, src, ())
+        reader.replace_input_with(src, new)
+        moved = True
+
+    if not moved:
+        return False
+    _annotate(on_path, node)
+    node.replace_all_uses_with(node.args[0])
+    graph.erase_node(node)
+    return True
+
+
+def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
+    """Lift a ``quantize_mx`` over the relayout ops feeding it, so it quantizes
+    the tensor they re-address rather than the one they hand on.
+
+    Those ops move no element, so quantizing above them is the same arithmetic
+    on less data -- and what they were going to do (broadcast a KV head, lay a
+    tile out for the MXU) the consumer folds into its addressing rather than
+    materializing.  Two things halt the walk: an op the quantization blocks do
+    not survive (``_axes_above``), and an MHA head permute, which is free only
+    where it is -- fused into the store of the projection that produced it.
+
+    The op has two outputs, so the value keeps the relayout ops it was lifted
+    over and the scale gets a replayed copy of them.  It is never forked: a
+    concat can move the axis it blocks along, and head splitting -- the only
+    thing that forks -- never runs where microscaling is used.
     """
     from .pt2e_utils import propagate_shape
 
     graph = model.graph
+    outs = {}
+    for user in node.users:
+        if user.target is not operator.getitem:
+            return False
+        outs[user.args[1]] = user
 
-    def find_prev_op_and_move_node(node, prev_node=None, curr_node=None):
-        nodes_on_path = []
-        prev_node = node.args[0] if prev_node is None else prev_node
-        while len(prev_node.users) == 1:
-            # If there are multiple input nodes, trace each path separately
-            if prev_node.target in [
-                torch.ops.aten.stack.default,
-                torch.ops.aten.cat.default,
-            ]:
-                nodes_on_path.append(prev_node)
-                for arg in prev_node.all_input_nodes:
-                    nodes_on_path.extend(
-                        find_prev_op_and_move_node(node, arg, prev_node)
-                    )
-                return nodes_on_path
+    src, path, axes_at, src_axes = _relayout_path(
+        node.args[0], node.args[2], keep_head_permute=True
+    )
+    if not path:
+        return False
 
-            # stack and cat are handled above, so we can safely assume that
-            # they won't appear here and there is only one input node
-            if (
-                not is_nop(prev_node)
-                and not is_reshape_op(prev_node)
-                and prev_node.target not in _HOISTABLE_OPS
-            ):
-                break
+    new = _copy_quantize_above(model, node, src, src_axes)
 
-            assert len(prev_node.all_input_nodes) == 1
+    def unpack(i: int) -> Node:
+        """Output ``i`` of the hoisted quantize.  ``quantize_mx``'s ``dtype`` is
+        the *pair* it returns, so each output takes its own element of it -- the
+        one the ``getitem`` it replaces carried."""
+        out = graph.call_function(operator.getitem, (new, i))
+        out.meta["dtype"] = outs[i].meta.get("dtype", None)
+        propagate_shape(out, model)
+        return out
 
-            nodes_on_path.append(prev_node)
-            curr_node = prev_node
-            prev_node = prev_node.args[0]
+    # The value keeps the relayout ops it was lifted over: rewire them onto it.
+    with graph.inserting_before(path[-1]):
+        value = unpack(_MX_VALUE)
+    path[-1].replace_input_with(src, value)
+    _annotate(path, outs[_MX_VALUE])
+    outs[_MX_VALUE].replace_all_uses_with(path[0])
 
-        # Check if the quantize or dq node can be moved.  In the case of a recursive
-        # call, nodes_on_path could be empty, so we need to check if prev_node is
-        # the same as the quantize or dq node.
-        if id(prev_node) == id(node.args[0]):
-            return None
-
-        value_remap = {node.args[0]: prev_node}
-        with graph.inserting_before(prev_node.next):
-            for n in node.all_input_nodes:
-                if n not in value_remap:
-                    value_remap[n] = graph.node_copy(n)
-            new_node = graph.node_copy(node, lambda n: value_remap[n])
-
-        assert (
-            curr_node in prev_node.users
-        ), "The last node on the path should be a user of the previous node"
-        curr_node.replace_input_with(prev_node, new_node)
-
-        for n in list(value_remap.values()) + [new_node]:
-            propagate_shape(n, model)
-
-        # Copy meta data from the original node, e.g. dtype
-        new_node.meta = {
-            k: copy.deepcopy(v) if k != "val" else v.clone()
-            for k, v in node.meta.items()
-        }
-
-        return nodes_on_path
-
-    # First, move the dequantize nodes before the stack and view nodes that
-    # are inserted during MHA splitting.  Then try to move quantize nodes forward
-    # to immediately after their previous ops (nodes that are not NOP).
-    for node in list(model.graph.nodes):
-        if node.target not in [
-            torch.ops.quantized_ops.dequantize.default,
-            torch.ops.quantized_ops.quantize.default,
-        ]:
+    # The scale is one element per block, so it needs its own copy of them.
+    for i, old in outs.items():
+        if i == _MX_VALUE:
             continue
+        with graph.inserting_before(node):
+            cur = unpack(i)
+            for k in reversed(range(len(path))):
+                cur = _replay_relayout(graph, path[k], cur, axes_at[k])
+                cur.meta["dtype"] = old.meta.get("dtype", None)
+                propagate_shape(cur, model)
+        old.replace_all_uses_with(cur)
 
-        # Only handle per-tensor quantization for now
+    return True
+
+
+def fuse_quantize_dequantize_with_previous_op(model: GraphModule):
+    """Move each quantize / dequantize up the graph to sit directly after the
+    op that computed its input, so the two can fuse into one kernel.
+
+    Everything it is lifted over only relayouts data -- a reshape, a transpose,
+    the ``stack`` MHA splitting leaves behind, the ``expand`` of GQA's
+    ``repeat_kv`` -- so quantizing above them is the same arithmetic on less
+    data.  A microscaling ``quantize_mx`` also blocks along an axis and returns
+    a scale beside its value, so it takes the ``_hoist_microscaling`` route;
+    the rest share the walk but fork over a concat.
+    """
+    graph = model.graph
+
+    for node in list(graph.nodes):
+        if node.target not in _QUANTIZE_OPS:
+            continue
+        if node.target is _QUANTIZE_MX:
+            _hoist_microscaling(model, node)
+            continue
+        # A blocked plain quantize would need the same axis bookkeeping as
+        # quantize_mx, which it does not have; only per-tensor is lifted.
         block_size = get_arg_value(node, 4, "block_size")
         if block_size is not None and block_size > 1:
             continue
-
-        output_node = node
-        nodes_on_path = find_prev_op_and_move_node(output_node)
-        if nodes_on_path is None:
-            continue
-
-        # Update dtype annotation for all nodes on the path.
-        is_dequantize = (
-            output_node.target == torch.ops.quantized_ops.dequantize.default
-        )
-        for n in nodes_on_path:
-            if is_dequantize:
-                n.meta.pop("dtype", None)
-            else:
-                n.meta["dtype"] = output_node.meta.get("dtype", None)
-
-        # Remove the nodes from the graph.  This has to be done at the end
-        # because we may need to copy and insert the nodes multiple times
-        # if there is stack or cat node in the path.
-        output_node.replace_all_uses_with(output_node.args[0])
-        graph.erase_node(output_node)
+        _hoist_forked(model, node)
 
     graph.lint()
     graph.eliminate_dead_code()
@@ -1100,7 +1287,7 @@ def convert_pt2e(
                         model, node, modules
                     )
                 elif mod.qscheme == qt.group_wise_affine:
-                    _replace_observer_with_group_wise_affine_quantize_dequantize_node_decomposed(
+                    _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
                         model, node, modules
                     )
                 else:

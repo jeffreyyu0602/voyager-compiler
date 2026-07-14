@@ -338,7 +338,11 @@ class IterationSpaceNormalizer:
                 env[node] = None
             elif anchor is not None and node is anchor:
                 env[node] = None
-            elif is_shape_changing_nop(node) or is_reshape_op(node):
+            elif (
+                is_shape_changing_nop(node)
+                or is_reshape_op(node)
+                or node.target is torch.ops.aten.expand.default
+            ):
                 source = node.all_input_nodes[0]
                 source_map = env.get(source) if source is not None else None
                 env[node] = (

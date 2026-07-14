@@ -544,11 +544,175 @@ def is_pooling(node: Node) -> bool:
     ]
 
 
+def is_mha_qkv_permute(node):
+    """
+    Check if the node is a permutation used in multi-head attention (MHA)
+    operations. It has characteristics that last dimension is a power of 2 and
+    the permuted dimensions are the middle two dimensions (2 and 3) of a 4D
+    tensor.
+    """
+    # Don't support head dimension not being a power of 2
+    if (
+        not hasattr(node, "shape")
+        or len(node.shape) != 4
+        or not math.log2(node.shape[-1]).is_integer()
+    ):
+        return False
+
+    if node.target == torch.ops.aten.permute.default:
+        dims = node.args[1]
+        return len(dims) == 4 and dims == [0, 2, 1, 3]
+
+    if node.target == torch.ops.aten.transpose.int:
+        dims = {x if x >= 0 else x + 4 for x in node.args[1:]}
+        return node.value.ndim == 4 and dims == {1, 2}
+
+    return False
+
+
 def is_reshape_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.transpose.int,
         torch.ops.aten.permute.default,
     ]
+
+
+_BROADCAST_OPS = (
+    torch.ops.aten.expand.default,
+    torch.ops.aten.repeat.default,
+)
+
+
+def _tensor_value(node):
+    """``node``'s traced tensor, or ``None`` — a multi-output op holds a tuple,
+    which none of the addressing below can read."""
+    if not isinstance(node, Node):
+        return None
+    value = getattr(node, "value", None)
+    return value if isinstance(value, torch.Tensor) else None
+
+
+def is_relayout_op(node: Node) -> bool:
+    """A node that only re-addresses a single tensor: it shares elements or
+    moves them, but computes none, so an index map replays through it exactly.
+    """
+    return (
+        node.op == "call_function"
+        and (
+            is_nop(node) or is_reshape_op(node) or node.target in _BROADCAST_OPS
+        )
+        and len(node.all_input_nodes) == 1
+    )
+
+
+def swaps_last_two_dims(node: Node) -> bool:
+    """Whether ``node`` transposes its input's last two dims — the ``Kᵀ`` an
+    attention ``Q @ Kᵀ`` leaves on its weight."""
+    if node.op != "call_function":
+        return False
+    src = node.args[0]
+    if (value := _tensor_value(src)) is None:
+        return False
+    ndim = value.ndim
+    if node.target is torch.ops.aten.transpose.int:
+        return {a % ndim for a in node.args[1:3]} == {ndim - 2, ndim - 1}
+    if node.target is torch.ops.aten.permute.default:
+        swapped = list(range(ndim))
+        swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
+        return list(node.args[1]) == swapped
+    return False
+
+
+def _repeat_through(source: Node, ops, out: torch.Tensor):
+    """Do ``ops``, applied to ``source``, amount to nothing more than repeating
+    one of its dims?  If so, by how much: ``(1, 4, 1)`` says dim 1 was repeated
+    4x and nothing else changed.  ``None`` if they do anything else.
+
+    Proved by running the ops rather than by recognizing them, so it does not
+    matter which ops they are.  Number the elements of ``source`` 0, 1, 2, ...
+    and push *that* through ``ops``; the result says, for every position of
+    ``out``, which element of ``source`` it reads.  Compare it against
+    ``repeat_interleave``, which is what a pure repeat reads.  Equal everywhere
+    => the ops only share elements along ``dim``, and the consumer can read
+    ``index // factor`` of ``source`` instead of a materialized copy.
+
+    Example: ``source`` ``[[0, 1, 2], [3, 4, 5]]`` through GQA's
+    ``unsqueeze -> expand -> reshape`` gives ``[[0, 1, 2], [0, 1, 2],
+    [3, 4, 5], [3, 4, 5]]`` — element for element what a repeat of 2 on dim 0
+    gives, so: ``(2, 1)``.
+
+    The shape checks up front are what make ``dim`` and ``factor`` well defined
+    (with two dims growing there is no single repeat to compare against), and
+    they reject most candidates before building a tensor.
+    """
+    value = _tensor_value(source)
+    if value is None:
+        return None
+    shape = tuple(value.shape)
+    out_shape = tuple(out.shape)
+    if len(shape) != len(out_shape):
+        return None
+
+    grown = [d for d, (a, b) in enumerate(zip(shape, out_shape)) if a != b]
+    if len(grown) != 1:
+        return None
+    dim = grown[0]
+    factor, remainder = divmod(out_shape[dim], shape[dim])
+    if remainder or factor < 2:
+        return None
+
+    seed = torch.arange(math.prod(shape)).reshape(shape)
+    index = seed
+    for n in ops:
+        index = n.target(
+            *(index if a is n.args[0] else a for a in n.args), **n.kwargs
+        )
+    if not torch.equal(index, seed.repeat_interleave(factor, dim=dim)):
+        return None
+
+    repeat = [1] * len(shape)
+    repeat[dim] = factor
+    return tuple(repeat)
+
+
+def repeat_of(node: Node):
+    """Is ``node`` a smaller tensor with one dim repeated?  Returns that tensor,
+    the ops that repeat it, and by how much — ``(source, ops, repeat)`` — or
+    ``None``.
+
+    Grouped-query attention is the case that matters.  8 KV heads reach the
+    attention matmul as 32, spelled ``unsqueeze -> expand -> reshape``, and
+    those ops copy every head 4 times into DRAM.  Recognized, they need not run:
+    the GEMM reads head ``h // 4`` of the 8-head tensor (``_InputSpec.repeat``)
+    and the copies never happen.
+
+    Walks up the relayout ops above ``node`` and asks ``_repeat_through`` where
+    the repeat starts, trying the *deepest* candidate first.  Deeper is better —
+    more ops fold away — but the chain does not always reach all the way down:
+    in prefill a head transpose sits under the broadcast, and a transpose is not
+    a repeat.  So it settles on the deepest source the ops above it are still a
+    pure repeat of.  Those fold into the tile address; whatever is below keeps
+    its own buffer.
+    """
+    out = _tensor_value(node)
+    if out is None:
+        return None
+
+    chain = []
+    src = node
+    while is_relayout_op(src) and len(src.users) == 1:
+        chain.append(src)
+        src = src.args[0]
+    if not chain:
+        return None
+    chain.reverse()
+
+    for i, source in enumerate([src, *chain[:-1]]):
+        ops = chain[i:]
+        repeat = _repeat_through(source, ops, out)
+        if repeat is not None:
+            return source, ops, repeat
+    return None
 
 
 def is_prunable_op(node: Node) -> bool:

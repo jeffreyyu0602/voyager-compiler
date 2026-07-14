@@ -155,10 +155,9 @@ def transform(
 
     if not bufferize:
         split_multi_head_attention(model)
-
-    convert_expand_to_memory_copy(model)
-    convert_cat_and_stack_as_stack_on_dim0(model)
-    convert_cat_with_mismatched_shapes_to_stack(model)
+        convert_expand_to_memory_copy(model)
+        convert_cat_and_stack_as_stack_on_dim0(model)
+        convert_cat_with_mismatched_shapes_to_stack(model)
 
     fuse_quantize_dequantize_with_previous_op(model)
 

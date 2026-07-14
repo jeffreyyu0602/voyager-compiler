@@ -45,6 +45,8 @@ from voyager_compiler.codegen.mapping_utils import (
     is_linear,
     is_matmul,
     quant_table_arg_nodes,
+    repeat_of,
+    swaps_last_two_dims,
 )
 from voyager_compiler.codegen.passes.tiling import compute_output_tiled_shapes
 from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
@@ -171,26 +173,39 @@ class _BufferedRef:
 
     # --- addressing (shared by both kinds) ----------------------------------
 
-    def _block_address(self, grid_idx):
-        """The ``(dims, indices)`` addressing this operand's tile for
-        ``async_copy`` at ``grid_idx``: a spec dim is dynamically indexed iff the
-        grid dim it maps to is tiled (``grid > 1``) and isn't broadcast.  Whole
-        / broadcast / ``None``-mapped dims stay at block 0 (omitted).  ``dims``
-        is ``None`` when every dim is dynamic (``async_copy``'s "all dims"
-        shorthand).
+    def _tiled_dims(self):
+        """``(d, g, r)`` for each operand dim that is dynamically indexed: it
+        maps to a tiled grid dim ``g`` (``grid > 1``) and is not broadcast.
+        Whole / broadcast / ``None``-mapped dims stay at block 0 and are left
+        out.  ``r`` is how many consecutive grid steps read the *same* block —
+        1 unless the operand repeats over ``g`` (a GQA head, say).
         """
         spec = self.spec
         bcast = getattr(spec, "is_broadcast", None)
-        dims, indices = [], []
+        rep = getattr(spec, "repeat", None)
         for d, g in enumerate(spec.index_map):
             if (
                 g is not None
                 and self.grid[g] > 1
                 and not (bcast is not None and bcast[d])
             ):
-                dims.append(d)
-                indices.append(grid_idx[g])
-        if len(dims) < len(spec.index_map):
+                yield d, g, (rep[d] if rep is not None else 1)
+
+    def _block(self, coord, r):
+        """The block index a grid coord addresses: every ``r``-th step advances
+        it, so a repeated operand re-reads one tile ``r`` times."""
+        return coord if r == 1 else coord // r
+
+    def _block_address(self, grid_idx):
+        """The ``(dims, indices)`` addressing this operand's tile for
+        ``async_copy`` at ``grid_idx``.  ``dims`` is ``None`` when every dim is
+        dynamic (``async_copy``'s "all dims" shorthand).
+        """
+        dims, indices = [], []
+        for d, g, r in self._tiled_dims():
+            dims.append(d)
+            indices.append(self._block(grid_idx[g], r))
+        if len(dims) < len(self.spec.index_map):
             return dims, indices
         return None, indices
 
@@ -203,17 +218,10 @@ class _BufferedRef:
         traced loop), no mixed-radix arithmetic.  Seeded with the first term
         (not ``False``) to avoid a redundant ``False | ...`` node.
         """
-        spec = self.spec
-        bcast = getattr(spec, "is_broadcast", None)
         differ = None
-        for d, g in enumerate(spec.index_map):
-            if (
-                g is not None
-                and self.grid[g] > 1
-                and not (bcast is not None and bcast[d])
-            ):
-                term = cur[g] != next[g]
-                differ = term if differ is None else (differ | term)
+        for _, g, r in self._tiled_dims():
+            term = self._block(cur[g], r) != self._block(next[g], r)
+            differ = term if differ is None else (differ | term)
         return False if differ is None else differ
 
     def _innermost_tiled_dim(self):
@@ -227,19 +235,13 @@ class _BufferedRef:
         """Whether this operand's tile block changes on every grid step (it
         spans the innermost tiled, non-broadcast dim).  Known at build time:
         when True the DMA is emitted unconditionally — no ``torch.cond`` guard,
-        no counter ``sym_ite``.
+        no counter ``sym_ite``.  A dim it *repeats* over advances only every
+        ``r``-th step, so it does not qualify.
         """
         inner = self._innermost_tiled_dim()
         if inner is None:
             return False
-        spec = self.spec
-        bcast = getattr(spec, "is_broadcast", None)
-        return any(
-            g is not None
-            and g == inner
-            and not (bcast is not None and bcast[d])
-            for d, g in enumerate(spec.index_map)
-        )
+        return any(g == inner and r == 1 for _, g, r in self._tiled_dims())
 
     def _unravel(self, flat):
         """The row-major grid coords of flat index ``flat`` as plain Python
@@ -1405,33 +1407,34 @@ def build_conv2d(
     return gm
 
 
-def _detect_weight_transpose(node: torch.fx.Node):
-    """Resolve a GEMM weight operand through a last-two-dim transpose / permute
-    to the un-transposed external operand it relayouts.
+def _peel_weight(node: torch.fx.Node):
+    """Resolve a GEMM weight operand through the relayouts fused onto it — a
+    last-two-dim transpose and/or a grouped-query broadcast — to the external
+    operand they read.
 
-    Returns ``(node, transposed)``.  An attention ``Q @ Kᵀ`` fuses
-    ``K.transpose(-2, -1)`` onto the weight; it is peeled to ``(K, True)``.  The
-    weight spec keeps the matmul (Kᵀ) layout, but the DRAM buffer is K's own
-    ``(N, K)`` storage, so ``_load_tile`` swaps the fetch to read it and
-    ``async_copy`` ``.mT``s the loaded tile into the bank.  Only a transpose of
-    an external operand (placeholder) is peeled; anything else is returned
-    unchanged as ``(operand, False)``.
+    Returns ``(node, transposed, repeat)``.  An attention ``Q @ Kᵀ`` fuses
+    ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that turns
+    8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the DMA
+    (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile into
+    the bank), ``repeat`` into the block index (``grid_index // repeat[d]``, so
+    four query heads share one KV tile).  Only relayouts of an external operand
+    — a placeholder, i.e. something the fused submodule is handed rather than
+    computes — peel; anything else comes back unchanged.
     """
-    if node.op != "call_function":
-        return node, False
-    src = node.args[0]
-    if not isinstance(src, torch.fx.Node) or src.op != "placeholder":
-        return node, False
-    ndim = src.value.ndim
-    if node.target is torch.ops.aten.transpose.int:
-        if {a % ndim for a in node.args[1:]} == {ndim - 2, ndim - 1}:
-            return src, True
-    elif node.target is torch.ops.aten.permute.default:
-        swapped = list(range(ndim))
-        swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
-        if list(node.args[1]) == swapped:
-            return src, True
-    return node, False
+    transposed = swaps_last_two_dims(node)
+    inner = node.args[0] if transposed else node
+    if not isinstance(inner, torch.fx.Node):
+        return node, False, None
+
+    if inner.op == "placeholder":
+        return inner, transposed, None
+
+    found = repeat_of(inner)
+    if found is not None and found[0].op == "placeholder":
+        source, _, repeat = found
+        return source, transposed, repeat
+
+    return node, False, None
 
 
 def build_gemm(
@@ -1469,10 +1472,10 @@ def build_gemm(
     if not (is_linear(anchor) or is_matmul(anchor)):
         return None
 
-    # A fused weight transpose (attention ``Q @ Kᵀ``): load the un-transposed
-    # external operand and transpose the tile in the DMA (the weight spec's
-    # ``transposed``); the spec itself stays in the matmul (Kᵀ) layout.
-    weight_node, transposed = _detect_weight_transpose(anchor.args[1])
+    # The weight's fused relayouts (attention's ``Kᵀ``, GQA's head repeat) are
+    # folded into how its tile is addressed rather than emitted; the spec itself
+    # stays in the matmul (Kᵀ) layout.
+    weight_node, transposed, weight_repeat = _peel_weight(anchor.args[1])
 
     act = anchor.args[0].value.clone()
     weight = weight_node.value.clone()
@@ -1546,6 +1549,7 @@ def build_gemm(
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
     weight_spec.transposed = transposed
+    weight_spec.repeat = weight_repeat
     bias_spec = _InputSpec((tn,), (gn,), (False,))
     # The output(s) tile onto the M/N grid dims (K reduction ``gk`` dropped); a
     # fused op may produce several (``quantize_mx``).
@@ -1591,6 +1595,12 @@ def build_gemm(
         v = anchor.kwargs.get(name)
         if not isinstance(v, torch.fx.Node):
             return
+        # A scale wears the same relayouts as the tensor it scales, so it peels
+        # the same way.
+        v, transposed, repeat = _peel_weight(v)
+        if spec is not None:
+            spec.transposed = transposed
+            spec.repeat = repeat
         if not hasattr(v, "value"):
             raise ValueError(
                 f"Expected materialized value for FX node kwarg {name!r}"

@@ -37,6 +37,13 @@ class _InputSpec:
                        an axis loaded whole / mapped to no grid dim (e.g. a conv
                        weight's kH/kW, never tiled).
       ``is_broadcast`` dim is size 1 in operand, >1 in output.
+      ``repeat``       grid steps this operand's dim holds still for: its block
+                       index is ``grid_index // repeat[d]``, so consecutive grid
+                       points read the *same* tile.  A GQA operand repeats over
+                       the query heads (8 KV heads feeding 32 query heads =>
+                       ``repeat`` 4 on the head dim), which is a broadcast that
+                       ``is_broadcast`` cannot say: the dim is 8, not 1.
+                       ``None`` => all ones.
       ``strides``      step between tiles (``None`` => == ``tile_sizes``).
       ``pad``          per-dim low padding (start -= pad).
       ``pad_value``    out-of-bounds fill for a padded load.
@@ -57,6 +64,7 @@ class _InputSpec:
     tile_sizes: Tuple[int, ...]
     index_map: Tuple[int, ...]
     is_broadcast: Tuple[bool, ...]
+    repeat: Optional[Tuple[int, ...]] = None
     strides: Optional[Tuple[int, ...]] = None
     pad: Optional[Tuple[int, ...]] = None
     pad_value: Optional[float] = None

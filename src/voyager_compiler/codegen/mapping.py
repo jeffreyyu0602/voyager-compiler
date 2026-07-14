@@ -26,12 +26,15 @@ from .mapping_utils import (
     is_fully_connected,
     is_gemm_op,
     is_addressing_op,
+    is_mha_qkv_permute,
     is_prunable_op,
     is_nop,
     is_reshape_op,
     map_node,
+    repeat_of,
     set_output_field,
     set_tensor_field,
+    swaps_last_two_dims,
 )
 from .memory import MemoryAllocator, Segment
 from .normalize import IterationSpaceNormalizer, NormalizationError
@@ -468,32 +471,6 @@ def is_tranpose(node: Node):
     return False
 
 
-def is_mha_qkv_permute(node):
-    """
-    Check if the node is a permutation used in multi-head attention (MHA)
-    operations. It has characteristics that last dimension is a power of 2 and
-    the permuted dimensions are the middle two dimensions (2 and 3) of a 4D
-    tensor.
-    """
-    # Don't support head dimension not being a power of 2
-    if (
-        not hasattr(node, "shape")
-        or len(node.shape) != 4
-        or not math.log2(node.shape[-1]).is_integer()
-    ):
-        return False
-
-    if node.target == torch.ops.aten.permute.default:
-        dims = node.args[1]
-        return len(dims) == 4 and dims == [0, 2, 1, 3]
-
-    if node.target == torch.ops.aten.transpose.int:
-        dims = {x if x >= 0 else x + 4 for x in node.args[1:]}
-        return node.value.ndim == 4 and dims == {1, 2}
-
-    return False
-
-
 def search_group(node, node_lists):
     for l in node_lists:
         if node in l:
@@ -734,6 +711,43 @@ def fuse_reshape_with_output(
     return True
 
 
+def fuse_repeat_with_gemm(graph, candidates, nodes_map, gemm_node):
+    """Fuse a repeated operand into the GEMM that reads it.
+
+    Grouped-query attention hands the attention matmul 8 KV heads blown up to
+    32.  Folding the ops that repeat them into the matmul's group leaves the
+    *un-repeated* tensor as the operand, and the bufferized builder then reads
+    head ``h // n_rep`` of it (``_InputSpec.repeat``) rather than materializing
+    the copies.  The reshape that flattens ``(heads, n_rep)`` is what would
+    otherwise force them into DRAM, so it comes along.
+
+    ``repeat_of`` decides what counts, and the builder's peel asks it the same
+    question, so the two cannot disagree about which operands are addressable.
+    """
+    fused = False
+    for operand in gemm_node.all_input_nodes:
+        # A transpose on top is folded into the DMA rather than the block index,
+        # so the repeat sits underneath it -- but it still has to come along,
+        # or the chain's result would leave the group and re-enter through it as
+        # a second operand.
+        transposed = swaps_last_two_dims(operand)
+        inner = operand.args[0] if transposed else operand
+        found = repeat_of(inner)
+        if found is None:
+            continue
+        _, chain, _ = found
+        if transposed:
+            chain = [*chain, operand]
+        if (group := search_group(gemm_node, candidates)) is not None:
+            group.extend(n for n in chain if n not in group)
+        else:
+            candidates.append([*chain, gemm_node])
+        nodes_map[chain[0]] = chain[-1]
+        fused = True
+
+    return fused
+
+
 def fuse_dequantize_with_gemm_or_elementwise(
     graph, candidates, nodes_map, node_to_fuse
 ):
@@ -891,6 +905,10 @@ def fuse_operator(
         fuse_dequantize_with_gemm_or_elementwise(
             graph, fused_nodes_list, nodes_map, node
         )
+
+    for node in list(graph.nodes):
+        if is_gemm_op(node):
+            fuse_repeat_with_gemm(graph, fused_nodes_list, nodes_map, node)
 
     # Sort nodes based on their order of appearance in the graph
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}
