@@ -38,8 +38,8 @@ from .codegen.mapping_utils import (
     is_mha_qkv_permute,
     is_nop,
     is_reshape_op,
-    is_conv2d,
     is_matmul,
+    reshape_preserves_full_blocks,
 )
 from .decomposed import quantized_ops_lib
 
@@ -907,6 +907,16 @@ _HOISTABLE_OPS = (
     torch.ops.aten.repeat.default,
 )
 
+# Ops that regroup dims without moving an element: they preserve row-major
+# order, so a quantize can be lifted over one even when it cuts across the axis
+# the quantize blocks along -- as long as the blocks come out the same
+# (``_blocks_survive_regroup``).  These are also the only ops whose size
+# argument ``_replay_relayout`` knows how to rebuild for the scale.
+_REGROUP_OPS = (
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.view.default,
+)
+
 # MHA head splitting rejoins the per-head results with one of these, so a
 # quantize lifted over it has to be duplicated onto every branch.
 _FORK_OPS = (
@@ -936,7 +946,9 @@ def _is_relayout(node) -> bool:
     )
 
 
-def _axes_above(node: Node, axes: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
+def _axes_above(
+    node: Node, axes: Tuple[int, ...], block_size: Optional[int]
+) -> Optional[Tuple[int, ...]]:
     """``axes`` -- the axes a microscaling quantize blocks along, read against
     ``node``'s output -- restated against its input.  ``None`` if the blocks do
     not survive ``node``, which is then as far as the quantize can be lifted.
@@ -945,7 +957,9 @@ def _axes_above(node: Node, axes: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
     of a block axis leaves it alone: that covers every op on the ``repeat_kv``
     path (``unsqueeze``, ``expand``, the head-flattening ``reshape``).  A
     transpose or a permute genuinely moves the axis, so it is remapped.  A
-    per-tensor quantize passes ``()`` and is unaffected.
+    reshape that regroups the block axis itself still passes if the blocks come
+    out the same set of elements.  A per-tensor quantize passes ``()`` and is
+    unaffected.
     """
     out_shape = tuple(node.value.shape)
     in_shape = tuple(node.args[0].value.shape)
@@ -961,11 +975,30 @@ def _axes_above(node: Node, axes: Tuple[int, ...]) -> Optional[Tuple[int, ...]]:
         return tuple(perm[x + rank] - rank for x in axes)
 
     if any(in_shape[x:] != out_shape[x:] for x in axes):
-        return None
+        # A reshape regrouping the block axis is still crossable if the blocks
+        # come out the same sets of elements.
+        if node.target not in _REGROUP_OPS or len(axes) != 1:
+            return None
+        a = axes[0]
+        if block_size is None or len(in_shape) < -a or len(out_shape) < -a:
+            return None
+        if not reshape_preserves_full_blocks(
+            in_shape,
+            a + len(in_shape),
+            out_shape,
+            a + len(out_shape),
+            block_size,
+        ):
+            return None
     return axes
 
 
-def _relayout_path(start, axes: Tuple[int, ...], keep_head_permute=False):
+def _relayout_path(
+    start,
+    axes: Tuple[int, ...],
+    block_size: Optional[int],
+    keep_head_permute=False,
+):
     """Walk up from ``start`` over relayout ops, restating ``axes`` at each.
 
     Returns ``(src, path, axes_at, src_axes)``: ``path`` is the ops crossed,
@@ -974,12 +1007,13 @@ def _relayout_path(start, axes: Tuple[int, ...], keep_head_permute=False):
     those at ``src``.  The walk stops at the first node that computes, that
     someone else also reads, or that the blocks would not survive.
 
-    ``keep_head_permute`` also stops it at an MHA head permute.  Only a
-    multi-output quantize needs that: lifted past one, it leaves a ``getitem``
-    between the projection and the permute, and the permute can no longer be
-    fused into the store it belongs to (``fuse_reshape_with_output`` crosses
-    NOPs, and a ``getitem`` is not one).  A single-output quantize has no
-    ``getitem`` and steps over freely.
+    ``keep_head_permute`` also stops it at an MHA head permute -- a *fusable*
+    reshape, one the GEMM below can store straight through
+    (``fuse_reshape_with_output``).  That is exactly where a multi-output
+    quantize wants to sit: fused as the last op of that group, quantizing the
+    tile on its way out.  Lifted past it, it would leave a ``getitem`` between
+    the two and neither could fuse.  A single-output quantize has no ``getitem``
+    and steps over freely.
     """
     path, axes_at = [], []
     src = start
@@ -988,7 +1022,7 @@ def _relayout_path(start, axes: Tuple[int, ...], keep_head_permute=False):
         and len(src.users) == 1
         and not (keep_head_permute and is_mha_qkv_permute(src))
     ):
-        above = _axes_above(src, axes)
+        above = _axes_above(src, axes, block_size)
         if above is None:
             break
         path.append(src)
@@ -1024,23 +1058,22 @@ def _copy_quantize_above(model: GraphModule, node: Node, src: Node, axes):
     return new
 
 
-def _replay_relayout(graph: Graph, node: Node, src: Node, axes) -> Node:
+def _replay_relayout(
+    graph: Graph, node: Node, src: Node, axes, block_size: int
+) -> Node:
     """Copy relayout ``node`` onto ``src``.  ``src`` is the scale of a hoisted
     ``quantize_mx``, so along ``axes`` it holds one element per *block* where
-    the original input held one per element -- a shape argument is rebuilt from
-    ``src``'s own sizes there.  Every other dim is untouched: ``_axes_above``
-    already proved the block axis and everything right of it survive.
+    the original input held one per element -- a shape argument keeps that dim's
+    own extent and divides it.  Every other dim is untouched: ``_axes_above``
+    already proved the blocks survive.
     """
     new = graph.node_copy(node, lambda n: src if n is node.args[0] else n)
     out_shape = tuple(node.value.shape)
 
-    if node.target in (
-        torch.ops.aten.reshape.default,
-        torch.ops.aten.view.default,
-    ):
+    if node.target in _REGROUP_OPS:
         shape = list(out_shape)
         for a in axes:
-            shape[a] = src.value.shape[a]
+            shape[a] = out_shape[a] // block_size
         new.args = (src, shape)
     elif node.target is torch.ops.aten.expand.default:
         # ``-1`` keeps a dim, so naming only the dims this expand actually grows
@@ -1084,7 +1117,7 @@ def _hoist_forked(model: GraphModule, node: Node) -> bool:
 
     while todo:
         start, reader = todo.pop()
-        src, path, _, _ = _relayout_path(start, ())
+        src, path, _, _ = _relayout_path(start, (), None)
         on_path.extend(path)
         if path:
             reader = path[-1]
@@ -1117,8 +1150,9 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     on less data -- and what they were going to do (broadcast a KV head, lay a
     tile out for the MXU) the consumer folds into its addressing rather than
     materializing.  Two things halt the walk: an op the quantization blocks do
-    not survive (``_axes_above``), and an MHA head permute, which is free only
-    where it is -- fused into the store of the projection that produced it.
+    not survive (``_axes_above``), and an MHA head permute, where the quantize
+    wants to stop -- the GEMM below stores straight through that permute, and
+    the quantize fuses onto the end of it (``fuse_reshape_with_output``).
 
     The op has two outputs, so the value keeps the relayout ops it was lifted
     over and the scale gets a replayed copy of them.  It is never forked: a
@@ -1134,8 +1168,9 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
             return False
         outs[user.args[1]] = user
 
+    block_size = node.args[3]
     src, path, axes_at, src_axes = _relayout_path(
-        node.args[0], node.args[2], keep_head_permute=True
+        node.args[0], node.args[2], block_size, keep_head_permute=True
     )
     if not path:
         return False
@@ -1165,7 +1200,9 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
         with graph.inserting_before(node):
             cur = unpack(i)
             for k in reversed(range(len(path))):
-                cur = _replay_relayout(graph, path[k], cur, axes_at[k])
+                cur = _replay_relayout(
+                    graph, path[k], cur, axes_at[k], block_size
+                )
                 cur.meta["dtype"] = old.meta.get("dtype", None)
                 propagate_shape(cur, model)
         old.replace_all_uses_with(cur)

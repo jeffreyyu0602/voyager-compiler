@@ -60,6 +60,10 @@ from voyager_compiler.codegen.mapping import (
 
 _SRAM = int(MemoryLevel.SRAM)
 
+# A microscaling quantize fuses onto the *end* of an MHA output relayout, so it
+# is what the body returns and the permute sits one step above it.
+_QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+
 # Default software-pipeline depth (2 = double buffering).  Single source of
 # truth for the ``num_banks`` default across the scheduler and op builders; a
 # spec may override it per operand (``_InputSpec`` / ``_OutputSpec.num_banks``).
@@ -790,6 +794,19 @@ def build_pipelined_buffers(
 # ---------------------------------------------------------------------------
 
 
+# One fused output, as the builders take it before it becomes an
+# ``_OutputSpec``: its DRAM shape, its SRAM tile, its dtype, and the output dim
+# -> grid dim map -- ``None`` for the builder's default, and ``None`` on a dim
+# that no grid index addresses (it is stored whole).
+_FusedOutput = Tuple[
+    Tuple[int, ...],
+    Tuple[int, ...],
+    torch.dtype,
+    Optional[Tuple[Optional[int], ...]],
+]
+
+
+@dataclass
 class _FusedInfo:
     """Parsed pieces of a fused ``call_module`` (GEMM/conv + post-op pointwise
     ops), for the GEMM / conv pipeline builders.
@@ -800,30 +817,19 @@ class _FusedInfo:
     -> output(s)`` on the anchor's result tile.  ``input_values`` are the
     tensors those ops consume; ``in_specs[i]`` is that input's tile
     ``_InputSpec`` (or ``None`` for a whole input); ``in_sources[i]`` is its
-    outer graph node, used to order operands canonically.  ``output_specs`` is
-    one ``(full_shape, tile_shape, dtype, index_map)`` per fused output (a tuple
-    ⇒ multi-output, e.g. ``quantize_mx``).
+    outer graph node, used to order operands canonically.  ``output_specs``
+    holds one ``_FusedOutput`` per fused output -- several when the fused op
+    returns a tuple (``quantize_mx``).
     """
 
-    def __init__(
-        self,
-        anchor_node,
-        is_conv,
-        fused_gm,
-        tiling,
-        input_values,
-        in_specs,
-        in_sources,
-        output_specs,
-    ):
-        self.anchor_node = anchor_node
-        self.is_conv = is_conv
-        self.fused_gm = fused_gm
-        self.tiling = tiling
-        self.input_values = input_values
-        self.in_specs = in_specs
-        self.in_sources = in_sources
-        self.output_specs = output_specs
+    anchor_node: torch.fx.Node
+    is_conv: bool
+    fused_gm: torch.fx.GraphModule
+    tiling: Optional[Tuple[int, ...]]
+    input_values: List[torch.Tensor]
+    in_specs: List[Optional[_InputSpec]]
+    in_sources: List[torch.fx.Node]
+    output_specs: List[_FusedOutput]
 
 
 def _retile_mha_view(fused_gm, nb, tm) -> None:
@@ -833,12 +839,14 @@ def _retile_mha_view(fused_gm, nb, tm) -> None:
     scrambles the data — replace it with the tile's ``tm`` and let the split
     outer (heads) auto-size via ``-1``.  View dims are ``[*batch, M, H,
     head_dim]`` (M at index ``nb``).  The body isn't ShapeProp'd, so navigate
-    output -> perm -> view by structure, not shape.
+    output -> [quantize] -> perm -> view by structure, not shape.
     """
     out = next(n for n in fused_gm.graph.nodes if n.op == "output")
     perm = out.args[0]
     if isinstance(perm, (list, tuple)):
         perm = perm[0]
+    if perm.target is _QUANTIZE_MX:
+        perm = perm.args[0]
     view = perm.args[0]
     dims = list(view.args[1])
     dims[nb] = tm  # M -> tile M
@@ -851,10 +859,15 @@ def _retile_mha_view(fused_gm, nb, tm) -> None:
 def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
     """If the fused tail ends with an MHA output relayout
     (``is_mha_qkv_permute`` — a ``transpose(1,2)`` / ``permute([0,2,1,3])`` on a
-    4-D tensor), return the relaid-out output ``(tile_sizes, index_map)`` (the
-    tile stored to the permuted block, tiling the output on its own axes) and,
-    for the projection case, retile the body's ``view`` in place; else ``None``
-    (the caller keeps the default, un-permuted output spec).
+    4-D tensor), return the relaid-out output ``(tile_sizes, index_map,
+    shape)`` (the tile stored to the permuted block, tiling the output on its
+    own axes) and, for the projection case, retile the body's ``view`` in place;
+    else ``None`` (the caller keeps the default, un-permuted output spec).
+
+    A microscaling quantize may sit on top of the permute, quantizing the tile
+    on its way out; the relayout is the permute below it, and the returned
+    ``shape`` is the relaid-out *data*, which the caller dices its scale
+    against.
 
     Two kinds, differing in where the head comes from:
 
@@ -872,6 +885,8 @@ def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
     ``fused_ops`` must be non-empty and ``tiling`` must not be ``None``.
     """
     perm = fused_ops[-1]
+    if perm.target is _QUANTIZE_MX:
+        perm = perm.args[0]
     if not is_mha_qkv_permute(perm):
         return None
     head_dim = perm.value.shape[-1]  # head_dim (unchanged by the perm)
@@ -895,7 +910,7 @@ def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
         outer = tuple(g_out.shape[: nb - 1])
         out_tile = outer + (tm, 1, tn)  # [*outer, S_t, H_t=1, head_dim]
         out_imap = tuple(range(nb - 1)) + (grid_m, nb - 1, grid_n)
-    return out_tile, out_imap
+    return out_tile, out_imap, tuple(perm.value.shape)
 
 
 def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
@@ -989,8 +1004,23 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     if not is_conv and fused_ops and tiling is not None:
         relayout = _detect_mha_relayout(fused_ops, anchor, tiling, fused_gm)
         if relayout is not None:
-            out_tile, out_imap = relayout
-            output_specs = [(full_shapes[0], out_tile, vals[0].dtype, out_imap)]
+            out_tile, out_imap, data_shape = relayout
+            # The relaid-out tile is the data output's.  A fused ``quantize_mx``
+            # returns a scale beside it, holding one element per block where the
+            # data holds one per element -- so it rides the same grid, on a tile
+            # shrunk by the very same ratio, dim by dim.
+            output_specs = [
+                (
+                    s,
+                    tuple(
+                        t * d // full
+                        for t, d, full in zip(out_tile, s, data_shape)
+                    ),
+                    v.dtype,
+                    out_imap,
+                )
+                for s, v in zip(full_shapes, vals)
+            ]
 
     return _FusedInfo(
         anchor,

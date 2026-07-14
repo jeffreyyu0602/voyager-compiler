@@ -696,6 +696,18 @@ def fuse_reshape_with_output(
         )
         return False
 
+    # A microscaling quantize reading the permute comes along as the group's
+    # last op: the tile is quantized on its way out of the GEMM, rather than
+    # written, read back and written again.  Nothing sits between the two.
+    users = list(reshape_node.users)
+    if (
+        len(users) == 1
+        and users[0].target is torch.ops.quantized_ops.quantize_mx.default
+        and users[0].args[0] is reshape_node
+        and search_group(users[0], candidates) is None
+    ):
+        fused_nodes.append(users[0])
+
     group = search_group(curr_node, candidates)
 
     if group is not None:

@@ -577,6 +577,29 @@ def is_reshape_op(node: Node) -> bool:
     ]
 
 
+def reshape_preserves_full_blocks(
+    input_shape: tuple[int, ...],
+    input_axis: int,
+    output_shape: tuple[int, ...],
+    output_axis: int,
+    group_size: int,
+) -> bool:
+    if math.prod(input_shape) != math.prod(output_shape):
+        return False
+
+    if group_size == 1:
+        return True
+
+    input_minor = math.prod(input_shape[input_axis + 1 :])
+    output_minor = math.prod(output_shape[output_axis + 1 :])
+
+    return (
+        input_minor == output_minor
+        and input_shape[input_axis] % group_size == 0
+        and output_shape[output_axis] % group_size == 0
+    )
+
+
 _BROADCAST_OPS = (
     torch.ops.aten.expand.default,
     torch.ops.aten.repeat.default,

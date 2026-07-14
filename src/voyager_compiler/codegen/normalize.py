@@ -24,6 +24,7 @@ from .mapping_utils import (
     is_reshape_op,
     is_shape_changing_nop,
     quant_table_arg_nodes,
+    reshape_preserves_full_blocks,
 )
 from .shape_prop import ShapeProp
 from ..pt2e_utils import propagate_shape, set_node_value
@@ -573,11 +574,18 @@ class IterationSpaceNormalizer:
             )
 
         if self._is_supported_mx_op(value):
+            # The quantize may sit on top of an output relayout, quantizing the
+            # tile the fused op is about to store through it.  The relayout is
+            # still what ends the iteration space -- the quantize does not move
+            # an element -- so peel it from the quantize's input, not from the
+            # output.
+            core, relayout = self._strip_output_relayout(value.args[0])
             return _OutputDescription(
                 value_node=value,
-                map_target=value,
-                iteration_node=value.args[0],
+                map_target=core if relayout else value,
+                iteration_node=core,
                 external_shapes=value.shape,
+                output_relayout=relayout,
             )
 
         return _OutputDescription(
@@ -670,15 +678,12 @@ class IterationSpaceNormalizer:
         """Whether restoring a single-axis ``quantize_mx`` op's outputs to
         ``external_shapes`` keeps every quantization block intact.
 
-        The restore is a pure order-preserving row-major view (guaranteed
-        here: a permute would route through the relayout branch and the
-        restore is an ``aten.view``).  It is block-safe when the quantized
-        (last, unit-stride) axis either keeps its length or has both its pre-
-        and post-restore lengths divisible by ``block_size``: then a data
-        element keeps its linear position ``p`` and its block id ``p //
-        block_size`` on both sides, so no block is split or regrouped and the
-        scales still line up.  Anything else -- a non-``quantize_mx`` op, a
-        non-last quantized axis, or a block-straddling merge -- is rejected.
+        The restore is a pure order-preserving row-major view (guaranteed here:
+        a permute would route through the relayout branch and the restore is an
+        ``aten.view``), so ``reshape_preserves_full_blocks`` decides it, on any
+        quantized axis.  An identity restore passes it by construction: nothing
+        moves, and the padding pass has already made the axis a whole number of
+        blocks long.
         """
         if value_node.target != torch.ops.quantized_ops.quantize_mx.default:
             return False
@@ -688,18 +693,23 @@ class IterationSpaceNormalizer:
             return False
         if len(axes) != 1:
             return False
-        if any(
-            math.prod(i) != math.prod(e)
-            for i, e in zip(internal_shapes, external_shapes)
-        ):
-            return False
         # quantize_mx returns (scale, data); blocks live on the data output.
         data_internal = tuple(internal_shapes[1])
         data_external = tuple(external_shapes[1])
-        if axes[0] not in (-1, len(data_internal) - 1):
+        # The axis counts from the end, so the restore hands it to whatever dim
+        # sits that far from the end of the restored shape.
+        dim = axes[0]
+        if dim >= 0:
+            dim -= len(data_internal)
+        if len(data_external) < -dim:
             return False
-        lb, la = data_internal[-1], data_external[-1]
-        return lb == la or (lb % block_size == 0 and la % block_size == 0)
+        return reshape_preserves_full_blocks(
+            data_internal,
+            dim + len(data_internal),
+            data_external,
+            dim + len(data_external),
+            block_size,
+        )
 
     # ------------------------------------------------------------------
     # Graph rewriting
