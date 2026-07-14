@@ -709,7 +709,7 @@ if __name__ == "__main__":
                 example_kwargs["attention_mask"]
             )
 
-        fuse_dequantize_quantize(gm)
+        fuse_dequantize_quantize(gm, unrepeat_qparams=args.bufferize)
 
         transform(gm, example_args, example_kwargs, **transform_args)
         compile(gm, example_args, example_kwargs, **compile_args)

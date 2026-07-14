@@ -1460,14 +1460,17 @@ def _peel_weight(node: torch.fx.Node):
     submodule is handed rather than computes — peel; anything else comes back
     unchanged.
     """
-    transposed = swaps_last_two_dims(node)
-    inner = node.args[0] if transposed else node
-    if not isinstance(inner, torch.fx.Node):
-        return node, False, None, None
-
+    inner = node
     dequant = None
     if inner.target is torch.ops.quantized_ops.dequantize.default:
         dequant = inner
+        inner = inner.args[0]
+
+    # A ``Kᵀ`` sits under the decode, never over it (``_insert_transpose_op``
+    # hoists it there).  The decode is none the wiser: the tile the fetch
+    # transposes into the bank is the one it was written against.
+    transposed = swaps_last_two_dims(inner)
+    if transposed:
         inner = inner.args[0]
 
     if inner.op == "placeholder":
@@ -1523,9 +1526,6 @@ def build_gemm(
     weight_node, transposed, weight_repeat, dequant = _peel_weight(
         anchor.args[1]
     )
-    assert not (
-        transposed and dequant is not None
-    ), "a dequantized weight fetched transposed would block along swapped axes"
 
     act = anchor.args[0].value.clone()
     weight = weight_node.value.clone()
@@ -1694,8 +1694,10 @@ def build_gemm(
                 continue
             spec = None
             if v not in tables:
+                v, t, r, _ = _peel_weight(v)
                 spec = _spec(v.value.shape, dq_tile, _proj(gn, gk))
-                spec.repeat = weight_repeat
+                spec.transposed = t
+                spec.repeat = r
             dq_nodes[i] = src(v)
             node_to_spec[src(v)] = (v.value.clone(), spec)
 

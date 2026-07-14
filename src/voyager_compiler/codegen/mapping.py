@@ -723,46 +723,49 @@ def fuse_reshape_with_output(
     return True
 
 
-def fuse_repeat_with_gemm(graph, candidates, nodes_map, gemm_node):
-    """Fuse a repeated operand into the GEMM that reads it.
+def fuse_repeat_with_input(graph, candidates, node) -> bool:
+    """Fuse a repeated tensor into the GEMM that reads it.
 
     Grouped-query attention hands the attention matmul 8 KV heads blown up to
-    32.  Folding the ops that repeat them into the matmul's group leaves the
-    *un-repeated* tensor as the operand, and the bufferized builder then reads
-    head ``h // n_rep`` of it (``_InputSpec.repeat``) rather than materializing
-    the copies.  The reshape that flattens ``(heads, n_rep)`` is what would
-    otherwise force them into DRAM, so it comes along.
+    32.  In the group, the ops that repeat them are not emitted: the builder
+    reads head ``h // n_rep`` of the un-repeated tensor (``_InputSpec.repeat``).
 
-    ``repeat_of`` decides what counts, and the builder's peel asks it the same
-    question, so the two cannot disagree about which operands are addressable.
+    Traced from the repeat down, not from the GEMM up: a repeated tensor need
+    not reach it as an operand.  A KIVI cache is decoded on the way in, so its
+    scale and zero point repeat into the ``dequantize`` instead -- which, like a
+    transpose, folds into the fetch and is crossed.
+
+    Bufferized only: the legacy path copies an ``expand`` into memory, so it
+    never sees one of these groups (hence no ``nodes_map`` entry).
     """
-    fused = False
-    for operand in gemm_node.all_input_nodes:
-        # A transpose on top is folded into the DMA rather than the block index,
-        # so the repeat sits underneath it -- but it still has to come along,
-        # or the chain's result would leave the group and re-enter through it as
-        # a second operand.
-        transposed = swaps_last_two_dims(operand)
-        inner = operand.args[0] if transposed else operand
-        found = repeat_of(inner)
-        if found is None:
-            continue
-        _, chain, _ = found
-        if transposed:
-            chain = [*chain, operand]
-        if (group := search_group(gemm_node, candidates)) is not None:
-            group.extend(n for n in chain if n not in group)
-        else:
-            candidates.append([*chain, gemm_node])
-        nodes_map[chain[0]] = chain[-1]
-        fused = True
+    found = repeat_of(node)
+    if found is None:
+        return False
+    _, chain, _ = found
 
-    return fused
+    crossed = []
+    curr = node
+    while True:
+        if len(curr.users) != 1:
+            return False
+        user = next(iter(curr.users))
+        if is_gemm_op(user):
+            break
+        if swaps_last_two_dims(user):
+            crossed.append(user)
+        elif user.target != torch.ops.quantized_ops.dequantize.default:
+            return False
+        curr = user
+
+    chain = [*chain, *crossed]
+    if (group := search_group(user, candidates)) is not None:
+        group.extend(n for n in chain if n not in group)
+    else:
+        candidates.append([*chain, user])
+    return True
 
 
-def fuse_dequantize_with_gemm_or_elementwise(
-    graph, candidates, nodes_map, node_to_fuse
-):
+def fuse_dequantize_with_input(graph, candidates, nodes_map, node_to_fuse):
     for user in list(node_to_fuse.users):
         _fuse_dequantize_recursive(
             graph, candidates, nodes_map, user, [node_to_fuse]
@@ -793,8 +796,12 @@ def _fuse_dequantize_recursive(
             candidates.append(fused_nodes)
         return
 
-    if current_node.target != torch.ops.aten.select.int and not is_nop(
-        current_node
+    # A transpose folds into the fetch (the DMA swaps the tile), so the decode
+    # still reaches the GEMM that runs it.
+    if (
+        current_node.target != torch.ops.aten.select.int
+        and not is_nop(current_node)
+        and not swaps_last_two_dims(current_node)
     ):
         logger.info(f"Cannot fuse {fused_nodes[0]} with {current_node}")
         return
@@ -914,13 +921,10 @@ def fuse_operator(
         if search_group(node, fused_nodes_list) is not None:
             continue
 
-        fuse_dequantize_with_gemm_or_elementwise(
-            graph, fused_nodes_list, nodes_map, node
-        )
+        fuse_dequantize_with_input(graph, fused_nodes_list, nodes_map, node)
 
     for node in list(graph.nodes):
-        if is_gemm_op(node):
-            fuse_repeat_with_gemm(graph, fused_nodes_list, nodes_map, node)
+        fuse_repeat_with_input(graph, fused_nodes_list, node)
 
     # Sort nodes based on their order of appearance in the graph
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}

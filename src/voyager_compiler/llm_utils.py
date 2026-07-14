@@ -14,7 +14,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb, repeat_kv
 
 from .decomposed import expand
-from .pt2e_utils import fetch_attr
+from .pt2e_utils import fetch_attr, propagate_shape
 from .quantize_pt2e import create_getattr_from_value
 from .codegen.mapping_utils import is_gemm_op, is_nop, is_reshape_op
 from .codegen.passes.utils import get_arg_value
@@ -802,6 +802,59 @@ LAYOUT_OPS = {
 }
 
 
+def store_qparam_unrepeated(
+    model, param, expand_node, name, insert_before, dtype
+):
+    """Store ``param`` once and repeat it in the graph, not in the buffer.
+
+    Grouped-query attention shares one KV head between several query heads, so a
+    quantization parameter run through that broadcast (``expand_node``) holds
+    every value that many times over.  Rebuilt as ``unsqueeze -> expand ->
+    reshape`` above the value it was quantized with, the copies never happen:
+    the consumer folds the repeat into its addressing and reads head
+    ``h // factor`` (``repeat_of``).
+
+    Returns the node the ops end at, or ``None`` if ``param`` is not that repeat
+    after all.
+    """
+    # The broadcast grows one dim, which the reshape under it then folds into
+    # the dim above -- the head dim.
+    grown = [
+        d
+        for d, s in enumerate(expand_node.args[1])
+        if s != expand_node.args[0].shape[d]
+    ]
+    if len(grown) != 1:
+        return None
+    dim = grown[0] - 1
+    factor = expand_node.args[1][grown[0]]
+
+    graph = model.graph
+    base = param.index_select(
+        dim, torch.arange(0, param.shape[dim], factor, device=param.device)
+    )
+    if not torch.equal(param, base.repeat_interleave(factor, dim=dim)):
+        return None
+
+    sizes = list(base.shape)
+    sizes.insert(dim + 1, factor)
+    with graph.inserting_before(insert_before):
+        attr = create_getattr_from_value(model, graph, name, base)
+        unsqueezed = graph.call_function(
+            torch.ops.aten.unsqueeze.default, (attr, dim + 1)
+        )
+        expanded = graph.call_function(
+            torch.ops.aten.expand.default, (unsqueezed, sizes)
+        )
+        reshaped = graph.call_function(
+            torch.ops.aten.reshape.default, (expanded, list(param.shape))
+        )
+    for n in (attr, unsqueezed, expanded, reshaped):
+        n.meta["dtype"] = dtype
+        propagate_shape(n, model)
+    return reshaped
+
+
 def run_qparam_through_nodes(model, input, nodes, axes, block_size):
     env = {nodes[0].args[0]: input}
     def map_node(n):
@@ -824,13 +877,21 @@ def run_qparam_through_nodes(model, input, nodes, axes, block_size):
     return env[nodes[-1]], axes
 
 
-def fuse_dequantize_quantize(model: torch.fx.GraphModule):
+def fuse_dequantize_quantize(
+    model: torch.fx.GraphModule, unrepeat_qparams: bool = False
+):
     """
     Fuses consecutive dequantize -> quantize operations in a quantized model
     for optimization.
 
     Args:
         model (GraphModule): The FX-traced model to optimize.
+        unrepeat_qparams (bool): Store a broadcast qparam (GQA's ``repeat_kv``)
+            once per KV head instead of once per query head, and put the repeat
+            back as graph ops.  Trades a smaller buffer for a longer graph, and
+            only pays off where the consumer can fold the repeat into its
+            addressing rather than copying -- which the bufferized path can and
+            the legacy path cannot.
 
     Returns:
         GraphModule: The optimized model with fused operations.
@@ -930,17 +991,42 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         dq_scale_expanded = expand(dq_scale, shape, block_size)
         fused_scale = dq_scale_expanded / q_scale_expanded
 
-        input_node = dq_node.args[0]
-        with graph.inserting_before(node):
-            new_scale = create_getattr_from_value(
-                model, graph, input_node.name + "_scale", fused_scale
-            )
-            if len(dq_node.args) > 2:
-                new_zero_point = create_getattr_from_value(
-                    model, graph, input_node.name + "_zero_point", zero_point
+        # The qparams were run through the path, so a broadcast on it (GQA's
+        # ``repeat_kv``) is baked into them: they hold each value once per query
+        # head sharing a KV head.  Where the repeat is free in the graph -- it
+        # folds into the tile's block index -- put it back and store the qparam
+        # once.
+        expand_node = next(
+            (
+                n
+                for n in nodes_on_path[1:-1]
+                if n.target is torch.ops.aten.expand.default
+            ),
+            None,
+        )
+
+        qparam_dtype = scale_node.meta.get("dtype")
+
+        def create_qparam(value, name):
+            if unrepeat_qparams and expand_node is not None:
+                repeated = store_qparam_unrepeated(
+                    model, value, expand_node, name, node, qparam_dtype
                 )
-            else:
-                new_zero_point = None
+                if repeated is not None:
+                    return repeated
+            with graph.inserting_before(node):
+                attr = create_getattr_from_value(model, graph, name, value)
+            attr.meta["dtype"] = qparam_dtype
+            return attr
+
+        input_node = dq_node.args[0]
+        new_scale = create_qparam(fused_scale, input_node.name + "_scale")
+        new_zero_point = (
+            create_qparam(zero_point, input_node.name + "_zero_point")
+            if len(dq_node.args) > 2
+            else None
+        )
+        with graph.inserting_before(node):
             # qmap is at arg index 1 for quantize_mx, index 5 for plain
             # quantize.
             if node.target == torch.ops.quantized_ops.quantize_mx.default:
@@ -971,12 +1057,8 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
                     dim=-1
                 )
 
-            with graph.inserting_before(node):
-                mx_scale = create_getattr_from_value(
-                    model, graph, input_node.name + "_scale", q_scale
-                )
+            mx_scale = create_qparam(q_scale, input_node.name + "_scale")
             scale_node.replace_all_uses_with(mx_scale)
-            mx_scale.meta["dtype"] = scale_node.meta.get("dtype")
 
         if node.target == torch.ops.quantized_ops.quantize_mx.default:
             value_getitem = next(
@@ -994,9 +1076,6 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule):
         dq_node.replace_all_uses_with(input_node)
         graph.erase_node(dq_node)
 
-        new_scale.meta["dtype"] = scale_node.meta.get("dtype")
-        if new_zero_point is not None:
-            new_zero_point.meta["dtype"] = scale_node.meta.get("dtype")
         for n in nodes_on_path[1:-1]:
             n.meta["dtype"] = input_node.meta.get("dtype")
 

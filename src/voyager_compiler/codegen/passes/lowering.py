@@ -999,6 +999,9 @@ def fold_constant_generators(model: GraphModule):
             torch.ops.aten.expand.default,
         ]:
             continue
+        # Bufferization pass can absorb expand into indexing to avoid copying.
+        if any(u.target is torch.ops.aten.expand.default for u in node.users):
+            continue
         if not isinstance(getattr(node, "value", None), torch.Tensor):
             continue
         const = node.target(

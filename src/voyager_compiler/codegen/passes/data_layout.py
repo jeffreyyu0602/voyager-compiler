@@ -411,34 +411,27 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
     return transposed
 
 
-def _rank(n: Node) -> int:
-    return len(n.shape)
-
-
 def _fix_axes_after_transpose(node: Node) -> List[int]:
     if (index := AXES_ARG_INDEX_MAP.get(node.target)) is None:
         return
 
     axes = get_arg_value(node, index, "axes")
-    rank = _rank(node)
+    rank = len(node.shape)
 
     # Build forward and inverse permutation for transpose(-2, -1)
     perm = list(range(rank))
     perm[-2], perm[-1] = perm[-1], perm[-2]
     inv_perm = [perm.index(i) for i in range(rank)]
 
-    # Normalize negative axes first
+    # Normalize negative axes and apply inverse permutation
     norm_axes = [(a + rank) % rank for a in axes]
-
-    # Apply inverse permutation
-    new_axes = tuple(inv_perm[a] for a in norm_axes)
-    node.args = node.args[:index] + (new_axes,) + node.args[index + 1 :]
+    node.update_arg(index, tuple(inv_perm[a] for a in norm_axes))
 
 
 def eliminate_canceling_transposes(
     model: GraphModule,
     chain: List[Node],
-    transposed_nodes: Dict[Node, Node] = None,
+    transposed_nodes: Dict[Node, Node],
 ) -> bool:
     """
     Optimizes a chain like [select_3, select_2, quantize_default_1, transpose_3]
@@ -453,22 +446,15 @@ def eliminate_canceling_transposes(
     """
     graph = model.graph
 
-    if transposed_nodes is None:
-        transposed_nodes = {}
-
-    chain = [n for n in chain if n.op == "call_function"]
-    if not chain or len(chain) < 2:
-        return False
-
     up_t = chain[0]
     down_t = chain[-1]
-
     if up_t.target != torch.ops.aten.transpose.int:
         return False
 
     # Ensure selects are on first dimension only
     selects = [n for n in chain if n.target == torch.ops.aten.select.int]
-    if _rank(up_t) < len(selects) + 2 or any(n.args[1] != 0 for n in selects):
+    rank = len(up_t.shape)
+    if rank < len(selects) + 2 or any(n.args[1] != 0 for n in selects):
         return False
 
     # We don't need to duplicate the upstream transpose node
@@ -498,105 +484,22 @@ def eliminate_canceling_transposes(
     return True
 
 
-def move_transpose_before_dq(
-    model: GraphModule,
-    chain: List[Node],
-    transposed_nodes: Dict[Node, Node] = None,
-) -> bool:
-    """
-    Optimizes a chain like [dequantize_default, select_3, select_2, transpose_3].
-
-    Steps:
-      1. Check if there's a dequantize operation in the chain.
-      2. If yes, move the transpose before the dequantize.
-
-    Returns:
-        bool: True if optimization was applied, else False.
-    """
-    graph = model.graph
-
-    if transposed_nodes is None:
-        transposed_nodes = {}
-
-    chain = [n for n in chain if n.op == "call_function"]
-    for i, n in enumerate(chain):
-        if n.target == torch.ops.quantized_ops.dequantize.default:
-            break
-
-    chain = chain[i:]  # Keep only from dequantize to end
-
-    if not chain or len(chain) < 2:
-        return False
-
-    down_t = chain[-1]
-
-    # Ensure selects are on first dimension only
-    selects = [n for n in chain if n.target == torch.ops.aten.select.int]
-    if any(n.args[1] != 0 for n in selects):
-        return False
-
-    chain = duplicate_shared_nodes(graph, chain)
-    dequantize_node = chain[0]
-
-    # Insert transpose after dequantize input
-    dq_input = dequantize_node.args[0]
-    up_t = next(
-        (n for n in dq_input.users if n.target == torch.ops.aten.transpose.int),
-        None,
-    )
-    if up_t is not None and up_t.meta.get("dtype") == dq_input.meta.get(
-        "dtype"
-    ):
-        dequantize_node.replace_input_with(dq_input, up_t)
-    else:
-        with graph.inserting_after(dq_input):
-            up_t = graph.call_function(
-                torch.ops.aten.transpose.int, (dq_input, -2, -1)
-            )
-        up_t.meta["dtype"] = dq_input.meta.get("dtype")
-        dequantize_node.replace_input_with(dq_input, up_t)
-        propagate_shape(up_t)
-
-    for n in chain:
-        for arg in n.all_input_nodes:
-            if arg in chain or arg.value.ndim < 2 or arg == up_t:
-                continue
-            if arg not in transposed_nodes:
-                transposed_nodes[arg] = _insert_transposed_input(arg, model)
-            n.replace_input_with(arg, transposed_nodes[arg])
-        _fix_axes_after_transpose(n)
-
-    down_t.replace_all_uses_with(down_t.args[0])
-    graph.erase_node(down_t)
-
-    logger.info(f"Hoisted {up_t} before {dequantize_node} and removed {down_t}")
-
-    return True
-
-
 def fold_transpose_into_constant(
     model: GraphModule,
     chain: List[Node],
-    transposed_nodes: Dict[Node, Node] = None,
+    transposed_nodes: Dict[Node, Node],
 ) -> bool:
     graph = model.graph
-    if not chain or len(chain) < 2:
-        return False
-
-    if transposed_nodes is None:
-        transposed_nodes = {}
 
     attr_node = chain[0]
     down_t = chain[-1]
-
     if attr_node.op != "get_attr":
         return False
 
     # Ensure selects are on first dimension only
     selects = [n for n in chain if n.target == torch.ops.aten.select.int]
-    if _rank(attr_node) < len(selects) + 2 or any(
-        n.args[1] != 0 for n in selects
-    ):
+    rank = len(attr_node.shape)
+    if rank < len(selects) + 2 or any(n.args[1] != 0 for n in selects):
         return False
 
     # We don't need to duplicate the transpose node
@@ -621,41 +524,71 @@ def fold_transpose_into_constant(
     return True
 
 
-def _update_tiled_shapes(node: Node) -> None:
-    """Updates the tiled_shapes metadata for a transposed node."""
-    if (tiled_shapes := node.meta.get("tiled_shapes")) is None:
-        return
-
-    for key in ["weight", "other", "weight_scale"]:
-        if key in tiled_shapes:
-            d0, d1 = tiled_shapes[key]
-            tiled_shapes[key] = (d1, d0)
-
-
 def _insert_transpose_op(
     model: GraphModule, node: Node, user: Node, transposed_nodes: dict
 ) -> Optional[List[Node]]:
-    """Inserts a transpose operation before the user node."""
-    with model.graph.inserting_before(user):
+    """Inserts a transpose operation before the user node.
+
+    A ``dequantize`` on the way in decodes element by element, so it is the same
+    tensor either side of it -- but the transpose goes *above* it, because a
+    decode the GEMM reads through is one it folds into its own fetch, where one
+    it reads from is an op with a buffer of its own.  Its scale and zero point
+    turn with it, and the axes it blocks along are restated.
+    """
+    # The legacy path splits the heads before the decode, so the GEMM's operand
+    # arrives through a chain of ``select``s on the leading dims.
+    chain = [node]
+    while chain[-1].target == torch.ops.aten.select.int:
+        chain.append(chain[-1].args[0])
+
+    dq = chain[-1]
+    selects = [n for n in chain if n.target == torch.ops.aten.select.int]
+    if dq.target != torch.ops.quantized_ops.dequantize.default or any(
+        n.args[1] != 0 for n in selects
+    ):
+        dq = None
+    else:
+        # Every head shares the decode, so give this GEMM one of its own to
+        # turn; once all of them are turned the copies are identical again and
+        # ``deduplicate_nodes`` folds them back.
+        chain = duplicate_shared_nodes(model.graph, chain)
+        dq = chain[0]
+
+    # Transpose what the decode reads, or what the GEMM reads if there is none.
+    src, consumer = (dq.args[0], dq) if dq is not None else (node, user)
+
+    with model.graph.inserting_before(consumer):
         new_node = model.graph.call_function(
-            torch.ops.aten.transpose.int, (node, -2, -1)
+            torch.ops.aten.transpose.int, (src, -2, -1)
         )
 
-    new_node.meta["dtype"] = node.meta.get("dtype")
+    new_node.meta["dtype"] = src.meta.get("dtype")
     propagate_shape(new_node, model)
-    user.replace_input_with(node, new_node)
+    consumer.replace_input_with(src, new_node)
+
+    if dq is not None:
+        for arg in list(dq.all_input_nodes):
+            if arg is new_node or arg.value.ndim < 2:
+                continue
+            if arg not in transposed_nodes:
+                transposed_nodes[arg] = _insert_transposed_input(arg, model)
+                propagate_shape(transposed_nodes[arg], model)
+            dq.replace_input_with(arg, transposed_nodes[arg])
+        _fix_axes_after_transpose(dq)
+        # The decode -- and every select over it -- now hands on a transposed
+        # tensor, which is the one the GEMM wanted.
+        for n in chain:
+            propagate_shape(n, model)
 
     path = find_upstream_transpose_or_param(new_node)
-    if not path:
-        return None
+    if path is None or len(path) < 2:
+        return
 
     node_order = {n: i for i, n in enumerate(model.graph.nodes)}
-    sorted_path = sorted(path, key=lambda n: node_order[n])
+    path = sorted(path, key=lambda n: node_order[n])
 
-    success = eliminate_canceling_transposes(
-        model, sorted_path, transposed_nodes
-    )
-    return None if success else sorted_path
+    eliminate_canceling_transposes(model, path, transposed_nodes)
+    fold_transpose_into_constant(model, path, transposed_nodes)
 
 
 # The two GEMM weight layouts: ``"kc"`` = [out, contraction] (aten
@@ -669,6 +602,17 @@ def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
     (fully-connected / batch-1) nodes follow ``mv_layout``, matrix-matrix
     nodes ``mm_layout``."""
     return mv_layout if is_fully_connected(node) else mm_layout
+
+
+def _update_shapes(node: Node) -> None:
+    """Updates the tiled_shapes metadata for a transposed node."""
+    if (tiled_shapes := node.meta.get("tiled_shapes")) is None:
+        return
+
+    for key in ["weight", "other", "weight_scale"]:
+        if key in tiled_shapes:
+            d0, d1 = tiled_shapes[key]
+            tiled_shapes[key] = (d1, d0)
 
 
 def _process_linear_node(model: GraphModule, node: Node) -> None:
@@ -696,7 +640,7 @@ def _process_linear_node(model: GraphModule, node: Node) -> None:
     if node.target == torch.ops.aten.linear.default:
         node.target = torch.ops.quantized_ops.linear.default
 
-    _update_tiled_shapes(node)
+    _update_shapes(node)
     node.meta["transposed"] = True
 
 
@@ -709,21 +653,17 @@ def _process_matmul_node(
     logger.info(f"Transposing weight for matmul node {node.name}")
 
     weight_node = node.args[1]
-    path = _insert_transpose_op(model, weight_node, node, transposed_nodes)
-    if path is not None:
-        move_transpose_before_dq(model, path, transposed_nodes)
+    _insert_transpose_op(model, weight_node, node, transposed_nodes)
 
     if (scale_node := node.kwargs.get("weight_scale")) is not None:
-        path = _insert_transpose_op(model, scale_node, node, transposed_nodes)
-        if path is not None:
-            fold_transpose_into_constant(model, path, transposed_nodes)
+        _insert_transpose_op(model, scale_node, node, transposed_nodes)
 
     if node.target == torch.ops.aten.matmul.default:
         node.target = torch.ops.quantized_ops.matmul.default
     elif node.target == torch.ops.quantized_ops.matmul_mx.default:
         node.kwargs = {**node.kwargs, "weight_layout": "kc"}
 
-    _update_tiled_shapes(node)
+    _update_shapes(node)
     node.meta["transposed"] = True
 
 
