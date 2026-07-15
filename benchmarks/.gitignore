@@ -1,0 +1,2 @@
+# Sweep run outputs (timestamped run dirs + the `latest` symlink).
+results/
