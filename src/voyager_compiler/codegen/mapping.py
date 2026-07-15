@@ -3,6 +3,7 @@ import logging
 import math
 import operator
 import os
+from itertools import permutations
 from typing import List, Dict, Callable, Union, Any, Optional
 from collections import defaultdict
 
@@ -323,7 +324,19 @@ def _create_and_insert_subgraph(
     return new_node
 
 
-def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
+def _nodes_sequential(
+    nodes: List[Node], order: Dict[Node, int], hoisted: bool = True
+) -> bool:
+    """Whether ``nodes`` can run as one group: each a user of the one before it,
+    and a ``dequantize`` only ever sitting on a GEMM.
+
+    ``hoisted`` says the caller runs the group up where its *first* node stands,
+    so an operand read from outside the chain has to be computed above that
+    point as well.  A group that instead stays where its *last* node stands --
+    what ``_create_and_insert_subgraph`` does -- has every operand it needs by
+    construction, since each one precedes the node consuming it and that node
+    precedes the group.
+    """
     prev_node = None
     for n in nodes:
         # Check if the current node is a user of the previous node
@@ -335,7 +348,7 @@ def _nodes_sequential(nodes: List[Node], order: Dict[Node, int]) -> bool:
             and not is_gemm_op(n.args[0])
         ):
             return False
-        if prev_node is not None:
+        if hoisted and prev_node is not None:
             for arg in n.all_input_nodes:
                 if id(arg) == id(prev_node):
                     continue
@@ -402,7 +415,7 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate, order):
+                if _nodes_sequential(candidate, order, hoisted=False):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True
@@ -415,6 +428,116 @@ def find_sequential_nodes_(
         singleton_nodes = (singleton_nodes | set(stage_nodes)) - fused_nodes
 
     return fused_chain
+
+
+def _materialize_bytes(node: Node) -> int:
+    """DRAM an output costs if it has to live in memory: one write, plus one
+    read per consumer, weighted by dtype -- an NF4 tensor is an eighth of the
+    same shape in bf16, so a group boundary landing on a quantized value is
+    cheap to leave materialized.
+    """
+    val = getattr(node, "value", None)
+    tensors = list(val) if isinstance(val, (list, tuple)) else [val]
+    dtypes = node.meta.get("dtype")
+    if not isinstance(dtypes, (list, tuple)):
+        dtypes = [dtypes] * len(tensors)
+    size = 0
+    for t, d in zip(tensors, dtypes):
+        if isinstance(t, torch.Tensor):
+            size += t.numel() * dtype_byte_size(d if d is not None else t.dtype)
+    return size * (1 + len(node.users))
+
+
+def _saved_bytes(groups: List[List[Node]]) -> int:
+    """DRAM these groups keep off the bus.  A node is free only if it is
+    interior (some later node in its group consumes it) *and* every one of its
+    users is inside that group -- otherwise its output still materializes for
+    the outside reader.  Each group's last node is the boundary and stays.
+    """
+    total = 0
+    for group in groups:
+        members = set(group)
+        for node in group[:-1]:
+            if all(u in members for u in node.users):
+                total += _materialize_bytes(node)
+    return total
+
+
+def _commit(order: List[List[Node]]) -> List[List[Node]]:
+    """Keep each chain in ``order``, truncated at the first node an earlier one
+    already took (a prefix of a chain is still a chain); drop what shrinks to a
+    single node."""
+    kept: List[List[Node]] = []
+    taken: set = set()
+    for group in order:
+        prefix = []
+        for node in group:
+            if node in taken:
+                break
+            prefix.append(node)
+        if len(prefix) > 1:
+            kept.append(prefix)
+            taken.update(prefix)
+    return kept
+
+
+def select_groups_min_dram(
+    all_candidates: List[List[Node]],
+) -> List[List[Node]]:
+    """Resolve chains that share a node by keeping the node where it removes the
+    most DRAM.
+
+    A node claimed by several chains can stay in only one; the others truncate
+    to the prefix that led up to it.  Which chain keeps it decides which values
+    stay on-chip and which not -- fusing a GEMM's output into the next op
+    keeps that large output off the bus, and a boundary on a quantized value is
+    cheap -- so pick the assignment that keeps the most bytes on-chip
+    (``_saved_bytes``, dtype-weighted).
+
+    Chains that transitively share a node form a cluster.  A small cluster tries
+    every commit order and takes the one whose survivors save the most; a large
+    one falls back to a single greedy order (most-saving, GEMM-anchored first).
+    """
+    node_to_groups: Dict[Node, List[int]] = defaultdict(list)
+    for i, group in enumerate(all_candidates):
+        for node in group:
+            node_to_groups[node].append(i)
+
+    parent = list(range(len(all_candidates)))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for shared in node_to_groups.values():
+        for j in shared[1:]:
+            parent[find(j)] = find(shared[0])
+
+    clusters: Dict[int, List[List[Node]]] = defaultdict(list)
+    for i, group in enumerate(all_candidates):
+        clusters[find(i)].append(group)
+
+    final: List[List[Node]] = []
+    for members in clusters.values():
+        if len(members) == 1:
+            final.extend(_commit(members))
+        elif len(members) <= 6:
+            final.extend(
+                max(map(_commit, permutations(members)), key=_saved_bytes)
+            )
+        else:
+            greedy = sorted(
+                members,
+                key=lambda g: (
+                    _saved_bytes([g]),
+                    any(is_gemm_op(n) for n in g),
+                ),
+                reverse=True,
+            )
+            final.extend(_commit(greedy))
+    return final
 
 
 def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
@@ -437,17 +560,7 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
         )
         all_candidates.extend(candidates)
 
-    all_candidates.sort(key=lambda group: len(group), reverse=True)
-
-    final_groups = []
-    seen_nodes = set()
-
-    for group in all_candidates:
-        if all(node not in seen_nodes for node in group):
-            final_groups.append(group)
-            seen_nodes.update(group)
-
-    return final_groups
+    return select_groups_min_dram(all_candidates)
 
 
 def is_tranpose(node: Node):

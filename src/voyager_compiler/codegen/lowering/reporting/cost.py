@@ -82,9 +82,12 @@ def dram_cycles(n_bytes: int, cost: CostParams) -> int:
 # --------------------------------------------------------------------------
 
 
+# Softmax and LayerNorm require three and four passes over the data,
+# respectively.  Since BF16/FP16 values occupy 2 bytes per element, their ideal
+# throughputs are 1/6 and 1/8 elements per cycle, respectively.
 OP_UTILIZATION = {
-    torch.ops.aten.layer_norm.default: 0.25,
-    torch.ops.aten.softmax.int: 0.33,
+    torch.ops.aten.layer_norm.default: 0.125,
+    torch.ops.aten.softmax.int: 0.167,
 }
 
 
@@ -105,6 +108,8 @@ def op_utilization(
     if "mma" in units and per_tile and ideal_cycles > 0:
         # Only ever a slowdown; clamp away model noise (and a zero divisor).
         return min(1.0, ideal_cycles / per_tile)
+    if is_fully_connected(anchor):
+        return 1.0
     return OP_UTILIZATION.get(anchor.target, 0.5)
 
 
