@@ -46,7 +46,7 @@ def slicing_and_padding_cancel_out(shape, slice_dim, start, end, pad):
     return True
 
 
-def pad_input_node(model, node, input, pad, scale, scale_pad):
+def pad_input_node(model, node, input, pad, scale, scale_pad, code):
     pad_quantize_mx_input = (
         scale is not None
         and input.target == operator.getitem
@@ -56,6 +56,15 @@ def pad_input_node(model, node, input, pad, scale, scale_pad):
     )
 
     node_to_pad = input.args[0].args[0] if pad_quantize_mx_input else input
+
+    # Padding the pre-quantize float contributes 0 with a plain 0 fill; padding
+    # the quantized value pads *codebook indices*, so it must fill with the
+    # index that decodes to 0 (NF4 keeps 0 at index 7, not 0 -- index 0 is
+    # -1.0), or the padded contraction adds a nonzero term.
+    pad_value = 0
+    if not pad_quantize_mx_input and code is not None:
+        zeros = (fetch_attr(model, code.target) == 0).nonzero().flatten()
+        pad_value = int(zeros[0]) if len(zeros) else 0
 
     skip_padding = False
     if node_to_pad.target == torch.ops.aten.slice.Tensor:
@@ -70,7 +79,7 @@ def pad_input_node(model, node, input, pad, scale, scale_pad):
         with model.graph.inserting_after(node_to_pad):
             new_input = model.graph.call_function(
                 torch.ops.aten.pad.default,
-                (node_to_pad, pad),
+                (node_to_pad, pad, "constant", pad_value),
             )
 
         propagate_shape(new_input)
@@ -199,7 +208,13 @@ def pad_matrix_op_dimensions(
                 scale_pad = [0, pad_C // bs]
 
             pad_input_node(
-                model, node, input, input_pad, input_scale, scale_pad
+                model,
+                node,
+                input,
+                input_pad,
+                input_scale,
+                scale_pad,
+                node.kwargs.get("input_code"),
             )
 
         weight = node.args[1]
@@ -246,7 +261,13 @@ def pad_matrix_op_dimensions(
                     propagate_shape(weight_scale, model)
             else:
                 pad_input_node(
-                    model, node, weight, weight_pad, weight_scale, ws_pad
+                    model,
+                    node,
+                    weight,
+                    weight_pad,
+                    weight_scale,
+                    ws_pad,
+                    node.kwargs.get("weight_code"),
                 )
 
             if pad_K and len(node.args) > 2 and node.args[2] is not None:

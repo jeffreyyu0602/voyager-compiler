@@ -32,6 +32,7 @@ from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
 )
 
+from .codegen.aten_classifier import is_compute_op
 from .codegen.passes.utils import get_arg_value
 from .codegen.mapping_utils import (
     is_gemm_op,
@@ -1173,6 +1174,11 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
         node.args[0], node.args[2], block_size, keep_head_permute=True
     )
     if not path:
+        return False
+
+    # TODO: we should skip moving quantize_mx if there is no fusable anchor.
+    # In the future maybe move this into operator fusion.
+    if not is_compute_op(src) and not is_mha_qkv_permute(src):
         return False
 
     new = _copy_quantize_above(model, node, src, src_axes)
