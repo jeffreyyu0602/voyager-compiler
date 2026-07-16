@@ -1152,20 +1152,22 @@ def get_anchor_node(node):
 
 
 def _build_conv2d_and_gemm_shape_map(node, output_shape):
-    from .passes.tiling import _conv2d_layout, _build_gemm_shape_map
+    from .passes.tiling import _build_gemm_shape_map
+    from .lowering.utils import _project, _unproject, _NHWC, _HWIO
 
     input_node = node.args[0]
     transposed = node.meta.get("transposed", False)
     bs = node.kwargs.get("block_size", 1)
 
     if is_conv2d(node):
+        in_dims = _NHWC if transposed else None
+        w_dims = _HWIO if transposed else None
+
         # Certain conv2d layers (e.g. conv1) have extra pixels for alignment
         # purpose. We directly take the input shape from the input node.
-        N, iy_tiled, ix_tiled, c_tiled = _conv2d_layout(
-            node.args[0].shape, False, not transposed
-        )
-        kH, kW, _, _ = _conv2d_layout(node.args[1].shape, True, not transposed)
-        _, _, _, k_tiled = _conv2d_layout(output_shape, False, not transposed)
+        N, c_tiled, iy_tiled, ix_tiled = _unproject(node.args[0].shape, in_dims)
+        _, _, kH, kW = _unproject(node.args[1].shape, w_dims)
+        _, k_tiled, _, _ = _unproject(output_shape, in_dims)
 
         new_shapes = {
             "input": (N, c_tiled, iy_tiled, ix_tiled),
@@ -1177,9 +1179,9 @@ def _build_conv2d_and_gemm_shape_map(node, output_shape):
 
         new_shapes = {
             k: (
-                _conv2d_layout(v, "weight" in k, transposed)
-                if k != "bias"
-                else v
+                v
+                if k == "bias"
+                else _project(v, w_dims if "weight" in k else in_dims)
             )
             for k, v in new_shapes.items()
         }

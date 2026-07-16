@@ -47,16 +47,14 @@ from voyager_compiler.codegen.mapping_utils import (
     quant_table_arg_nodes,
     repeat_of,
     swaps_last_two_dims,
+    trailing_mha_perm,
 )
 from voyager_compiler.codegen.passes.tiling import compute_output_tiled_shapes
 from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
 
 # Top-level: these modules do not import this one at module scope
 # (bufferization imports the builders function-locally), so no cycle.
-from voyager_compiler.codegen.mapping import (
-    get_anchor_node,
-    is_mha_qkv_permute,
-)
+from voyager_compiler.codegen.mapping import get_anchor_node
 
 _SRAM = int(MemoryLevel.SRAM)
 
@@ -884,10 +882,8 @@ def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
 
     ``fused_ops`` must be non-empty and ``tiling`` must not be ``None``.
     """
-    perm = fused_ops[-1]
-    if perm.target is _QUANTIZE_MX:
-        perm = perm.args[0]
-    if not is_mha_qkv_permute(perm):
+    perm = trailing_mha_perm(fused_ops)
+    if perm is None:
         return None
     head_dim = perm.value.shape[-1]  # head_dim (unchanged by the perm)
     g_out = anchor.value  # gemm output [*batch, M, N]
@@ -943,7 +939,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         out_tiling = None
         out_index_map = None
     elif is_conv:
-        ny, nx, _, nk = tiling  # logical (Y, X, C, K) counts
+        ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
         odims = _NHWC if anchor.meta.get("transposed", False) else None
         out_tiling = _project((1, nk, ny, nx), odims)  # physical output counts
         out_index_map = _project((0, 1, 2, 3), odims)
@@ -1239,12 +1235,12 @@ def build_conv2d(
     K, _, kH, kW = _unproject(w.shape, w_dims)
     oH, oW = _unproject(out.shape, out_dims)[2:]
 
-    # ``tiling`` is the logical output/reduction tile factors ``(n_y, n_x, n_c,
-    # n_k)`` (``None`` => untiled); tile sizes are ``full // factor``.  Batch is
+    # ``tiling`` is the logical output/reduction tile factors ``(n_y, n_x, n_k,
+    # n_c)`` (``None`` => untiled); tile sizes are ``full // factor``.  Batch is
     # never tiled; ``n_c`` (the C reduction) is the kernel's ``num_k``.
     if tiling is None:
         tiling = (1, 1, 1, 1)
-    ny, nx, nc, nk = tiling
+    ny, nx, nk, nc = tiling
     tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
     num_k = nc
 

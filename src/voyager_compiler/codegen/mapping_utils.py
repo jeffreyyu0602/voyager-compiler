@@ -570,6 +570,18 @@ def is_mha_qkv_permute(node):
     return False
 
 
+def trailing_mha_perm(fused_ops):
+    """The MHA qkv permute at the end of ``fused_ops`` (peeled of a trailing
+    microscaling ``quantize_mx``), or ``None`` if the tail is not such a
+    relayout."""
+    if not fused_ops:
+        return None
+    perm = fused_ops[-1]
+    if perm.target is torch.ops.quantized_ops.quantize_mx.default:
+        perm = perm.args[0]
+    return perm if is_mha_qkv_permute(perm) else None
+
+
 def is_reshape_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.transpose.int,

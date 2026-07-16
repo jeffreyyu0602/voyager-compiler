@@ -44,14 +44,14 @@ class RuntimeCalculator:
         input_dtype_width: int,
         output_dtype_width: int,
         double_buffered_accum_buffer: bool,
-        has_high_precision_vector_input: bool = False,
+        has_tail_operands: bool = False,
         has_sparse_op: bool = False,
     ):
         self.input_dtype_width = input_dtype_width
         self.output_dtype_width = output_dtype_width
         self.double_buffered_accum_buffer = double_buffered_accum_buffer
         self.has_sparse_op = has_sparse_op
-        self.has_high_precision_vector_input = has_high_precision_vector_input
+        self.has_tail_operands = has_tail_operands
         if self.has_sparse_op:
             print(
                 "Using sparse runtime calculator, "
@@ -120,7 +120,7 @@ class RuntimeCalculator:
 
         requires_high_precision = (
             self.output_dtype_width > self.input_dtype_width
-            or self.has_high_precision_vector_input
+            or self.has_tail_operands
         )
 
         if requires_high_precision:
@@ -247,36 +247,31 @@ def _extract_layer_dims(node, key_to_shape, output_shape):
     output_shape: tiled shape of the output tensor.
     """
     import interstellar
-    from .passes.tiling import _conv2d_layout
     from .passes.utils import get_arg_value, _pair
-    from .mapping_utils import is_conv2d, is_matmul, is_depthwise_conv
+    from .mapping_utils import (
+        is_conv2d,
+        is_matmul,
+        is_depthwise_conv,
+        is_fully_connected,
+    )
+    from .lowering.utils import _unproject, _NHWC, _HWIO
 
-    if is_depthwise_conv(node):
+    if is_depthwise_conv(node) or is_fully_connected(node):
         return None
 
-    input_shape = key_to_shape.get("input")
-    if input_shape is None:
-        return None
-
-    # Skip fully-connected layers (no spatial tiling needed)
-    if math.prod(input_shape[:-1]) == 1:
-        return None
+    transposed = node.meta.get("transposed", False)
 
     if is_conv2d(node):
         weight_shape = key_to_shape.get("weight")
         if weight_shape is None or len(weight_shape) != 4:
             return None
 
-        transposed = node.meta.get("transposed", False)
-        (
-            kH,
-            kW,
-            input_channels,
-            output_channels,
-        ) = _conv2d_layout(weight_shape, True, not transposed)
-        _, height, width, _ = _conv2d_layout(
-            output_shape, False, not transposed
+        w_dims = _HWIO if transposed else None
+        in_dims = _NHWC if transposed else None
+        output_channels, input_channels, kH, kW = _unproject(
+            weight_shape, w_dims
         )
+        _, _, height, width = _unproject(output_shape, in_dims)
 
         # Skip 3-channel first layer (torchvision convention)
         if input_channels == 3:
@@ -285,25 +280,20 @@ def _extract_layer_dims(node, key_to_shape, output_shape):
         stride_val = _pair(get_arg_value(node, 3, "stride", 1))
         stride_h, stride_w = stride_val
     else:
-        # linear or matmul
         weight_shape = key_to_shape.get("weight") or key_to_shape.get("other")
         if weight_shape is None or len(weight_shape) != 2:
             return None
 
-        # mirrors _build_gemm_shape_map in tiling.py
-        weight_transposed = is_matmul(node) ^ node.meta.get("transposed", False)
-        if weight_transposed:
-            input_channels, output_channels = weight_shape  # (IC, OC)
+        if is_matmul(node) ^ transposed:
+            input_channels, output_channels = weight_shape
         else:
-            output_channels, input_channels = weight_shape  # transposed
+            output_channels, input_channels = weight_shape
 
         kH, kW = 1, 1
         height = 1
         width = math.prod(output_shape[:-1])
         stride_h, stride_w = 1, 1
 
-    input_node = node.args[0] if len(node.args) > 0 else None
-    weight_node = node.args[1] if len(node.args) > 1 else None
     return interstellar.Layer(
         nifm=input_channels,
         nofm=output_channels,
@@ -365,7 +355,7 @@ def run_interstellar_for_tiled_op(
     output_width = _node_dtype_bits(output_node)
 
     # Check for high-precision operands in fused post-GEMM vector ops
-    has_high_prec_vector_input = False
+    has_tail_operands = False
     if output_node.op == "call_module":
         gm = named_modules[output_node.target]
         for n in gm.graph.nodes:
@@ -374,7 +364,7 @@ def run_interstellar_for_tiled_op(
 
             n = n.meta.get("source_node", n)
             if _node_dtype_bits(n) > input_width:
-                has_high_prec_vector_input = True
+                has_tail_operands = True
                 break
 
     has_sparse_op = gemm_node.kwargs.get("A_indptr") is not None
@@ -390,7 +380,7 @@ def run_interstellar_for_tiled_op(
         layer.hstd,
         input_width,
         output_width,
-        has_high_prec_vector_input,
+        has_tail_operands,
         has_sparse_op,
     )
 
@@ -403,7 +393,7 @@ def run_interstellar_for_tiled_op(
             input_width,
             output_width,
             double_buffered_accum_buffer,
-            has_high_prec_vector_input,
+            has_tail_operands,
             has_sparse_op,
         )
         _, runtime, mapping, _ = interstellar.optimizer.opt_optimizer(

@@ -37,6 +37,7 @@ from ..banking import (
     require_allocation,
     _get_scope,
 )
+from ..lowering.utils import _project, _unproject, _NHWC, _HWIO
 from ...layout_ops import NHWC_OP_VARIANTS
 from ...pt2e_utils import WrapperModule, fetch_attr, propagate_shape
 from ...quantize_pt2e import create_getattr_from_value, export_model
@@ -1137,16 +1138,6 @@ def get_valid_tiling(
                 break
 
 
-def _conv2d_layout(shape, is_weight=False, do_transpose=False):
-    assert len(shape) == 4, "Conv2d shape must be 4D"
-    if not do_transpose:
-        return shape
-    if is_weight:
-        return (shape[2], shape[3], shape[1], shape[0])
-    else:
-        return (shape[0], shape[2], shape[3], shape[1])
-
-
 def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
     bs = node.kwargs.get("block_size", 1)
     transposed = node.meta.get("transposed", False)
@@ -1158,8 +1149,9 @@ def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
     padding = _pair(get_arg_value(node, 4, "padding", 0))
     dilation = _pair(get_arg_value(node, 5, "dilation", 1))
 
-    weight_shape = node.args[1].shape
-    kH, kW, _, _ = _conv2d_layout(weight_shape, True, not transposed)
+    in_dims = _NHWC if transposed else None
+    w_dims = _HWIO if transposed else None
+    _, _, kH, kW = _unproject(node.args[1].shape, w_dims)
 
     iy_tile = (
         (y_tile - 1) * stride[0] - 2 * padding[0] + dilation[0] * (kH - 1) + 1
@@ -1168,16 +1160,13 @@ def _build_conv2d_shape_map(node, tile_sizes, divisor=None):
         (x_tile - 1) * stride[1] - 2 * padding[1] + dilation[1] * (kW - 1) + 1
     )
 
-    def apply_layout(shape, is_weight):
-        return _conv2d_layout(shape, is_weight, transposed)
-
     return {
-        "input": apply_layout((1, c_tile, iy_tile, ix_tile), False),
-        "weight": apply_layout((k_tile, c_tile, kH, kW), True),
+        "input": _project((1, c_tile, iy_tile, ix_tile), in_dims),
+        "weight": _project((k_tile, c_tile, kH, kW), w_dims),
         "bias": (k_tile,),
-        "input_scale": apply_layout((1, c_scaled, iy_tile, ix_tile), False),
-        "weight_scale": apply_layout((k_tile, c_scaled, kH, kW), True),
-        "output": apply_layout((1, k_tile, y_tile, x_tile), False),
+        "input_scale": _project((1, c_scaled, iy_tile, ix_tile), in_dims),
+        "weight_scale": _project((k_tile, c_scaled, kH, kW), w_dims),
+        "output": _project((1, k_tile, y_tile, x_tile), in_dims),
     }
 
 

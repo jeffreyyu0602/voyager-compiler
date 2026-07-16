@@ -24,12 +24,14 @@ from ..mapping_utils import (
     is_bmm,
     is_conv2d,
     is_depthwise_conv,
+    is_fully_connected,
     is_linear,
     is_matmul,
     quant_table_arg_nodes,
+    trailing_mha_perm,
 )
-from ..passes.tiling import _conv2d_layout
 from ..passes.utils import _pair, get_arg_value
+from .utils import _unproject, _NHWC, _HWIO
 from ..tiler import _node_dtype_bits, get_dtype_width
 
 logger = logging.getLogger(__name__)
@@ -153,13 +155,14 @@ def build_interstellar_tiler(
     )
 
 
-def _layer_cache_key(node, in_bits, w_bits, out_dtype, fused=()):
+def _layer_cache_key(node, out_dtype, fused=()):
     """A hashable key capturing everything (besides the fixed architecture) that
     determines a node's interstellar mapping: op, operand / output shapes, the
-    conv stride/padding/dilation, the element widths, and the fused post-op
-    operand descriptors.  Identical layers thus share one optimizer run.
-    ``out_dtype`` is the outer node's output dtype (a ``(scale, value)`` list for
-    a fused mx output); list-ified to a tuple so the key stays hashable."""
+    conv stride/padding/dilation, the operand + scale element widths, the
+    microscaling block size, and the fused post-op operand descriptors.
+    Identical layers thus share one optimizer run.  ``out_dtype`` is the outer
+    node's output dtype (a ``(scale, value)`` list for a fused mx output);
+    list-ified to a tuple so the key stays hashable."""
     val = node.value
     out_shape = tuple(val.shape) if isinstance(val, torch.Tensor) else None
     key = [
@@ -167,8 +170,11 @@ def _layer_cache_key(node, in_bits, w_bits, out_dtype, fused=()):
         tuple(node.args[0].shape),
         tuple(node.args[1].shape),
         out_shape,
-        in_bits,
-        w_bits,
+        _node_dtype_bits(node.args[0]),
+        _node_dtype_bits(node.args[1]),
+        _node_dtype_bits(node.kwargs.get("input_scale"), 0),
+        _node_dtype_bits(node.kwargs.get("weight_scale"), 0),
+        node.kwargs.get("block_size"),
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused),
     ]
@@ -277,7 +283,13 @@ def output_is_psum(point, level):
     return ic_above > 1
 
 
-def make_size_fn(node, out_dtype=None, fused_specs=(), extra_sharing=0):
+def make_size_fn(
+    node,
+    out_dtype=None,
+    fused_specs=(),
+    extra_sharing=0,
+    oc_align=None,
+):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
 
@@ -287,7 +299,7 @@ def make_size_fn(node, out_dtype=None, fused_specs=(), extra_sharing=0):
     and fused post-op operands interstellar knows nothing about, and how all of
     them are packed into banks.
 
-    Operands are grouped one per bank ideally::
+    Operands are grouped one per bank ideally:
 
         input | input_scale | weight+weight_scale+bias | output+output_scale
               | each fused operand
@@ -333,6 +345,11 @@ def make_size_fn(node, out_dtype=None, fused_specs=(), extra_sharing=0):
             if partitioning_accum is not None:
                 e *= partitioning_accum[d]
             return e
+
+        # Veto an OC tile that splits an attention head — the MHA relayout must
+        # store whole heads.
+        if oc_align and extent(le.OC) % oc_align != 0:
+            return (float("inf"),) * 3
 
         # The output is a wide partial sum until IC is fully reduced; only the
         # final value carries an output scale.
@@ -622,31 +639,25 @@ class RuntimeCalculator:
         return total_time
 
 
-def _extract_layer_from_node(node, out_dtype=None, fused_specs=()):
+def _extract_layer_from_node(node):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
-
-    Reads shapes directly from the FX node, before any tiling has occurred.
-    ``out_dtype`` is the outer (fused) node's output dtype (the true quantized
-    output dtype lives there, not on the matmul/conv anchor).  A fused mx output
-    is ``(scale, value)`` so ``out_dtype`` is then a 2-list -- value (the output
-    dtype) last, scale dtype first; a single dtype (or None) means no output
-    scale and the output width falls back to the anchor's own dtype.
-
-    Returns None for layers that should be skipped (depthwise, FC with batch=1,
+    Return None for layers that should be skipped (depthwise, FC with batch=1,
     3-channel first conv, unsupported weight shapes).
     """
-    if is_depthwise_conv(node):
+    if is_depthwise_conv(node) or is_fully_connected(node):
         return None
 
     weight_shape = node.args[1].shape
+    transposed = node.meta.get("transposed", False)
 
     if is_conv2d(node):
-        transposed = node.meta.get("transposed", False)
-        kH, kW, input_channels, output_channels = _conv2d_layout(
-            weight_shape, True, not transposed
+        w_dims = _HWIO if transposed else None
+        in_dims = _NHWC if transposed else None
+        output_channels, input_channels, kH, kW = _unproject(
+            weight_shape, w_dims
         )
-        _, height, width, _ = _conv2d_layout(node.shape, False, not transposed)
+        _, _, height, width = _unproject(node.shape, in_dims)
 
         if input_channels == 3:
             return None
@@ -657,19 +668,12 @@ def _extract_layer_from_node(node, out_dtype=None, fused_specs=()):
             return None
 
         input_shape = node.args[0].shape
-        # Per-batch output rows M: a bmm keeps its batch dim(s) separate (the
-        # tiler maps one (M, N, K) gemm and leaves the batch whole) while a
-        # linear / broadcast-matmul flattens its leading dims into M.  Matches
-        # ``get_tiling``'s OX (X) dim.
         width = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
-        if width == 1:
-            return None  # matrix-vector: nothing to tile along M
 
         # Weight (other operand) is (.., K, N): reduction K and output N are its
         # last two dims, flipped by ``is_matmul XOR transposed`` (rank-agnostic,
         # so a batched (B, K, N) weight reads K/N, not the batch dim).
-        weight_transposed = is_matmul(node) ^ node.meta.get("transposed", False)
-        if weight_transposed:
+        if is_matmul(node) ^ transposed:
             input_channels, output_channels = weight_shape[-2], weight_shape[-1]
         else:
             output_channels, input_channels = weight_shape[-2], weight_shape[-1]
@@ -687,7 +691,6 @@ def _extract_layer_from_node(node, out_dtype=None, fused_specs=()):
         hfil=kH,
         wstd=stride_w,
         hstd=stride_h,
-        size_fn=make_size_fn(node, out_dtype, fused_specs),
     )
 
 
@@ -717,7 +720,7 @@ def run_interstellar(
     tiler,
     out_dtype=None,
     fused_specs=(),
-    has_tail_operands=False,
+    oc_align=None,
 ):
     """Run interstellar with the 4-level DRAM architecture for a single
     GEMM/conv node.
@@ -738,10 +741,11 @@ def run_interstellar(
         out_dtype: The outer (fused) node's output dtype; a ``(scale, value)``
             list for a fused mx output.
         fused_specs: The fused tail's own tiled operands, from
-            ``_fused_operand_specs``; they need banks of their own.
-        has_tail_operands (bool): The fused tail reads a tiled operand of its
-            own (a residual / mask), which keeps the vector unit at high
-            precision.
+            ``_fused_operand_specs``; they need banks of their own.  A non-empty
+            list also keeps the vector unit at high precision (the tail reads a
+            tiled residual / mask).
+        oc_align (int, optional): ``head_dim`` for a projection GEMM feeding an
+            MHA output relayout — its OC tile is constrained to whole heads.
 
     Returns:
         ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
@@ -751,7 +755,7 @@ def run_interstellar(
         counts the ``Tiling`` proto reports.  All ``None`` if the node is
         skipped.
     """
-    layer = _extract_layer_from_node(node, out_dtype, fused_specs)
+    layer = _extract_layer_from_node(node)
     if layer is None:
         return None, None, None
 
@@ -761,12 +765,17 @@ def run_interstellar(
     if_bits = _node_dtype_bits(node.args[0])
     fl_bits = _node_dtype_bits(node.args[1])
     of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
+    if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
+    fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
 
     logger.info(
-        f"[interstellar DRAM] {node.name}: "
+        f"[interstellar] {node.name}: "
         f"IC={layer.nifm} OC={layer.nofm} "
         f"H={layer.hofm} W={layer.wofm} "
-        f"kH={layer.hfil} kW={layer.wfil}"
+        f"kH={layer.hfil} kW={layer.wfil} | "
+        f"if={if_bits}b fl={fl_bits}b of={of_bits}b "
+        f"if_scale={if_scale_bits}b fl_scale={fl_scale_bits}b "
+        f"bs={node.kwargs.get('block_size')}"
     )
 
     sram_bandwidth = min(tiler.unroll) * if_bits / 8
@@ -781,13 +790,13 @@ def run_interstellar(
         sram_bandwidth,
         tiler.dram_bandwidth,
         double_buffered_l2=tiler.double_buffered_l2,
-        has_tail_operands=has_tail_operands,
+        has_tail_operands=bool(fused_specs),
     )
 
     result = None
     for extra_sharing in range(4 + len(fused_specs)):
         layer.size_fn = make_size_fn(
-            node, out_dtype, fused_specs, extra_sharing
+            node, out_dtype, fused_specs, extra_sharing, oc_align
         )
         result = _try_optimize(tiler, layer, rc)
         if result is not None:
@@ -839,7 +848,7 @@ def get_tiling(node, tiler=None):
     """Per-dim tile *counts* for a GEMM/conv ``node`` (standalone or fused
     ``call_module``), or ``None`` (not a matrix op / untiled / skipped).
 
-    conv -> ``(n_y, n_x, n_c, n_k)``; gemm -> ``(batch.., n_m, n_n, n_k)`` — the
+    conv -> ``(n_y, n_x, n_k, n_c)``; gemm -> ``(batch.., n_m, n_n, n_k)`` — the
     output-spatial / M / N counts plus the reduction count last (``n_c`` for
     conv, ``n_k`` for gemm; the builder's ``num_k``).  The builder derives the
     tile sizes as ``full_dim // count``.
@@ -864,42 +873,51 @@ def get_tiling(node, tiler=None):
     # full-extent count -- one tile per batch element.
     gemm_batch = tuple(anchor.value.shape[: anchor.value.ndim - 2])
 
-    l2_tiling = anchor.meta.get("l2_tiling")
-    logger.debug(f"Found {anchor.name} tiling: {l2_tiling}")
-    if l2_tiling is not None:
+    if (tiling := anchor.meta.get("l2_tiling")) is not None:
+        logger.debug(f"Found {anchor.name} tiling: {tiling}")
         if is_conv:
-            # ``(n_N, n_k, n_y, n_x)`` keeps the reduction whole (``n_c = 1``);
-            # an optional 5th element sets the C-reduction factor directly.
-            if len(l2_tiling) == 5:
-                _, nk, ny, nx, nc = l2_tiling
-            else:
-                _, nk, ny, nx = l2_tiling
-                nc = 1
-            return (ny, nx, nc, nk)
-        # ``(n_m, n_n)`` keeps the reduction whole (``n_k = 1``); an optional
-        # 3rd element sets the K-reduction factor directly.
-        if len(l2_tiling) == 3:
-            nm, nn, nk = l2_tiling
-        else:
-            nm, nn = l2_tiling
-            nk = 1
+            if len(tiling) not in (4, 5):
+                raise ValueError(
+                    f"{anchor.name} tiling {tiling} must be 4 or 5 elements"
+                )
+            _, nk, ny, nx, *nc = tiling
+            nc = nc[0] if nc else 1
+            return (ny, nx, nk, nc)
+        if len(tiling) not in (2, 3):
+            raise ValueError(
+                f"{anchor.name} tiling {tiling} must be 2 or 3 elements"
+            )
+        nm, nn, *nk = tiling
+        nk = nk[0] if nk else 1
         return gemm_batch + (nm, nn, nk)
 
     if tiler is None:
         return None
 
-    # Run interstellar (cached per layer; the optimizer is slow).  ``out_dtype``
-    # is the outer (fused) node's output dtype; the fused post-op operands add
-    # their own L2+ banks (modeled via ``layer.size_fn``).
+    sub_gm = node.meta.get("submodule")
+
+    # Fused-submodule placeholders lack the quant ``meta['dtype']``; copy it
+    # from the outer ``all_input_nodes``
+    if sub_gm is not None:
+        ph_dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
+        placeholdes = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]
+        for i, ph in enumerate(placeholdes):
+            ph.meta["dtype"] = ph_dtypes[i]
+
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
-    key = _layer_cache_key(
-        anchor,
-        _node_dtype_bits(anchor.args[0]),
-        _node_dtype_bits(anchor.args[1]),
-        out_dtype,
-        tuple(fused_specs),
-    )
+
+    # A projection GEMM feeding an MHA relayout must tile OC on whole heads
+    # (else ``_detect_mha_relayout`` can't store the tile).  ``oc_align`` is the
+    # ``head_dim`` when the fused tail's permute grows the rank, else ``None``.
+    oc_align = None
+    if sub_gm is not None and not is_conv:
+        nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
+        perm = trailing_mha_perm(nodes)
+        if perm is not None and perm.value.ndim > anchor.value.ndim:
+            oc_align = perm.value.shape[-1]
+
+    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (oc_align,)
     if key in tiler.cache:
         mapping, per_tile_cycles, access_list = tiler.cache[key]
         logger.debug(
@@ -915,7 +933,7 @@ def get_tiling(node, tiler=None):
             tiler,
             out_dtype=out_dtype,
             fused_specs=fused_specs,
-            has_tail_operands=bool(fused_specs),
+            oc_align=oc_align,
         )
         logger.info(
             "[tiling] %s: interstellar took %.2fs",
@@ -940,5 +958,5 @@ def get_tiling(node, tiler=None):
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 
     if is_conv:
-        return (b[le.OY][3], b[le.OX][3], b[le.IC][3], b[le.OC][3])
+        return (b[le.OY][3], b[le.OX][3], b[le.OC][3], b[le.IC][3])
     return gemm_batch + (b[le.OX][3], b[le.OC][3], b[le.IC][3])
