@@ -35,11 +35,11 @@ import latency_dram_chart as ldc
 CONTEXT_LENGTHS = [128, 256, 512, 1024, 2048, 4096, 8192]
 
 MODEL_SIZES = [
-    "meta-llama/Llama-3.2-1B",
-    "meta-llama/Llama-3.2-3B",
-    "meta-llama/Llama-2-7b-hf",
-    "meta-llama/Llama-3.1-8B",
-    "meta-llama/Llama-2-13b-hf",
+    ("meta-llama/Llama-3.2-1B", "1B"),
+    ("meta-llama/Llama-3.2-3B", "3B"),
+    ("meta-llama/Llama-2-7b-hf", "7B"),
+    ("meta-llama/Llama-3.1-8B", "8B"),
+    ("meta-llama/Llama-2-13b-hf", "13B"),
 ]
 
 # (label, weight_bits, act_bits) -- KV is fixed BF16.
@@ -51,10 +51,10 @@ QUANT_CONFIGS = [
 ]
 
 FAMILY_MODELS = [
-    "meta-llama/Llama-3.1-8B",
-    "mistralai/Mistral-7B-v0.3",
-    "Qwen/Qwen2.5-7B",
-    "google/gemma-2-9b",
+    ("meta-llama/Llama-3.1-8B", "Llama 3.1"),
+    ("mistralai/Mistral-7B-v0.3", "Mistral"),
+    ("Qwen/Qwen2.5-7B", "Qwen 2.5"),
+    ("google/gemma-2-9b", "Gemma 2"),
 ]
 
 PE_ARRAYS = [(16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
@@ -73,11 +73,6 @@ Point = namedtuple("Point", "sheet prefix group axis_title label mode cfg")
 
 # Sheet order in the workbook (baseline breakdown sheets are prepended).
 SHEET_ORDER = ["context", "model_size", "quant", "family", "hardware"]
-
-
-def _short(model_id):
-    """A compact category label for a model id (drop the org prefix)."""
-    return model_id.split("/")[-1]
 
 
 def build_points(args):
@@ -101,16 +96,16 @@ def build_points(args):
                 )
             )
 
-    for model in MODEL_SIZES:
+    for model_id, label in MODEL_SIZES:
         for mode in MODES:
-            cfg = common.config_from_args(args, model_id=model, mode=mode)
+            cfg = common.config_from_args(args, model_id=model_id, mode=mode)
             pts.append(
                 Point(
                     "model_size",
                     "",
                     "",
                     "Model Size",
-                    _short(model),
+                    label,
                     mode,
                     cfg,
                 )
@@ -127,13 +122,11 @@ def build_points(args):
                 )
             )
 
-    for model in FAMILY_MODELS:
+    for model_id, label in FAMILY_MODELS:
         for mode in MODES:
-            cfg = common.config_from_args(args, model_id=model, mode=mode)
+            cfg = common.config_from_args(args, model_id=model_id, mode=mode)
             pts.append(
-                Point(
-                    "family", "", "", "Model Family", _short(model), mode, cfg
-                )
+                Point("family", "", "", "Model Family", label, mode, cfg)
             )
 
     for pe in PE_ARRAYS:
@@ -152,7 +145,7 @@ def build_points(args):
             )
     for mb in SRAM_EFFECTIVE_MB:
         # Effective SRAM = 2 * cache_size (double buffering).
-        cache_size = mb * 1024 * 1024 // 2
+        cache_size = int(mb * 1024 * 1024) // 2
         num_banks = max(1, cache_size // common.SRAM_BANK_SIZE)
         for mode in MODES:
             cfg = common.config_from_args(
