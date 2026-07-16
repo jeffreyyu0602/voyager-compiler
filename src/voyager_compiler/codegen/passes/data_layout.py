@@ -6,7 +6,6 @@ import torch
 from torch.fx import GraphModule, Node
 
 from .utils import get_arg_value
-from ..banking import require_allocation
 from ..mapping import duplicate_shared_nodes
 from ..mapping_utils import (
     is_conv2d,
@@ -18,6 +17,8 @@ from ..mapping_utils import (
     is_nop,
     is_pooling,
     is_reshape_op,
+    quant_table_arg_nodes,
+    swaps_last_two_dims,
 )
 from ...pt2e_utils import deduplicate_nodes, fetch_attr, propagate_shape
 from ...layout_ops import (
@@ -35,12 +36,6 @@ __all__ = [
     "normalize_conv2d_layout",
     "normalize_gemm_weight_layout",
 ]
-
-AXES_ARG_INDEX_MAP = {
-    torch.ops.quantized_ops.dequantize.default: 3,
-    torch.ops.quantized_ops.quantize.default: 3,
-    torch.ops.quantized_ops.quantize_mx.default: 2,
-}
 
 
 def extract_conv2d_graph(
@@ -110,7 +105,7 @@ def remap_pad_after_permute(
     Remap padding after permuting a tensor.
 
     Args:
-        pad: Original pad tuple as in torch.nn.functional.pad (starts from last dim).
+        pad: Original pad tuple as in F.pad (starts from last dim).
         dims: Permutation dimensions.
         ndim: Number of dimensions in the original tensor.
 
@@ -343,57 +338,48 @@ def eliminate_reshape_with_no_effect(model: GraphModule):
 
 ALLOWED_UPSTREAM_OPS: Set[any] = {
     torch.ops.aten.select.int,
+    torch.ops.aten.pad.default,
     torch.ops.quantized_ops.dequantize.default,
     torch.ops.quantized_ops.quantize.default,
     torch.ops.quantized_ops.quantize_mx.default,
 }
 
 
-def is_transpose_2d(node: torch.fx.Node) -> bool:
-    """Checks if node is a transpose on the last two dimensions."""
-    if node.target != torch.ops.aten.transpose.int:
-        return False
-    # Check args to ensure it is specifically swapping -2 and -1
-    # args format: (input, dim0, dim1)
-    rank = len(node.shape)
-    dims = set(d if d >= 0 else rank + d for d in node.args[1:])
-    return dims == {rank - 2, rank - 1}
-
-
 def find_upstream_transpose_or_param(
     node: torch.fx.Node,
-    *,
-    max_depth: int = 16,
 ) -> Optional[List[torch.fx.Node]]:
-    """
-    Starting from a transpose node, walks upstream through a list
-    of allowed operations until reaching another transpose node
-    or a constant param node.
-    """
-    if not is_transpose_2d(node):
+    """Walk upstream from a transpose, along its single data operand, to
+    another transpose or a constant param.  Returns the linear chain
+    ``[node, ..., anchor]`` (nearest ``node`` first), or ``None``.
+
+    A relayout op's non-data inputs are quantization tables
+    (``quant_table_arg_nodes``) and are excluded; a node left with more than
+    one input is a merge, not a relayout, so the walk stops -- keeping the
+    result the single chain the eliminators consume."""
+    if not swaps_last_two_dims(node):
         return None
 
-    def dfs(curr: Node, depth: int) -> Optional[List[Node]]:
-        if is_transpose_2d(curr):
-            return [curr]
+    chain = [node]
+    curr = node.args[0]
+    while isinstance(curr, Node):
+        if swaps_last_two_dims(curr) or curr.op == "get_attr":
+            return chain + [curr]
 
-        if curr.op == "get_attr" and require_allocation(curr):
-            return [curr]
-
-        if depth > max_depth:
+        if not (curr.target in ALLOWED_UPSTREAM_OPS or is_nop(curr)):
             return None
 
-        path = []
-        if curr.target in ALLOWED_UPSTREAM_OPS or is_nop(curr):
-            for inp in curr.all_input_nodes:
-                path.extend(dfs(inp, depth + 1) or [])
+        data_inputs = [
+            i
+            for i in curr.all_input_nodes
+            if i not in quant_table_arg_nodes(curr)
+        ]
+        if len(data_inputs) != 1:
+            return None
 
-        return [curr] + path if path else None
+        chain.append(curr)
+        curr = data_inputs[0]
 
-    if (found_path := dfs(node.args[0], 0)) is None:
-        return None
-
-    return list(set([node] + found_path))
+    return None
 
 
 def _insert_transposed_input(arg: Node, model: GraphModule):
@@ -411,21 +397,30 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
     return transposed
 
 
-def _fix_axes_after_transpose(node: Node) -> List[int]:
-    if (index := AXES_ARG_INDEX_MAP.get(node.target)) is None:
-        return
+AXES_ARG_INDEX_MAP = {
+    torch.ops.quantized_ops.dequantize.default: 3,
+    torch.ops.quantized_ops.quantize.default: 3,
+    torch.ops.quantized_ops.quantize_mx.default: 2,
+}
 
-    axes = get_arg_value(node, index, "axes")
-    rank = len(node.shape)
 
-    # Build forward and inverse permutation for transpose(-2, -1)
-    perm = list(range(rank))
-    perm[-2], perm[-1] = perm[-1], perm[-2]
-    inv_perm = [perm.index(i) for i in range(rank)]
-
-    # Normalize negative axes and apply inverse permutation
-    norm_axes = [(a + rank) % rank for a in axes]
-    node.update_arg(index, tuple(inv_perm[a] for a in norm_axes))
+def _remap_dim_args_after_transpose(node: Node) -> None:
+    """Restate a node's dim-referencing arg after a cancelling
+    ``transpose(-2, -1)`` around it is removed: a quantize's blocked ``axes``
+    through the inverse permutation, or a ``pad``'s pairs by swapping the last
+    two dims (pad is last-dim-first, so a last-dim-only pad grows a zero pair
+    for the second-last first)."""
+    if (index := AXES_ARG_INDEX_MAP.get(node.target)) is not None:
+        rank = len(node.shape)
+        swap = {rank - 2: rank - 1, rank - 1: rank - 2}
+        axes = (a % rank for a in node.args[index])
+        node.update_arg(index, tuple(swap.get(a, a) for a in axes))
+    elif node.target is torch.ops.aten.pad.default:
+        pad = list(get_arg_value(node, 1, "pad"))
+        while len(pad) < 4:
+            pad.append(0)
+        pad[0:2], pad[2:4] = pad[2:4], pad[0:2]
+        node.update_arg(1, tuple(pad))
 
 
 def eliminate_canceling_transposes(
@@ -471,7 +466,7 @@ def eliminate_canceling_transposes(
             if arg not in transposed_nodes:
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
             n.replace_input_with(arg, transposed_nodes[arg])
-        _fix_axes_after_transpose(n)
+        _remap_dim_args_after_transpose(n)
 
     down_t.replace_all_uses_with(down_t.args[0])
     graph.erase_node(down_t)
@@ -512,6 +507,7 @@ def fold_transpose_into_constant(
             if arg not in transposed_nodes:
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
             n.replace_input_with(arg, transposed_nodes[arg])
+        _remap_dim_args_after_transpose(n)
 
     down_t.replace_all_uses_with(down_t.args[0])
     graph.erase_node(down_t)
@@ -574,7 +570,7 @@ def _insert_transpose_op(
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
                 propagate_shape(transposed_nodes[arg], model)
             dq.replace_input_with(arg, transposed_nodes[arg])
-        _fix_axes_after_transpose(dq)
+        _remap_dim_args_after_transpose(dq)
         # The decode -- and every select over it -- now hands on a transposed
         # tensor, which is the one the GEMM wanted.
         for n in chain:

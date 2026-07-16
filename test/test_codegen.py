@@ -377,11 +377,16 @@ if __name__ == "__main__":
 
         past_key_values = None
 
+        block = args.hardware_unrolling[1]
+        # context + generation budget, rounded up to a block_size multiple.
+        raw = args.context_length + 128
+        max_cache_len = -(-raw // block) * block
+
         if args.model == "llm_decode":
             past_key_values = StaticCache(
                 config=model.config,
                 max_batch_size=1,
-                max_cache_len=input_ids.shape[1] + 128,
+                max_cache_len=max_cache_len,
                 dtype=model.dtype,
             )
 
@@ -413,7 +418,7 @@ if __name__ == "__main__":
         causal_mask = TorchExportableModuleWithStaticCache._prepare_4d_causal_attention_mask_with_cache_position(
             None,
             sequence_length=inputs_embeds.shape[1],
-            target_length=args.context_length + 128,
+            target_length=max_cache_len,
             dtype=inputs_embeds.dtype,
             device=inputs_embeds.device,
             cache_position=cache_position,
@@ -585,12 +590,13 @@ if __name__ == "__main__":
 
         input_ids = encodings.input_ids[:, : args.context_length]
 
+        block = args.hardware_unrolling[1]
+        # context + generation budget, rounded up to a block_size multiple.
+        raw = args.context_length + 128
+        max_cache_len = -(-raw // block) * block
+
         max_length = args.context_length
-        bs = (
-            64
-            if args.hardware_unrolling is None
-            else args.hardware_unrolling[0]
-        )
+        max_gen = max_cache_len - max_length
 
         swap_llama_attention(model)
 
@@ -598,14 +604,14 @@ if __name__ == "__main__":
 
         with _disable_aten_to_metadata_assertions():
             gm = convert_and_export_with_split_cache(
-                model, max_len=max_length, max_new_tokens=bs
+                model, max_len=max_length, max_new_tokens=max_gen
             ).module()
 
         # Run decode once to fill in the KV caches
         output = TorchExportableModuleWithStaticCache.generate(
             model,
             prompt_token_ids=input_ids,
-            max_new_tokens=bs,
+            max_new_tokens=max_gen,
             min_length=max_length + 1,
             eos_token_id=[
                 tokenizer.eos_token_id,
@@ -680,7 +686,7 @@ if __name__ == "__main__":
         example_cache_position = torch.tensor([0], dtype=torch.long)
         example_cache_position_residual = torch.tensor([0], dtype=torch.long)
         example_attention_mask = torch.ones(
-            (1, max_length + bs), dtype=torch_dtype
+            (1, max_cache_len), dtype=torch_dtype
         )[None, None, :, :]
         example_args = ()
         example_kwargs = {

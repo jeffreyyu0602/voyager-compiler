@@ -46,6 +46,81 @@ def slicing_and_padding_cancel_out(shape, slice_dim, start, end, pad):
     return True
 
 
+# Relayout ops a pad is immune to: each leaves the padded dim's extent -- and
+# its position from the end -- alone, so a slice above them cancels a pad below
+# them exactly as an adjacent one would.  ``repeat_kv`` is why this earns its
+# keep: its unsqueeze / expand / reshape sit between the two.
+_PAD_IMMUNE_OPS = (
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten.expand.default,
+    torch.ops.aten.unsqueeze.default,
+)
+
+# The immune ops that *name* their output extents, so the padded dim's size has
+# to be restated on them once the slice below is gone.
+_SIZED_OPS = (
+    torch.ops.aten.reshape.default,
+    torch.ops.aten.view.default,
+    torch.ops.aten.expand.default,
+)
+
+
+def _padded_dim(pad):
+    """The one dim (counted from the end) ``pad`` grows, or None if it grows
+    several -- no single slice cancels that."""
+    dims = [
+        -(k + 1) for k in range(len(pad) // 2) if pad[2 * k] or pad[2 * k + 1]
+    ]
+    return dims[0] if len(dims) == 1 else None
+
+
+def _find_cancelling_slice(node, pad):
+    """``(slice, chain)`` for the slice above ``node`` that ``pad`` exactly
+    undoes, or ``(None, [])``.  ``chain`` is the immune relayout ops in
+    between, nearest ``node`` first.  Each is required to have a single user:
+    restating its extents must not disturb anyone else."""
+    dim = _padded_dim(pad)
+    if dim is None:
+        return None, []
+
+    chain = []
+    curr = node
+    while curr.target in _PAD_IMMUNE_OPS and len(curr.users) == 1:
+        src = curr.args[0]
+        if not isinstance(src, Node):
+            return None, []
+        if src.value.shape[dim] != curr.value.shape[dim]:
+            return None, []
+        chain.append(curr)
+        curr = src
+
+    if curr.target is not torch.ops.aten.slice.Tensor:
+        return None, []
+    if not slicing_and_padding_cancel_out(
+        curr.args[0].value.shape, *curr.args[1:], pad
+    ):
+        return None, []
+    return curr, chain
+
+
+def _drop_slice_through_chain(cancel, chain, dim):
+    """Re-point ``chain`` at what ``cancel`` sliced and restate the extents the
+    relayout ops name for ``dim``, so the full-width tensor flows through them
+    and the pad below is unnecessary."""
+    full = cancel.args[0]
+    size = full.value.shape[dim]
+    chain[-1].replace_input_with(cancel, full)
+    for n in reversed(chain):
+        if n.target in _SIZED_OPS:
+            sizes = list(n.args[1])
+            i = dim + len(sizes)
+            if sizes[i] != -1:
+                sizes[i] = size
+                n.update_arg(1, sizes)
+        propagate_shape(n)
+
+
 def pad_input_node(model, node, input, pad, scale, scale_pad, code):
     pad_quantize_mx_input = (
         scale is not None
@@ -471,6 +546,22 @@ def pad_vector_op_dimensions(
             _pad_softmax(model, node, K_unroll)
         elif node.target == torch.ops.quantized_ops.quantize_mx.default:
             _pad_quantize_mx(model, node, K_unroll)
+
+    for node in list(model.graph.nodes):
+        if node.target is not torch.ops.aten.pad.default:
+            continue
+
+        pad = get_arg_value(node, 1, "pad")
+        cancel, chain = _find_cancelling_slice(node.args[0], pad)
+        if cancel is None:
+            continue
+
+        logger.info(f"Eliminating slice / pad round-trip: {cancel} and {node}")
+        if chain:
+            _drop_slice_through_chain(cancel, chain, _padded_dim(pad))
+            node.replace_all_uses_with(node.args[0])
+        else:
+            node.replace_all_uses_with(cancel.args[0])
 
     model.graph.lint()
     model.graph.eliminate_dead_code()
