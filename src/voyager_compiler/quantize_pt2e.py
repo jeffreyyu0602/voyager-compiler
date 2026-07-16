@@ -1065,8 +1065,10 @@ def _replay_relayout(
     """Copy relayout ``node`` onto ``src``.  ``src`` is the scale of a hoisted
     ``quantize_mx``, so along ``axes`` it holds one element per *block* where
     the original input held one per element -- a shape argument keeps that dim's
-    own extent and divides it.  Every other dim is untouched: ``_axes_above``
-    already proved the blocks survive.
+    own extent and divides it by the block size, rounding up: an axis shorter
+    than a block (e.g. a 128-wide head under a 256 block) is one block, matching
+    how ``_reshape_to_blocks`` pads a partial axis up to a single tile.  Every
+    other dim is untouched: ``_axes_above`` already proved the blocks survive.
     """
     new = graph.node_copy(node, lambda n: src if n is node.args[0] else n)
     out_shape = tuple(node.value.shape)
@@ -1074,7 +1076,7 @@ def _replay_relayout(
     if node.target in _REGROUP_OPS:
         shape = list(out_shape)
         for a in axes:
-            shape[a] = out_shape[a] // block_size
+            shape[a] = -(-out_shape[a] // block_size)
         new.args = (src, shape)
     elif node.target is torch.ops.aten.expand.default:
         # ``-1`` keeps a dim, so naming only the dims this expand actually grows
