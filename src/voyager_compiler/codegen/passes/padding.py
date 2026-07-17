@@ -10,6 +10,7 @@ from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
 from .utils import get_arg_value
 from ..mapping_utils import (
+    _BROADCAST_OPS,
     is_conv2d,
     is_depthwise_conv,
     is_elementwise_op,
@@ -55,6 +56,8 @@ _PAD_IMMUNE_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten.expand.default,
     torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.permute.default,
 )
 
 # The immune ops that *name* their output extents, so the padded dim's size has
@@ -75,53 +78,244 @@ def _padded_dim(pad):
     return dims[0] if len(dims) == 1 else None
 
 
-def _find_cancelling_slice(node, pad):
-    """``(slice, chain)`` for the slice above ``node`` that ``pad`` exactly
-    undoes, or ``(None, [])``.  ``chain`` is the immune relayout ops in
-    between, nearest ``node`` first.  Each is required to have a single user:
-    restating its extents must not disturb anyone else."""
-    dim = _padded_dim(pad)
-    if dim is None:
-        return None, []
+def _pad_for_dim(pad, dim, new_dim):
+    """``pad``'s one non-zero pair, restated to grow ``new_dim`` rather than
+    ``dim`` -- both counted from the end, as ``F.pad`` orders its pairs."""
+    j = -dim - 1
+    out = [0] * (2 * -new_dim)
+    out[-2 * new_dim - 2] = pad[2 * j]
+    out[-2 * new_dim - 1] = pad[2 * j + 1]
+    return out
 
-    chain = []
+
+def _dim_above(node, dim):
+    """``dim`` -- counted from the end of ``node``'s output -- restated against
+    its input, or ``None`` if ``node`` does not hand that dim through intact.
+
+    A transpose or permute genuinely moves the dim, so it is remapped; the rest
+    of ``_PAD_IMMUNE_OPS`` only touch dims to its left and leave it where it is.
+    """
+    src = node.args[0]
+    if not isinstance(src, Node) or not hasattr(src, "value"):
+        return None
+    out, inp = tuple(node.value.shape), tuple(src.value.shape)
+    rank = len(out)
+
+    if node.target is torch.ops.aten.transpose.int:
+        a, b = (int(d) % rank - rank for d in node.args[1:3])
+        above = {a: b, b: a}.get(dim, dim)
+    elif node.target is torch.ops.aten.permute.default:
+        perm = [int(p) % rank for p in node.args[1]]
+        above = perm[dim + rank] - rank
+    else:
+        above = dim
+
+    if len(inp) < -above or inp[above] != out[dim]:
+        return None
+    return above
+
+
+def _relayout_chain_above(node, dim):
+    """``(chain, src, src_dim, dims)`` -- the immune relayout ops feeding
+    ``node`` (nearest first), the tensor they re-address, ``dim`` restated
+    against it, and ``dim`` as each chain op's own output sees it.  Walks while
+    the op hands the dim through and nobody else reads it: restating an op's
+    extents must disturb no one."""
+    chain, dims = [], []
     curr = node
     while curr.target in _PAD_IMMUNE_OPS and len(curr.users) == 1:
-        src = curr.args[0]
-        if not isinstance(src, Node):
-            return None, []
-        if src.value.shape[dim] != curr.value.shape[dim]:
-            return None, []
+        above = _dim_above(curr, dim)
+        if above is None:
+            break
         chain.append(curr)
-        curr = src
+        dims.append(dim)
+        dim = above
+        curr = curr.args[0]
+    return chain, curr, dim, dims
 
+
+def _find_cancelling_slice(node, pad):
+    """``(slice, chain, dims)`` for the slice above ``node`` that ``pad``
+    exactly undoes, or ``(None, [], [])``."""
+    dim = _padded_dim(pad)
+    if dim is None:
+        return None, [], []
+
+    chain, curr, src_dim, dims = _relayout_chain_above(node, dim)
+    if src_dim != dim:
+        # The pad and the slice name different dims; they cannot be compared
+        # without rebuilding the pad, which the cancel check does not do.
+        return None, [], []
     if curr.target is not torch.ops.aten.slice.Tensor:
-        return None, []
+        return None, [], []
     if not slicing_and_padding_cancel_out(
         curr.args[0].value.shape, *curr.args[1:], pad
     ):
-        return None, []
-    return curr, chain
+        return None, [], []
+    return curr, chain, dims
 
 
-def _drop_slice_through_chain(cancel, chain, dim):
-    """Re-point ``chain`` at what ``cancel`` sliced and restate the extents the
-    relayout ops name for ``dim``, so the full-width tensor flows through them
-    and the pad below is unnecessary."""
-    full = cancel.args[0]
-    size = full.value.shape[dim]
-    chain[-1].replace_input_with(cancel, full)
-    for n in reversed(chain):
+def _restate_chain(chain, dims, size):
+    """Restate the extent each op in ``chain`` names for the padded dim -- at
+    that op's own view of it -- so a tensor grown to ``size`` flows through."""
+    for n, d in zip(reversed(chain), reversed(dims)):
         if n.target in _SIZED_OPS:
             sizes = list(n.args[1])
-            i = dim + len(sizes)
+            i = d + len(sizes)
             if sizes[i] != -1:
                 sizes[i] = size
                 n.update_arg(1, sizes)
         propagate_shape(n)
 
 
-def pad_input_node(model, node, input, pad, scale, scale_pad, code):
+def _drop_slice_through_chain(cancel, chain, dims):
+    """Re-point ``chain`` at what ``cancel`` sliced and restate the extents the
+    relayout ops name, so the full-width tensor flows through them and the pad
+    below is unnecessary."""
+    full = cancel.args[0]
+    chain[-1].replace_input_with(cancel, full)
+    _restate_chain(chain, dims, full.value.shape[dims[-1]])
+
+
+_INDEX_COPY = torch.ops.aten.index_copy_.default
+
+# Whether a pad on a KV-cache write is taken into the buffer rather than run
+# over the whole cache every step (``_fold_pad_into_cache``).  It rewrites the
+# buffer's contents and its dtype, so it is worth being able to turn off.
+FOLD_PAD_INTO_CACHE = True
+
+
+def _fold_pad_into_cache(model, idx, pad, pad_value, fold_cache):
+    """Pad the KV cache buffer itself, and the token written into it, rather
+    than the whole cache on every step.
+
+    The write puts one token into a buffer the array wants wider.  Widening the
+    buffer is a compile-time edit of its contents, and the token then arrives
+    already wide -- a pad on one position, which cancels against the slice its
+    projection left on it.  So the cache pays nothing.
+
+    Not when the pad grows the axis the write indexes: that would move every
+    position the cache holds.
+    """
+    dim = _padded_dim(pad)
+    if dim is None:
+        return False
+
+    cache = idx.args[0]
+    if not isinstance(cache, Node) or cache.op != "get_attr":
+        return False
+    if idx.args[1] % len(idx.value.shape) == dim % len(idx.value.shape):
+        return False
+
+    baked = F.pad(fetch_attr(model, cache.target), pad, "constant", pad_value)
+    with model.graph.inserting_before(idx):
+        wide = create_getattr_from_value(
+            model, model.graph, cache.target + "_padded", baked
+        )
+        propagate_shape(wide, model)
+
+    # The token has to arrive wide, one position's worth.
+    token = _insert_pad(model, idx.args[3], pad, pad_value, fold_cache)
+
+    wide.meta["dtype"] = cache.meta.get("dtype")
+    idx.update_arg(0, wide)
+    idx.update_arg(3, token)
+    propagate_shape(idx)
+    return True
+
+
+def _insert_pad(model, node, pad, pad_value, fold_cache=False):
+    """``node`` grown by ``pad``: a pad node, or -- where a slice above it left
+    exactly what the pad puts back -- what that slice was hiding, with neither
+    op left behind.
+
+    Every pad goes in through here, so each way of not paying for one is tried
+    in turn: a slice above that already left room, then a cache write that can
+    take the pad into its buffer, then a buffer that is simply padded as it
+    stands.  The round-trip sweep would reach the same graph on its own, but
+    only after L2 tiling and the layout pass have read a pad that was never
+    needed, and tiling is what it would mislead.
+    """
+    cancel, chain, dims = _find_cancelling_slice(node, pad)
+    if cancel is not None:
+        logger.info(f"Padding {node} cancels the slice {cancel}")
+        if not chain:
+            return cancel.args[0]
+        _drop_slice_through_chain(cancel, chain, dims)
+        return node
+
+    if (
+        fold_cache
+        and node.target is _INDEX_COPY
+        and _fold_pad_into_cache(model, node, pad, pad_value, fold_cache)
+    ):
+        return node
+
+    if node.op == "get_attr":
+        # Nothing writes it, so its padded form is known now: widen the buffer
+        # once here rather than the tensor it holds on every step.
+        baked = F.pad(
+            fetch_attr(model, node.target), pad, "constant", pad_value
+        )
+        with model.graph.inserting_after(node):
+            wide = create_getattr_from_value(
+                model, model.graph, node.target + "_padded", baked
+            )
+        propagate_shape(wide, model)
+        wide.meta["dtype"] = node.meta.get("dtype")
+        return wide
+
+    with model.graph.inserting_after(node):
+        padded = model.graph.call_function(
+            torch.ops.aten.pad.default, (node, pad, "constant", pad_value)
+        )
+    propagate_shape(padded)
+    padded.meta["dtype"] = node.meta.get("dtype")
+    return padded
+
+
+def _hoist_pad_above_repeat(model, node, pad, pad_value, fold_cache):
+    """Pad what the relayout ops feeding ``node`` re-address, rather than what
+    they hand on, and let the pad flow back down through them.
+
+    ``repeat_kv`` is the case that matters: padding its output fills the 32
+    heads it broadcast, where padding its input fills the 8 the cache holds --
+    the same fill on a quarter of the data, and the broadcast still folds into
+    the consumer's addressing.  Only worth it when the chain actually repeats;
+    over a plain relayout the pad is the same size either side of it.  A
+    transpose on the way up moves the dim the pad grows, so the pad is rebuilt
+    against the dim the source holds it in.
+
+    Returns the tensor the op should read: ``node`` itself where the pad was
+    hoisted (its chain now carries the wide tensor), and otherwise whatever
+    padding ``node`` directly comes to.
+    """
+    dim = _padded_dim(pad)
+    if dim is None:
+        return _insert_pad(model, node, pad, pad_value, fold_cache)
+
+    chain, src, src_dim, dims = _relayout_chain_above(node, dim)
+    if not any(n.target in _BROADCAST_OPS for n in chain):
+        return _insert_pad(model, node, pad, pad_value, fold_cache)
+
+    padded = _insert_pad(
+        model, src, _pad_for_dim(pad, dim, src_dim), pad_value, fold_cache
+    )
+    chain[-1].replace_input_with(src, padded)
+    _restate_chain(chain, dims, padded.value.shape[src_dim])
+    return node
+
+
+def pad_input_node(model, node, is_weight, pad, scale_pad, fold_cache):
+    if is_weight:
+        input = node.args[1]
+        scale = node.kwargs.get("weight_scale")
+        code = node.kwargs.get("weight_code")
+    else:
+        input = node.args[0]
+        scale = node.kwargs.get("input_scale")
+        code = node.kwargs.get("input_code")
+
     pad_quantize_mx_input = (
         scale is not None
         and input.target == operator.getitem
@@ -141,24 +335,9 @@ def pad_input_node(model, node, input, pad, scale, scale_pad, code):
         zeros = (fetch_attr(model, code.target) == 0).nonzero().flatten()
         pad_value = int(zeros[0]) if len(zeros) else 0
 
-    skip_padding = False
-    if node_to_pad.target == torch.ops.aten.slice.Tensor:
-        arg = node_to_pad.args[0]
-        skip_padding = slicing_and_padding_cancel_out(
-            arg.value.shape, *node_to_pad.args[1:], pad
-        )
-
-    if skip_padding:
-        new_input = node_to_pad.args[0]
-    else:
-        with model.graph.inserting_after(node_to_pad):
-            new_input = model.graph.call_function(
-                torch.ops.aten.pad.default,
-                (node_to_pad, pad, "constant", pad_value),
-            )
-
-        propagate_shape(new_input)
-        new_input.meta["dtype"] = node_to_pad.meta.get("dtype")
+    new_input = _hoist_pad_above_repeat(
+        model, node_to_pad, pad, pad_value, fold_cache
+    )
 
     if pad_quantize_mx_input:
         input.args[0].replace_input_with(node_to_pad, new_input)
@@ -169,75 +348,82 @@ def pad_input_node(model, node, input, pad, scale, scale_pad, code):
         node.replace_input_with(node_to_pad, new_input)
 
         if scale is not None and any(x for x in scale_pad):
-            with model.graph.inserting_before(node):
-                padded_scale = model.graph.call_function(
-                    torch.ops.aten.pad.default,
-                    (scale, scale_pad),
-                )
-
-            node.replace_input_with(scale, padded_scale)
-
-            propagate_shape(padded_scale)
-            padded_scale.meta["dtype"] = scale.meta.get("dtype")
+            node.replace_input_with(
+                scale,
+                _hoist_pad_above_repeat(model, scale, scale_pad, 0, fold_cache),
+            )
 
 
-def slice_output(model, output_node, slice_args):
-    sliced_output_users = []
+def _crossable(node, user, slice_args):
+    """Whether ``user`` can read ``node`` unsliced -- and widen it to, if so.
 
-    for user in list(output_node.users.keys()):
-        # Cannot slice microscaling quantization ops.
-        if user.target in [
-            torch.ops.quantized_ops.dequantize.default,
-            torch.ops.quantized_ops.quantize.default,
-        ]:
-            bs = get_arg_value(user, 4, "block_size")
-            if bs is None:
-                slice_output(model, user, slice_args)
-                continue
+    An op that keeps every lane to itself does not care that the pad left extra
+    ones, so the slice can sink past it and be spent nearer a pad that cancels
+    it.  A per-tensor quantize is such an op; a blocked one is not, a slice
+    below it cutting the blocks it scaled.  A second operand agrees only if it
+    is already sliced the same way -- and stripping those slices is what widens
+    the op.
+    """
+    # Only support non-MX quantization
+    if user.target in [
+        torch.ops.quantized_ops.dequantize.default,
+        torch.ops.quantized_ops.quantize.default,
+    ]:
+        return get_arg_value(user, 4, "block_size") is None
 
-        if is_elementwise_op(user):
-            if len(user.all_input_nodes) == 1:
-                propagate_shape(user)
-                slice_output(model, user, slice_args)
-                continue
+    if not is_elementwise_op(user):
+        return False
 
-            # If all inputs have the same slice args, strip the redundant slice.
-            if all(
-                n == output_node
-                or (
-                    n.target == torch.ops.aten.slice.Tensor
-                    and n.args[1:] == slice_args
-                )
-                for n in user.all_input_nodes
-            ):
-                for n in user.all_input_nodes:
-                    if n.target == torch.ops.aten.slice.Tensor:
-                        user.replace_input_with(n, n.args[0])
+    if len(user.all_input_nodes) != 1:
+        if not all(
+            n == node
+            or (
+                n.target == torch.ops.aten.slice.Tensor
+                and n.args[1:] == slice_args
+            )
+            for n in user.all_input_nodes
+        ):
+            return False
 
-                propagate_shape(user)
-                slice_output(model, user, slice_args)
-                continue
+        for n in user.all_input_nodes:
+            if n.target == torch.ops.aten.slice.Tensor:
+                user.replace_input_with(n, n.args[0])
 
-        sliced_output_users.append(user)
+    propagate_shape(user)
+    return True
 
-    if sliced_output_users:
-        with model.graph.inserting_after(output_node):
+
+def slice_output(model, node, slice_args):
+    frontier = [node]
+
+    while frontier:
+        node = frontier.pop()
+        needs_slice = []
+        for user in list(node.users.keys()):
+            if _crossable(node, user, slice_args):
+                frontier.append(user)
+            else:
+                needs_slice.append(user)
+        if not needs_slice:
+            continue
+
+        with model.graph.inserting_after(node):
             slice_node = model.graph.call_function(
-                torch.ops.aten.slice.Tensor,
-                (output_node, *slice_args),
+                torch.ops.aten.slice.Tensor, (node, *slice_args)
             )
 
         propagate_shape(slice_node)
-        slice_node.meta["dtype"] = output_node.meta.get("dtype")
+        slice_node.meta["dtype"] = node.meta.get("dtype")
 
-        for n in sliced_output_users:
-            n.replace_input_with(output_node, slice_node)
+        for n in needs_slice:
+            n.replace_input_with(node, slice_node)
 
 
 def pad_matrix_op_dimensions(
     model: GraphModule,
     C_unroll,
     K_unroll,
+    fold_cache: bool = FOLD_PAD_INTO_CACHE,
 ) -> GraphModule:
     """
     Pad inputs and weights to conv2d nodes in a torch.fx.GraphModule so that
@@ -271,26 +457,12 @@ def pad_matrix_op_dimensions(
 
         bs = node.kwargs.get("block_size", 1)
 
-        # Pad input along C dimension
+        # Pad input along input channel dimension
         if pad_C:
-            input_scale = node.kwargs.get("input_scale")
-
-            if is_conv:
-                input_pad = [0, 0, 0, 0, 0, pad_C]
-                scale_pad = [0, 0, 0, 0, 0, pad_C // bs]
-            else:
-                input_pad = [0, pad_C]
-                scale_pad = [0, pad_C // bs]
-
-            pad_input_node(
-                model,
-                node,
-                input,
-                input_pad,
-                input_scale,
-                scale_pad,
-                node.kwargs.get("input_code"),
-            )
+            lead = [0, 0, 0, 0] if is_conv else []
+            in_pad = lead + [0, pad_C]
+            in_scale_pad = lead + [0, pad_C // bs]
+            pad_input_node(model, node, False, in_pad, in_scale_pad, fold_cache)
 
         weight = node.args[1]
         C_in = weight.shape[-2] if is_mm else weight.shape[1]
@@ -306,53 +478,28 @@ def pad_matrix_op_dimensions(
         if is_dw:
             pad_K = pad_C
 
-        # Pad weight along K and C dimensions
+        # Pad weight along input and output channel dimensions
         if pad_C or pad_K:
-            weight_scale = node.kwargs.get("weight_scale")
-
             if is_dw:
-                weight_pad = [0, 0, 0, 0, 0, 0, 0, pad_K]
+                w_pad = [0, 0, 0, 0, 0, 0, 0, pad_K]
                 ws_pad = [0, 0, 0, 0, 0, 0, 0, pad_K]
             elif is_conv:
-                weight_pad = [0, 0, 0, 0, 0, pad_C, 0, pad_K]
+                w_pad = [0, 0, 0, 0, 0, pad_C, 0, pad_K]
                 ws_pad = [0, 0, 0, 0, 0, pad_C // bs, 0, pad_K]
             elif is_mm:
-                weight_pad = [0, pad_K, 0, pad_C]
+                w_pad = [0, pad_K, 0, pad_C]
                 ws_pad = [0, pad_K, 0, pad_C // bs]
             else:
-                weight_pad = [0, pad_C, 0, pad_K]
+                w_pad = [0, pad_C, 0, pad_K]
                 ws_pad = [0, pad_C // bs, 0, pad_K]
+            pad_input_node(model, node, True, w_pad, ws_pad, fold_cache)
 
-            if weight.op == "get_attr":
-                logger.debug(f"Pad {weight} with {weight_pad}")
-                param = fetch_attr(model, weight.target)
-                param.data = F.pad(param.data, weight_pad)
-                propagate_shape(weight, model)
-
-                if weight_scale is not None:
-                    logger.debug(f"Pad {weight_scale} with {ws_pad}")
-                    scale_param = fetch_attr(model, weight_scale.target)
-                    scale_param.data = F.pad(scale_param.data, ws_pad)
-                    propagate_shape(weight_scale, model)
-            else:
-                pad_input_node(
-                    model,
-                    node,
-                    weight,
-                    weight_pad,
-                    weight_scale,
-                    ws_pad,
-                    node.kwargs.get("weight_code"),
-                )
-
-            if pad_K and len(node.args) > 2 and node.args[2] is not None:
-                bias = node.args[2]
-                bias_param = fetch_attr(model, bias.target)
-                bias_param.data = F.pad(bias_param.data, [0, pad_K])
-                propagate_shape(bias, model)
+        bias = get_arg_value(node, 2, "bias")
+        if pad_K and bias is not None:
+            new_bias = _insert_pad(model, bias, [0, pad_K], 0)
+            node.replace_input_with(bias, new_bias)
 
         propagate_shape(node)
-
         if pad_K:
             slice_dim = 1 if is_conv else -1
             slice_output(model, node, (slice_dim, 0, C_out))
@@ -424,7 +571,7 @@ def _pad_layer_norm(
     model.graph.erase_node(node)
 
 
-def _pad_quantize_mx(model, node, unroll):
+def _pad_quantize_mx(model, node, unroll, fold_cache):
     input = node.args[0]
     axes = get_arg_value(node, 2, "axes")
     block_size = get_arg_value(node, 3, "block_size")
@@ -458,14 +605,7 @@ def _pad_quantize_mx(model, node, unroll):
     for dim in range(ndim - 1, min_pad_dim - 1, -1):
         pad_tuple.extend([0, pad_dims.get(dim, 0)])
 
-    with model.graph.inserting_before(node):
-        new_input = model.graph.call_function(
-            torch.ops.aten.pad.default,
-            (input, pad_tuple, "constant", 0),
-        )
-
-    propagate_shape(new_input)
-    new_input.meta["dtype"] = input.meta.get("dtype")
+    new_input = _insert_pad(model, input, pad_tuple, 0, fold_cache)
     node.replace_input_with(input, new_input)
     propagate_shape(node)
 
@@ -527,6 +667,7 @@ def _pad_softmax(model, node, unroll):
 def pad_vector_op_dimensions(
     model: GraphModule,
     K_unroll,
+    fold_cache: bool = FOLD_PAD_INTO_CACHE,
 ) -> GraphModule:
     """
     Pad inputs to vector operations to multiples of the hardware unroll size.
@@ -545,20 +686,20 @@ def pad_vector_op_dimensions(
         elif node.target == torch.ops.aten.softmax.int:
             _pad_softmax(model, node, K_unroll)
         elif node.target == torch.ops.quantized_ops.quantize_mx.default:
-            _pad_quantize_mx(model, node, K_unroll)
+            _pad_quantize_mx(model, node, K_unroll, fold_cache)
 
     for node in list(model.graph.nodes):
         if node.target is not torch.ops.aten.pad.default:
             continue
 
         pad = get_arg_value(node, 1, "pad")
-        cancel, chain = _find_cancelling_slice(node.args[0], pad)
+        cancel, chain, dims = _find_cancelling_slice(node.args[0], pad)
         if cancel is None:
             continue
 
         logger.info(f"Eliminating slice / pad round-trip: {cancel} and {node}")
         if chain:
-            _drop_slice_through_chain(cancel, chain, _padded_dim(pad))
+            _drop_slice_through_chain(cancel, chain, dims)
             node.replace_all_uses_with(node.args[0])
         else:
             node.replace_all_uses_with(cancel.args[0])
