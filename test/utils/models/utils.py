@@ -1,6 +1,8 @@
 def get_transform_args(args, vector_stages):
     fuse_reshape = not args.disable_reshape_fusion and (
-        args.hardware_unrolling is None or max(args.hardware_unrolling) < 64
+        args.bufferize
+        or args.hardware_unrolling is None
+        or max(args.hardware_unrolling) < 64
     )
 
     return {

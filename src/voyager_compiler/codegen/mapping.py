@@ -563,27 +563,6 @@ def find_sequential_nodes(model: GraphModule, patterns: List[List[List[Any]]]):
     return select_groups_min_dram(all_candidates)
 
 
-def is_tranpose(node: Node):
-    """
-    Transpose operations are characterized by swapping the last two dimensions
-    """
-    if node.target == torch.ops.aten.transpose.int:
-        ndim = node.args[0].value.ndim
-        axes = {x if x >= 0 else x + ndim for x in node.args[1:]}
-        return axes == {ndim - 2, ndim - 1}
-
-    if node.target == torch.ops.aten.permute.default:
-        permute_dims = node.args[1]
-        tranpose_dims = list(range(len(permute_dims)))
-        tranpose_dims[-2], tranpose_dims[-1] = (
-            tranpose_dims[-1],
-            tranpose_dims[-2],
-        )
-        return permute_dims == tranpose_dims
-
-    return False
-
-
 def search_group(node, node_lists):
     for l in node_lists:
         if node in l:
@@ -673,23 +652,26 @@ def _fuse_reshape_with_input_impl(
     current_node: Node,
     fused_nodes: List[Node],
     simulate: bool = False,
+    bufferize: bool = False,
 ) -> Union[bool, List[Node]]:
     reshape_node = fused_nodes[0]
     fused_nodes.append(current_node)
 
-    # Check if fusion is valid
-    if is_gemm_op(current_node) and not is_fully_connected(current_node):
+    can_fuse = False
+    if is_elementwise_op(current_node):
+        can_fuse = not swaps_last_two_dims(reshape_node)
+    elif is_gemm_op(current_node) and bufferize:
+        can_fuse = fused_nodes[-2] in (
+            current_node.args[1],
+            current_node.kwargs.get("weight_scale"),
+            current_node.kwargs.get("other_scale"),
+        )
+    elif is_gemm_op(current_node) and not is_fully_connected(current_node):
         input_node = fused_nodes[-2]
         if is_mha_qkv_permute(reshape_node):
             can_fuse = input_node == current_node.args[0]
-        elif is_tranpose(reshape_node):
+        elif swaps_last_two_dims(reshape_node):
             can_fuse = input_node in current_node.args[:2]
-        else:
-            can_fuse = False
-    elif is_elementwise_op(current_node):
-        can_fuse = not is_tranpose(reshape_node)
-    else:
-        can_fuse = False
 
     if "tiled_shapes" not in current_node.meta and can_fuse:
         if simulate:
@@ -706,7 +688,7 @@ def _fuse_reshape_with_input_impl(
         logger.warning(f"Cannot fuse {reshape_node} with {current_node}")
 
     if not is_nop(current_node) and not (
-        is_tranpose(reshape_node)
+        swaps_last_two_dims(reshape_node)
         and current_node.target == torch.ops.aten.select.int
         and current_node.args[1] == 0
     ):
@@ -716,7 +698,13 @@ def _fuse_reshape_with_input_impl(
     all_results = []
     for user in list(current_node.users):
         result = _fuse_reshape_with_input_impl(
-            graph, candidates, nodes_map, user, list(fused_nodes), simulate
+            graph,
+            candidates,
+            nodes_map,
+            user,
+            list(fused_nodes),
+            simulate,
+            bufferize,
         )
         if simulate:
             if not result:
@@ -732,11 +720,18 @@ def fuse_reshape_with_input(
     candidates: List[List[Node]],
     nodes_map: Dict[Node, Node],
     reshape_node: Node,
+    bufferize: bool = False,
 ):
     # First pass: simulate fusion to ensure all users can be fused
     for user in list(reshape_node.users):
         result = _fuse_reshape_with_input_impl(
-            graph, candidates, nodes_map, user, [reshape_node], simulate=True
+            graph,
+            candidates,
+            nodes_map,
+            user,
+            [reshape_node],
+            simulate=True,
+            bufferize=bufferize,
         )
         if not result:
             logger.info(
@@ -747,7 +742,13 @@ def fuse_reshape_with_input(
     # Second pass: perform actual fusion
     for user in list(reshape_node.users):
         result = _fuse_reshape_with_input_impl(
-            graph, candidates, nodes_map, user, [reshape_node], simulate=False
+            graph,
+            candidates,
+            nodes_map,
+            user,
+            [reshape_node],
+            simulate=False,
+            bufferize=bufferize,
         )
 
 
@@ -851,8 +852,7 @@ def fuse_repeat_with_input(graph, candidates, node) -> bool:
     Bufferized only: the legacy path copies an ``expand`` into memory, so it
     never sees one of these groups (hence no ``nodes_map`` entry).
     """
-    found = repeat_of(node)
-    if found is None:
+    if (found := repeat_of(node)) is None:
         return False
     _, chain, _ = found
 
@@ -997,6 +997,7 @@ def fuse_operator(
     model: GraphModule,
     operations: List[List[Callable]] = None,
     fuse_reshape: bool = True,
+    bufferize: bool = False,
 ):
     """
     Fuse reshape, slicing, and dequantize operations with their immediate users.
@@ -1024,7 +1025,9 @@ def fuse_operator(
 
         # Attempt to fuse it with its immediate user
         if fuse_reshape and is_reshape_op(node):
-            fuse_reshape_with_input(graph, fused_nodes_list, nodes_map, node)
+            fuse_reshape_with_input(
+                graph, fused_nodes_list, nodes_map, node, bufferize
+            )
 
     for node in list(graph.nodes):
         if node.target != torch.ops.quantized_ops.dequantize.default:
@@ -1036,8 +1039,9 @@ def fuse_operator(
 
         fuse_dequantize_with_input(graph, fused_nodes_list, nodes_map, node)
 
-    for node in list(graph.nodes):
-        fuse_repeat_with_input(graph, fused_nodes_list, node)
+    if bufferize:
+        for node in list(graph.nodes):
+            fuse_repeat_with_input(graph, fused_nodes_list, node)
 
     # Sort nodes based on their order of appearance in the graph
     nodes_order = {node: i for i, node in enumerate(graph.nodes)}

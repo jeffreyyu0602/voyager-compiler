@@ -229,7 +229,7 @@ def transform(
     # Conv+ReLU) into single kernels to reduce memory access overhead.
 
     if not skip_op_fusion:
-        fuse_operator(model, patterns, fuse_reshape)
+        fuse_operator(model, patterns, fuse_reshape, bufferize)
 
     rename_nodes_with_param_names(model)
     deduplicate_nodes(model)
