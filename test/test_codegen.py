@@ -383,6 +383,9 @@ if __name__ == "__main__":
         max_cache_len = -(-raw // block) * block
 
         if args.model == "llm_decode":
+            transform_args["context_len"] = args.context_length
+            transform_args["max_gen"] = 128
+
             past_key_values = StaticCache(
                 config=model.config,
                 max_batch_size=1,

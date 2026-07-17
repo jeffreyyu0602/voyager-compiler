@@ -122,6 +122,8 @@ def transform(
     use_fake_mode=True,
     use_interstellar_tiling=False,
     bufferize=False,
+    context_len=None,
+    max_gen=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -159,7 +161,9 @@ def transform(
         convert_cat_and_stack_as_stack_on_dim0(model)
         convert_cat_with_mismatched_shapes_to_stack(model)
 
-    fuse_quantize_dequantize_with_previous_op(model, bufferize)
+    fuse_quantize_dequantize_with_previous_op(
+        model, bufferize, context_len, max_gen
+    )
 
     # -------------------------------------------------------------------------
     # 2. Hardware Alignment (Padding)

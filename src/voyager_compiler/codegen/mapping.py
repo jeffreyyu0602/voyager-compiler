@@ -159,7 +159,7 @@ def replace_node_with_graph_module(
                     value_remap[n] = graph.create_node("get_attr", name)
                 else:
                     value_remap[n] = create_getattr_from_value(
-                        model, graph, "_tensor_constant_", attr
+                        model, graph, n.target, attr
                     )
             else:
                 value_remap[n] = graph.node_copy(n, lambda n: value_remap[n])
