@@ -23,7 +23,7 @@ from .mapping_utils import (
     is_nop,
     is_reshape_op,
     is_shape_changing_nop,
-    quant_table_arg_nodes,
+    quant_param_arg_nodes,
     reshape_preserves_full_blocks,
 )
 from .shape_prop import ShapeProp
@@ -208,7 +208,7 @@ class IterationSpaceNormalizer:
         # they are passed whole to every tile. Skip them.
         quant_tables = set()
         for node in child.graph.nodes:
-            quant_tables |= quant_table_arg_nodes(node)
+            quant_tables |= quant_param_arg_nodes(node)
 
         input_plans: Dict[str, InputPlan] = {}
         for placeholder in normalizable_placeholders:

@@ -17,7 +17,7 @@ from ..mapping_utils import (
     is_nop,
     is_pooling,
     is_reshape_op,
-    quant_table_arg_nodes,
+    quant_param_arg_nodes,
     swaps_last_two_dims,
 )
 from ...pt2e_utils import deduplicate_nodes, fetch_attr, propagate_shape
@@ -353,7 +353,7 @@ def find_upstream_transpose_or_param(
     ``[node, ..., anchor]`` (nearest ``node`` first), or ``None``.
 
     A relayout op's non-data inputs are quantization tables
-    (``quant_table_arg_nodes``) and are excluded; a node left with more than
+    (``quant_param_arg_nodes``) and are excluded; a node left with more than
     one input is a merge, not a relayout, so the walk stops -- keeping the
     result the single chain the eliminators consume."""
     if not swaps_last_two_dims(node):
@@ -371,7 +371,7 @@ def find_upstream_transpose_or_param(
         data_inputs = [
             i
             for i in curr.all_input_nodes
-            if i not in quant_table_arg_nodes(curr)
+            if i not in quant_param_arg_nodes(curr)
         ]
         if len(data_inputs) != 1:
             return None

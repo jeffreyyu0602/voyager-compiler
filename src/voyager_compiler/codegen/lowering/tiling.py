@@ -27,7 +27,7 @@ from ..mapping_utils import (
     is_fully_connected,
     is_linear,
     is_matmul,
-    quant_table_arg_nodes,
+    quant_param_arg_nodes,
     trailing_mha_perm,
 )
 from ..passes.utils import _pair, get_arg_value
@@ -216,7 +216,7 @@ def _operand_placeholders(root):
         if n.op == "placeholder":
             leaves.append(n)
             continue
-        codebooks = quant_table_arg_nodes(n)
+        codebooks = quant_param_arg_nodes(n)
         for inp in n.all_input_nodes:
             if inp not in codebooks:
                 stack.append(inp)
@@ -248,7 +248,7 @@ def _fused_operand_specs(node, anchor):
     anchor_operands = set(_operand_placeholders(anchor))
     codebooks = set()
     for n in submod.graph.nodes:
-        codebooks |= quant_table_arg_nodes(n)
+        codebooks |= quant_param_arg_nodes(n)
 
     specs = []
     for p in submod.graph.nodes:

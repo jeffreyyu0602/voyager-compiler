@@ -24,7 +24,7 @@ from torch.fx import GraphModule, Node
 from ...pt2e_utils import update_submod_user_meta
 from ..mapping import get_anchor_node, replace_node_with_graph_module
 from ..mapping_utils import (
-    quant_table_arg_nodes,
+    quant_param_arg_nodes,
     is_compute_op,
     is_conv2d,
     is_elementwise_op,
@@ -34,6 +34,11 @@ from ..mapping_utils import (
     is_shape_changing_nop,
 )
 from .ops import MemoryLevel, oracle_disabled
+from .utils import (
+    _collect_codebook_nodes,
+    _passed_whole,
+    _subgraph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +57,6 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 
 
-def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
-    """The GraphModule attribute named ``target`` on ``gm`` (a loop body/cond
-    or fused submodule), or None if ``target`` is not a submodule."""
-    try:
-        sub = gm.get_submodule(str(target))
-    except AttributeError:
-        return None
-    return sub if isinstance(sub, GraphModule) else None
-
-
 def _produces_tensor(node: Node) -> bool:
     """Whether ``node`` yields a tensor (or a tuple of tensors) — as opposed to
     an index / counter / SymInt from loop-counter arithmetic, which carries no
@@ -73,51 +68,6 @@ def _produces_tensor(node: Node) -> bool:
     if isinstance(val, (tuple, list)):
         return any(isinstance(e, torch.Tensor) for e in val)
     return False
-
-
-def _collect_codebook_nodes(gm: GraphModule, result: set) -> set:
-    """Add every codebook / qmap node (recursing into ``while_loop`` bodies and
-    fused ``call_module`` submodules) to ``result``; return this graph's
-    placeholders that are codebooks, so a caller can flag the operands feeding
-    them as codebooks too.
-
-    Codebook-ness flows bottom-up: an op flags its codebook args
-    (``quant_table_arg_nodes``) and an operand bound to a codebook sub-graph
-    placeholder is itself a codebook — so a top-level ``code`` / ``qmap``
-    get_attr threaded through the loops is caught.
-    """
-    local = set()
-
-    def _thread(operands, sub):
-        if sub is None:
-            return
-        sub_phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
-        sub_cb = _collect_codebook_nodes(sub, result)
-        for operand, ph in zip(operands, sub_phs):
-            if isinstance(operand, Node) and ph in sub_cb:
-                local.add(operand)
-
-    for n in gm.graph.nodes:
-        if n.op == "call_function":
-            local |= quant_table_arg_nodes(n)
-            if n.target is _WHILE_LOOP:
-                operands = list(n.args[2])
-                if len(n.args) > 3:
-                    operands += list(n.args[3])
-                _thread(operands, _subgraph(gm, n.args[1].target))
-            elif n.target is _COND:
-                # Both cond branches share the operand list (args[3]); thread
-                # codebook-ness into each, exactly like a while_loop body — a
-                # tail op (e.g. quantize_mx) inside a finalize cond consumes its
-                # codebook through a branch placeholder.
-                operands = list(n.args[3]) if len(n.args) > 3 else []
-                _thread(operands, _subgraph(gm, n.args[1].target))
-                _thread(operands, _subgraph(gm, n.args[2].target))
-        elif n.op == "call_module":
-            _thread(list(n.args), _subgraph(gm, n.target))
-
-    result |= local
-    return {p for p in gm.graph.nodes if p.op == "placeholder" and p in local}
 
 
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
@@ -147,8 +97,7 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
     when an op's result is the body's output, the check threads to the users of
     the loop / cond node in the parent graph.  A violation raises.
     """
-    codebooks: set = set()
-    _collect_codebook_nodes(gm, codebooks)
+    codebooks = _collect_codebook_nodes(gm)
     _annotate_and_validate(gm, codebooks, parent_hop=None, parent_ctx=None)
 
 
@@ -262,17 +211,6 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
     return None
 
 
-def _passed_whole(node: Node, codebooks: set) -> bool:
-    """An operand handed to the op whole rather than tiled into a bank, and so
-    exempt from the Scratchpad rule: a codebook / qmap (a *param*, which carries
-    no space at all), or a scalar (read from DRAM).  ``_build_for_untiled``
-    loads neither."""
-    if node in codebooks:
-        return True
-    val = node.meta.get("val", getattr(node, "value", None))
-    return isinstance(val, torch.Tensor) and val.numel() == 1
-
-
 def _validate_compute(node: Node, codebooks: set, ctx: tuple) -> None:
     """The array only reaches Scratchpad, so every tile a compute op reads must
     be there, and its result must be stored back there (via ``insert``)."""
@@ -319,7 +257,11 @@ def _annotate_and_validate(
             if parent_hop is None and _produces_tensor(node):
                 node.meta["space"] = "DRAM"  # a model input
         elif node.op == "get_attr":
-            if _subgraph(gm, node.target) is None and _produces_tensor(node):
+            if (
+                _subgraph(gm, node.target) is None
+                and _produces_tensor(node)
+                and not _passed_whole(node, codebooks)
+            ):
                 node.meta["space"] = "DRAM"  # a weight param
         elif node.target is _VOYAGER_ALLOC:
             level = (
@@ -994,7 +936,7 @@ def _build_for_untiled(node: Node):
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
     outputs = list(val) if isinstance(val, (list, tuple)) else [val]
-    codebooks = quant_table_arg_nodes(node)
+    codebooks = quant_param_arg_nodes(node)
 
     # Resolve each arg *now* into a ``(value, is_index)`` template: an input Node
     # -> ``(tile_slot, True)`` (the loaded tile at that slot is substituted when

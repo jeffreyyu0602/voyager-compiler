@@ -46,7 +46,12 @@ from torch.fx.operator_schemas import normalize_function
 
 import interstellar
 
-from ..mapping_utils import is_nop, save_tensor
+from ..mapping_utils import (
+    QMAP_PARAMS,
+    is_nop,
+    quant_param_arg_nodes,
+    save_tensor,
+)
 from ..passes.utils import get_arg_value
 from ..voyager_ir_pb2 import (
     Argument,
@@ -71,6 +76,7 @@ from ..voyager_ir_pb2 import (
 from ..shape_prop import ShapeProp
 from .bufferization import _is_compute
 from .ops import oracle_disabled
+from .utils import _collect_codebook_nodes, _passed_whole
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
@@ -579,9 +585,12 @@ class _Emitter:
             op=self._op_kind(node),
             target=_target_name(node.target),
         )
+        qmaps = quant_param_arg_nodes(node, QMAP_PARAMS)
         for key, value in self._kwargs(node).items():
             if value is None:
                 continue  # an unset optional: absent, not null
+            if isinstance(value, Node) and value in qmaps:
+                continue  # a qmap lookup table is not emitted
             if key == "semaphore" and node.target is _ASYNC_COPY:
                 continue  # what it *posts* -- on the Operation, not an operand
             call.kwargs[key].CopyFrom(self._argument(value, env, internal))
@@ -884,11 +893,21 @@ class _Emitter:
         self.bind(self.model, {})
 
         model = Model()
+        quant_params = _collect_codebook_nodes(self.model)
         for node in self.model.graph.nodes:
             if node.op == "placeholder" and _is_tensor(node):
                 model.inputs.append(self._tensor_box(node))
             elif node.op == "get_attr" and _is_tensor(node):
-                model.parameters.append(self._tensor_box(node))
+                if not _passed_whole(node, quant_params):
+                    model.parameters.append(self._tensor_box(node))
+            else:
+                continue
+            is_qmap = node in quant_params and "qmap" in node.name
+            if self.dump_dir is not None and not is_qmap:
+                save_tensor(
+                    _value(node),
+                    os.path.join(self.dump_dir, f"{node.name}.bin"),
+                )
 
         self.emit_region(self.model, model.ops)
 

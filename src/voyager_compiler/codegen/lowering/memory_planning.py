@@ -37,8 +37,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..banking import require_allocation
 from .bufferization import _viewed_buffer
+from .utils import _collect_codebook_nodes, _passed_whole, _subgraph
 from ..memory import MemorySpace, Segment, _align_size
 from ..passes.utils import get_arg_value
 from ...pt2e_utils import dtype_byte_size
@@ -107,14 +107,6 @@ def _nbytes(node, bank_width=None) -> int:
     return int(_align_size(size, bank_width))
 
 
-def _submodule(gm: GraphModule, target) -> Optional[GraphModule]:
-    try:
-        sub = gm.get_submodule(str(target))
-    except AttributeError:
-        return None
-    return sub if isinstance(sub, GraphModule) else None
-
-
 @dataclass
 class MemoryPlan:
     dram_bytes: int
@@ -165,14 +157,15 @@ def _greedy_best_fit(
 # ---------------------------------------------------------------------------
 
 
-def _is_param(node: Node, gm: GraphModule) -> bool:
+def _is_param(node: Node, gm: GraphModule, codebooks: set) -> bool:
     if node.op != "get_attr":
         return False
-    if _submodule(gm, node.target) is not None:
+    if _subgraph(gm, node.target) is not None:
         return False
     if str(node.target).startswith("lifted_tensor"):
         return False
-    return require_allocation(node)
+    # A codebook / qmap or a scalar scale is passed whole and owns no storage.
+    return not _passed_whole(node, codebooks)
 
 
 def _materializes_dram(node: Node) -> bool:
@@ -199,6 +192,8 @@ def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
 
+    codebooks = _collect_codebook_nodes(model)
+
     # The DRAM buffers, split into two pools:
     #   persistent -- inputs + weights, live the whole run (placed once)
     #   reusable   -- activation buffers, recycled once dead: an ``alloc``, or a
@@ -210,8 +205,8 @@ def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     for n in nodes:
         if n.op == "placeholder" and _val(n) is not None:
             persistent.append(n)  # model input
-        elif _is_param(n, model) and _val(n) is not None:
-            persistent.append(n)  # weight / codebook
+        elif _is_param(n, model, codebooks) and _val(n) is not None:
+            persistent.append(n)  # weight
         elif n.op == "call_function" and (
             n.target is _ALLOC or _materializes_dram(n)
         ):
@@ -266,16 +261,16 @@ def _walk(gm: GraphModule):
     for n in gm.graph.nodes:
         yield n
         if n.op == "call_function" and n.target is _WHILE:
-            body = _submodule(gm, n.args[1].target)
+            body = _subgraph(gm, n.args[1].target)
             if body is not None:
                 yield from _walk(body)
         elif n.op == "call_function" and n.target is _COND:
             for branch in (n.args[1], n.args[2]):
-                sub = _submodule(gm, branch.target)
+                sub = _subgraph(gm, branch.target)
                 if sub is not None:
                     yield from _walk(sub)
         elif n.op == "call_module":
-            sub = _submodule(gm, n.target)
+            sub = _subgraph(gm, n.target)
             if sub is not None:
                 yield from _walk(sub)
 
@@ -327,7 +322,7 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
                 bind(n, viewed)
 
             if n.op == "call_function" and n.target is _WHILE:
-                body = _submodule(gm, n.args[1].target)
+                body = _subgraph(gm, n.args[1].target)
                 if body is None:
                     continue
                 phs = [p for p in body.graph.nodes if p.op == "placeholder"]
@@ -348,7 +343,7 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
             elif n.op == "call_function" and n.target is _COND:
                 operands = list(n.args[3]) if len(n.args) > 3 else []
                 for branch in (n.args[1], n.args[2]):
-                    sub = _submodule(gm, branch.target)
+                    sub = _subgraph(gm, branch.target)
                     if sub is None:
                         continue
                     phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
@@ -356,7 +351,7 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
                         bind(ph, o)
                     walk(sub)
             elif n.op == "call_module":
-                sub = _submodule(gm, n.target)
+                sub = _subgraph(gm, n.target)
                 if sub is None:
                     continue
                 phs = [p for p in sub.graph.nodes if p.op == "placeholder"]

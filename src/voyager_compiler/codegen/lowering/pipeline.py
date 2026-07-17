@@ -43,7 +43,7 @@ from voyager_compiler.codegen.mapping_utils import (
     is_conv2d,
     is_linear,
     is_matmul,
-    quant_table_arg_nodes,
+    quant_param_arg_nodes,
     repeat_of,
     swaps_last_two_dims,
     trailing_mha_perm,
@@ -949,7 +949,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         if sn is anchor or sn.op != "call_function" or sn in anchor_prelude:
             continue
         fused_ops.append(sn)
-        codebooks = quant_table_arg_nodes(sn)
+        codebooks = quant_param_arg_nodes(sn)
         for inp in sn.all_input_nodes:
             if (
                 inp.op != "placeholder"
@@ -1640,7 +1640,7 @@ def build_gemm(
             tn // dq_bs if n_dim in dq_axes else tn,
             tk // dq_bs if k_dim in dq_axes else tk,
         )
-        tables = quant_table_arg_nodes(dequant)
+        tables = quant_param_arg_nodes(dequant)
         for i, v in enumerate(dequant.args):
             if i == 0 or not isinstance(v, torch.fx.Node):
                 continue
@@ -1810,7 +1810,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
         for sn in submod.graph.nodes:
             if sn.op != "call_function":
                 continue
-            for cb in quant_table_arg_nodes(sn):
+            for cb in quant_param_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
         compute = submod
@@ -1832,7 +1832,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
         op_args = [_plain(a) for a in node.args]
         op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
         op = node.target
-        codebooks = quant_table_arg_nodes(node)
+        codebooks = quant_param_arg_nodes(node)
 
         def compute(*tiles):
             args = [
@@ -1997,7 +1997,7 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     codebooks = set()
     for sn in submod.graph.nodes:
         if sn.op == "call_function":
-            for cb in quant_table_arg_nodes(sn):
+            for cb in quant_param_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
     inputs, in_specs = [], []

@@ -15,11 +15,84 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
+from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.lowering import ops
-from voyager_compiler.codegen.mapping_utils import is_compute_op, is_nop
+from voyager_compiler.codegen.mapping_utils import (
+    is_compute_op,
+    is_nop,
+    quant_param_arg_nodes,
+)
 
 voyager = torch.ops.voyager
+_WHILE_LOOP = torch.ops.higher_order.while_loop
+_COND = torch.ops.higher_order.cond
+
+
+def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
+    """The GraphModule attribute named ``target`` on ``gm`` (a loop body/cond
+    or fused submodule), or None if ``target`` is not a submodule."""
+    try:
+        sub = gm.get_submodule(str(target))
+    except AttributeError:
+        return None
+    return sub if isinstance(sub, GraphModule) else None
+
+
+def _passed_whole(node: Node, codebooks: set) -> bool:
+    """An operand handed to the op whole rather than tiled into a bank, and so
+    exempt from the Scratchpad rule: a codebook / qmap (a *param*, which carries
+    no space at all), or a scalar (read from DRAM).  ``_build_for_untiled``
+    loads neither."""
+    if node in codebooks:
+        return True
+    val = node.meta.get("val", getattr(node, "value", None))
+    return isinstance(val, torch.Tensor) and val.numel() == 1
+
+
+def _collect_codebook_nodes(gm: GraphModule) -> set:
+    """Every codebook / qmap node in ``gm`` — recursing into ``while_loop``
+    bodies, ``cond`` branches, and fused ``call_module`` submodules.
+
+    Codebook-ness flows bottom-up: an op flags its codebook args
+    (``quant_param_arg_nodes``) and an operand bound to a codebook sub-graph
+    placeholder is itself a codebook — so a top-level ``code`` / ``qmap``
+    get_attr threaded through the loops is caught.
+    """
+    codebooks = set()
+
+    def _thread(operands, sub):
+        if sub is None:
+            return
+        sub_phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+        sub_cb = _collect_codebook_nodes(sub)
+        codebooks.update(sub_cb)
+        # A sub placeholder can only be a codebook at sub's own level, so
+        # membership in the whole sub set is membership among its placeholders.
+        for operand, ph in zip(operands, sub_phs):
+            if isinstance(operand, Node) and ph in sub_cb:
+                codebooks.add(operand)
+
+    for n in gm.graph.nodes:
+        if n.op == "call_function":
+            codebooks.update(quant_param_arg_nodes(n))
+            if n.target is _WHILE_LOOP:
+                operands = list(n.args[2])
+                if len(n.args) > 3:
+                    operands += list(n.args[3])
+                _thread(operands, _subgraph(gm, n.args[1].target))
+            elif n.target is _COND:
+                # Both cond branches share the operand list (args[3]); thread
+                # codebook-ness into each, exactly like a while_loop body — a
+                # tail op (e.g. quantize_mx) inside a finalize cond consumes its
+                # codebook through a branch placeholder.
+                operands = list(n.args[3]) if len(n.args) > 3 else []
+                _thread(operands, _subgraph(gm, n.args[1].target))
+                _thread(operands, _subgraph(gm, n.args[2].target))
+        elif n.op == "call_module":
+            _thread(list(n.args), _subgraph(gm, n.target))
+
+    return codebooks
 
 
 @dataclass

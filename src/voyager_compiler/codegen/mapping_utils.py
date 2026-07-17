@@ -413,20 +413,14 @@ aten = torch.ops.aten
 INT64_MAX = torch.iinfo(torch.int64).max
 
 
-# Quantization lookup-table args (qmaps and codebooks) across the
-# quantized_ops quantize/dequantize/quantize_mx family. They are indexed by
-# value, not by iteration position, so they are passed whole (never tiled /
-# position-mapped).
-QUANT_TABLE_PARAMS = {
-    "qmap",
-    "scale_qmap",
-    "input_qmap",
-    "output_qmap",
-    "code",
-    "input_code",
-    "weight_code",
-    "output_code",
-}
+# Quantization lookup-table args across the quantized_ops
+# quantize/dequantize/quantize_mx family. They are indexed by value, not by
+# iteration position, so they are passed whole (never tiled / position-mapped).
+# qmaps are mapped by the accelerator itself, so they are neither emitted nor
+# dumped (as in the legacy path); codebooks are passed whole and dumped.
+QMAP_PARAMS = {"qmap", "scale_qmap", "input_qmap", "output_qmap"}
+CODEBOOK_PARAMS = {"code", "input_code", "weight_code", "output_code"}
+QUANT_PARAMS = QMAP_PARAMS | CODEBOOK_PARAMS
 
 
 def ancestors(node: Node) -> set:
@@ -447,18 +441,17 @@ def ancestors(node: Node) -> set:
     return result
 
 
-def quant_table_arg_nodes(node: Node) -> set:
-    """Tensor args of ``node`` that are quantization lookup tables (qmaps /
-    codebooks), identified by schema arg name so positions need not be
-    hardcoded."""
+def quant_param_arg_nodes(node: Node, params: set = QUANT_PARAMS) -> set:
+    """Tensor args of ``node`` that are quantization lookup tables, identified
+    by schema arg name so positions need not be hardcoded.  ``params`` selects
+    the family — ``QMAP_PARAMS``, ``CODEBOOK_PARAMS``, or both (the default)."""
     result = set()
-    schema = getattr(node.target, "_schema", None)
-    if schema is None:
+    if getattr(node.target, "namespace", None) != "quantized_ops":
         return result
-    for i, arg in enumerate(schema.arguments):
-        if arg.name not in QUANT_TABLE_PARAMS:
+    for i, arg in enumerate(node.target._schema.arguments):
+        if arg.name not in params:
             continue
-        val = node.args[i] if i < len(node.args) else node.kwargs.get(arg.name)
+        val = get_arg_value(node, i, arg.name)
         if isinstance(val, Node):
             result.add(val)
     return result
