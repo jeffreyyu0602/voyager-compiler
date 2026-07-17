@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 DEFAULT_DRAM_SIZE_GB = 16.0
-DEFAULT_DRAM_BANDWIDTH_GBS = 50.0
+DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
 DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
 
 

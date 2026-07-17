@@ -82,24 +82,34 @@ def dram_cycles(n_bytes: int, cost: CostParams) -> int:
 # --------------------------------------------------------------------------
 
 
-# Softmax and LayerNorm require three and four passes over the data,
-# respectively.  Since BF16/FP16 values occupy 2 bytes per element, their ideal
-# throughputs are 1/6 and 1/8 elements per cycle, respectively.
-OP_UTILIZATION = {
-    torch.ops.aten.layer_norm.default: 0.125,
-    torch.ops.aten.softmax.int: 0.167,
+# Passes an op makes over its data; it fetches its operands once per pass.
+OP_PASSES = {
+    torch.ops.aten.layer_norm.default: 4,
+    torch.ops.aten.softmax.int: 3,
 }
 
 
 def op_utilization(
-    node: Node, anchor: Node, units: Tuple[str, ...], ideal_cycles: int
+    node: Node,
+    anchor: Node,
+    units: Tuple[str, ...],
+    ideal_cycles: int,
+    cost: CostParams,
 ) -> float:
     """The utilization to charge ``node``.
 
     A matrix op the interstellar tiler mapped carries the RuntimeCalculator's
     per-tile compute cycles (stamped on it by the builder), which is what one of
     its tiled executions really costs -- so its utilization is the ideal-to-
-    actual ratio.  Everything else is looked up by op.
+    actual ratio.
+
+    A vector op is bound by SRAM bandwidth instead (DRAM is modeled separately,
+    as ``async_copy`` events).  The SRAM is provisioned to match DRAM, so its
+    bandwidth is ``dram_bandwidth / frequency`` bytes per cycle.  Peak is one
+    ``unroll[1]``-wide lane group per cycle, fetched at the widest of the
+    anchor's input / output element widths and once per pass the op makes over
+    its data, so the op sustains the fraction of peak at which that fetch keeps
+    up.
 
     The rules key off the *anchor*: a fused ``call_module``'s own target is just
     the submodule name, so only the anchor names the real op.
@@ -110,7 +120,20 @@ def op_utilization(
         return min(1.0, ideal_cycles / per_tile)
     if is_fully_connected(anchor):
         return 1.0
-    return OP_UTILIZATION.get(anchor.target, 0.5)
+    sram_bandwidth = cost.dram_bandwidth / cost.frequency  # bytes / cycle
+    # A node whose value never got propagated carries no dtype -- skip it
+    # rather than guess at a width.
+    widths = [
+        dtype_byte_size(_dtype(n))
+        for n in [node, *node.all_input_nodes]
+        if _val(n) is not None
+    ]
+    num_bytes = cost.unroll[1] * max(widths, default=2.0)
+    fetch_cycles = OP_PASSES.get(anchor.target, 1) * math.ceil(
+        num_bytes / sram_bandwidth
+    )
+    # Bandwidth to spare does not beat peak, it only reaches it.
+    return min(1.0, 1.0 / fetch_cycles)
 
 
 # --------------------------------------------------------------------------
@@ -160,7 +183,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
                 "output": out,
             },
             units=matrix_units,
-            utilization=op_utilization(node, anchor, matrix_units, ideal),
+            utilization=op_utilization(node, anchor, matrix_units, ideal, cost),
         )
 
     if is_gemm_op(anchor):
@@ -185,7 +208,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
                 "output": out,
             },
             units=units,
-            utilization=op_utilization(node, anchor, units, ideal),
+            utilization=op_utilization(node, anchor, units, ideal, cost),
         )
 
     # Vector op: work is the larger of input / output element count -- a
@@ -202,5 +225,5 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         ideal,
         {"ops": ops, "input": in_shape, "output": out},
         units=("vector",),
-        utilization=op_utilization(node, anchor, ("vector",), ideal),
+        utilization=op_utilization(node, anchor, ("vector",), ideal, cost),
     )
