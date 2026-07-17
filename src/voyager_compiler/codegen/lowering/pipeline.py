@@ -41,7 +41,6 @@ from voyager_compiler.codegen.mapping_utils import (
     ancestors,
     is_bmm,
     is_conv2d,
-    is_gemm_op,
     is_linear,
     is_matmul,
     quant_table_arg_nodes,
@@ -812,8 +811,10 @@ class _FusedInfo:
     ``anchor_node`` is the GEMM/conv reference op (inside the submodule, so its
     ``args`` are submodule placeholders whose ``meta['source_node']`` point back
     to the outer graph).  ``fused_gm`` runs the post-op ops as ``[acc, *fused]
-    -> output(s)`` on the anchor's result tile.  ``input_values`` are the
-    tensors those ops consume; ``in_specs[i]`` is that input's tile
+    -> output(s)`` on the anchor's result tile, and is ``None`` when there is no
+    tail to run -- a submodule can hold the anchor and nothing but its prelude
+    (a GQA ``expand``), and it is still a ``_fused`` node.  ``input_values`` are
+    the tensors those ops consume; ``in_specs[i]`` is that input's tile
     ``_InputSpec`` (or ``None`` for a whole input); ``in_sources[i]`` is its
     outer graph node, used to order operands canonically.  ``output_specs``
     holds one ``_FusedOutput`` per fused output -- several when the fused op
@@ -821,8 +822,7 @@ class _FusedInfo:
     """
 
     anchor_node: torch.fx.Node
-    is_conv: bool
-    fused_gm: torch.fx.GraphModule
+    fused_gm: Optional[torch.fx.GraphModule]
     tiling: Optional[Tuple[int, ...]]
     input_values: List[torch.Tensor]
     in_specs: List[Optional[_InputSpec]]
@@ -911,7 +911,7 @@ def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
 
 def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     """Parse a fused ``call_module`` ``node`` into a ``_FusedInfo``, or ``None``
-    if its anchor is not a GEMM/conv.
+    if ``node`` is not a fused submodule (a bare op the builder reads directly).
 
     The submodule (``node.meta['submodule']``) holds a GEMM/conv anchor followed
     by post-op pointwise ops.  The fused operands / outputs tile at the output
@@ -919,21 +919,16 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     projected to the output's physical layout).  The factors are stashed on
     ``_FusedInfo.tiling`` so the builder reuses them (no second tiler run).
     """
+    if node.op != "call_module":
+        return None
     submod = node.meta.get("submodule")
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
-    if not is_conv and not is_gemm_op(anchor):
-        return None
 
     ShapeProp(submod).propagate(
         *(n.value.clone() for n in node.all_input_nodes)
     )
 
-    # ``tiling`` = the anchor's per-dim tile counts (logical).  ``out_tiling`` =
-    # those in the output's physical layout with the reduction dim dropped (the
-    # divisor that dices fused operands / outputs).  ``out_index_map`` = output
-    # dim -> grid dim: conv projects the physical (NHWC) layout, gemm is
-    # identity (K reduction is the last grid dim).  ``None`` => untiled (whole).
     tiling = get_tiling(node, tiler)
     if tiling is None:
         out_tiling = None
@@ -947,11 +942,6 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         out_tiling = tiling[:-1]  # gemm (batch.., n_m, n_n, n_k) -> drop K
         out_index_map = tuple(range(len(out_tiling)))
 
-    # Walk the fused pointwise chain after the anchor, collecting each op and,
-    # for every new placeholder it consumes, the node, its cloned value, and its
-    # tile ``_InputSpec`` (``None`` for a codebook / scalar passed whole, or an
-    # untiled op).  The anchor's own operands (act / weight / scales) are
-    # handled by the builder, not as fused post-op operands — exclude them here.
     anchor_prelude = ancestors(anchor)
     fused_ops = []
     input_nodes, input_values, in_specs = [], [], []
@@ -978,9 +968,11 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
                     )
                 )
 
-    fused_gm = _build_fused_gm(submod, anchor, fused_ops, input_nodes)
-    # Each fused operand's outer graph node, so the builder can order operands
-    # canonically.
+    fused_gm = (
+        _build_fused_gm(submod, anchor, fused_ops, input_nodes)
+        if fused_ops
+        else None
+    )
     in_sources = [n.meta.get("source_node", n) for n in input_nodes]
 
     multi_outputs = isinstance(node.value, (list, tuple))
@@ -1003,10 +995,6 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         relayout = _detect_mha_relayout(fused_ops, anchor, tiling, fused_gm)
         if relayout is not None:
             out_tile, out_imap, data_shape = relayout
-            # The relaid-out tile is the data output's.  A fused ``quantize_mx``
-            # returns a scale beside it, holding one element per block where the
-            # data holds one per element -- so it rides the same grid, on a tile
-            # shrunk by the very same ratio, dim by dim.
             output_specs = [
                 (
                     s,
@@ -1022,7 +1010,6 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
 
     return _FusedInfo(
         anchor,
-        is_conv,
         fused_gm,
         tiling,
         input_values,
@@ -1203,12 +1190,7 @@ def build_conv2d(
     projected onto each operand's physical order (``meta["transposed"]`` selects
     NHWC + HWIO).  Returns the gm or ``None``.
     """
-    info = (
-        parse_fused_submodule(node, tiler) if node.op == "call_module" else None
-    )
-    if node.op == "call_module" and (info is None or not info.is_conv):
-        return None
-
+    info = parse_fused_submodule(node, tiler)
     tiling = info.tiling if info is not None else get_tiling(node, tiler)
     if info is None and tiling is None:
         return None
@@ -1223,9 +1205,6 @@ def build_conv2d(
     if groups != 1:
         return None  # depthwise conv unsupported
 
-    # ``meta["transposed"]`` selects the systolic layout: NHWC feature maps +
-    # HWIO weight.  Specs are logical NCHW/OIHW and ``_project``-ed onto each
-    # operand's physical order; the grid stays logical (``None`` => identity).
     nhwc = anchor.meta.get("transposed", False)
     in_dims = _NHWC if nhwc else None
     w_dims = _HWIO if nhwc else None
@@ -1235,9 +1214,6 @@ def build_conv2d(
     K, _, kH, kW = _unproject(w.shape, w_dims)
     oH, oW = _unproject(out.shape, out_dims)[2:]
 
-    # ``tiling`` is the logical output/reduction tile factors ``(n_y, n_x, n_k,
-    # n_c)`` (``None`` => untiled); tile sizes are ``full // factor``.  Batch is
-    # never tiled; ``n_c`` (the C reduction) is the kernel's ``num_k``.
     if tiling is None:
         tiling = (1, 1, 1, 1)
     ny, nx, nk, nc = tiling
@@ -1287,10 +1263,6 @@ def build_conv2d(
             for shape, tile, dtype, imap in info.output_specs
         ]
 
-    # Assemble operands in the fused node's ``all_input_nodes`` order (keyed by
-    # each anchor placeholder's ``source_node``) and dispatch by canonical index,
-    # so the placeholder splice binds correctly even when a fused-tail operand is
-    # graph-ordered before the anchor (mirrors build_gemm).
     src = lambda n: n.meta.get("source_node", n)
     node_to_spec = {
         src(anchor.args[0]): (inp, in_spec),
@@ -1357,6 +1329,7 @@ def build_conv2d(
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
     fused_idx = [order[s] for s in info.in_sources] if info is not None else []
+    fused_gm = info.fused_gm if info is not None else None
 
     def _conv(in_tile, w_tile, bias, kw):
         return target(
@@ -1392,15 +1365,15 @@ def build_conv2d(
     def compute(*in_tiles):
         # num_k == 1 map: conv in one step, then the fused tail (if any).
         result = conv2d_kernel(in_tiles, True)
-        if info is not None:
-            return info.fused_gm(result, *[in_tiles[i] for i in fused_idx])
+        if fused_gm is not None:
+            return fused_gm(result, *[in_tiles[i] for i in fused_idx])
         return result
 
     acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
     if num_k == 1:
         scratch_specs = []
         kernel = _map_kernel(compute, len(out_specs))
-    elif info is None and acc_dtype == out.dtype:
+    elif fused_gm is None and acc_dtype == out.dtype:
         scratch_specs = []
         kernel = _reduction_inplace_kernel(conv2d_kernel, reduction_dim=4)
     else:
@@ -1415,7 +1388,7 @@ def build_conv2d(
             last_idx=num_k - 1,
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
-            fused_gm=info.fused_gm if info is not None else None,
+            fused_gm=fused_gm,
             fused_operand_indices=fused_idx,
         )
     gm = build_pipelined_buffers(
@@ -1501,19 +1474,11 @@ def build_gemm(
     (``act_idx`` / ``kw_idx`` / ``fused_idx``), not a positional ``*extra``
     split.
     """
-    info = (
-        parse_fused_submodule(node, tiler) if node.op == "call_module" else None
-    )
-    if node.op == "call_module" and info is None:
-        return None
-
+    info = parse_fused_submodule(node, tiler)
     tiling = info.tiling if info is not None else get_tiling(node, tiler)
     if info is None and tiling is None and not is_bmm(node):
         return None
-
     anchor = info.anchor_node if info is not None else node
-    if not (is_linear(anchor) or is_matmul(anchor)):
-        return None
 
     # The weight's fused relayouts (attention's ``Kᵀ``, GQA's head repeat) are
     # folded into how its tile is addressed rather than emitted; the spec itself
@@ -1556,11 +1521,6 @@ def build_gemm(
         K // tk,
     )
 
-    # Weight storage layout: C-major ``(K, N)`` iff ``ck``, else K-major
-    # ``(N, K)``.  matmul's weight is naturally C-major and linear's K-major;
-    # ``meta["transposed"]`` flips it (``ck = is_matmul XOR transposed``).
-    # ``_proj`` orders an (N, K) pair into that layout; weight and scale share
-    # it.
     ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))
     _proj = lambda n, k: (k, n) if ck else (n, k)
 
@@ -1612,10 +1572,6 @@ def build_gemm(
             for shape, tile, dtype, imap in info.output_specs
         ]
 
-    # Every kernel input maps to one entry of ``node.all_input_nodes`` via the
-    # anchor placeholder's ``source_node``.  Collect ``outer_node -> (value,
-    # spec)``, materialize ``inputs`` / ``in_specs`` in ``all_input_nodes``
-    # order, and record each role's canonical tile index for ``compute``.
     src = lambda n: n.meta.get("source_node", n)
     node_to_spec = {
         src(anchor.args[0]): (act, act_spec),
@@ -1714,6 +1670,7 @@ def build_gemm(
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
     fused_idx = [order[s] for s in info.in_sources] if info is not None else []
+    fused_gm = info.fused_gm if info is not None else None
 
     # The kernel body is traced, and dynamo refuses to look inside an FX node
     # there — so read the dequantize's call apart here: its scalar args as plain
@@ -1758,15 +1715,15 @@ def build_gemm(
     def compute(*in_tiles):
         # num_k == 1 map: GEMM in one step, then the fused tail (if any).
         result = gemm_kernel(in_tiles, True)
-        if info is not None:
-            return info.fused_gm(result, *[in_tiles[i] for i in fused_idx])
+        if fused_gm is not None:
+            return fused_gm(result, *[in_tiles[i] for i in fused_idx])
         return result
 
     acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
     if num_k == 1:
         scratch_specs = []
         kernel = _map_kernel(compute, len(out_specs))
-    elif info is None and acc_dtype == out.dtype:
+    elif fused_gm is None and acc_dtype == out.dtype:
         scratch_specs = []
         kernel = _reduction_inplace_kernel(gemm_kernel, reduction_dim=gk)
     else:
@@ -1779,7 +1736,7 @@ def build_gemm(
             last_idx=num_k - 1,
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
-            fused_gm=info.fused_gm if info is not None else None,
+            fused_gm=fused_gm,
             fused_operand_indices=fused_idx,
         )
     gm = build_pipelined_buffers(
@@ -1791,9 +1748,6 @@ def build_gemm(
         scratch_specs=scratch_specs,
         num_banks=num_banks,
     )
-    # A weight dequantize is compute the GEMM's kernel has to own: an op left
-    # standing alone is given a store of its own, and this one only decodes a
-    # tile the GEMM is about to read.
     if num_k > 1 or info is not None or dequant is not None:
         _fuse_tail_in_body(
             gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
@@ -1835,10 +1789,6 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     writes each output tile once (no cross-tile reduction).  Returns the gm, or
     ``None``.
     """
-    # Tiling comes from the anchor's ``l2_tiling`` — per-output-dim tile counts
-    # set by the vector L2 tiling pass.  A non-fused op with no ``l2_tiling`` is
-    # bufferized whole-tensor elsewhere; a fused untiled submodule falls back to
-    # whole tensor (trip-1) below.
     anchor = get_anchor_node(node)
     tiling = anchor.meta.get("l2_tiling") if anchor is not None else None
     if node.op != "call_module" and tiling is None:
@@ -1967,10 +1917,6 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
 
-    # Tiling comes from the anchor's ``l2_tiling`` — logical ``(n_N, n_H, n_W,
-    # n_C)`` tile factors set by the pool L2 tiling pass.  A non-fused op with
-    # no ``l2_tiling`` is bufferized whole-tensor elsewhere; a fused untiled
-    # submodule falls back to whole tensor (trip-1) below.
     tiling = anchor.meta.get("l2_tiling")
     if node.op != "call_module" and tiling is None:
         return None
@@ -1983,9 +1929,6 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     output_shape = tuple(outputs[-1].shape)
 
     in_dims = _NHWC if anchor.meta.get("transposed", False) else None
-    # ``_unproject`` gives the logical ``(N, C, H, W)`` output; tile sizes are
-    # ``dim // factor``.  ``l2_tiling`` is logical ``(n_N, n_H, n_W, n_C)``
-    # (``None`` => untiled).
     N, C, H, W = _unproject(output_shape, in_dims)
     if tiling is None:
         nN, nH, nW, nC = 1, 1, 1, 1
