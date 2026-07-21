@@ -25,7 +25,7 @@ task_to_keys = {
 }
 
 def retrieve_dataset(model, tokenizer, args):
-    raw_datasets = load_dataset("glue", args.task_name)
+    raw_datasets = load_dataset("nyu-mll/glue", args.task_name)
 
     sentence1_key, sentence2_key = task_to_keys[args.task_name]
 
