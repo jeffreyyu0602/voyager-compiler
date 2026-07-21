@@ -55,6 +55,7 @@ _VOYAGER_ASYNC = (
 )  # guarded DRAM<->Scratchpad DMA
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
+_COMMIT = torch.ops.higher_order.commit
 
 
 def _produces_tensor(node: Node) -> bool:
@@ -72,6 +73,7 @@ def _produces_tensor(node: Node) -> bool:
 
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
 _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
+_VOYAGER_FILL = torch.ops.voyager.fill.default
 _SUBVIEW = torch.ops.voyager.subview.default
 
 
@@ -270,9 +272,9 @@ def _annotate_and_validate(
             node.meta["space"] = (
                 "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
             )
-        elif node.target is _VOYAGER_ZEROS:
-            # A DMA semaphore bank, not a tensor buffer: no space (and so not
-            # the DRAM default below either).
+        elif node.target in (_VOYAGER_ZEROS, _VOYAGER_FILL):
+            # A semaphore bank (``zeros`` = 0, ``fill`` = a seed credit), not a
+            # tensor buffer: no space (and so not the DRAM default below either).
             pass
         elif node.target is _WHILE_LOOP:
             operands = list(node.args[2])
@@ -282,6 +284,10 @@ def _annotate_and_validate(
         elif node.target is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
             _walk_region(gm, node, operands, node.args[1:3], codebooks, ctx)
+        elif node.target is _COMMIT:
+            _walk_region(
+                gm, node, list(node.args[1:]), (node.args[0],), codebooks, ctx
+            )
         elif _is_compute(node):
             _validate_compute(node, codebooks, ctx)
         elif node.target is _VOYAGER_INSERT:
@@ -440,6 +446,8 @@ def propagate_logical_dtypes(
         elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
             _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
+        elif t is _COMMIT:
+            _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
         elif rules.get(t) is not None:
             # A compute op: its output dtype comes from the original graph's rule.
             _set_dtype(node, rules[t])
@@ -660,6 +668,9 @@ def rename_nest_nodes(model: GraphModule) -> None:
             for branch in (n.args[1], n.args[2]):
                 if (br := _subgraph(gm, branch.target)) is not None:
                     rename_graph(br, scope, anchor_target)
+        elif n.op == "call_function" and n.target is _COMMIT:
+            if (body := _subgraph(gm, n.args[0].target)) is not None:
+                rename_graph(body, scope, anchor_target)
 
     def rename_graph(
         gm: GraphModule, scope: str, anchor_target, keep: Optional[set] = None
@@ -886,9 +897,58 @@ def bufferize_graph(
 
     graph.lint()
     model.recompile()
+    _dedup_regions(model)
     annotate_tensor_spaces(model)
     rename_nest_nodes(model)
     return model
+
+
+# Never CSE these: an ``alloc`` / ``zeros`` / ``fill`` is a *distinct*
+# allocation even when byte-identical (a separate buffer / semaphore bank), and
+# the side-effecting ops / HOP regions carry effects a merge would drop.
+_DEDUP_SKIP = frozenset(
+    {
+        _VOYAGER_ALLOC,
+        _VOYAGER_ZEROS,
+        _VOYAGER_FILL,
+        _VOYAGER_INSERT,
+        _VOYAGER_ASYNC,
+        torch.ops.voyager.async_wait.default,
+        _WHILE_LOOP,
+        _COND,
+        _COMMIT,
+    }
+)
+
+
+def _dedup_regions(gm: GraphModule) -> None:
+    """CSE identical *pure* nodes in ``gm`` and every nested region (while_loop
+    / cond / commit bodies, fused submodules), skipping ``_DEDUP_SKIP``.  A
+    D==0 prefetch loads into the same slot the read consumes, so the fetch and
+    read ``subview``s (bank + semaphore) are identical -- this folds them, and
+    any other repeated index math, to one node per region."""
+    seen, merged = {}, set()
+    for node in list(gm.graph.nodes):
+        if node.op != "call_function" or node.target in _DEDUP_SKIP:
+            continue
+        key = (node.target, tuple(node.args), frozenset(node.kwargs.items()))
+        orig = seen.get(key)
+        if orig is None:
+            seen[key] = node
+            continue
+        node.replace_all_uses_with(orig)
+        gm.graph.erase_node(node)
+        merged.add(orig)
+    named = dict(gm.named_modules())
+    for node in merged:
+        update_submod_user_meta(gm, node, named)
+    gm.graph.lint()
+    gm.recompile()
+    for node in list(gm.graph.nodes):
+        if node.op in ("get_attr", "call_module"):
+            sub = _subgraph(gm, node.target)
+            if sub is not None:
+                _dedup_regions(sub)
 
 
 _MULTI_OUTPUT_POINTWISE = {

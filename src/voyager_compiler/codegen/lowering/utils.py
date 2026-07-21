@@ -12,7 +12,7 @@ per-dimension tile-grid extents (consumed by the loop-aware code generator).
 import contextlib
 import operator
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch.fx import GraphModule, Node
@@ -27,6 +27,32 @@ from voyager_compiler.codegen.mapping_utils import (
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
+_COMMIT = torch.ops.higher_order.commit
+
+
+def effect_cond(
+    pred: torch.Tensor | torch.SymBool | bool,
+    action: Callable[[], None],
+) -> None:
+    """Run the side-effecting ``action()`` when ``pred`` holds, else nothing —
+    a ``torch.cond`` guard whose two branches return the *same* constant.
+
+    Returning different ints from the branches (the ``do`` returns 1 / ``skip``
+    returns 0 idiom) makes ``torch.cond`` mint an unbacked symint for the
+    discarded result; inside a ``()``-returning ``voyager.commit`` that dangling
+    symbol trips export's ``PendingUnbackedSymbolNotFound``.  Matched constants
+    mint none.  ``action``'s own return is ignored; ``has_side_effect(cond)``
+    keeps the guard.
+    """
+
+    def true_branch():
+        action()
+        return 0
+
+    def false_branch():
+        return 0
+
+    torch.cond(pred, true_branch, false_branch)
 
 
 def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
@@ -89,6 +115,8 @@ def _collect_codebook_nodes(gm: GraphModule) -> set:
                 operands = list(n.args[3]) if len(n.args) > 3 else []
                 _thread(operands, _subgraph(gm, n.args[1].target))
                 _thread(operands, _subgraph(gm, n.args[2].target))
+            elif n.target is _COMMIT:
+                _thread(list(n.args[1:]), _subgraph(gm, n.args[0].target))
         elif n.op == "call_module":
             _thread(list(n.args), _subgraph(gm, n.target))
 
@@ -476,6 +504,10 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
             anchor_cond = n
             break
     if anchor_cond is None:
+        # No accumulate cond: the async flatten runs the last-round accumulate
+        # and the tail bare in the finalize commit body (the outer round cond
+        # gates them), so there is no finalize cond to key off.
+        _fuse_flattened_finalize(gm, target)
         return
 
     # 1a. Fuse each branch of the reduction cond ``torch.cond(coord == 0, init,
@@ -535,6 +567,48 @@ def _fuse_tail_only(gm: torch.fx.GraphModule, target) -> None:
     _create_and_insert_subgraph(ops, branch)
     branch.graph.lint()
     branch.recompile()
+
+
+def _fuse_flattened_finalize(gm: torch.fx.GraphModule, target) -> None:
+    """num_k > 1 async flatten: the finalize commit body runs the last-round
+    accumulate and the tail bare, one behind the other, joined only through the
+    scratch buffer (a store, not an SSA edge).  So it holds two disjoint compute
+    cones — fuse each into its own ``call_module``:
+
+      1. **accumulate** — the anchor + its ``+ scratch`` add, ending at the
+         scratch ``insert``.  Grown from the anchor (``_fuse_tail_in_body``);
+         the scratch store disconnects it from the tail, so growth stops there.
+      2. **tail** — the ``fused_gm`` compute the completed accumulator feeds,
+         ending at the output ``insert``.  Whatever compute is left once the
+         accumulate cone is a ``call_module`` (a multi-output op keeps its
+         ``getitem`` users outside).
+    """
+    from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
+
+    anchors = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function" and n.target is target
+    ]
+    if len(anchors) != 1:
+        return  # no bare anchor: not a flattened finalize body
+
+    _fuse_tail_in_body(gm, target, fuse_anchor_with_tail=True)
+
+    insert = voyager.insert.default
+    tail = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target is not operator.getitem
+        and n.target is not insert
+        and not is_nop(n)
+    ]
+    if len(tail) < 2:
+        return  # a lone tail op stores through its own insert — nothing to fuse
+    _create_and_insert_subgraph(tail, gm)
+    gm.graph.lint()
+    gm.recompile()
 
 
 def _strip_assert_scalars(gm: torch.fx.GraphModule) -> None:

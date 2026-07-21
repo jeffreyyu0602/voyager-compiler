@@ -9,13 +9,18 @@ lowering pass and consumed by the loop-aware code generator.
 Primitives
 ----------
 ``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
-``voyager.zeros(size, dtype)``       zero-initialised tile / bank (accumulator, semaphore).
+``voyager.zeros(size, dtype)``       zero-initialised bank (accumulator, semaphore).
+``voyager.fill(size, dtype, v)``     value-initialised bank (seed a semaphore credit).
 ``voyager.subview(src, o, s, st)``   strided window onto a buffer (a bank slot).
 ``voyager.insert(src, dst, sem)``    destination-passing compute-result write.
 ``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
 ``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
 ``voyager.delinearize_index(...)``   linear loop counter -> multi-dim index.
+``commit(subgraph, operands, ...)``  async compute region (a higher-order op):
+                                     wait on every semaphore in ``deps``, run
+                                     ``subgraph(*operands)``, then signal
+                                     ``post``.
 """
 
 from contextlib import contextmanager
@@ -23,6 +28,10 @@ from enum import IntEnum
 from typing import Optional, Tuple
 
 import torch
+from torch._higher_order_ops.base_hop import (
+    BaseHOP,
+    FunctionWithNoFreeVars,
+)
 from torch.library import Library, impl
 
 # "DEF" creates/owns the namespace.  Keep a module-level handle alive.
@@ -126,6 +135,38 @@ def _zeros_fake(
 
 
 # ---------------------------------------------------------------------------
+# voyager.fill — like ``zeros`` but with a constant value: a storage-declaring
+# primitive (an owned buffer), used to seed a counting semaphore with an
+# initial credit (an output store-sem starts at 1 so its slot's first use has
+# a token to consume, sparing a warm-up guard).
+# ---------------------------------------------------------------------------
+voyager_lib.define(
+    "fill(SymInt[] size, ScalarType dtype, Scalar value, int banks=0) "
+    "-> Tensor"
+)
+
+
+@impl(voyager_lib, "fill", "CompositeExplicitAutograd")
+def fill(
+    size: Tuple[int, ...],
+    dtype: torch.dtype,
+    value,
+    banks: int = UNBANKED,
+) -> torch.Tensor:
+    return torch.full(_banked_size(size, banks), value, dtype=dtype)
+
+
+@torch.library.register_fake("voyager::fill")
+def _fill_fake(
+    size: Tuple[int, ...],
+    dtype: torch.dtype,
+    value,
+    banks: int = UNBANKED,
+) -> torch.Tensor:
+    return torch.full(_banked_size(size, banks), value, dtype=dtype)
+
+
+# ---------------------------------------------------------------------------
 # voyager.subview — a strided window onto a buffer, after MLIR's memref.subview:
 # ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim.
 # ``squeeze_dim`` names the windowed dims to drop from the result (each of size
@@ -205,11 +246,17 @@ def _insert_fake(
 # increments it (post / V), ``async_wait`` asserts ``> 0`` and decrements it
 # (wait / P) — so a *correct* pipeline keeps every wait matched by a prior copy
 # into the same slot (a stray wait trips the assert).
+#
+# ``post_count`` (default 1) is how much the transfer signals: a tile loaded
+# once but consumed by ``R`` per-step ``commit``s posts ``+R``, so a reused
+# input balances a per-step consume against a once-per-block load without being
+# re-fetched (see ``AsyncPipelinedKernel``).
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
     "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? strides=None, "
-    "bool transposed=False, SymInt[]? pad=None, float? pad_value=None) -> ()"
+    "bool transposed=False, SymInt[]? pad=None, float? pad_value=None, "
+    "SymInt post_count=1) -> ()"
 )
 
 
@@ -225,6 +272,7 @@ def async_copy(
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
+    post_count: int = 1,
 ) -> None:
     if strides is None:
         strides = sizes
@@ -266,8 +314,9 @@ def async_copy(
             dst.copy_(region.mT if transposed else region)
         else:
             dst[sl] = src.mT if transposed else src
-    # Emulate a counting semaphore: the completed transfer signals its slot.
-    semaphore.add_(1)
+    # Emulate a counting semaphore: the completed transfer signals its slot,
+    # ``post_count`` times (a reused tile posts once per consumer).
+    semaphore.add_(post_count)
 
 
 @torch.library.register_fake("voyager::async_copy")
@@ -282,6 +331,7 @@ def _async_copy_fake(
     transposed: bool = False,
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
+    post_count: int = 1,
 ) -> None:
     return None
 
@@ -311,18 +361,24 @@ def oracle_disabled():
         _oracle_enabled = prev
 
 
+def _consume_semaphore(semaphore: torch.Tensor) -> None:
+    """Wait on (decrement) a counting semaphore, honoring the oracle.
+
+    Shared by ``async_wait`` and every ``commit`` dependency: assert a prior
+    signal is pending, then consume one.  A no-op when the oracle is disabled
+    (codegen ShapeProp runs a single loop body in isolation, where a wait may
+    legitimately precede its matching signal — see ``oracle_disabled``)."""
+    if not _oracle_enabled:
+        return
+    assert semaphore.item() > 0, "wait on a semaphore with no pending signal"
+    semaphore.sub_(1)
+
+
 @impl(voyager_lib, "async_wait", "CompositeExplicitAutograd")
 def async_wait(semaphore: torch.Tensor) -> None:
-    # Emulate a counting semaphore: block until signaled, then consume.  The
-    # transfer is synchronous (already done), so this only checks the invariant
-    # that a matching ``async_copy`` ran first.  Skipped when the oracle is
-    # disabled (codegen ShapeProp — see ``oracle_disabled``).
-    if not _oracle_enabled:
-        return None
-    assert (
-        semaphore.item() > 0
-    ), "async_wait on a semaphore with no pending async_copy"
-    semaphore.sub_(1)
+    # A synchronous transfer (already done): this only checks the invariant
+    # that a matching ``async_copy`` signalled first, then consumes it.
+    _consume_semaphore(semaphore)
     return None
 
 
@@ -407,3 +463,71 @@ def _delinearize_index_fake(
     linear: int, basis: Tuple[int, ...]
 ) -> Tuple[int, ...]:
     return _delinearize(linear, basis)
+
+
+# ---------------------------------------------------------------------------
+# voyager.commit — an async committed compute region (a higher-order op).
+#
+# Unlike the primitives above, ``commit`` takes a *subgraph* (a traceable
+# callable / ``GraphModule``), so it is a ``HigherOrderOperator`` (via
+# ``BaseHOP``), not a schema-based ``torch.library`` op — exactly like
+# ``torch.cond`` / ``torch.while_loop``.  It survives tracing as one
+# ``call_function`` node whose first argument is the traced ``GraphModule`` it
+# calls; it therefore lives in the ``higher_order`` namespace
+# (``torch.ops.higher_order.commit``), not the ``voyager`` one.
+#
+# Semantics wrap ``subgraph(*operands)`` with the counting-semaphore model of
+# the async DMA pair: before running it *waits on* (decrements) every
+# semaphore in ``dependencies`` — the region may not start until each producer
+# it depends on has signalled — and after running it *signals* (increments)
+# ``post``, unblocking downstream waiters.  Each holds int64 semaphore tensors
+# (from ``voyager.zeros``), mutated in place.  The waits honor the
+# ``async_wait`` oracle, so codegen ShapeProp can disable it.
+#
+# Public entry is the ``commit(subgraph, operands, dependencies, post)``
+# wrapper below: ``operands`` is an explicit list (like ``torch.cond`` /
+# ``while_loop``), so ``dependencies`` / ``post`` may be passed positionally.
+# The HOP's own ``__call__`` must stay variadic — HOP dispatch re-enters it
+# with the operands already flattened, so a list parameter there would break
+# re-dispatch — hence the wrapper splats the list into it.
+# ---------------------------------------------------------------------------
+class AsyncOp(BaseHOP):
+    def __init__(self) -> None:
+        super().__init__("commit")
+
+    def __call__(self, subgraph, *operands, dependencies=(), post=None):
+        if not isinstance(
+            subgraph, (torch.fx.GraphModule, FunctionWithNoFreeVars)
+        ):
+            subgraph = FunctionWithNoFreeVars(subgraph)
+        return super().__call__(
+            subgraph, *operands, dependencies=dependencies, post=post
+        )
+
+    def _call_CompositeExplicitAutograd(
+        self, subgraph, *operands, dependencies=(), post=None
+    ):
+        # Eager / ShapeProp execution: wait on every dependency, run the
+        # region, then signal completion.  Tracing (Fake / Proxy modes) runs
+        # the subgraph for shapes only and leaves the semaphores untouched —
+        # BaseHOP's mode impls ignore these kwargs.
+        for semaphore in dependencies:
+            _consume_semaphore(semaphore)
+        out = subgraph(*operands)
+        if post is not None:
+            post.add_(1)
+        return out
+
+
+commit_hop = AsyncOp()
+
+
+def commit(subgraph, operands, dependencies=(), post=None):
+    """Run ``subgraph(*operands)`` as an async committed compute region.
+
+    Waits on (decrements) every semaphore in ``dependencies`` before running,
+    then signals (increments) ``post`` on completion.  ``operands`` is an
+    explicit list (cond/while_loop style); it is splatted into the underlying
+    ``commit_hop`` HOP, which survives tracing as a single ``call_function``
+    node over the traced subgraph ``GraphModule``."""
+    return commit_hop(subgraph, *operands, dependencies=dependencies, post=post)

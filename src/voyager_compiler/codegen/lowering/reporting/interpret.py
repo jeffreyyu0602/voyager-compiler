@@ -26,7 +26,7 @@ from torch.fx import GraphModule, Node
 from ...mapping_utils import is_compute_op, is_nop
 from ...passes.utils import get_arg_value
 from ..bufferization import _produces_tensor, _viewed_buffer
-from ..codegen import COND, WHILE_LOOP, _loop_extents, _norm_extent
+from ..codegen import COMMIT, COND, WHILE_LOOP, _loop_extents, _norm_extent
 from .cost import _shape, _val, tile_bytes
 from .model import CostParams, ScheduleResult
 from .scheduler import ResourceState
@@ -37,6 +37,7 @@ _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
 _INSERT = torch.ops.voyager.insert.default
+_FILL = torch.ops.voyager.fill.default
 
 
 def _feeds_sem_insert(node: Node) -> bool:
@@ -340,10 +341,13 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             env[node] = _run_loop(node, gm, env, ctx, path)
         elif t is COND:
             env[node] = _run_cond(node, gm, env, ctx, path)
+        elif t is COMMIT:
+            env[node] = _run_commit(node, gm, env, ctx, path)
         elif t is _ASYNC_COPY:
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
             key = _sem_key(node.args[4], env, ctx.bind)
+            post_count = _resolve(get_arg_value(node, 10, "post_count", 1), env)
             ctx.rs.async_copy(
                 node,
                 n_bytes,
@@ -351,7 +355,15 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
                 key,
                 path,
                 _buf_category(buf, ctx.bind),
+                post_count=post_count,
             )
+        elif t is _FILL:
+            # A credit-seeded output store-sem: seed each bank slot's FIFO so
+            # the first commit that waits the slot free draws the credit.
+            value = int(get_arg_value(node, 2, "value", 0) or 0)
+            banks = int(get_arg_value(node, 3, "banks", 1) or 1)
+            for slot in range(banks):
+                ctx.rs.seed_semaphore((id(node), slot), value)
         elif t is _ASYNC_WAIT:
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif t is _INSERT:
@@ -416,6 +428,33 @@ def _run_cond(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
     return _walk(branch_gm, env, ctx, path)
 
 
+def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
+    """A committed (async) region: it is parked until every semaphore in
+    ``dependencies`` is posted, then its body walks off the program clock (its
+    compute occupies the datapath without advancing the program clock) and
+    ``post`` is signalled with the last body op's completion.  See
+    ``ResourceState.register_commit``.  The dep / done-sem slots are resolved
+    now (their indices were computed before the commit); the body walk is
+    deferred into ``run``."""
+    sub = getattr(gm, str(node.args[0].target))
+    deps = [
+        _sem_key(d, env, ctx.bind)
+        for d in node.kwargs.get("dependencies") or ()
+    ]
+    post = node.kwargs.get("post")
+    done_key = _sem_key(post, env, ctx.bind) if post is not None else None
+    result = {}
+
+    def run():
+        _bind(_placeholders(sub), list(node.args[1:]), env, ctx)
+        result["out"] = _walk(sub, env, ctx, path)
+        if done_key is not None:
+            ctx.rs.post_semaphore(done_key, ctx.rs.last_commit_node or node)
+
+    ctx.rs.register_commit(deps, run)
+    return result.get("out")
+
+
 def estimate_schedule(
     model: GraphModule,
     dram_bandwidth: float,
@@ -440,6 +479,7 @@ def estimate_schedule(
     rs = ResourceState(cost)
     ctx = _Ctx(rs=rs, cost=cost, bind={})
     _walk(model, {}, ctx, ())
+    rs.assert_commits_drained("<graph end>")
 
     return ScheduleResult(
         records=rs.records,

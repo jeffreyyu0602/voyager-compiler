@@ -15,6 +15,12 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 
 
+def _commit_op():
+    """The ``voyager`` ``commit`` HOP, resolved lazily — it is registered by
+    ``ops.py``, which imports after this low-level module."""
+    return getattr(torch.ops.higher_order, "commit", None)
+
+
 class ShapeProp:
     """Execute a ``GraphModule`` node-by-node with the given args, recording
     each node's output ``.value`` (shape / dtype) via ``set_node_value``.
@@ -93,6 +99,13 @@ class ShapeProp:
                 taken = self._subprop(true_g.target, ins)
                 other = self._subprop(false_g.target, ins)
                 result = taken if load_arg(pred) else other
+            elif self._recurse and node.target is _commit_op():
+                # ``commit(subgraph, *operands, ...)``: stamp the region (and run
+                # its kernel, mutating the destination buffer) with the operand
+                # values.  The dependency / post semaphores are side effects the
+                # oracle-disabled ShapeProp ignores.
+                sub_g, *operands = node.args
+                result = self._subprop(sub_g.target, load_arg(list(operands)))
             elif node.op == "call_function":
                 result = node.target(
                     *load_arg(node.args), **load_arg(node.kwargs)

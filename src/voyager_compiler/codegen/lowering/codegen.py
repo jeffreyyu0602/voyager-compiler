@@ -24,9 +24,7 @@ non-bufferized path).  Three ideas carry the whole translation:
     dropped, and ``dst`` becomes the *producing* op's ``Output.destination`` —
     for a ``torch.cond``, on the producer inside *each* branch.  An ``insert``
     whose source is another buffer is a genuine move, and is emitted as a
-    ``clone`` into that destination.  A semaphore it carried folds onto the
-    producer as ``Operation.semaphore``: what that operation signals when it
-    completes.  A DMA's post lives there too, so the backend has one rule.
+    ``clone`` into that destination.
   * **Control logic is emitted**, tagged ``op: "cpu"``: index arithmetic,
     predicates and ``delinearize_index`` run on the control processor rather
     than the accelerator datapath, but they are real work the backend schedules.
@@ -80,15 +78,17 @@ from .utils import _collect_codebook_nodes, _passed_whole
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
+COMMIT = torch.ops.higher_order.commit
 _INSERT = torch.ops.voyager.insert.default
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
+_FILL = torch.ops.voyager.fill.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _ASYNC_COPY = torch.ops.voyager.async_copy.default
 
 # The ops that *declare* storage; every other tensor node refers to storage one
 # of these owns.
-_ALLOCATORS = (_ALLOC, _ZEROS)
+_ALLOCATORS = (_ALLOC, _ZEROS, _FILL)
 
 # Operand names for the Python builtins the loop control uses (``operator.eq`` /
 # ``and_`` / ``add`` ...), which carry no ATen schema to normalize against.
@@ -297,10 +297,6 @@ class _Emitter:
         self.boxes: Dict[str, Node] = {}
         # Destination-passing: producer -> {output index: destination}.
         self.dest: Dict[Node, Dict[Optional[int], TensorBoxRef]] = {}
-        # The semaphore an asynchronous op posts when it completes: a DMA, or a
-        # producer whose store carried one.  Read back at the *operation* level,
-        # so a fused group signals when the whole group retires.
-        self.sem: Dict[Node, TensorBoxRef] = {}
 
     # --- references ------------------------------------------------------
 
@@ -457,13 +453,11 @@ class _Emitter:
                         self.bind(
                             branch, self._child_env(branch, operands, env)
                         )
+                elif node.target is COMMIT:
+                    sub = named[str(node.args[0].target)]
+                    self.bind(sub, self._child_env(sub, node.args[1:], env))
                 elif node.target is _INSERT:
                     self._bind_insert(node, gm, env)
-                elif node.target is _ASYNC_COPY:
-                    # A DMA posts on completion, exactly like a producer whose
-                    # store carried a semaphore -- one rule for the backend.
-                    sem = get_arg_value(node, 4, "semaphore")
-                    self.sem[node] = self._ref(sem, env)
 
     def _child_env(self, sub: GraphModule, operands, env) -> Dict[Node, object]:
         """Bind a region's placeholders to the operands passed into it, so a
@@ -504,7 +498,6 @@ class _Emitter:
         the value, and where it lands."""
         src, dst = node.args[0], node.args[1]
         destination = self._ref(dst, env)
-        semaphore = get_arg_value(node, 2, "semaphore")
 
         producers = self._producers(src, gm, env)
         if producers is None:
@@ -521,14 +514,6 @@ class _Emitter:
 
         for producer, index in producers:
             self.dest.setdefault(producer, {})[index] = destination
-            if semaphore is None:
-                continue
-            ref = self._ref(semaphore, env)
-            if self.sem.setdefault(producer, ref) != ref:
-                raise ValueError(
-                    f"'{producer.name}' posts two different semaphores: an "
-                    f"operation signals once, when it completes"
-                )
 
     def _producers(self, node, gm, env, index=None):
         """The op(s) whose result this store writes, as ``[(node, index)]`` — or
@@ -668,15 +653,6 @@ class _Emitter:
             out.name = node.name if index is None else f"{node.name}_{index}"
             out.destination.CopyFrom(destination)
 
-    def _set_semaphore(self, op: Operation, node) -> None:
-        """The semaphore this operation signals when it completes: a DMA's own,
-        or the one its ``insert`` carried (with the store gone, the op that
-        produced the value is what runs asynchronously).  It hangs on the
-        *operation*, so a fused group signals when the whole group retires --
-        there is no op inside it that the signal belongs to."""
-        if (semaphore := self.sem.get(node)) is not None:
-            op.semaphore.CopyFrom(semaphore)
-
     def _tensor_box(self, node) -> TensorBox:
         """Declare ``node``'s storage.  A banked buffer records its depth and
         pitch instead of a leading bank *dimension*, so ``shape`` stays the
@@ -698,10 +674,11 @@ class _Emitter:
         return box
 
     def _memory_level(self, node):
-        """A semaphore (``voyager.zeros``) names no memory — bufferization gives
-        it no space — because it is a counter the accelerator maps itself, so it
-        is declared at register level with no address."""
-        if node.op == "call_function" and node.target is _ZEROS:
+        """A semaphore (``voyager.zeros`` / a credit-seeded ``voyager.fill``)
+        names no memory — bufferization gives it no space — because it is a
+        counter the accelerator maps itself, so it is declared at register level
+        with no address."""
+        if node.op == "call_function" and node.target in (_ZEROS, _FILL):
             return MEMORY_LEVEL_REGISTER
         if node.meta.get("space") == "Scratchpad":
             return MEMORY_LEVEL_SCRATCHPAD
@@ -747,6 +724,9 @@ class _Emitter:
         if node.target is COND:
             ops.append(self._cond(node, named, env))
             return
+        if node.target is COMMIT:
+            ops.append(self._async(node, named, env))
+            return
         if node.target is _INSERT:
             return  # a destination-passing store is not an instruction
         if (
@@ -762,7 +742,6 @@ class _Emitter:
         op = Operation(name=node.name)
         op.prim.CopyFrom(self._call(node, env))
         self._set_outputs(op, node, env)
-        self._set_semaphore(op, node)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
         ops.append(op)
@@ -789,7 +768,6 @@ class _Emitter:
         for inner in chain:
             op.fused.op_list.append(self._call(inner, sub_env, internal))
         self._set_outputs(op, node, env)
-        self._set_semaphore(op, node)
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
         return op
@@ -873,6 +851,22 @@ class _Emitter:
             out.scalar = _scalar_type(_value(_outputs_of(branches[0][0])[i]))
         return op
 
+    def _async(self, node, named, env) -> Operation:
+        """A ``commit`` region: dispatched asynchronously — it waits every
+        semaphore in ``dependencies``, runs its body, then signals ``post`` on
+        retirement.  Emitted as an ``AsyncOp`` wrapping the body region (whose
+        ops keep destination-passing, exactly like a top-level op) plus the
+        dependency / post semaphore references."""
+        sub = named[str(node.args[0].target)]
+        op = Operation(name=node.name)
+        async_op = getattr(op, "async")  # ``async`` is a Python keyword
+        self.emit_region(sub, async_op.body.ops)
+        for dep in node.kwargs.get("dependencies") or ():
+            async_op.dependencies.add().CopyFrom(self._ref(dep, env))
+        if (post := node.kwargs.get("post")) is not None:
+            async_op.post.CopyFrom(self._ref(post, env))
+        return op
+
     def _yielded_scalars(self, node, branch) -> List[int]:
         """The branch result slots the enclosing region actually reads *as
         scalars*.  A tensor slot is a destination (already threaded into the
@@ -946,6 +940,9 @@ def compute_op_names(model: GraphModule) -> List[str]:
                 for branch in (n.args[1], n.args[2]):
                     if (br := subgraph(branch.target)) is not None:
                         walk(br)
+            elif n.target is COMMIT:
+                if (body := subgraph(n.args[0].target)) is not None:
+                    walk(body)
             elif _is_compute(n):
                 names.append(n.name)
 
@@ -1269,6 +1266,42 @@ def _print_cond(
     lines.append(f"{pad}}}")
 
 
+def _print_commit(
+    node, gm, named, lines: List[str], indent: int, pad: str
+) -> None:
+    """Print a ``voyager.commit`` in region form — the committed body descended
+    into like a ``cond`` branch, its operands bound to the body placeholders and
+    the ``dependencies`` / ``post`` semaphores shown on the header:
+
+        commit = commit deps=[..] post=.. (b_arg0 = src0, ...) {
+          <body>
+          return <results>
+        }
+    """
+    subgraph, operands = node.args[0], list(node.args[1:])
+    mod = named.get(str(subgraph.target)) or getattr(
+        gm, str(subgraph.target), None
+    )
+    phs = (
+        [n for n in mod.graph.nodes if n.op == "placeholder"]
+        if isinstance(mod, GraphModule)
+        else []
+    )
+    binds = ", ".join(
+        f"{ph.name}{_type_str(ph)} = {src}" for ph, src in zip(phs, operands)
+    )
+    tags = f"deps={_fmt_arg(node.kwargs.get('dependencies', ()))}"
+    post = node.kwargs.get("post", None)
+    if post is not None:
+        tags += f" post={_fmt_arg(post)}"
+    lines.append(
+        f"{pad}{node.name}{_type_str(node)} = commit {tags} ({binds}) {{"
+    )
+    if isinstance(mod, GraphModule):
+        _print_graph(mod, lines, indent + 1, skip_placeholders=True)
+    lines.append(f"{pad}}}")
+
+
 def _print_graph(
     gm: GraphModule,
     lines: List[str],
@@ -1304,6 +1337,10 @@ def _print_graph(
 
         if node.op == "call_function" and node.target is COND:
             _print_cond(node, gm, named, lines, indent, pad)
+            continue
+
+        if node.op == "call_function" and node.target is COMMIT:
+            _print_commit(node, gm, named, lines, indent, pad)
             continue
 
         if node.op == "call_module":

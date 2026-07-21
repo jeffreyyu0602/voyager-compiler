@@ -49,12 +49,13 @@ logger = logging.getLogger(__name__)
 voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
 _ZERO = voyager.zeros.default
+_FILL = voyager.fill.default
 _WHILE = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
+_COMMIT = torch.ops.higher_order.commit
 
 # Position of ``banks`` in each allocation primitive's schema:
-# ``alloc(size, dtype, space, banks)`` / ``zeros(size, dtype, banks)``.
-_BANKS_ARG = {_ALLOC: 3, _ZERO: 2}
+_BANKS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +270,10 @@ def _walk(gm: GraphModule):
                 sub = _subgraph(gm, branch.target)
                 if sub is not None:
                     yield from _walk(sub)
+        elif n.op == "call_function" and n.target is _COMMIT:
+            sub = _subgraph(gm, n.args[0].target)
+            if sub is not None:
+                yield from _walk(sub)
         elif n.op == "call_module":
             sub = _subgraph(gm, n.target)
             if sub is not None:
@@ -350,6 +355,14 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
                     for ph, o in zip(phs, operands):
                         bind(ph, o)
                     walk(sub)
+            elif n.op == "call_function" and n.target is _COMMIT:
+                sub = _subgraph(gm, n.args[0].target)
+                if sub is None:
+                    continue
+                phs = [p for p in sub.graph.nodes if p.op == "placeholder"]
+                for ph, o in zip(phs, n.args[1:]):
+                    bind(ph, o)
+                walk(sub)
             elif n.op == "call_module":
                 sub = _subgraph(gm, n.target)
                 if sub is None:

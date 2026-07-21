@@ -305,6 +305,30 @@ message CondOp {
 
 
 // -----------------------------------------------------------------------------
+// Asynchronous committed region
+// -----------------------------------------------------------------------------
+
+// A region of compute dispatched asynchronously: send its params and do not
+// wait. The region starts once every semaphore in dependencies has been
+// signaled, and signals post once, when the whole region retires. This lets a
+// systolic-array tile's ramp-up (input / weight buffer load) overlap the
+// ramp-down of the previous tile.
+//
+// The body holds one or more ops (e.g. a GEMM plus a fused tail). Its ops write
+// their destinations destination-passing, exactly as at top level; only scalar
+// values are yielded.
+//
+// It is self-contained: dependencies (waited before start) and post (signaled
+// on completion) live here, not on Operation.semaphore.
+message AsyncOp {
+  Region body = 1;
+
+  repeated TensorBoxRef dependencies = 2;
+  optional TensorBoxRef post = 3;
+}
+
+
+// -----------------------------------------------------------------------------
 // Existing accelerator tiling metadata
 // -----------------------------------------------------------------------------
 
@@ -353,18 +377,13 @@ message Operation {
     PrimOpList fused = 3;
     LoopOp loop = 4;
     CondOp cond = 5;
+    AsyncOp async = 6;
   }
 
   // Materialized destinations or scalar SSA results.
-  repeated Output outputs = 6;
+  repeated Output outputs = 7;
 
-  optional Tiling tiling = 7;
-
-  // Signaled when this operation completes, if it runs asynchronously: a DMA,
-  // or a compute op another unit waits on. A fused operation signals once, on
-  // retirement. voyager::async_wait consumes a semaphore and takes it as an
-  // operand instead.
-  optional TensorBoxRef semaphore = 8;
+  optional Tiling tiling = 8;
 }
 
 

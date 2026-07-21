@@ -30,6 +30,9 @@ has_side_effect(torch.ops.higher_order.cond)
 has_side_effect(torch.ops.voyager.insert.default)
 has_side_effect(torch.ops.voyager.async_copy.default)
 has_side_effect(torch.ops.voyager.async_wait.default)
+# ``commit`` mutates its dependency / post semaphores and its output may be
+# unused (a pure-sync commit), so DCE must not drop it.
+has_side_effect(torch.ops.higher_order.commit)
 from .bufferization import annotate_tensor_spaces, bufferize_graph  # noqa: F401
 from .codegen import (  # noqa: F401
     gen_code_bufferized,
