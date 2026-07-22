@@ -24,6 +24,7 @@ Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program order:
       rescale fused with the accumulate, o = alpha·(o + pv_buf).
 """
 
+import logging
 import math
 
 import torch
@@ -33,6 +34,8 @@ from voyager_compiler import export_model
 from voyager_compiler.codegen.lowering.attention import (
     _MASK_FILL,
     _fuse_passes,
+    fold_mask_tensor,
+    plan_gqa_fold,
 )
 from voyager_compiler.codegen.lowering.ops import (
     MemoryLevel,
@@ -53,6 +56,8 @@ from voyager_compiler.codegen.shape_prop import ShapeProp
 from voyager_compiler.codegen.passes.utils import get_arg_value
 
 _SRAM = int(MemoryLevel.SRAM)
+
+logger = logging.getLogger(__name__)
 
 
 def _unravel(flat, basis):
@@ -86,9 +91,27 @@ class _FA3Pipeline(torch.nn.Module):
         out_shape,
         out_dtype,
         acc_dtype,
+        g_head,
+        sq_orig,
+        q_fold_shape,
+        out_unfold_shape,
+        mask_broadcast,
+        mask_fold_shape,
     ):
         super().__init__()
-        self.grid = tuple(grid)  # (*batch, num_q_blocks, num_kv_blocks)
+        # GQA fold: the ``g_head`` query heads sharing a KV head are folded
+        # into the query rows (see ``build_attention_fa3``), so the pipeline
+        # runs plain MHA over the KV-head batch and K/V load once per KV head.
+        # ``forward`` reshapes q / mask in and the output back out.
+        self.g_head = g_head
+        self.sq_orig = sq_orig
+        self.q_fold_shape = tuple(q_fold_shape)
+        self.out_unfold_shape = tuple(out_unfold_shape)
+        self.mask_broadcast = mask_broadcast
+        self.mask_fold_shape = (
+            tuple(mask_fold_shape) if mask_fold_shape is not None else None
+        )
+        self.grid = tuple(grid)  # (*kv_batch, num_q_blocks, num_kv_blocks)
         self.num_steps = math.prod(grid)
         self.N = num_kv_blocks
         self.nb = len(grid) - 2
@@ -243,9 +266,24 @@ class _FA3Pipeline(torch.nn.Module):
         voyager.insert(torch.zeros_like(l), l)
         voyager.insert(torch.zeros_like(o), o)
 
+    def _fold_mask(self, mask):
+        return fold_mask_tensor(
+            mask,
+            mask_broadcast=self.mask_broadcast,
+            sq_orig=self.sq_orig,
+            g_head=self.g_head,
+            mask_fold_shape=self.mask_fold_shape,
+        )
+
     # --------------------------------------------------------------------
 
     def forward(self, q, k, v, mask=None):
+        # GQA fold: reshape q (and mask) so the shared query heads become extra
+        # query rows; the output is reshaped back at the end.
+        if self.g_head > 1:
+            q = q.reshape(self.q_fold_shape)
+            if mask is not None:
+                mask = self._fold_mask(mask)
         grid, N, nb = self.grid, self.N, self.nb
         num_steps = self.num_steps
         unit = (1,) * nb
@@ -441,6 +479,8 @@ class _FA3Pipeline(torch.nn.Module):
         voyager.insert((o / l).to(self.out_dtype), select_bank(out_bank, 0))
         self._store_out(select_bank(out_bank, 0), out, out_sem, c_last)
         voyager.async_wait(select_bank(out_sem, 0))  # drain
+        if self.g_head > 1:
+            out = out.reshape(self.out_unfold_shape)
         return out
 
 
@@ -456,9 +496,11 @@ def build_attention_fa3(
     Returns the bufferized ``GraphModule`` (prologue + rolled
     ``while_loop`` + epilogue over ``voyager.*`` primitives, see the
     module docstring), or ``None`` when uncovered (missing tiling,
-    dropout / GQA, unsupported rank).  ``tiler`` is accepted for
-    signature parity but unused — attention tiling comes from
-    ``node.meta['l2_tiling']`` (``(num_q_blocks, num_kv_blocks)``).
+    unsupported rank).  GQA is supported by folding the head group into
+    the query rows (below); ``dropout_p`` is ignored (identity at
+    inference).  ``tiler`` is accepted for signature parity but unused —
+    attention tiling comes from ``node.meta['l2_tiling']``
+    (``(num_q_blocks, num_kv_blocks)``).
     """
     if (
         node.op != "call_function"
@@ -472,8 +514,13 @@ def build_attention_fa3(
     dropout_p = get_arg_value(node, 4, "dropout_p", 0.0)
     is_causal = get_arg_value(node, 5, "is_causal", False)
     scale = node.kwargs.get("scale", None)
-    if node.kwargs.get("enable_gqa", False) or dropout_p:
-        return None  # GQA / dropout unsupported
+    if dropout_p:
+        logger.warning(
+            "%s: dropout_p=%s ignored (attention dropout is identity at "
+            "inference; lowering the dropout-free kernel)",
+            node.name,
+            dropout_p,
+        )
     if is_causal:
         raise NotImplementedError(
             "is_causal attention is not supported yet; pass an explicit "
@@ -492,26 +539,35 @@ def build_attention_fa3(
     if q.ndim < 2 or q.ndim != k.ndim or q.ndim != v.ndim:
         return None
 
-    batch = tuple(q.shape[:-2])
-    nb = len(batch)
+    nb = q.ndim - 2
     Sq, d = q.shape[-2], q.shape[-1]
     Skv = k.shape[-2]
-    tq, tkv = Sq // num_q_blocks, Skv // num_kv_blocks
     if scale is None:
         scale = 1.0 / math.sqrt(d)
 
-    grid = batch + (num_q_blocks, num_kv_blocks)
+    # GQA folds the head group into the query rows so K/V load once per KV head
+    # and reuse across the group (see ``plan_gqa_fold``); ``forward`` applies
+    # the q / mask / output reshapes.
+    mask_val = mask_node.value if isinstance(mask_node, torch.fx.Node) else None
+    plan = plan_gqa_fold(q, k, v, mask_val, out.shape, num_q_blocks)
+    if plan is None:
+        return None
+    kbatch, g_head = plan.kbatch, plan.g_head
+    tq, tkv = plan.sq_eff // num_q_blocks, Skv // num_kv_blocks
+    grid = kbatch + (num_q_blocks, num_kv_blocks)
     gq, gkv = nb, nb + 1
 
+    # Mask [*mbatch, Sq, Skv]: dynamic dims are the >1-block batch dims (a
+    # size-1 batch dim broadcasts, pinned to block 0) plus the q / kv dims when
+    # tiled.  Under the fold the mask's batch dims are the folded ones.
     mask_is_bool = False
     mask_dyn = []
     if isinstance(mask_node, torch.fx.Node):
         mask = mask_node.value
         mask_is_bool = mask.dtype == torch.bool
-        # Mask [*mbatch, Sq, Skv]: dynamic dims are the >1-block batch
-        # dims (a size-1 batch dim broadcasts, pinned to block 0) plus
-        # the q / kv dims when tiled.
         mb = tuple(mask.shape[:-2])
+        if g_head > 1:
+            mb = plan.mask_fold_shape[:-2]
         off = nb - len(mb)
         for j, sz in enumerate(mb):
             g = off + j
@@ -534,7 +590,13 @@ def build_attention_fa3(
         has_mask=mask_node is not None,
         mask_is_bool=mask_is_bool,
         mask_dyn=mask_dyn,
-        out_shape=tuple(out.shape),
+        g_head=g_head,
+        sq_orig=Sq,
+        q_fold_shape=plan.q_fold_shape,
+        out_unfold_shape=plan.out_unfold_shape,
+        mask_broadcast=plan.mask_broadcast,
+        mask_fold_shape=plan.mask_fold_shape,
+        out_shape=plan.out_fold_shape,
         out_dtype=out.dtype,
         acc_dtype=torch.float32 if accumulate_fp32 else out.dtype,
     )

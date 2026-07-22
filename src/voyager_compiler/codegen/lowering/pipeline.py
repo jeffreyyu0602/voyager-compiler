@@ -1005,6 +1005,7 @@ def build_pipelined_buffers(
     num_banks: int = _DEFAULT_NUM_BANKS,
     async_pipeline: bool = False,
     kwargs: Optional[dict] = None,
+    wrapper: Optional[Callable] = None,
 ) -> torch.fx.GraphModule:
     """Build the bufferized FX graph (a single rolled ``while_loop`` over
     ``voyager.*`` primitives) for ``kernel`` over ``grid``.  Mirrors
@@ -1015,6 +1016,10 @@ def build_pipelined_buffers(
     synchronous :class:`PipelinedKernel`.  ``kernel`` must then be an async
     kernel template (``_map_kernel(async_pipeline=True)``) that issues the
     ``commit`` itself.
+
+    ``wrapper`` optionally wraps the pattern module before export (``pattern =
+    wrapper(pattern)``) -- e.g. the GQA fold that reshapes operands in and the
+    output back out; ``inputs`` are then the wrapper's (unfolded) operands.
     """
     cls = AsyncPipelinedKernel if async_pipeline else PipelinedKernel
     pattern = cls(
@@ -1025,10 +1030,13 @@ def build_pipelined_buffers(
         scratch_specs=scratch_specs,
         num_banks=num_banks,
     )
+    num_steps = pattern.num_steps
+    if wrapper is not None:
+        pattern = wrapper(pattern)
     with _lenient_verifier():
         gm = export_model(pattern, inputs, kwargs=kwargs)
     gm = _finalize_exported_gm(gm)
-    _tag_loop_extents(gm, [[(0, pattern.num_steps, 1)]])
+    _tag_loop_extents(gm, [[(0, num_steps, 1)]])
     # Stamp a concrete-offset ``.value`` on every node (incl. loop / cond
     # bodies) so the tail re-fusion's ShapeProp never sees export's symbolic
     # ``step % num_banks`` tile offset.

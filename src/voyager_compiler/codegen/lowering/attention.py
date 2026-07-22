@@ -39,6 +39,8 @@ lacks on-chip causal masking); callers pass an explicit additive mask instead.
 
 import math
 import operator
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import torch
 
@@ -59,6 +61,116 @@ from voyager_compiler.codegen.passes.utils import get_arg_value
 _MASK_FILL = -0.7 * torch.finfo(torch.float32).max
 
 _INSERT = voyager.insert.default
+
+
+# -------------------------------------------------------------------------
+# GQA fold (shared by both attention builders)
+# -------------------------------------------------------------------------
+@dataclass
+class GqaFoldPlan:
+    """How a grouped-query attention folds into plain MHA: the ``g_head`` query
+    heads sharing a KV head become ``g_head`` extra query rows (``Sq ->
+    g_head*Sq``), so K/V read once per KV head and reuse across the group.
+    ``g_head == 1`` is the non-GQA no-op (shapes unchanged)."""
+
+    g_head: int
+    sq_orig: int
+    kbatch: Tuple[int, ...]  # the folded batch = the KV heads
+    sq_eff: int  # folded query length = g_head * Sq
+    q_fold_shape: Tuple[int, ...]
+    out_fold_shape: Tuple[int, ...]  # the pipeline's (folded) output
+    out_unfold_shape: Tuple[int, ...]  # the SDPA node's real output
+    mask_broadcast: bool
+    mask_fold_shape: Optional[Tuple[int, ...]]
+
+
+def plan_gqa_fold(q, k, v, mask, out_shape, num_q_blocks):
+    """Plan the GQA fold for an SDPA whose Q/K/V are ``[*batch, seq, d]``.
+    Returns a :class:`GqaFoldPlan`, or ``None`` when unfoldable: a grouped
+    non-head batch dim, a query length the tiling can't divide, or a mask head
+    layout other than per-query-head / broadcast."""
+    batch = tuple(q.shape[:-2])
+    kbatch = tuple(k.shape[:-2])
+    nb = len(batch)
+    if kbatch != tuple(v.shape[:-2]) or len(kbatch) != nb:
+        return None
+    group = []
+    for qs, ks in zip(batch, kbatch):
+        if ks == 0 or qs % ks:
+            return None
+        group.append(qs // ks)
+    if any(g != 1 for g in group[:-1]):
+        return None  # only the last batch dim (heads) may be grouped
+    g_head = group[-1] if group else 1
+
+    sq, d = q.shape[-2], q.shape[-1]
+    sq_eff = g_head * sq
+    if sq_eff % num_q_blocks:
+        return None
+    q_fold_shape = kbatch + (sq_eff, d)
+
+    mask_broadcast = False
+    mask_fold_shape = None
+    if mask is not None and g_head > 1:
+        mb = tuple(mask.shape[:-2])
+        m_skv = mask.shape[-1]
+        m_head = mb[-1] if mb else 1
+        if m_head == batch[-1]:  # per-query-head mask: reshapes like q
+            mask_fold_shape = kbatch + (sq_eff, m_skv)
+        elif m_head == 1:  # head-broadcast mask: expands the group
+            mask_broadcast = True
+            mask_fold_shape = mb + (sq_eff, m_skv)
+        else:
+            return None
+    return GqaFoldPlan(
+        g_head=g_head,
+        sq_orig=sq,
+        kbatch=kbatch,
+        sq_eff=sq_eff,
+        q_fold_shape=q_fold_shape,
+        out_fold_shape=kbatch + (sq_eff, d),
+        out_unfold_shape=tuple(out_shape),
+        mask_broadcast=mask_broadcast,
+        mask_fold_shape=mask_fold_shape,
+    )
+
+
+def fold_mask_tensor(mask, *, mask_broadcast, sq_orig, g_head, mask_fold_shape):
+    """Fold a mask's query rows to match the folded q (runtime, in the traced
+    forward): a per-query-head mask reshapes like q; a head-broadcast mask
+    expands the group so each of the ``g_head`` folded rows repeats the same
+    [Sq, Skv] block."""
+    if mask_broadcast:
+        b, skv = mask.shape[0], mask.shape[-1]
+        mask = mask.reshape(b, 1, 1, sq_orig, skv)
+        mask = mask.expand(b, 1, g_head, sq_orig, skv)
+    return mask.reshape(mask_fold_shape)
+
+
+class _FoldInputs(torch.nn.Module):
+    """Wrap a bufferized attention pattern so it runs plain MHA over the folded
+    (KV-head-batch) operands: reshape q (and mask) in, unfold the output.  The
+    spec-based builder's counterpart of FA3's in-``forward`` reshapes."""
+
+    def __init__(self, inner, plan: GqaFoldPlan, has_mask: bool):
+        super().__init__()
+        self.inner = inner
+        self.plan = plan
+        self.has_mask = has_mask
+
+    def forward(self, *args):
+        args = list(args)
+        p = self.plan
+        args[0] = args[0].reshape(p.q_fold_shape)
+        if self.has_mask:
+            args[-1] = fold_mask_tensor(
+                args[-1],
+                mask_broadcast=p.mask_broadcast,
+                sq_orig=p.sq_orig,
+                g_head=p.g_head,
+                mask_fold_shape=p.mask_fold_shape,
+            )
+        return self.inner(*args).reshape(p.out_unfold_shape)
 
 
 def _flash_attention_kernel(
@@ -211,9 +323,11 @@ def build_attention(
 
     Returns the bufferized ``GraphModule`` (a rolled ``while_loop`` over
     ``voyager.*`` primitives) implementing flash attention over a KV reduction
-    grid dim, or ``None`` when uncovered (missing tiling, dropout / GQA,
-    unsupported rank).  ``tiler`` is accepted for signature parity but unused —
-    attention tiling comes from ``node.meta['l2_tiling']`` (``(n_q, n_kv)``).
+    grid dim, or ``None`` when uncovered (missing tiling, dropout, unsupported
+    rank).  GQA is supported by folding the head group into the query rows
+    (:func:`plan_gqa_fold`).  ``tiler`` is accepted for signature parity but
+    unused — attention tiling comes from ``node.meta['l2_tiling']``
+    (``(n_q, n_kv)``).
     """
     if (
         node.op != "call_function"
@@ -227,8 +341,8 @@ def build_attention(
     dropout_p = get_arg_value(node, 4, "dropout_p", 0.0)
     is_causal = get_arg_value(node, 5, "is_causal", False)
     scale = node.kwargs.get("scale", None)
-    if node.kwargs.get("enable_gqa", False) or dropout_p:
-        return None  # GQA / dropout unsupported
+    if dropout_p:
+        return None  # dropout unsupported
     if is_causal:
         # On-chip causal masking (generating the triangular mask from the
         # tile's block indices) is not supported by the hardware yet; callers
@@ -250,15 +364,24 @@ def build_attention(
     if q.ndim < 2 or q.ndim != k.ndim or q.ndim != v.ndim:
         return None
 
-    batch = tuple(q.shape[:-2])
-    nb = len(batch)
-    Sq, d = q.shape[-2], q.shape[-1]
+    nb = q.ndim - 2
+    d = q.shape[-1]
     Skv = k.shape[-2]
-    tq, tkv = Sq // n_q, Skv // n_kv
     if scale is None:
         scale = 1.0 / math.sqrt(d)
 
-    # Grid: (*batch, n_q, n_kv); kv (last) is the reduction sweep.
+    # GQA folds into the query rows (see ``plan_gqa_fold``): K/V become a plain
+    # ``kbatch`` (KV-head) batch, read once per KV head and reused across the
+    # ``g_head`` folded query rows -- no per-head operand repeat.  ``g_head ==
+    # 1`` leaves everything unfolded (the ordinary MHA path).
+    mask_val = mask_node.value if isinstance(mask_node, torch.fx.Node) else None
+    plan = plan_gqa_fold(q, k, v, mask_val, out.shape, n_q)
+    if plan is None:
+        return None
+    batch = plan.kbatch  # the folded batch = the KV heads
+    tq, tkv = plan.sq_eff // n_q, Skv // n_kv
+
+    # Grid: (*kv_batch, n_q, n_kv); kv (last) is the reduction sweep.
     gq, gkv = nb, nb + 1
     grid = batch + (n_q, n_kv)
     last_idx = n_kv - 1
@@ -295,8 +418,11 @@ def build_attention(
         mask = mask_node.value
         mask_is_bool = mask.dtype == torch.bool
         # Mask [*mbatch, Sq, Skv] tiles [tq, tkv] on the q / kv grid dims; a
-        # size-1 batch dim broadcasts (pinned to block 0).
+        # size-1 batch dim broadcasts (pinned to block 0).  Under the fold the
+        # mask's query rows fold too, so its batch dims are the folded ones.
         mb = tuple(mask.shape[:-2])
+        if plan.g_head > 1:
+            mb = plan.mask_fold_shape[:-2]
         off = nb - len(mb)
         mtile, mimap, mbcast = [], [], []
         for j, sz in enumerate(mb):
@@ -321,9 +447,10 @@ def build_attention(
 
     # Output tile [.., tq, d]; the kv reduction dim is dropped (index_map has no
     # ``gkv``), so the bank stays live across the sweep, written once at the
-    # last kv step — single-buffered, drained at block-exit.
+    # last kv step — single-buffered, drained at block-exit.  The shape is the
+    # folded (KV-head-batch) output; ``_FoldInputs`` unfolds it back.
     out_spec = _OutputSpec(
-        tuple(out.shape),
+        plan.out_fold_shape,
         unit + (tq, d),
         batch_map + (gq, None),
         out.dtype,
@@ -350,6 +477,14 @@ def build_attention(
         out_dtype=out.dtype,
     )
 
+    # When GQA folds, wrap the pattern to reshape q / mask into the folded
+    # (KV-head-batch) plain-MHA shape and unfold the output.
+    has_mask = mask_node is not None
+    wrap = (
+        (lambda inner: _FoldInputs(inner, plan, has_mask))
+        if plan.g_head > 1
+        else None
+    )
     gm = build_pipelined_buffers(
         kernel,
         grid,
@@ -358,6 +493,7 @@ def build_attention(
         inputs=tuple(inputs),
         scratch_specs=scratch_specs,
         num_banks=num_banks,
+        wrapper=wrap,
     )
     _fuse_passes(gm)
     return gm
