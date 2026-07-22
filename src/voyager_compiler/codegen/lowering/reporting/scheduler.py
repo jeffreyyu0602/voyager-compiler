@@ -3,16 +3,16 @@
 A compute occupies the unit(s) named by its ``OpInfo.units`` — ``mma``
 (systolic matrix array), ``vector`` (vector unit), or both (a fused GEMM /
 conv, whose tail runs on the VU).  Whether it advances the **program clock**
-depends on how its result is written:
+depends on how it is dispatched:
 
-* **synchronous** (its ``insert`` carries no semaphore): advances the program
-  clock, so it serializes and forms the clock the waits reconcile against.
-* **asynchronous** (its result is published by a ``semaphore``-carrying
-  ``insert``): occupies its unit(s) but does **not** advance the program clock,
-  so it runs while the clock moves on other units; the ``insert`` posts its
-  completion onto the semaphore FIFO, exactly as ``async_copy`` does.  Two ops
-  on the same unit still serialize (shared ``*_free`` counter); overlap appears
-  only across different units.
+* **synchronous**: advances the program clock, so it serializes and forms the
+  clock the waits reconcile against.
+* **asynchronous** (dispatched inside a ``voyager.commit``): occupies its
+  unit(s) but does **not** advance the program clock, so it runs while the clock
+  moves on other units; the commit posts its completion onto the done-semaphore
+  FIFO, exactly as ``async_copy`` does.  Two ops on the same unit still
+  serialize (shared ``*_free`` counter); overlap appears only across different
+  units.
 
 ``async_copy`` *is* asynchronous: it occupies DRAM for its transfer without
 advancing the program clock, so a prefetch overlaps compute; ``async_wait``
@@ -118,7 +118,7 @@ class ResourceState:
 
     # -- event kinds --------------------------------------------------------
 
-    def compute(self, node, path, async_post: bool = False) -> TimingRecord:
+    def compute(self, node, path) -> TimingRecord:
         eid = self._eid()
         op = self.get_op(node)
         units_free = [self._unit_free(u) for u in op.units]
@@ -157,14 +157,12 @@ class ResourceState:
         for u in op.units:
             self._occupy(u, end, eid)
         if self.in_commit:
+            # A committed op occupies its unit(s) but leaves the program clock;
+            # its done-sem post carries the completion.  A sync one advances it.
             self.commit_now = end
             self.last_commit_eid = eid
             self.last_commit_node = node
             self.commit_deps = ()
-            self.pending_post[id(node)] = (end, eid)
-        # An async compute occupies its unit(s) but leaves the program clock;
-        # the following insert posts its completion.  A sync one advances it.
-        elif async_post:
             self.pending_post[id(node)] = (end, eid)
         else:
             self.now = end

@@ -56,6 +56,7 @@ _VOYAGER_ASYNC = (
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
+_SDPA = torch.ops.aten.scaled_dot_product_attention.default
 
 
 def _produces_tensor(node: Node) -> bool:
@@ -703,6 +704,7 @@ def bufferize_graph(
     pipelined: bool = False,
     tiler=None,
     single_buffer_tail: bool = False,
+    flash_attention_v3: bool = True,
 ) -> GraphModule:
     """Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
 
@@ -717,7 +719,12 @@ def bufferize_graph(
         tiler: Interstellar ``TilerContext`` supplying per-node tile factors.
         single_buffer_tail: Single-buffer a >1-tile reduction's output + fused
           post-op operands (SRAM saved vs. prefetch); off => double-buffered.
+        flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
+          the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
+          baseline flash-attention builder (``build_attention``).
     """
+    from .attention import build_attention
+    from .attention_v3 import build_attention_fa3
     from .pipeline import (
         build_conv2d,
         build_gemm,
@@ -787,6 +794,12 @@ def bufferize_graph(
                 )
             elif is_pooling(anchor):
                 sub_gm = build_pool(node, num_banks=num_banks)
+            elif anchor.target is _SDPA:
+                sub_gm = (
+                    build_attention_fa3(node, tiler=tiler)
+                    if flash_attention_v3
+                    else build_attention(node, num_banks=num_banks, tiler=tiler)
+                )
             elif (
                 is_elementwise_op(anchor)
                 or anchor.target in _REDUCTION_POINTWISE_OPS

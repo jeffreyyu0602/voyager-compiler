@@ -9,10 +9,10 @@ and pick ``torch.cond`` branches.  Tensor *shapes* come from the static
 
 For each node it overlays timing on the ``ResourceState`` (see ``scheduler``):
 compute on the systolic array, ``async_copy`` on the DRAM interface, and waits
-as zero-time control. A DPS ``insert`` writes a compute result into its buffer:
-a plain one is bookkeeping (skipped), but a ``semaphore``-carrying one marks its
-producing compute asynchronous and posts that semaphore when the compute
-finishes -- so ``async_wait`` can reconcile compute the same way it does a DMA.
+as zero-time control. A DPS ``insert`` writes a compute result into its buffer
+and is pure bookkeeping (skipped). An asynchronous compute is dispatched by
+``voyager.commit``, which posts its done-semaphore when it finishes -- so
+``async_wait`` can reconcile compute the same way it does a DMA.
 """
 
 import math
@@ -38,18 +38,6 @@ _ASYNC_COPY = torch.ops.voyager.async_copy.default
 _ASYNC_WAIT = torch.ops.voyager.async_wait.default
 _INSERT = torch.ops.voyager.insert.default
 _FILL = torch.ops.voyager.fill.default
-
-
-def _feeds_sem_insert(node: Node) -> bool:
-    """Whether ``node``'s result is published by a ``semaphore``-carrying
-    ``insert`` -- i.e. this compute runs asynchronously (commit, do not wait).
-    """
-    return any(
-        u.op == "call_function"
-        and u.target is _INSERT
-        and get_arg_value(u, 2, "semaphore") is not None
-        for u in node.users
-    )
 
 
 @dataclass
@@ -336,7 +324,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
 
         t = node.target
         if node.op == "call_module":
-            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
+            ctx.rs.compute(node, path)
         elif t is WHILE_LOOP:
             env[node] = _run_loop(node, gm, env, ctx, path)
         elif t is COND:
@@ -367,19 +355,18 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif t is _ASYNC_WAIT:
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif t is _INSERT:
-            # Destination-passing write: zero-time itself, but a semaphore posts
-            # the producing compute's completion so async_wait can consume it.
-            sem = get_arg_value(node, 2, "semaphore")
-            if sem is not None:
-                key = _sem_key(sem, env, ctx.bind)
-                ctx.rs.post_semaphore(key, node.args[0])
+            # Destination-passing write: pure bookkeeping, zero-time -- the
+            # producing compute already carries its destination.  (An async
+            # producer posts its completion via voyager.commit's ``post``, not
+            # the insert.)
+            pass
         elif _produces_tensor(node) and is_compute_op(node):
-            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
+            ctx.rs.compute(node, path)
         elif _is_dram_copy(node):
             reads, write = _copy_traffic(node, ctx.bind)
             ctx.rs.dram_copy(node, reads, write, path)
         elif _is_scratchpad_op(node, ctx.bind):
-            ctx.rs.compute(node, path, async_post=_feeds_sem_insert(node))
+            ctx.rs.compute(node, path)
         elif _should_eval(node):
             env[node] = _eval(node, env)
     return None

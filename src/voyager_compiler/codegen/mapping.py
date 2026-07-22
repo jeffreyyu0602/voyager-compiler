@@ -161,6 +161,17 @@ def replace_node_with_graph_module(
                     value_remap[n] = create_getattr_from_value(
                         model, graph, n.target, attr
                     )
+            elif n.op == "call_module":
+                # A fused compute submodule (the attention builders run
+                # _fuse_passes, leaving top-level fused call_modules): register
+                # an independent copy under a fresh name, like a body subgraph,
+                # and retarget the copied call at it.
+                sub = fetch_attr(replacement, n.target)
+                name = get_new_node_name_with_prefix(n.target)(model)
+                setattr(model, name, _copy_graph_module(sub))
+                new = graph.node_copy(n, lambda x: value_remap[x])
+                new.target = name
+                value_remap[n] = new
             else:
                 value_remap[n] = graph.node_copy(n, lambda n: value_remap[n])
             if propagate:

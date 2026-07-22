@@ -1,62 +1,20 @@
 """FA3-style flash-attention bufferization builder (cross-sweep pipelined).
 
-A standalone sibling of ``attention.build_attention`` that overlaps the
-systolic (matrix) array with the vector unit, the way FlashAttention-3
-overlaps Hopper's tensor cores with its multi-function units.  The
-baseline kernel serializes the two units inside every KV step (QKᵀ GEMM →
-softmax chain → PV GEMM); this builder restructures the schedule so both
-units always have work:
+A dedicated scheduler (``_FA3Pipeline``) that overlaps the systolic (matrix)
+array with the vector unit: each iteration runs the current block's QKᵀ matmul
+and the previous block's P@V matmul on the matrix unit while the vector unit
+softmaxes, a one-step skew fused across Q-tile / head boundaries.  The pipeline
+is peeled — a prologue, ``num_steps - 1`` uniform loop iterations, an epilogue.
+The matmuls (QKᵀ, P@V) and the DMA are asynchronous; the softmax chain and the
+accumulate/rescale are synchronous.  Each async matmul is dispatched with
+``voyager.commit`` — its input load semaphores are the ``dependencies`` and it
+posts a done-semaphore (``sem_scores`` for QKᵀ, ``sem_pv`` for P@V) that
+``voyager.async_wait`` consumes where a synchronous op reads the result.
 
-1. **Deferred rescale.**  The accumulator update is
-   ``o += P_prev @ V_prev`` *then* ``o *= alpha``: entering a step, ``o``
-   (all earlier blocks) and ``P_prev`` share the previous running-max
-   scale, so accumulate-then-rescale moves the whole sum to the new scale
-   at once — same math, but the PV GEMM no longer depends on the current
-   block's softmax.
-2. **One-step skew, fused across sweeps.**  Each loop iteration runs the
-   QKᵀ GEMM of the *current* KV block and the PV GEMM of the *previous*
-   step's block back-to-back on the matrix unit while the vector unit
-   softmaxes the current scores.  Unlike the FA3 paper's Algorithm 2
-   (which drains each Q tile's pipeline before the next — its per-tile
-   bubbles are hidden by ping-ponging two warpgroups, impossible in one
-   instruction stream), the skew here crosses Q-tile and head boundaries:
-   a tile's leftover PV GEMM and its ``o/l`` finalize execute during the
-   NEXT tile's first iteration, so the units never idle at boundaries.
+Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program order:
 
-The pipeline is peeled, matching Algorithm 2's shape: a **prologue**
-(traced once before the ``while_loop``) primes the DMA and runs the very
-first QKᵀ + softmax; the loop then runs ``num_steps - 1`` completely
-uniform iterations (counter starting at 1); an **epilogue** (traced once
-after the loop) runs the final tile's leftover PV GEMM, finalize, and
-output store.  This is implemented as a dedicated scheduler
-(``_FA3Pipeline``) rather than through the generic ``PipelinedKernel`` —
-the schedule needs a lagged V stream, a lagged output store, and the
-peeled iterations, none of which the generic scheduler models; the FA3
-case has fixed operand roles and depths, so the explicit DMA bookkeeping
-below is small.
-
-The matrix unit computes only ``A @ B``, so the P@V is split: a pure GEMM
-into ``pv_buf`` on the matrix unit, then an accumulate into ``o`` on the
-vector unit.  Only the DMA (``async_copy``) and the GEMMs (QKᵀ, P@V) are
-asynchronous — issued onto their unit and left running while the instruction
-stream continues; the softmax chain and the accumulate/rescale are
-synchronous.  So a semaphore is needed exactly where a synchronous op must
-wait on an asynchronous producer: an ``insert`` carrying a semaphore posts it
-when that GEMM finishes and ``voyager.async_wait`` consumes it (the eager
-impls assert every wait has a matching prior post, so tests validate it):
-
-  ``sem_scores``  the QKᵀ GEMM wrote S       → softmax may read it.
-  ``sem_pv``      the P@V GEMM wrote pv_buf  → the accumulate may read it.
-
-(softmax → the next step's P@V needs no semaphore: softmax is synchronous, so
-it has already written P by the time the stream issues that P@V.)
-
-Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program
-order — the P@V GEMM ([B]) runs on the matrix unit while the vector unit
-softmaxes ([C]), then the vector unit lands the P@V into ``o`` ([D]/[E]):
-
-  [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];   GEMM, post sem_scores
-  [B] wait V DMA;  pv_buf = s_buf[(step-1) % 2] @ V_prev; GEMM, post sem_pv
+  [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];  commit, post sem_scores
+  [B] pv_buf = s_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
   [D] kv == 0 only (a Q-tile boundary): wait sem_pv; o += pv_buf; drain the
       previous output store; (o / l) -> o_bank; store o_bank to the PREVIOUS
       tile's DRAM rows (the finalize belongs to the tile that just ended);
@@ -64,24 +22,6 @@ softmaxes ([C]), then the vector unit lands the P@V into ``o`` ([D]/[E]):
   [C] wait sem_scores;  softmax chain (rowmax, m, alpha, P, rowsum, l).
   [E] kv >= 1 only (vector unit, after [C]): wait sem_pv;  the deferred
       rescale fused with the accumulate, o = alpha·(o + pv_buf).
-
-Because [B] is issued (async) before the synchronous [C], the matrix unit runs
-the P@V while the vector unit softmaxes — the two overlap on every non-boundary
-step. ``pv_buf`` is single-buffered: the accumulate ([D]/[E]) is synchronous
-and reads ``pv_buf`` before the stream issues the next step's P@V, so the write
-never races the read. ``s_buf`` needs two slots, though: [A] writes the next
-block's scores into ``s_buf[step % 2]`` while [B] is still reading the previous
-block's probabilities from ``s_buf[(step-1) % 2]`` — two async GEMMs' operands
-live at once (the later overwrite is safe by matrix-unit program order).
-``o/l/m`` are single-buffered — only the synchronous vector ops touch them.
-
-DMA schedule (exact — every block fetched once and consumed once): per
-iteration one K block and one V block, V's stream one step behind K's
-(matching its one-step-behind consumption).  K prefetches the next step's
-block (gated off on the last iteration); V fetches the CURRENT step's
-block into the slot the next step reads; Q prefetches the next sweep's
-tile at each sweep's last iteration.  The prologue primes K0/Q0 (+ the
-K1/V0 prefetches); the epilogue consumes V's one remaining block.
 """
 
 import math
@@ -94,7 +34,11 @@ from voyager_compiler.codegen.lowering.attention import (
     _MASK_FILL,
     _fuse_passes,
 )
-from voyager_compiler.codegen.lowering.ops import MemoryLevel, oracle_disabled
+from voyager_compiler.codegen.lowering.ops import (
+    MemoryLevel,
+    commit,
+    oracle_disabled,
+)
 from voyager_compiler.codegen.lowering.pipeline import (
     _guarded_wait,
     select_bank,
@@ -182,6 +126,9 @@ class _FA3Pipeline(torch.nn.Module):
     def _load_q(self, q, bank, slot, sem, coords):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
+        # Q is loaded once per sweep but read on every one of the sweep's N
+        # steps; post its load semaphore N times so the per-step [A] commit
+        # consume balances the single load.
         voyager.async_copy(
             q,
             select_bank(bank, slot),
@@ -189,6 +136,7 @@ class _FA3Pipeline(torch.nn.Module):
             unit + (self.tq, self.d),
             select_bank(sem, slot),
             dims,
+            post_count=self.N,
         )
 
     def _load_k(self, k, bank, slot, sem, coords):
@@ -241,15 +189,42 @@ class _FA3Pipeline(torch.nn.Module):
 
     # --- compute helpers (shared by prologue / loop / epilogue) ---------
 
-    def _gemm_a(self, q_tile, k_tile, mask_tile, s_slot, sem_scores):
-        """[A]: S = (Q @ Kᵀ)·scale (+ mask) -> s_slot; post sem_scores."""
-        s = torch.matmul(q_tile, k_tile) * self.scale
+    def _matmul_qk(self, q_tile, k_tile, mask_tile, s_slot, sem_scores, deps):
+        """[A]: commit S = (Q @ Kᵀ)·scale (+ mask) -> s_slot.  ``deps`` are the
+        input load semaphores it waits on; it posts ``sem_scores`` when the
+        matmul retires.  The body branches on ``has_mask`` at build time, so the
+        traced subgraph carries no runtime cond."""
+        scale = self.scale
         if self.has_mask:
-            if self.mask_is_bool:
-                s = torch.where(mask_tile, s, _MASK_FILL)
-            else:
-                s = s + mask_tile
-        voyager.insert(s, s_slot, semaphore=sem_scores)
+            mask_is_bool = self.mask_is_bool
+
+            def body(q, k, mask, s):
+                out = torch.matmul(q, k) * scale
+                if mask_is_bool:
+                    out = torch.where(mask, out, _MASK_FILL)
+                else:
+                    out = out + mask
+                voyager.insert(out, s)
+
+            operands = [q_tile, k_tile, mask_tile, s_slot]
+        else:
+
+            def body(q, k, s):
+                voyager.insert(torch.matmul(q, k) * scale, s)
+
+            operands = [q_tile, k_tile, s_slot]
+        commit(body, operands, dependencies=deps, post=sem_scores)
+
+    def _matmul_pv(self, s_tile, v_tile, pv_buf, sem_pv, deps):
+        """[B]: commit pv_buf = s_tile @ v_tile on the matrix unit.  ``deps`` is
+        the V load semaphore; it posts ``sem_pv`` when the matmul retires (the
+        probabilities in ``s_tile`` are written synchronously, so need no dep).
+        """
+
+        def body(s, v, pv):
+            voyager.insert(torch.matmul(s, v), pv)
+
+        commit(body, [s_tile, v_tile, pv_buf], dependencies=deps, post=sem_pv)
 
     def _softmax(self, s_slot, m, l, row_tmp, alpha, sem_scores):
         """[C]'s chain: waits for S, then rowmax / m / alpha / P / rowsum
@@ -327,16 +302,16 @@ class _FA3Pipeline(torch.nn.Module):
         self._load_v(v, v_bank, 1 % 2, v_sem, c0)
 
         self._reset(m, l, o)
-        voyager.async_wait(select_bank(q_sem, 0))
-        voyager.async_wait(select_bank(k_sem, 0))
+        deps = [select_bank(k_sem, 0), select_bank(q_sem, 0)]
         if self.has_mask:
-            voyager.async_wait(select_bank(m_sem, 0))
-        self._gemm_a(
+            deps.append(select_bank(m_sem, 0))
+        self._matmul_qk(
             select_bank(q_bank, 0),
             select_bank(k_bank, 0),
             select_bank(m_bank, 0) if self.has_mask else None,
             select_bank(s_buf, 0),
             sem_scores,
+            deps,
         )
         self._softmax(select_bank(s_buf, 0), m, l, row_tmp, alpha, sem_scores)
 
@@ -378,38 +353,36 @@ class _FA3Pipeline(torch.nn.Module):
                 (kv == N - 1) & (step + 1 < num_steps), q_fetch, lambda: 0
             )
 
-            # Waits, just-in-time per Algorithm 2: K (and mask) before the
-            # S GEMM here; V only later, right before the P@V GEMM — so
-            # the S GEMM can issue while V's DMA is still in flight.  Q is
-            # waited once per sweep, at its first iteration.
-            voyager.async_wait(select_bank(k_sem, cur_slot))
-            if self.has_mask:
-                voyager.async_wait(select_bank(m_sem, cur_slot))
+            # [A] current block's scores on the matrix unit: its K (and mask)
+            # load semaphores are per-step commit dependencies; Q's is too, but
+            # Q is loaded once per sweep, so its load posts N times (see
+            # _load_q) to balance the per-step consume.  V is not a dependency
+            # here — it feeds [B], so [A] issues while V's DMA is in flight.
             q_slot = (step // N) % 2
             torch._check(q_slot < 2)
-            _guarded_wait(select_bank(q_sem, q_slot), kv == 0)
-
-            # [A] current block's scores on the matrix unit.
-            self._gemm_a(
+            deps = [select_bank(k_sem, cur_slot), select_bank(q_sem, q_slot)]
+            if self.has_mask:
+                deps.append(select_bank(m_sem, cur_slot))
+            self._matmul_qk(
                 select_bank(q_bank, q_slot),
                 select_bank(k_bank, cur_slot),
                 select_bank(m_bank, cur_slot) if self.has_mask else None,
                 select_bank(s_buf, cur_slot),
                 sem_scores,
+                deps,
             )
 
             # [B] the lagged P@V on the matrix unit: previous step's
             # probabilities × its V block (in this step's V read slot) into
-            # pv_buf.
+            # pv_buf; the V load semaphore is the commit dependency.
             prev_slot = (step - 1) % 2
             torch._check(prev_slot < 2)
-            voyager.async_wait(select_bank(v_sem, cur_slot))
-            voyager.insert(
-                torch.matmul(
-                    select_bank(s_buf, prev_slot), select_bank(v_bank, cur_slot)
-                ),
+            self._matmul_pv(
+                select_bank(s_buf, prev_slot),
+                select_bank(v_bank, cur_slot),
                 pv_buf,
-                semaphore=sem_pv,
+                sem_pv,
+                [select_bank(v_sem, cur_slot)],
             )
 
             # [D] Q-tile boundary: land the previous tile's last P@V into o,
@@ -431,7 +404,7 @@ class _FA3Pipeline(torch.nn.Module):
             torch.cond(kv == 0, boundary, lambda: 0)
 
             # [C] softmax of the current block on the vector unit — runs
-            # (synchronously) while the matrix [B] GEMM is still in flight.
+            # (synchronously) while the matrix [B] matmul is still in flight.
             self._softmax(
                 select_bank(s_buf, cur_slot), m, l, row_tmp, alpha, sem_scores
             )
@@ -453,14 +426,12 @@ class _FA3Pipeline(torch.nn.Module):
         c_last = _unravel(num_steps - 1, grid)
         v_slot = num_steps % 2
         # [B] the final block's P@V on the matrix unit.
-        voyager.async_wait(select_bank(v_sem, v_slot))
-        voyager.insert(
-            torch.matmul(
-                select_bank(s_buf, (num_steps - 1) % 2),
-                select_bank(v_bank, v_slot),
-            ),
+        self._matmul_pv(
+            select_bank(s_buf, (num_steps - 1) % 2),
+            select_bank(v_bank, v_slot),
             pv_buf,
-            semaphore=sem_pv,
+            sem_pv,
+            [select_bank(v_sem, v_slot)],
         )
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)

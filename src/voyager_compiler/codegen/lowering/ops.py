@@ -12,7 +12,7 @@ Primitives
 ``voyager.zeros(size, dtype)``       zero-initialised bank (accumulator, semaphore).
 ``voyager.fill(size, dtype, v)``     value-initialised bank (seed a semaphore credit).
 ``voyager.subview(src, o, s, st)``   strided window onto a buffer (a bank slot).
-``voyager.insert(src, dst, sem)``    destination-passing compute-result write.
+``voyager.insert(src, dst)``         destination-passing compute-result write.
 ``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
 ``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
 ``voyager.increment_indices(...)``   multi-dim tile-index counter (carry).
@@ -211,28 +211,16 @@ impl(voyager_lib, "subview", "CompositeExplicitAutograd")(_subview)
 torch.library.register_fake("voyager::subview")(_subview)
 
 
-voyager_lib.define(
-    "insert(Tensor src, Tensor(a!) dst, Tensor(b!)? semaphore=None) -> ()"
-)
+voyager_lib.define("insert(Tensor src, Tensor(a!) dst) -> ()")
 
 
 @impl(voyager_lib, "insert", "CompositeExplicitAutograd")
-def insert(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    semaphore: Optional[torch.Tensor] = None,
-) -> None:
+def insert(src: torch.Tensor, dst: torch.Tensor) -> None:
     dst.copy_(src)
-    if semaphore is not None:
-        semaphore.add_(1)
 
 
 @torch.library.register_fake("voyager::insert")
-def _insert_fake(
-    src: torch.Tensor,
-    dst: torch.Tensor,
-    semaphore: Optional[torch.Tensor] = None,
-) -> None:
+def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
     return None
 
 
