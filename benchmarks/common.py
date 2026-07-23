@@ -32,6 +32,7 @@ import multiprocessing
 import operator
 import os
 import re
+import signal
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, fields, replace
@@ -65,6 +66,7 @@ from voyager_compiler import (
     convert_and_export_with_split_cache,
     convert_pt2e,
     export_model,
+    gen_compute_graph,
     get_default_quantizer,
     prepare_pt2e,
     remove_softmax_dtype_cast,
@@ -83,6 +85,7 @@ from voyager_compiler.codegen.lowering.reporting import (
     write_perfetto,
 )
 from voyager_compiler.codegen.lowering.tiling import build_interstellar_tiler
+from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.codegen.mapping_utils import (
     is_compute_op,
     is_fully_connected,
@@ -107,13 +110,12 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 # -- baseline design point (spec §1), matching test_llama_report.py -------
 # ``cache_size`` is the tiler's L2 scratchpad; double buffering makes the
 # effective on-chip SRAM ``2 * cache_size`` (so 1 MiB here == 2 MB effective).
-SRAM_BANK_SIZE = 128 * 1024  # physical bank size, held fixed across sweeps
 BASELINE_CACHE_SIZE = 1 * 1024 * 1024
 BASELINE_NUM_BANKS = 8
 BASELINE_BANK_WIDTH = 64
 BASELINE_PE = (64, 64)
 BASELINE_FREQUENCY_GHZ = 1.0
-BASELINE_DRAM_BANDWIDTH_GBS = 50.0
+BASELINE_DRAM_BANDWIDTH_GBS = 64.0
 BASELINE_DRAM_ACCESS_LATENCY_NS = 100.0
 BASELINE_PROMPT_LEN = 1024
 
@@ -222,9 +224,30 @@ class SweepConfig:
     # Build only this many decoder layers; None uses the real count.
     num_layers_override: Optional[int] = None
 
+    dump_dir: Optional[str] = None
+
     @property
     def unroll(self) -> Tuple[int, int]:
         return tuple(self.pe)
+
+    @property
+    def acc_config(self) -> AcceleratorConfig:
+        """The accelerator description this sweep point compiles for.  L2 is
+        double-buffered (effective SRAM is ``2 * cache_size``)."""
+        return AcceleratorConfig(
+            pe_array_size=self.unroll,
+            scratchpad_size=self.cache_size,
+            num_banks=self.num_banks,
+            bank_width=self.bank_width,
+            input_buffer_size=1024,
+            weight_buffer_size=1024,
+            accum_buffer_size=1024,
+            double_buffered_l2=True,
+            dram_size=64.0,
+            dram_bandwidth=self.dram_bandwidth_gbs,
+            dram_access_latency=self.dram_access_latency_ns,
+            frequency=self.frequency_ghz,
+        )
 
     @property
     def group(self) -> int:
@@ -245,7 +268,7 @@ def add_config_args(parser: argparse.ArgumentParser, defaults=None, exclude=()):
     base = defaults or SweepConfig()
     hints = get_type_hints(SweepConfig)
     for f in fields(SweepConfig):
-        if f.name in exclude:
+        if f.name in exclude or f.name in NON_DESIGN_FIELDS:
             continue
         typ = hints[f.name]
         if get_origin(typ) is Union:  # Optional[T] -> T
@@ -309,6 +332,7 @@ def config_from_args(args, **overrides) -> "SweepConfig":
     """Build a SweepConfig from parsed args; ``overrides`` win."""
     names = {f.name for f in fields(SweepConfig)}
     kw = {k: v for k, v in vars(args).items() if k in names}
+    kw["dump_dir"] = args.log_dir or args.out
     kw.update(overrides)
     if isinstance(kw.get("pe"), list):
         kw["pe"] = tuple(kw["pe"])
@@ -326,7 +350,7 @@ def dtype_spec(bits: int, group: int) -> Optional[str]:
     if bits == 8:
         return f"int8,qs=microscaling,bs={group}"
     if bits == 4:
-        return f"fp4_e2m1,qs=microscaling,bs={group},scale=fp8_e4m3"
+        return f"fp4_e2m1,qs=microscaling,bs={group}"
     raise ValueError(f"unsupported weight/activation bits: {bits}")
 
 
@@ -347,6 +371,36 @@ def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
     raise ValueError(f"unsupported kv bits: {bits}")
 
 
+NON_DESIGN_FIELDS = ("dump_dir",)
+_UNUSED_BY_MODE = {"prefill": "kv_len", "decode": "prompt_len"}
+_PROBE_FIELDS = ("num_layers_override",)
+
+
+def _cfg_value(name: str, value) -> str:
+    """One field as a filename fragment: readable where ``str`` is not."""
+    if name == "pe":
+        return "x".join(str(v) for v in value)
+    if name == "model_id":
+        return value.split("/")[-1]
+    return str(value)
+
+
+def _cfg_stem(cfg: SweepConfig) -> str:
+    """``cfg`` as a filename: the axes it is swept along, then its mode
+    (``kv_len-4096_decode``); ``baseline`` where no axis moved."""
+    base = SweepConfig()
+    skip = {*NON_DESIGN_FIELDS, "mode", _UNUSED_BY_MODE.get(cfg.mode)}
+    diff = [
+        (f.name, f"{f.name}-{_cfg_value(f.name, getattr(cfg, f.name))}")
+        for f in fields(SweepConfig)
+        if f.name not in skip and getattr(cfg, f.name) != getattr(base, f.name)
+    ]
+    swept = [s for name, s in diff if name not in _PROBE_FIELDS]
+    probe = [s for name, s in diff if name in _PROBE_FIELDS]
+    parts = [*(swept or ["baseline"]), cfg.mode, *probe]
+    return re.sub(r"[^\w.-]+", "_", "_".join(parts))
+
+
 def build_quantizer(cfg: SweepConfig):
     """A quantizer for ``cfg``'s weight / activation precision (microscaling for
     8/4-bit, unquantized bf16 for 16-bit).  KV-cache precision is *not* set here
@@ -354,11 +408,15 @@ def build_quantizer(cfg: SweepConfig):
     ``_annotate_kv_cache`` (KIVI keeps the full-precision residual untouched).
     """
     group = cfg.group
-    return get_default_quantizer(
+    quantizer = get_default_quantizer(
         input_activation=dtype_spec(cfg.act_bits, group),
         weight=dtype_spec(cfg.weight_bits, group),
         force_scale_power_of_two=True,
     )
+    quantizer.set_module_name_object_type_order(
+        "model.model.rotary_emb", torch.ops.aten.matmul.default, 0, None
+    )
+    return quantizer
 
 
 # -------------------------------------------------------------------------
@@ -602,7 +660,6 @@ def _frontend(cfg: SweepConfig):
     interstellar tiler.  Returns ``(gm, model, tiler)`` -- the graph is
     transformed and tile-ready but *not* yet whole-graph bufferized, so both the
     whole-graph and the per-module paths can share this."""
-    unroll = cfg.unroll
     is_decode = cfg.mode == "decode"
     # The builders return an already-exported graph (prefill via export_model,
     # decode via convert_and_export_with_split_cache).
@@ -637,43 +694,40 @@ def _frontend(cfg: SweepConfig):
         example_args,
         example_kwargs=example_kwargs,
         patterns=FUSION_PIPELINE,
-        unroll_dims=unroll,
+        config=cfg.acc_config,
         transform_layout=True,
-        cache_size=cfg.cache_size,
-        num_banks=cfg.num_banks,
         use_interstellar_tiling=True,
         bufferize=True,
+        context_len=cfg.kv_len if is_decode else None,
+        max_gen=DECODE_MAX_GEN if is_decode else None,
     )
+
+    if cfg.dump_dir is not None:
+        os.makedirs(cfg.dump_dir, exist_ok=True)
+        path = os.path.join(cfg.dump_dir, _cfg_stem(cfg))
+
+        # gen_compute_graph shells out to graphviz, which can hang on a large
+        # graph; cap it so a stuck render never stalls the sweep.
+        def _timeout(signum, frame):
+            raise TimeoutError
+
+        old = signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(60)
+        try:
+            gen_compute_graph(gm, path)
+        except TimeoutError:
+            print(f"  [skip] compute graph dump timed out: {path}", flush=True)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
 
     flat_args, _ = torch.utils._pytree.tree_flatten(
         (example_args, example_kwargs)
     )
     ShapeProp(gm).propagate(*flat_args)
 
-    bytes_per_cycle = cfg.dram_bandwidth_gbs / cfg.frequency_ghz
-    tiler = build_interstellar_tiler(
-        unroll,
-        input_buffer_size=1024,
-        weight_buffer_size=1024,
-        accum_buffer_size=1024,
-        scratchpad_size=cfg.cache_size,
-        dram_size=64.0,
-        dram_bandwidth=bytes_per_cycle,
-        double_buffered_l2=True,
-        num_banks=cfg.num_banks,
-    )
+    tiler = build_interstellar_tiler(cfg.acc_config)
     return gm, model, tiler
-
-
-def _plan(cfg, gm):
-    # Double buffering: the planner sees twice the cache and banks.
-    return plan_memory(
-        gm,
-        cfg.cache_size * 2,
-        num_banks=cfg.num_banks * 2,
-        bank_width=cfg.bank_width,
-        unroll_dims=cfg.unroll,
-    )
 
 
 def _compile(cfg: SweepConfig):
@@ -686,7 +740,7 @@ def _compile(cfg: SweepConfig):
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
     )
-    plan = _plan(cfg, gm)
+    plan = plan_memory(gm, cfg.acc_config)
     return gm, model, plan
 
 
@@ -697,13 +751,7 @@ def _num_params(model) -> int:
 def run_design_point(cfg: SweepConfig) -> Metrics:
     """Compile ``cfg`` and return its ideal latency + DRAM traffic."""
     gm, model, plan = _compile(cfg)
-    r = estimate_schedule(
-        gm,
-        dram_bandwidth=cfg.dram_bandwidth_gbs,
-        dram_access_latency=cfg.dram_access_latency_ns,
-        frequency=cfg.frequency_ghz,
-        unroll=cfg.unroll,
-    )
+    r = estimate_schedule(gm, cfg.acc_config)
     return Metrics(
         total_latency=r.total_latency,
         dram_read_bytes=r.dram_read_bytes,
@@ -992,7 +1040,7 @@ def _tail_block_nodes(gm):
     return out
 
 
-def _estimate_block(cfg, model, gm, tiler, node, common_kw, dump_dir):
+def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
     """Bufferize + plan + estimate one block standalone -> a ``Metrics`` (count
     1), through the *same* ``estimate_schedule`` the whole-graph path uses --
     the only addition is ``_time_split`` for the runtime breakdown, which this
@@ -1005,9 +1053,9 @@ def _estimate_block(cfg, model, gm, tiler, node, common_kw, dump_dir):
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
     )
-    plan = _plan(cfg, sub)
+    plan = plan_memory(sub, acc_config)
     # Split off the *uncompressed* estimate, then compress + dump.
-    r = estimate_schedule(sub, **common_kw)
+    r = estimate_schedule(sub, acc_config)
     compute, memory, overlap, stall = _time_split(r)
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
@@ -1044,18 +1092,13 @@ def report_per_module(cfg, layer, dump_dir=None):
     With ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
     gm, model, tiler = _frontend(cfg)
     n_layers = model.config.num_hidden_layers
-    common_kw = dict(
-        dram_bandwidth=cfg.dram_bandwidth_gbs,
-        dram_access_latency=cfg.dram_access_latency_ns,
-        frequency=cfg.frequency_ghz,
-        unroll=cfg.unroll,
-    )
+    acc_config = cfg.acc_config
     rows = []
     for node in _layer_block_nodes(gm, layer):
-        m = _estimate_block(cfg, model, gm, tiler, node, common_kw, dump_dir)
+        m = _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir)
         rows.append(_scale(m, n_layers))
     for node in _tail_block_nodes(gm):
-        m = _estimate_block(cfg, model, gm, tiler, node, common_kw, dump_dir)
+        m = _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir)
         rows.append(m)  # tail runs once (count 1); no scaling
     return rows
 

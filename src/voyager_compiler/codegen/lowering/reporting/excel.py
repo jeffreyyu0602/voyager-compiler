@@ -76,8 +76,8 @@ def _architecture(wb, result: ScheduleResult):
         ("frequency", float(result.cost.frequency)),  # GHz
         ("dram_bandwidth", float(result.cost.dram_bandwidth)),  # GB/s
         ("dram_access_latency", float(result.cost.dram_access_latency)),  # ns
-        ("ic_unroll", int(result.cost.unroll[0])),
-        ("oc_unroll", int(result.cost.unroll[1])),
+        ("ic_unroll", int(result.cost.pe_array_size[0])),
+        ("oc_unroll", int(result.cost.pe_array_size[1])),
     ]
     for i, (name, val) in enumerate(rows):
         r = i + 1

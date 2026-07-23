@@ -3,6 +3,7 @@ import logging
 import math
 import operator
 import re
+from functools import partial
 from typing import List, Tuple, Generator, Optional, Union
 
 import torch
@@ -37,6 +38,7 @@ from ..banking import (
     require_allocation,
     _get_scope,
 )
+from .tiling_cost import vector_tile_latency
 from ..lowering.utils import _project, _unproject, _NHWC, _HWIO
 from ...layout_ops import NHWC_OP_VARIANTS
 from ...pt2e_utils import WrapperModule, fetch_attr, propagate_shape
@@ -1269,9 +1271,16 @@ def _search_tiling(
     base_tiling=None,
     multiple_of=None,
     extra_size_fn=None,
+    cost_fn=None,
 ):
     """
     Generic driver that iterates over banking strategies and valid tilings.
+
+    ``get_valid_tiling`` yields candidates largest -> smallest.  Without
+    ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
+    fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
+    tiled_shapes, global_tiling) -> latency`` -- every fitting candidate is
+    scored and the minimum-latency one is returned (DRAM-aware two-step search).
     """
     op_scope = _get_scope(node.target)
     node_to_key = get_node_to_key_map(node)
@@ -1279,6 +1288,7 @@ def _search_tiling(
 
     strategies = get_banking_strategies_for_op(node.target)
 
+    best = None  # (score, tile_sizes, tiled_shapes, node_to_shape, strategy)
     for strategy in strategies:
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
@@ -1304,30 +1314,47 @@ def _search_tiling(
             if extra_size_fn is not None:
                 total_size += extra_size_fn(node, tile_sizes, tiled_shapes)
 
-            if total_size <= cache_size:
+            if total_size > cache_size:
+                continue
+
+            if cost_fn is None:
                 _log_tiling_details(node, node_to_shape, strategy)
                 return tile_sizes, tiled_shapes
+
+            score = cost_fn(node, tile_sizes, tiled_shapes, global_tiling)
+            if best is None or score < best[0]:
+                best = (
+                    score,
+                    tile_sizes,
+                    tiled_shapes,
+                    node_to_shape,
+                    strategy,
+                )
+
+    if best is not None:
+        _, tile_sizes, tiled_shapes, node_to_shape, strategy = best
+        _log_tiling_details(node, node_to_shape, strategy)
+        return tile_sizes, tiled_shapes
 
     logger.warning(f"Failed to tile {node} with cache size {cache_size}.")
     return None, None
 
 
-def search_conv2d_tiling(node, unroll_dims, cache_size, bank_width, bank_size):
-    if isinstance(unroll_dims, int):
-        unroll_dims = (unroll_dims, unroll_dims)
-
+def search_conv2d_tiling(
+    node, pe_array_size, cache_size, bank_width, bank_size
+):
     N, K, Y, X = node.shape
     C = node.args[0].shape[1]
 
     full_shape = (Y, X, C, K)
 
-    min_xy = int(math.sqrt(unroll_dims[0]))
+    min_xy = int(math.sqrt(pe_array_size[0]))
 
     # conv1 has special hardware constraints
     if C == 3:
         min_xy = 56
 
-    min_sizes = (min_xy, min_xy, unroll_dims[0], unroll_dims[1])
+    min_sizes = (min_xy, min_xy, pe_array_size[0], pe_array_size[1])
 
     order = (3, 0, 1, 2)
 
@@ -1367,11 +1394,8 @@ def mha_projection_head_dim(node) -> Optional[int]:
 
 
 def search_gemm_tiling(
-    node, unroll_dims, cache_size, bank_width, bank_size, k_multiple=1
+    node, pe_array_size, cache_size, bank_width, bank_size, k_multiple=1
 ):
-    if isinstance(unroll_dims, int):
-        unroll_dims = (unroll_dims, unroll_dims)
-
     input_shape = node.args[0].shape
     X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
     C = input_shape[-1]
@@ -1380,14 +1404,14 @@ def search_gemm_tiling(
     weight_shape = node.args[1].shape
     K = weight_shape[-1] if is_mat else weight_shape[0]
 
-    x_min_size = min(sum(unroll_dims), X)
+    x_min_size = min(sum(pe_array_size), X)
 
     num_c_tile = 1
     if bank_size is not None:
         input_bytes = get_node_bytes(node.args[0])
         c_max_size = bank_size / input_bytes / x_min_size
         for (c,), (num_c_tile,) in get_valid_tiling(
-            (C,), min_sizes=(unroll_dims[0],)
+            (C,), min_sizes=(pe_array_size[0],)
         ):
             if c <= c_max_size:
                 break
@@ -1397,7 +1421,7 @@ def search_gemm_tiling(
             )
 
     full_shape = (X, C // num_c_tile, K)
-    min_sizes = (x_min_size, unroll_dims[0], unroll_dims[1])
+    min_sizes = (x_min_size, pe_array_size[0], pe_array_size[1])
     order = (2, 0, 1)
 
     logger.info(f"Running L2 tiling for matrix op: {node}")
@@ -1407,8 +1431,8 @@ def search_gemm_tiling(
         full_shape=full_shape,
         min_sizes=min_sizes,
         multiple_of=(
-            unroll_dims[0],
-            math.lcm(unroll_dims[1], k_multiple),
+            pe_array_size[0],
+            math.lcm(pe_array_size[1], k_multiple),
         ),
         order=order,
         shape_func=_build_gemm_shape_map,
@@ -1448,33 +1472,26 @@ def search_gemm_tiling(
     return tile_sizes, tiled_shapes
 
 
-def run_matrix_op_l2_tiling(
-    model,
-    unroll,
-    cache_size=None,
-    num_banks=None,
-    bank_width=None,
-    use_interstellar_tiling=False,
-):
+def run_matrix_op_l2_tiling(model, config, use_interstellar_tiling=False):
     """
     Perform heuristic L2 tiling on GEMM/conv operations to fit intermediate data
     into cache, splitting each op along the reduction dimension when needed.
 
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
-        unroll (int): Systolic array input and output channel unrolling dimension.
-        cache_size (int): Total cache size in bytes.
-        num_banks (int, optional): Number of cache banks for bank-aligned tiling.
-        bank_width (int, optional): Width of memory for bank-aligned tiling.
+        config (AcceleratorConfig): The hardware description (PE array size,
+            scratchpad size, banking).
         use_interstellar_tiling (bool): When True, the interstellar path already
             tiles matrix-matrix GEMMs and convs on demand, so this pass handles
             only the batch-1 fully-connected (matrix-vector) ops it skips.
     """
     graph = model.graph
 
+    pe_array_size = config.pe_array_size
+    cache_size = config.scratchpad_size
     if cache_size is None:
         cache_size = DEFAULT_CACHE_SIZE
-
+    num_banks = config.num_banks
     bank_size = None if num_banks is None else cache_size // num_banks
 
     for node in list(graph.nodes):
@@ -1482,7 +1499,7 @@ def run_matrix_op_l2_tiling(
             if use_interstellar_tiling:
                 continue
             tile_sizes, tiled_shape = search_conv2d_tiling(
-                node, unroll, cache_size, None, bank_size
+                node, pe_array_size, cache_size, None, bank_size
             )
 
             if tile_sizes is not None:
@@ -1504,7 +1521,7 @@ def run_matrix_op_l2_tiling(
             )
             tile_sizes, tiled_shapes = search_gemm_tiling(
                 node,
-                unroll,
+                pe_array_size,
                 cache_size,
                 None,
                 bank_size,
@@ -1590,13 +1607,14 @@ def _build_vector_op_shape_map(node, tile_sizes, divisor):
     return shapes_map
 
 
-def run_vector_op_node_l2_tiling(
-    node,
-    unroll,
-    cache_size=None,
-    num_banks=None,
-    bank_width=None,
-):
+def run_vector_op_node_l2_tiling(node, config):
+    vector_unit_width = config.vector_lanes
+    cache_size = config.scratchpad_size
+    if cache_size is None:
+        cache_size = DEFAULT_CACHE_SIZE
+    num_banks = config.num_banks
+    bank_width = config.bank_width
+
     if not is_elementwise_op(node) and node.target not in [
         torch.ops.aten.softmax.int,
         torch.ops.aten.layer_norm.default,
@@ -1610,7 +1628,7 @@ def run_vector_op_node_l2_tiling(
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
-    min_sizes = (unroll,)
+    min_sizes = (vector_unit_width,)
     multiple_of = None
     if node.target == torch.ops.aten.softmax.int:
         last_dim = get_arg_value(node, 1, "dim", -1)
@@ -1634,7 +1652,7 @@ def run_vector_op_node_l2_tiling(
         axes = set(a % ndim for a in (axes or ()))
         min_sizes = tuple(
             (
-                max(block_size, unroll)
+                max(block_size, vector_unit_width)
                 if i == ndim - 1
                 else block_size if i in axes else 1
             )
@@ -1642,7 +1660,7 @@ def run_vector_op_node_l2_tiling(
         )
         multiple_of = tuple(
             (
-                math.lcm(block_size if i in axes else 1, unroll)
+                math.lcm(block_size if i in axes else 1, vector_unit_width)
                 if i == ndim - 1
                 else block_size if i in axes else 1
             )
@@ -1661,6 +1679,14 @@ def run_vector_op_node_l2_tiling(
 
     logger.info(f"Running L2 tiling for vector op: {node}")
 
+    # With DRAM info, rank the fitting tiles by a pipeline latency model
+    # instead of taking the largest that fits (see ``tiling_cost``).
+    cost_fn = (
+        partial(vector_tile_latency, config=config)
+        if config.dram_bandwidth is not None
+        else None
+    )
+
     tile_sizes, tiled_shapes = _search_tiling(
         node=node,
         full_shape=output_shape,
@@ -1671,6 +1697,7 @@ def run_vector_op_node_l2_tiling(
         cache_size=cache_size,
         bank_width=bank_width,
         bank_size=None if num_banks is None else cache_size // num_banks,
+        cost_fn=cost_fn,
     )
 
     if tile_sizes is not None:
@@ -1680,30 +1707,20 @@ def run_vector_op_node_l2_tiling(
         )
 
 
-def run_vector_op_l2_tiling(
-    model,
-    unroll,
-    cache_size=None,
-    num_banks=None,
-    bank_width=None,
-):
+def run_vector_op_l2_tiling(model, config):
     """
     Perform tiling on vector operations to fit intermediate data into cache.
 
     Args:
         model: A model object with a FX Graph containing vector operation nodes.
-        unroll (int): Minimum unrolling dimension for vector operations.
-        cache_size (int): Total cache size in bytes.
-        bank_width (int, optional): Width of memory for bank-aligned tiling.
-        num_banks (int, optional): Number of memory banks for bank-aligned tiling.
+        config (AcceleratorConfig): The hardware description.  When it carries a
+            DRAM bandwidth, tiles are chosen by the latency model (``tiling_cost``)
+            rather than by largest-that-fits.
     """
     graph = model.graph
 
-    if cache_size is None:
-        cache_size = DEFAULT_CACHE_SIZE
-
     for node in list(graph.nodes):
-        run_vector_op_node_l2_tiling(node, unroll, cache_size, num_banks)
+        run_vector_op_node_l2_tiling(node, config)
 
     graph.lint()
     graph.eliminate_dead_code()
@@ -2074,13 +2091,7 @@ def split_adaptive_pool_node(model, node, tile_sizes, tiled_shapes):
             )
 
 
-def run_pool_op_l2_tiling(
-    model,
-    unroll,
-    cache_size=None,
-    num_banks=None,
-    bank_width=None,
-):
+def run_pool_op_l2_tiling(model, config):
     """
     Perform tiling on pooling operations to fit intermediate data into Scratchpad.
 
@@ -2089,16 +2100,17 @@ def run_pool_op_l2_tiling(
 
     Args:
         model: A model object with a FX Graph containing pooling nodes.
-        unroll (int): Minimum channel tile size (aligned to hardware unroll factor).
-        cache_size (int): Total Scratchpad size in bytes.
-        num_banks (int, optional): Number of cache banks for bank-aligned tiling.
-        bank_width (int, optional): Width of memory for bank-aligned tiling.
+        config (AcceleratorConfig): The hardware description (vector lane count,
+            scratchpad size, banking).
     """
     graph = model.graph
 
+    vector_unit_width = config.vector_lanes
+    cache_size = config.scratchpad_size
     if cache_size is None:
         cache_size = DEFAULT_CACHE_SIZE
-
+    num_banks = config.num_banks
+    bank_width = config.bank_width
     bank_size = None if num_banks is None else cache_size // num_banks
 
     for node in list(graph.nodes):
@@ -2119,7 +2131,7 @@ def run_pool_op_l2_tiling(
             tile_sizes, tiled_shapes = _search_tiling(
                 node=node,
                 full_shape=(N, H_out, W_out, C),
-                min_sizes=(1, 1, 1, unroll),
+                min_sizes=(1, 1, 1, vector_unit_width),
                 order=(3, 0, 1, 2),
                 shape_func=_build_non_adaptive_pool_shape_map,
                 cache_size=cache_size,
@@ -2142,7 +2154,7 @@ def run_pool_op_l2_tiling(
             tile_sizes, tiled_shapes = _search_tiling(
                 node=node,
                 full_shape=(N, C),
-                min_sizes=(1, unroll),
+                min_sizes=(1, vector_unit_width),
                 order=(1, 0),
                 shape_func=_build_adaptive_pool_shape_map,
                 cache_size=cache_size,

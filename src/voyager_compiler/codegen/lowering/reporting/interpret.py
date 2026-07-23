@@ -28,8 +28,9 @@ from ...passes.utils import get_arg_value
 from ..bufferization import _produces_tensor, _viewed_buffer
 from ..codegen import COMMIT, COND, WHILE_LOOP, _loop_extents, _norm_extent
 from .cost import _shape, _val, tile_bytes
-from .model import CostParams, ScheduleResult
+from .model import ScheduleResult
 from .scheduler import ResourceState
+from ....hardware import AcceleratorConfig
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
@@ -43,7 +44,7 @@ _FILL = torch.ops.voyager.fill.default
 @dataclass
 class _Ctx:
     rs: ResourceState
-    cost: CostParams
+    cost: AcceleratorConfig
     # placeholder -> the outer source node it is bound to (for semaphore-bank
     # rooting across loop / cond boundaries).
     bind: Dict[Node, Node]
@@ -442,27 +443,15 @@ def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
     return result.get("out")
 
 
-def estimate_schedule(
-    model: GraphModule,
-    dram_bandwidth: float,
-    dram_access_latency: float,
-    frequency: float,
-    unroll: tuple[int, int],
-) -> ScheduleResult:
+def estimate_schedule(model: GraphModule, config) -> ScheduleResult:
     """Walk a bufferized + memory-planned FX graph and return its schedule:
     per-node timing records, total latency, and DRAM read / write bytes.
 
-    ``dram_bandwidth`` (GB/s), ``dram_access_latency`` (ns) and ``frequency``
-    (GHz) are physical units; ``cost.py`` converts them to cycles.  Shapes are
-    read from the nodes' existing ``meta['val']`` / ``.value`` (set during
-    bufferization), so the model needs no re-execution.
+    ``config`` is the ``AcceleratorConfig``; ``cost.py`` converts its physical
+    units to cycles.  Shapes are read from the nodes' existing ``meta['val']`` /
+    ``.value`` (set during bufferization), so the model needs no re-execution.
     """
-    cost = CostParams(
-        dram_bandwidth=dram_bandwidth,
-        dram_access_latency=dram_access_latency,
-        frequency=frequency,
-        unroll=tuple(unroll),
-    )
+    cost = config
     rs = ResourceState(cost)
     ctx = _Ctx(rs=rs, cost=cost, bind={})
     _walk(model, {}, ctx, ())

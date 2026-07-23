@@ -426,7 +426,7 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate, order, hoisted=False):
+                if _nodes_sequential(candidate, order, hoisted=True):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True
@@ -789,6 +789,7 @@ def fuse_reshape_with_output(
     candidates: List[List[Node]],
     nodes_map: Dict[Node, Node],
     reshape_node: Node,
+    bufferize: bool = False,
 ) -> bool:
     if not is_mha_qkv_permute(reshape_node):
         return False
@@ -824,9 +825,12 @@ def fuse_reshape_with_output(
     # A microscaling quantize reading the permute comes along as the group's
     # last op: the tile is quantized on its way out of the GEMM, rather than
     # written, read back and written again.  Nothing sits between the two.
+    # Only the bufferized path can quantize the tile on store; the per-node
+    # emitter can't, so outside bufferization the quantize stays separate.
     users = list(reshape_node.users)
     if (
-        len(users) == 1
+        bufferize
+        and len(users) == 1
         and users[0].target is torch.ops.quantized_ops.quantize_mx.default
         and users[0].args[0] is reshape_node
         and search_group(users[0], candidates) is None
@@ -1031,7 +1035,9 @@ def fuse_operator(
 
     for node in list(graph.nodes):
         # Try to fuse MHA QKV permute with preceeding GEMM
-        if fuse_reshape_with_output(graph, fused_nodes_list, nodes_map, node):
+        if fuse_reshape_with_output(
+            graph, fused_nodes_list, nodes_map, node, bufferize
+        ):
             continue
 
         # Attempt to fuse it with its immediate user
@@ -1218,11 +1224,8 @@ def run_submod_l2_tiling(
     module,
     key_to_node,
     tiled_shapes,
-    unroll_dims,
+    config,
     strategy,
-    cache_size,
-    bank_width,
-    bank_size,
 ):
     from .passes.tiling import (
         get_valid_tiling,
@@ -1231,10 +1234,15 @@ def run_submod_l2_tiling(
         _merge_tiling,
     )
 
+    array_size = config.pe_array_size
+    cache_size = config.scratchpad_size
+    bank_width = config.bank_width
+    bank_size = config.bank_size
+
     anchor_node = get_anchor_node(node)
 
     total_size, scratchpad_map = strategy.evaluate(
-        key_to_node, node, tiled_shapes, bank_width, bank_size, unroll_dims[1]
+        key_to_node, node, tiled_shapes, bank_width, bank_size, array_size[1]
     )
 
     # Skip if GEMM already has fused reshape op
@@ -1259,11 +1267,11 @@ def run_submod_l2_tiling(
         if is_conv2d(anchor_node):
             dim = 3 if transposed else 1
             min_sizes = (
-                output_shape[:dim] + (unroll_dims[0],) + output_shape[dim + 1 :]
+                output_shape[:dim] + (array_size[0],) + output_shape[dim + 1 :]
             )
         else:
-            x_min_size = min(sum(unroll_dims), math.prod(output_shape[:-1]))
-            min_sizes = (x_min_size, unroll_dims[0])
+            x_min_size = min(sum(array_size), math.prod(output_shape[:-1]))
+            min_sizes = (x_min_size, array_size[0])
 
     for tile_sizes, tiling in get_valid_tiling(
         output_shape, min_sizes=min_sizes, reverse=is_gemm
@@ -1289,7 +1297,12 @@ def run_submod_l2_tiling(
             logger.debug(f"  {n}: {s}")
 
         total_size, scratchpad_map = strategy.evaluate(
-            key_to_node, node, new_shapes, bank_width, bank_size, unroll_dims[1]
+            key_to_node,
+            node,
+            new_shapes,
+            bank_width,
+            bank_size,
+            array_size[1],
         )
         logger.debug(f"  Total size: {total_size}, Available: {cache_size}")
 
@@ -1363,10 +1376,7 @@ def propagate_tiled_shapes_upstream(start_node, tiled_shapes):
 def adjust_tiling(
     node: Node,
     named_modules: dict,
-    cache_size: int,
-    num_banks: int = None,
-    bank_width: int = None,
-    unroll_dims=None,
+    config,
     interstellar=None,
 ):
     """Tile one node for the scratchpad and return its ``scratchpad_map``.
@@ -1387,10 +1397,12 @@ def adjust_tiling(
     """
     from .passes.tiling import compute_output_tiled_shapes, compute_tiled_shape
 
+    cache_size = config.scratchpad_size
     if cache_size is None:
         return None
 
-    bank_size = cache_size // num_banks if num_banks is not None else None
+    bank_width = config.bank_width
+    bank_size = config.bank_size
 
     anchor_node = get_anchor_node(node)
 
@@ -1442,15 +1454,7 @@ def adjust_tiling(
     for strategy in strategies:
         if node.op == "call_module":
             total_size, scratchpad_map, new_shapes = run_submod_l2_tiling(
-                node,
-                mod,
-                key_to_node,
-                tiled_shapes,
-                unroll_dims,
-                strategy,
-                cache_size=cache_size,
-                bank_width=bank_width,
-                bank_size=bank_size,
+                node, mod, key_to_node, tiled_shapes, config, strategy
             )
         else:
             total_size, scratchpad_map = strategy.evaluate(
@@ -1459,7 +1463,7 @@ def adjust_tiling(
                 tiled_shapes,
                 bank_width,
                 bank_size,
-                unroll_dims[1],
+                config.pe_array_size[1],
             )
             new_shapes = tiled_shapes if l2_tiling else None
 
@@ -1498,42 +1502,30 @@ def adjust_tiling(
 
 def run_memory_mapping(
     model: GraphModule,
+    config,
     allocator: MemoryAllocator = None,
-    cache_size: int = None,
-    num_banks: int = None,
-    bank_width: int = None,
-    unroll_dims=None,
-    double_buffered_accum_buffer: bool = False,
-    input_buffer_size: int = None,
-    weight_buffer_size: int = None,
-    accum_buffer_size: int = None,
 ):
     graph = model.graph
     named_modules = dict(model.named_modules(remove_duplicate=False))
 
-    if isinstance(unroll_dims, int):
-        unroll_dims = (unroll_dims, unroll_dims)
-
     # Build interstellar arch/schedule once if hardware config is provided
     interstellar = None
     if (
-        unroll_dims
-        and input_buffer_size is not None
-        and weight_buffer_size is not None
-        and accum_buffer_size is not None
+        config.pe_array_size
+        and config.input_buffer_size is not None
+        and config.weight_buffer_size is not None
+        and config.accum_buffer_size is not None
     ):
-        arch, schedule = build_architecture_and_schedule(
-            unroll_dims[0],
-            unroll_dims[1],
-            cache_size,
-            input_buffer_size,
-            weight_buffer_size,
-            accum_buffer_size,
+        arch, schedule = build_architecture_and_schedule(config)
+        interstellar = (
+            arch,
+            schedule,
+            config.double_buffered_accum_buffer,
+            {},
         )
-        interstellar = (arch, schedule, double_buffered_accum_buffer, {})
 
     if allocator is None:
-        allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE, bank_width)
+        allocator = MemoryAllocator(DEFAULT_MEMORY_SIZE, config.bank_width)
 
     # Store all the weights in memory if persistent is enabled
     for node in model.graph.nodes:
@@ -1591,10 +1583,7 @@ def run_memory_mapping(
         node.meta["scratchpad_map"] = adjust_tiling(
             node,
             named_modules,
-            cache_size,
-            num_banks,
-            bank_width,
-            unroll_dims,
+            config,
             interstellar,
         )
 
@@ -1622,10 +1611,8 @@ def run_memory_mapping(
         user.replace_input_with(node, copy_node)
         propagate_shape(copy_node, model)
         register_last_uses(copy_node, user)
-        if cache_size is not None:
-            run_vector_op_node_l2_tiling(
-                copy_node, unroll_dims[1], cache_size, num_banks
-            )
+        if config.scratchpad_size is not None:
+            run_vector_op_node_l2_tiling(copy_node, config)
         copy_node.meta["dtype"] = node.meta.get("dtype", None)
         return copy_node
 

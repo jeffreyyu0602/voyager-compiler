@@ -1,6 +1,6 @@
 import argparse
 
-from voyager_compiler.codegen.lowering.reporting.model import (
+from voyager_compiler.hardware import (
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
     DEFAULT_DRAM_BANDWIDTH_GBS,
     DEFAULT_DRAM_SIZE_GB,
@@ -354,10 +354,16 @@ def add_compile_args(parser=None):
         help="Transpose the weights of fully connected layers.",
     )
     parser.add_argument(
-        "--hardware_unrolling",
+        "--pe_array_size",
         type=lambda x: tuple(map(int, x.split(","))),
         default=None,
-        help="Hardware unroll dimensions, e.g. 16,16.",
+        help="Systolic PE array size (rows,cols), e.g. 16,16.",
+    )
+    parser.add_argument(
+        "--vector_unit_width",
+        type=int,
+        default=None,
+        help="Vector unit lane count; defaults to the PE array columns.",
     )
 
     # -- tiling / bufferized lowering ---------------------------------------

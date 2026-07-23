@@ -685,8 +685,6 @@ class IterationSpaceNormalizer:
         moves, and the padding pass has already made the axis a whole number of
         blocks long.
         """
-        if value_node.target != torch.ops.quantized_ops.quantize_mx.default:
-            return False
         axes = value_node.args[2]
         block_size = value_node.args[3]
         if not isinstance(block_size, int) or block_size <= 0:
@@ -694,8 +692,8 @@ class IterationSpaceNormalizer:
         if len(axes) != 1:
             return False
         # quantize_mx returns (scale, data); blocks live on the data output.
-        data_internal = tuple(internal_shapes[1])
-        data_external = tuple(external_shapes[1])
+        data_internal = tuple(internal_shapes[-1])
+        data_external = tuple(external_shapes[-1])
         # The axis counts from the end, so the restore hands it to whatever dim
         # sits that far from the end of the restored shape.
         dim = axes[0]

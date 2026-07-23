@@ -2,6 +2,8 @@ import logging
 import math
 from typing import Optional
 
+import interstellar
+
 from ..pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
@@ -59,8 +61,6 @@ class RuntimeCalculator:
             )
 
     def calculate_runtime(self, architecture, layer, mapping):
-        import interstellar
-
         le = interstellar.le
 
         blockings = mapping.loop_blockings
@@ -170,15 +170,8 @@ class RuntimeCalculator:
         return total_time
 
 
-def build_architecture_and_schedule(
-    ic_dim: int,
-    oc_dim: int,
-    l2_cache_size: int,
-    input_buffer_size: int,
-    weight_buffer_size: int,
-    accum_buffer_size: int,
-):
-    import interstellar
+def build_architecture_and_schedule(config):
+    ic_dim, oc_dim = config.pe_array_size
 
     # L0/L1 are slot arrays: one fixed-width slot per element (the max dtype in a
     # mixed-precision design; narrower dtypes are padded into a full slot), so
@@ -188,11 +181,11 @@ def build_architecture_and_schedule(
         buf_capacity_list=[
             [1, 1, 1],
             [
-                input_buffer_size * ic_dim,
-                accum_buffer_size * oc_dim,
-                weight_buffer_size * oc_dim,
+                config.input_buffer_size * ic_dim,
+                config.accum_buffer_size * oc_dim,
+                config.weight_buffer_size * oc_dim,
             ],
-            [l2_cache_size],
+            [config.scratchpad_size],
         ],
         buf_access_cost_list=[[1, 1, 1], [10, 10, 10], [100]],
         buf_unit_static_cost_list=[[0, 0, 0], [0, 0, 0], [0]],
@@ -246,7 +239,6 @@ def _extract_layer_dims(node, key_to_shape, output_shape):
     key_to_shape: dict mapping kwarg key names to tiled shapes.
     output_shape: tiled shape of the output tensor.
     """
-    import interstellar
     from .passes.utils import get_arg_value, _pair
     from .mapping_utils import (
         is_conv2d,
@@ -316,8 +308,6 @@ def run_interstellar_for_tiled_op(
     tiling_cache,
     named_modules,
 ):
-    import interstellar
-
     from .mapping import get_node_to_key_map
 
     node_to_key = get_node_to_key_map(gemm_node)

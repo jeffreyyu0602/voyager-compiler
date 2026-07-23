@@ -10,27 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-DEFAULT_DRAM_SIZE_GB = 16.0
-DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
-DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
-
-
-@dataclass(frozen=True)
-class CostParams:
-    """Editable hardware knobs of the latency / traffic model, in physical
-    units; ``cost.py`` converts to cycles via ``frequency``.
-
-    ``dram_bandwidth`` is GB/s, ``dram_access_latency`` is ns, ``frequency`` is
-    GHz (so bytes/cycle = ``dram_bandwidth / frequency`` and per-transfer
-    latency cycles = ``dram_access_latency * frequency``).  ``unroll`` is the
-    ``(rows, cols)`` of the systolic array: GEMM/conv run at
-    ``unroll[0]*unroll[1]`` MACs/cycle, vector ops at ``unroll[1]`` lanes.
-    """
-
-    dram_bandwidth: float  # GB/s
-    dram_access_latency: float  # ns
-    frequency: float  # GHz
-    unroll: Tuple[int, int]
+from ....hardware import AcceleratorConfig
 
 
 @dataclass
@@ -133,7 +113,7 @@ class ScheduleResult:
     total_latency: int
     dram_read_bytes: int
     dram_write_bytes: int
-    cost: CostParams
+    cost: AcceleratorConfig
     dram_weight_bytes: int = 0
     dram_activation_bytes: int = 0
     dram_kv_bytes: int = 0

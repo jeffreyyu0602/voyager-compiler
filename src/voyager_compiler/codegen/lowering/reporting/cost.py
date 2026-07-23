@@ -16,8 +16,10 @@ from torch.fx import GraphModule, Node
 
 from ...mapping import get_anchor_node
 from ...mapping_utils import is_conv2d, is_fully_connected, is_gemm_op
+from ...passes.tiling_cost import vector_op_utilization
 from ....pt2e_utils import dtype_byte_size
-from .model import CostParams, OpInfo
+from ....hardware import AcceleratorConfig
+from .model import OpInfo
 
 
 def _val(node):
@@ -70,7 +72,7 @@ def tile_bytes(buffer_node: Node, sizes) -> int:
     return math.ceil(n * dtype_byte_size(_dtype(buffer_node)))
 
 
-def dram_cycles(n_bytes: int, cost: CostParams) -> int:
+def dram_cycles(n_bytes: int, cost: AcceleratorConfig) -> int:
     # GB/s == bytes/ns, so n_bytes / dram_bandwidth is the transfer time in ns;
     # add the access latency (ns) and convert to cycles with frequency (GHz).
     time_ns = cost.dram_access_latency + n_bytes / cost.dram_bandwidth
@@ -82,19 +84,11 @@ def dram_cycles(n_bytes: int, cost: CostParams) -> int:
 # --------------------------------------------------------------------------
 
 
-# Passes an op makes over its data; it fetches its operands once per pass.
-OP_PASSES = {
-    torch.ops.aten.layer_norm.default: 4,
-    torch.ops.aten.softmax.int: 3,
-}
-
-
 def op_utilization(
     node: Node,
-    anchor: Node,
     units: Tuple[str, ...],
     ideal_cycles: int,
-    cost: CostParams,
+    cost: AcceleratorConfig,
 ) -> float:
     """The utilization to charge ``node``.
 
@@ -103,37 +97,15 @@ def op_utilization(
     its tiled executions really costs -- so its utilization is the ideal-to-
     actual ratio.
 
-    A vector op is bound by SRAM bandwidth instead (DRAM is modeled separately,
-    as ``async_copy`` events).  The SRAM is provisioned to match DRAM, so its
-    bandwidth is ``dram_bandwidth / frequency`` bytes per cycle.  Peak is one
-    ``unroll[1]``-wide lane group per cycle, fetched at the widest of the
-    anchor's input / output element widths and once per pass the op makes over
-    its data, so the op sustains the fraction of peak at which that fetch keeps
-    up.
-
-    The rules key off the *anchor*: a fused ``call_module``'s own target is just
-    the submodule name, so only the anchor names the real op.
+    Everything else runs on the vector unit; ``vector_op_utilization`` (shared
+    with the vector L2-tiling cost model) charges it, at
+    ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
+    case, which it sizes by the streamed weight.
     """
     per_tile = node.meta.get("per_tile_cycles")
     if "mma" in units and per_tile and ideal_cycles > 0:
-        # Only ever a slowdown; clamp away model noise (and a zero divisor).
         return min(1.0, ideal_cycles / per_tile)
-    if is_fully_connected(anchor):
-        return 1.0
-    sram_bandwidth = cost.dram_bandwidth / cost.frequency  # bytes / cycle
-    # A node whose value never got propagated carries no dtype -- skip it
-    # rather than guess at a width.
-    widths = [
-        dtype_byte_size(_dtype(n))
-        for n in [node, *node.all_input_nodes]
-        if _val(n) is not None
-    ]
-    num_bytes = cost.unroll[1] * max(widths, default=2.0)
-    fetch_cycles = OP_PASSES.get(anchor.target, 1) * math.ceil(
-        num_bytes / sram_bandwidth
-    )
-    # Bandwidth to spare does not beat peak, it only reaches it.
-    return min(1.0, 1.0 / fetch_cycles)
+    return vector_op_utilization(node, cost.vector_lanes, cost.bytes_per_cycle)
 
 
 # --------------------------------------------------------------------------
@@ -141,7 +113,7 @@ def op_utilization(
 # --------------------------------------------------------------------------
 
 
-def op_info(node: Node, cost: CostParams) -> OpInfo:
+def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     """Classify a compute node and compute its ideal (100%-utilization) cycle
     count.  GEMM/conv use the ``unroll[0]*unroll[1]`` systolic throughput;
     vector ops use the ``unroll[1]`` lane count.
@@ -153,8 +125,8 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     scales / codes / bias).
     """
     anchor = get_anchor_node(node)
-    macs_unroll = max(1, cost.unroll[0] * cost.unroll[1])
-    vec_unroll = max(1, cost.unroll[1])
+    mma_macs = max(1, cost.pe_array_size[0] * cost.pe_array_size[1])
+    vec_lanes = max(1, cost.vector_lanes)
     out = _shape(anchor)
 
     # A fused submodule drives the vector unit too (its tail runs on the VU,
@@ -171,7 +143,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
         macs = math.prod(out) * c * kh * kw
-        ideal = math.ceil(macs / macs_unroll)
+        ideal = math.ceil(macs / mma_macs)
         return OpInfo(
             node.name,
             "conv",
@@ -183,7 +155,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
                 "output": out,
             },
             units=matrix_units,
-            utilization=op_utilization(node, anchor, matrix_units, ideal, cost),
+            utilization=op_utilization(node, matrix_units, ideal, cost),
         )
 
     if is_gemm_op(anchor):
@@ -194,7 +166,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
         # A fully-connected (matrix-vector) GEMM runs on the vector unit, so
         # its throughput is the vector lane count, not the systolic MAC count.
         fc = is_fully_connected(anchor)
-        divisor = vec_unroll if fc else macs_unroll
+        divisor = vec_lanes if fc else mma_macs
         ideal = math.ceil(macs / divisor)
         units = ("vector",) if fc else matrix_units
         return OpInfo(
@@ -208,7 +180,7 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
                 "output": out,
             },
             units=units,
-            utilization=op_utilization(node, anchor, units, ideal, cost),
+            utilization=op_utilization(node, units, ideal, cost),
         )
 
     # Vector op: work is the larger of input / output element count -- a
@@ -218,12 +190,12 @@ def op_info(node: Node, cost: CostParams) -> OpInfo:
     in_nodes = anchor.all_input_nodes
     in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
-    ideal = math.ceil(ops / vec_unroll)
+    ideal = math.ceil(ops / vec_lanes)
     return OpInfo(
         node.name,
         "vector",
         ideal,
         {"ops": ops, "input": in_shape, "output": out},
         units=("vector",),
-        utilization=op_utilization(node, anchor, ("vector",), ideal, cost),
+        utilization=op_utilization(node, ("vector",), ideal, cost),
     )

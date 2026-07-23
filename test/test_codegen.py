@@ -272,6 +272,7 @@ if __name__ == "__main__":
 
     transform_args = get_transform_args(args, VECTOR_PIPELINE)
     compile_args = get_compile_args(args)
+    config = transform_args["config"]
 
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)
@@ -377,7 +378,7 @@ if __name__ == "__main__":
 
         past_key_values = None
 
-        block = args.hardware_unrolling[1]
+        block = config.vector_lanes
         # context + generation budget, rounded up to a block_size multiple.
         raw = args.context_length + 128
         max_cache_len = -(-raw // block) * block
@@ -499,9 +500,7 @@ if __name__ == "__main__":
         )
 
         if args.enable_mixed_precision:
-            qconfig = get_llama_qconfig(
-                args.hardware_unrolling[0], args.outlier_pct
-            )
+            qconfig = get_llama_qconfig(args.pe_array_size[1], args.outlier_pct)
 
             script_dir = os.path.dirname(os.path.abspath(__file__))
             target_path = os.path.join(
@@ -593,7 +592,7 @@ if __name__ == "__main__":
 
         input_ids = encodings.input_ids[:, : args.context_length]
 
-        block = args.hardware_unrolling[1]
+        block = config.vector_lanes
         # context + generation budget, rounded up to a block_size multiple.
         raw = args.context_length + 128
         max_cache_len = -(-raw // block) * block

@@ -15,7 +15,6 @@ from .compress import compress_schedule
 from .excel import write_excel_report
 from .interpret import estimate_schedule
 from .model import (
-    CostParams,
     LoopSummary,
     OpInfo,
     ScheduleResult,
@@ -24,7 +23,6 @@ from .model import (
 from .perfetto import write_perfetto
 
 __all__ = [
-    "CostParams",
     "LoopSummary",
     "OpInfo",
     "ScheduleResult",
@@ -39,10 +37,7 @@ __all__ = [
 
 def report(
     model,
-    dram_bandwidth: float,
-    dram_access_latency: float,
-    frequency: float,
-    unroll: tuple[int, int],
+    config,
     *,
     output_dir: str = ".",
     basename: str = "schedule",
@@ -52,20 +47,14 @@ def report(
     """Estimate, compress, and write the reports for a bufferized + memory-
     planned ``model``.
 
-    ``dram_bandwidth`` (GB/s), ``dram_access_latency`` (ns) and ``frequency``
-    (GHz) are physical units (cost.py converts to cycles).  Writes
-    ``<basename>.xlsx`` (and, when ``perfetto``, ``<basename>.perfetto.json``)
-    under ``output_dir`` and returns the (compressed) ``ScheduleResult``.
-    ``compress_events`` writes only the compressed schedule to the Events sheet,
-    so it stays small (and fast to write) for large trip counts.
+    ``config`` is the ``AcceleratorConfig`` (physical units; cost.py converts to
+    cycles).  Writes ``<basename>.xlsx`` (and, when ``perfetto``,
+    ``<basename>.perfetto.json``) under ``output_dir`` and returns the
+    (compressed) ``ScheduleResult``.  ``compress_events`` writes only the
+    compressed schedule to the Events sheet, so it stays small (and fast to
+    write) for large trip counts.
     """
-    result = estimate_schedule(
-        model,
-        dram_bandwidth=dram_bandwidth,
-        dram_access_latency=dram_access_latency,
-        frequency=frequency,
-        unroll=unroll,
-    )
+    result = estimate_schedule(model, config)
     compress_schedule(result)
 
     os.makedirs(output_dir, exist_ok=True)

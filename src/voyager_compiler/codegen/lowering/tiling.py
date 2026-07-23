@@ -41,64 +41,55 @@ le = interstellar.le
 @dataclass
 class TilerContext:
     """The interstellar architecture + run options, built once and shared by
-    every builder so each can map its anchor node on demand."""
+    every builder so each can map its anchor node on demand.  ``arch`` /
+    ``schedule`` are built from ``config``; ``cache`` is per-run memoization."""
 
     arch: object
     schedule: object
-    unroll: tuple  # (ic_dim, oc_dim)
-    dram_bandwidth: int  # bytes per cycle
-    double_buffered_accum_buffer: bool = False
-    double_buffered_l2: bool = False
+    config: object  # AcceleratorConfig
     cache: dict = field(default_factory=dict)
 
 
-def build_interstellar_tiler(
-    unroll,
-    input_buffer_size,
-    weight_buffer_size,
-    accum_buffer_size,
-    scratchpad_size,
-    dram_size,
-    dram_bandwidth,
-    double_buffered_accum_buffer=False,
-    double_buffered_l2=False,
-    dram_access_cost=1000,
-    num_banks=None,
-):
+def build_interstellar_tiler(config, dram_access_cost=1000):
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
 
-    ``unroll`` is ``(ic_dim, oc_dim)``.  ``dram_bandwidth`` is in **bytes per
-    cycle** (already ``dram_bandwidth / frequency``); the DRAM transfer
-    accounting is in absolute bytes, so it is not normalized by any element
-    width.
+    ``config.pe_array_size`` is ``(ic_dim, oc_dim)``.  The DRAM transfer
+    accounting is in absolute bytes (bandwidth as ``config.bytes_per_cycle`` is
+    read at run time), so it is not normalized by any element width.
 
     The L0/L1 capacities are slot arrays: one fixed-width slot per element (the
-    max dtype in a mixed-precision design; narrower dtypes are padded into a full
-    slot), so they are element / slot counts and the fit check is
+    max dtype in a mixed-precision design; narrower dtypes are padded into a
+    full slot), so they are element / slot counts and the fit check is
     dtype-independent.  The flat L2/L3 byte pools let sub-byte operands pack, so
     those stay in bytes.  When ``double_buffered_l2`` is set, two L3 tiles must
     fit in L2 at once (one computing, one loading), so the effective L2 capacity
     is halved.
+
+    ``config`` carries physical units (GB); the interstellar model wants bytes,
+    so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
+    to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     """
-    ic_dim, oc_dim = unroll
+    ic_dim, oc_dim = config.pe_array_size
+    scratchpad_size = config.scratchpad_size
+    num_banks = config.num_banks
 
     # Banking applies only at L2 (the on-chip scratchpad). The bank size is the
     # physical cache split into ``num_banks`` -> derive it from the real cache
     # size (``scratchpad_size``), not the L2 capacity below (which is fudged by
     # the double-buffer ``*2`` hack). None = no banking.
-    l2_bank_size = None if num_banks is None else scratchpad_size // num_banks
+    bank_size = scratchpad_size // num_banks if num_banks is not None else None
 
     architecture = interstellar.Resource(
         buf_capacity_list=[
             [1, 1, 1],
             [
-                input_buffer_size * ic_dim,
-                accum_buffer_size * oc_dim,
-                weight_buffer_size * oc_dim,
+                config.input_buffer_size * ic_dim,
+                config.accum_buffer_size * oc_dim,
+                config.weight_buffer_size * oc_dim,
             ],
             [scratchpad_size],
-            [dram_size],
+            [config.dram_size * 1024**3],  # GB -> bytes
         ],
         buf_access_cost_list=[
             [1, 1, 1],
@@ -112,7 +103,7 @@ def build_interstellar_tiler(
         mac_capacity=0,
         partition_mode=[0, 0, 0, 0],
         invalid_underutilized=False,
-        bank_size_list=[None, None, l2_bank_size, None],
+        bank_size_list=[None, None, bank_size, None],
     )
 
     schedule_constraint = {
@@ -148,10 +139,7 @@ def build_interstellar_tiler(
     return TilerContext(
         arch=architecture,
         schedule=schedule,
-        unroll=unroll,
-        dram_bandwidth=dram_bandwidth,
-        double_buffered_accum_buffer=double_buffered_accum_buffer,
-        double_buffered_l2=double_buffered_l2,
+        config=config,
     )
 
 
@@ -413,11 +401,18 @@ class RuntimeCalculator:
     issues both simultaneously, replace the sum with max(...) in
     calculate_runtime.
 
+    dram_access_latency_cycles: fixed DRAM latency (cycles) charged once per
+    transfer -- the input load, the weight load and the output store are three
+    separate transfers per L3 block -- so a tiling with more, smaller L3 blocks
+    pays that latency more often. Mirrors the vector-op tiling model
+    (``vector_tile_latency`` in ``codegen/passes/tiling_cost.py``).
+
     double_buffered_l2: when True, DRAM I/O and compute overlap (ping-pong).
     The L3 loop cost becomes max(dram_loading_time, per_l3_compute_time) instead
-    of their sum. The L2 capacity should be halved in
-    build_interstellar_tiler when this is enabled, so that two L3 tiles fit
-    on-chip simultaneously.
+    of their sum, plus the unoverlapped prologue read and epilogue write (the
+    first block's load and the last block's store have nothing to overlap with).
+    The L2 capacity should be halved in build_interstellar_tiler when this is
+    enabled, so that two L3 tiles fit on-chip simultaneously.
     """
 
     def __init__(
@@ -428,6 +423,7 @@ class RuntimeCalculator:
         double_buffered_accum_buffer: bool,
         sram_bandwidth: int,
         dram_bandwidth: int,
+        dram_access_latency_cycles: float,
         double_buffered_l2: bool = False,
         has_sparse_op: bool = False,
         has_tail_operands: bool = False,
@@ -438,6 +434,7 @@ class RuntimeCalculator:
         self.double_buffered_accum_buffer = double_buffered_accum_buffer
         self.sram_bandwidth = sram_bandwidth
         self.dram_bandwidth = dram_bandwidth
+        self.dram_access_latency_cycles = dram_access_latency_cycles
         self.double_buffered_l2 = double_buffered_l2
         self.has_sparse_op = has_sparse_op
         self.has_tail_operands = has_tail_operands
@@ -626,13 +623,24 @@ class RuntimeCalculator:
             * self.output_dtype_width
             / 8
         )
-        dram_loading_time = (
-            dram_input_size + dram_weight_size + dram_output_size
-        ) / self.dram_bandwidth
+        # Input, weight and output are three separate sequential transfers,
+        # each paying one DRAM access latency: the read loads input + weight
+        # (two transfers), the write stores the output (one).
+        lat = self.dram_access_latency_cycles
+        read = (
+            2 * lat + (dram_input_size + dram_weight_size) / self.dram_bandwidth
+        )
+        write = lat + dram_output_size / self.dram_bandwidth
+        dram_loading_time = read + write
 
         if self.double_buffered_l2:
-            # DRAM I/O and compute overlap: bottleneck is the slower of the two.
-            total_time = l3_blocks * max(dram_loading_time, per_l3_compute_time)
+            # DRAM I/O and compute overlap: each block runs at the slower of the
+            # two, plus the unoverlapped prologue read and epilogue write.
+            total_time = (
+                read
+                + l3_blocks * max(dram_loading_time, per_l3_compute_time)
+                + write
+            )
         else:
             total_time = l3_blocks * (dram_loading_time + per_l3_compute_time)
 
@@ -778,7 +786,7 @@ def run_interstellar(
         f"bs={node.kwargs.get('block_size')}"
     )
 
-    sram_bandwidth = min(tiler.unroll) * if_bits / 8
+    sram_bandwidth = min(tiler.config.pe_array_size) * if_bits / 8
 
     # Use the node's dtype widths so the timing model and the feasibility check
     # (which sizes the same operands) stay consistent.
@@ -786,10 +794,11 @@ def run_interstellar(
         if_bits,
         fl_bits,
         of_bits,
-        tiler.double_buffered_accum_buffer,
+        tiler.config.double_buffered_accum_buffer,
         sram_bandwidth,
-        tiler.dram_bandwidth,
-        double_buffered_l2=tiler.double_buffered_l2,
+        tiler.config.bytes_per_cycle,
+        tiler.config.access_latency_cycles,
+        double_buffered_l2=tiler.config.double_buffered_l2,
         has_tail_operands=bool(fused_specs),
     )
 

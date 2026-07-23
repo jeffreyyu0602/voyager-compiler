@@ -27,7 +27,8 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .cost import dram_cycles, op_info
-from .model import CostParams, OpInfo, TimingRecord
+from .model import OpInfo, TimingRecord
+from ....hardware import AcceleratorConfig
 
 
 @dataclass
@@ -44,7 +45,7 @@ class _PendingCommit:
 
 
 class ResourceState:
-    def __init__(self, cost: CostParams):
+    def __init__(self, cost: AcceleratorConfig):
         self.cost = cost
         self.now = 0
         self.mma_free = 0

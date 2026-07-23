@@ -421,16 +421,14 @@ def quantize_and_dump_model(
         )
 
     example_args = (calibration_data[0]["image"].to(torch_dtype),)
-    unroll = (
-        args.hardware_unrolling[1]
-        if args.hardware_unrolling is not None
-        else None
+    vector_lanes = (
+        args.pe_array_size[1] if args.pe_array_size is not None else None
     )
 
     gm = export_model(model, example_args)
     remove_zero_attention_mask(gm, example_args)
     pad_vit_embeddings_output(
-        gm, model.vit.embeddings, example_args, unroll=unroll
+        gm, model.vit.embeddings, example_args, unroll=vector_lanes
     )
 
     gm = prepare_pt2e(gm, quantizer)

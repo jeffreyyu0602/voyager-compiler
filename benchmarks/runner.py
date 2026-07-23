@@ -146,10 +146,9 @@ def build_points(args):
     for mb in SRAM_EFFECTIVE_MB:
         # Effective SRAM = 2 * cache_size (double buffering).
         cache_size = int(mb * 1024 * 1024) // 2
-        num_banks = max(1, cache_size // common.SRAM_BANK_SIZE)
         for mode in MODES:
             cfg = common.config_from_args(
-                args, mode=mode, cache_size=cache_size, num_banks=num_banks
+                args, mode=mode, cache_size=cache_size
             )
             pts.append(
                 Point(

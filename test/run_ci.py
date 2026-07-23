@@ -38,7 +38,7 @@ DIFF_EXCERPT_LINES = 60
 #
 # Each Command is expanded at runtime into a test_codegen.py argv:
 #     <python> test_codegen.py <model> <SCHEME_ARGS[scheme]>
-#         --hardware_unrolling <unrolling> <extra>
+#         --pe_array_size <unrolling> <extra>
 #         --model_output_dir <run_dir>/<label>
 # The shared per-scheme quantization/compile flags live once in SCHEME_ARGS
 # (no --dump_tensors, no --bufferize). To add coverage, add a Command (and a
@@ -80,7 +80,7 @@ class Command:
 
     model: str  # test_codegen.py positional argument
     scheme: str  # key into SCHEME_ARGS
-    unrolling: str  # --hardware_unrolling value, e.g. "16,16"
+    unrolling: str  # --pe_array_size value, e.g. "16,16"
     network: str = ""  # output/label name (defaults to model)
     extra: str = ""  # any per-command extra flags
 
@@ -165,7 +165,7 @@ def _build(command, run_dir):
 
     argv = [sys.executable, str(TEST_CODEGEN), command.model]
     argv += shlex.split(SCHEME_ARGS[command.scheme])
-    argv += ["--hardware_unrolling", command.unrolling]
+    argv += ["--pe_array_size", command.unrolling]
     argv += shlex.split(command.extra)
     argv += ["--model_output_dir", str(dest)]
     return label, dest, argv

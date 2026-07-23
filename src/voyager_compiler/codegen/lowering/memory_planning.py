@@ -422,7 +422,6 @@ def _plan_scratchpad(
     cache_size: int,
     num_banks: Optional[int],
     bank_width: Optional[int],
-    unroll_dim: Optional[int],
 ):
     """Pack every Scratchpad buffer with greedy best-fit, exactly like DRAM.
 
@@ -560,14 +559,7 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def plan_memory(
-    model: GraphModule,
-    cache_size: Optional[int],
-    *,
-    num_banks: Optional[int] = None,
-    bank_width: Optional[int] = None,
-    unroll_dims=None,
-) -> MemoryPlan:
+def plan_memory(model: GraphModule, config) -> MemoryPlan:
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
 
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
@@ -578,8 +570,18 @@ def plan_memory(
     the address belongs to the buffer, not to every reference to it.  Warns,
     listing the buffers live at the peak, if the scratchpad plan exceeds
     ``cache_size``.
+
+    ``config.scratchpad_size`` is the *per-buffer* budget; under
+    ``double_buffered_l2`` the planner places two ping-pong buffers, so the
+    physical capacity (and bank count) it plans against is doubled here.
     """
-    unroll_dim = unroll_dims[1] if unroll_dims else None
+    bank_width = config.bank_width
+    cache_size = config.scratchpad_size
+    num_banks = config.num_banks
+    if cache_size is not None and config.double_buffered_l2:
+        cache_size *= 2
+    if num_banks is not None and config.double_buffered_l2:
+        num_banks *= 2
 
     # Which buffer every name denotes, and the global schedule: both arenas need
     # them (a buffer dies at the last read of *any* of its names), so compute
@@ -592,7 +594,7 @@ def plan_memory(
     peak_region = None
     if cache_size is not None:
         scratchpad_bytes, peak_region = _plan_scratchpad(
-            model, bufs, cache_size, num_banks, bank_width, unroll_dim
+            model, bufs, cache_size, num_banks, bank_width
         )
 
     _stamp_banking(model, bank_width)

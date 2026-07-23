@@ -5,6 +5,7 @@ from torch.utils._pytree import tree_flatten
 from .cli_args import *
 from .codegen import *
 from .codegen.mapping_utils import flush_tensor_files
+from .hardware import AcceleratorConfig
 from .decomposed import *
 from .fake_quantize import *
 from .fp8 import *
@@ -111,11 +112,9 @@ def transform(
     example_args,
     example_kwargs=None,
     patterns=None,
-    unroll_dims=None,
+    config=None,
     transform_layout=False,
     transpose_fc=False,
-    cache_size=None,
-    num_banks=None,
     skip_op_fusion=False,
     fuse_reshape=True,
     split_spmm=False,
@@ -127,6 +126,11 @@ def transform(
 ):
     if example_kwargs is None:
         example_kwargs = {}
+
+    # A null config (no hardware specified) skips padding / tiling, as passing
+    # no ``unroll_dims`` / ``cache_size`` used to.
+    if config is None:
+        config = AcceleratorConfig(pe_array_size=None)
 
     fake_mode = (
         FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
@@ -170,8 +174,8 @@ def transform(
     # -------------------------------------------------------------------------
     # Pad dimensions to align with hardware unrolling constraints (SIMD, systolic
     # array dimensions, etc.) to ensure efficient execution.
-    if unroll_dims is not None:
-        pad_matrix_op_dimensions(model, *unroll_dims)
+    if config.pe_array_size is not None:
+        pad_matrix_op_dimensions(model, *config.pe_array_size)
 
     # -------------------------------------------------------------------------
     # 3. Matrix Operation Tiling
@@ -180,12 +184,10 @@ def transform(
     # optimize for the specific cache size and memory bank configuration. This
     # annotates each GEMM/conv with ``l2_tiling`` (the bufferized builders read
     # it).
-    if cache_size is not None:
+    if config.scratchpad_size is not None:
         run_matrix_op_l2_tiling(
             model,
-            unroll_dims,
-            cache_size,
-            num_banks,
+            config,
             use_interstellar_tiling=use_interstellar_tiling,
         )
 
@@ -218,13 +220,13 @@ def transform(
     if split_spmm:
         split_dense_spmm_node(model)
 
-    if unroll_dims is not None:
-        pad_vector_op_dimensions(model, unroll_dims[1])
+    if config.pe_array_size is not None:
+        pad_vector_op_dimensions(model, config.vector_lanes)
 
     # Apply L2 tiling logic for vector-based operations.
-    if cache_size is not None:
-        run_pool_op_l2_tiling(model, unroll_dims[1], cache_size, num_banks)
-        run_vector_op_l2_tiling(model, unroll_dims[1], cache_size, num_banks)
+    if config.scratchpad_size is not None:
+        run_pool_op_l2_tiling(model, config)
+        run_vector_op_l2_tiling(model, config)
 
     # -------------------------------------------------------------------------
     # 6. Operator Fusion
@@ -245,26 +247,16 @@ def compile(
     model: torch.fx.GraphModule,
     example_args,
     example_kwargs=None,
-    total_memory=None,
-    cache_size=None,
-    num_banks=None,
-    bank_width=None,
-    unroll_dims=None,
+    config=None,
     output_dir=None,
     output_file="compute_graph",
     dump_tensors=True,
     dump_snapshot=False,
-    input_buffer_size: int = None,
-    weight_buffer_size: int = None,
-    accum_buffer_size: int = None,
-    double_buffered_accum_buffer: bool = False,
-    double_buffered_l2: bool = False,
-    dram_size: int = None,
-    dram_bandwidth: float = None,
-    frequency: float = 1.0,
-    dram_access_latency: float = None,
     bufferize: bool = False,
 ):
+    if config is None:
+        config = AcceleratorConfig(pe_array_size=None)
+
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
@@ -288,18 +280,7 @@ def compile(
         from .codegen.lowering.codegen import compute_op_names
         from .codegen.lowering.tiling import build_interstellar_tiler
 
-        tiler = build_interstellar_tiler(
-            unroll_dims,
-            input_buffer_size=input_buffer_size,
-            weight_buffer_size=weight_buffer_size,
-            accum_buffer_size=accum_buffer_size,
-            scratchpad_size=cache_size,
-            dram_size=dram_size * 1024**3,
-            dram_bandwidth=dram_bandwidth / frequency,
-            double_buffered_accum_buffer=double_buffered_accum_buffer,
-            double_buffered_l2=double_buffered_l2,
-            num_banks=num_banks,
-        )
+        tiler = build_interstellar_tiler(config)
 
         gen_compute_graph(
             model, os.path.join(output_dir, output_file + "_prelowered")
@@ -307,28 +288,19 @@ def compile(
 
         # Reuse the tiler's double-buffering decision: when L2 is double-buffered the
         # tiles already assume two-buffer occupancy, so emit software-pipelined loops.
-        bufferize_graph(model, pipelined=double_buffered_l2, tiler=tiler)
+        bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
 
         # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
         # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).  Writes
         # meta['memory'] / meta['scratchpad'] that the proto emitter reads.
-        plan_memory(
-            model,
-            cache_size * 2 if double_buffered_l2 else cache_size,
-            num_banks=num_banks * 2 if double_buffered_l2 else num_banks,
-            bank_width=bank_width,
-            unroll_dims=unroll_dims,
-        )
+        plan_memory(model, config)
         print_bufferized_graph(model)
 
         # Estimate latency / DRAM traffic from the scheduled graph and dump a
         # live Excel workbook + Perfetto trace alongside the protobuf.
         result = report(
             model,
-            dram_bandwidth=dram_bandwidth,
-            dram_access_latency=dram_access_latency,
-            frequency=frequency,
-            unroll=unroll_dims,
+            config,
             output_dir=output_dir,
             basename=output_file,
         )
@@ -359,19 +331,13 @@ def compile(
         flush_tensor_files()
         return params
 
-    allocator = MemoryAllocator(total_memory, bank_width=bank_width)
-    run_memory_mapping(
-        model,
-        allocator,
-        cache_size,
-        num_banks,
-        bank_width,
-        unroll_dims,
-        double_buffered_accum_buffer=double_buffered_accum_buffer,
-        input_buffer_size=input_buffer_size,
-        weight_buffer_size=weight_buffer_size,
-        accum_buffer_size=accum_buffer_size,
+    total_memory = (
+        None
+        if config.dram_size is None
+        else int(config.dram_size * 1024**3)  # GB -> bytes
     )
+    allocator = MemoryAllocator(total_memory, bank_width=config.bank_width)
+    run_memory_mapping(model, config, allocator)
 
     if dump_snapshot:
         allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))
