@@ -426,7 +426,7 @@ def find_sequential_nodes_(
                 if node in fused_nodes or order[node] < order[last_node]:
                     continue
                 candidate = nodes + nops + [node]
-                if _nodes_sequential(candidate, order, hoisted=True):
+                if _nodes_sequential(candidate, order, hoisted=False):
                     new_chains.append(candidate)
                     fused_nodes.update(candidate)
                     matched = True

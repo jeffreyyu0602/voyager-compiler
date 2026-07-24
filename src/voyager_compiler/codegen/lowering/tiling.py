@@ -386,33 +386,30 @@ def make_size_fn(
 
 
 class RuntimeCalculator:
-    """
-    Runtime cost model for a 4-level memory hierarchy:
-      L0 = PE registers, L1 = scratchpad, L2 = on-chip SRAM, L3 = DRAM.
+    """Runtime cost model for a 4-level hierarchy (PE / L1 / L2 / DRAM).
 
-    Mirrors RuntimeCalculator for L0-L2, then wraps the L2 timing in an outer
-    L3 loop and adds DRAM transfer latency (input + weight tile loaded from DRAM
-    to L2 before each L3 iteration).
+    Wraps the L0-L2 timing in an outer L3 loop and adds each iteration's DRAM
+    transfers -- input, weight and output, assumed sequential.
 
-    dram_bandwidth: DRAM bandwidth in bytes per cycle; the DRAM transfer sizes
-    below are in absolute bytes, so the two share a unit.
+    Deliberately carries no prologue / epilogue term: tilings that keep the
+    array equally busy are meant to score equally, leaving the optimizer's
+    energy tie-break -- which prices DRAM accesses -- to choose between them.
 
-    Input and weight transfers are assumed sequential. If the memory controller
-    issues both simultaneously, replace the sum with max(...) in
-    calculate_runtime.
-
-    dram_access_latency_cycles: fixed DRAM latency (cycles) charged once per
-    transfer -- the input load, the weight load and the output store are three
-    separate transfers per L3 block -- so a tiling with more, smaller L3 blocks
-    pays that latency more often. Mirrors the vector-op tiling model
-    (``vector_tile_latency`` in ``codegen/passes/tiling_cost.py``).
-
-    double_buffered_l2: when True, DRAM I/O and compute overlap (ping-pong).
-    The L3 loop cost becomes max(dram_loading_time, per_l3_compute_time) instead
-    of their sum, plus the unoverlapped prologue read and epilogue write (the
-    first block's load and the last block's store have nothing to overlap with).
-    The L2 capacity should be halved in build_interstellar_tiler when this is
-    enabled, so that two L3 tiles fit on-chip simultaneously.
+    Args:
+        input_dtype_width: Input element width, bits.
+        weight_dtype_width: Weight element width, bits.
+        output_dtype_width: Output element width, bits.
+        double_buffered_accum_buffer: Overlap the accumulator drain.
+        sram_bandwidth: L2 -> L1 bandwidth, bytes per cycle.
+        dram_bandwidth: DRAM bandwidth, bytes per cycle -- transfer sizes are
+            absolute bytes, so the two share a unit.
+        dram_access_latency_cycles: Fixed per-transfer latency.  Not charged
+            at present -- see the FIXME in ``calculate_runtime``.
+        double_buffered_l2: Overlap DRAM I/O with compute, so an iteration
+            costs ``max(dram, compute)`` and not their sum;
+            ``build_interstellar_tiler`` halves the L2 capacity to match.
+        has_sparse_op: Double the weight load time.
+        has_tail_operands: Hold the vector unit at high precision.
     """
 
     def __init__(
@@ -551,8 +548,14 @@ class RuntimeCalculator:
 
     @staticmethod
     def _l3_blocks(mapping):
-        """Number of L3 (DRAM) tiles.  IC is pinned to blocking_size=1 at L3,
-        so this is purely spatial."""
+        """Number of L3 (DRAM) tiles, the reduction loop excluded."""
+        # FIXME: nothing pins IC to 1 at L3 -- the schedule hint constrains only
+        # FX / FY -- so a K-tiled GEMM runs blockings[IC][3] times more
+        # iterations than this counts and calculate_runtime comes out low by
+        # that factor.  Correcting it alone makes the tiling *worse*: that error
+        # is the only term in the objective that tracks DRAM traffic, since it
+        # rewards splitting K, which is free in bytes and buys the big M / N
+        # tiles that divide the refetch.
         blockings = mapping.loop_blockings
         l3_blocks = 1
         for i in range(le.NUM):
@@ -586,9 +589,9 @@ class RuntimeCalculator:
         l3_blocks = self._l3_blocks(mapping)
         per_l3_compute_time = self.per_tile_compute_cycles(mapping)
 
-        # DRAM transfer size (in absolute bytes) for one L3 block (levels 0-2
-        # only; [3] is the L3 iteration count and belongs in l3_blocks, not in
-        # the per-iteration tile size).  ``dram_bandwidth`` is bytes/cycle.
+        # DRAM transfer size (in absolute bytes) for one L3 iteration (levels
+        # 0-2 only; [3] is the iteration count and belongs in l3_blocks, not in
+        # the tile size).  ``dram_bandwidth`` is bytes/cycle.
         dram_input_size = (
             partitionings[le.IC][0]
             * blockings[le.IC][1]
@@ -623,24 +626,18 @@ class RuntimeCalculator:
             * self.output_dtype_width
             / 8
         )
-        # Input, weight and output are three separate sequential transfers,
-        # each paying one DRAM access latency: the read loads input + weight
-        # (two transfers), the write stores the output (one).
-        lat = self.dram_access_latency_cycles
-        read = (
-            2 * lat + (dram_input_size + dram_weight_size) / self.dram_bandwidth
-        )
-        write = lat + dram_output_size / self.dram_bandwidth
-        dram_loading_time = read + write
+        # FIXME: one iteration's operands, but they reload every reduction step
+        # while the output stores only once -- so this both under-counts the
+        # weight refetch and over-counts the store.  Under the double-buffered
+        # max() below the error never surfaces, which is why the objective is
+        # blind to DRAM traffic and the energy tie-break has to decide.
+        dram_loading_time = (
+            dram_input_size + dram_weight_size + dram_output_size
+        ) / self.dram_bandwidth
 
         if self.double_buffered_l2:
-            # DRAM I/O and compute overlap: each block runs at the slower of the
-            # two, plus the unoverlapped prologue read and epilogue write.
-            total_time = (
-                read
-                + l3_blocks * max(dram_loading_time, per_l3_compute_time)
-                + write
-            )
+            # DRAM I/O and compute overlap: bottleneck is the slower of the two.
+            total_time = l3_blocks * max(dram_loading_time, per_l3_compute_time)
         else:
             total_time = l3_blocks * (dram_loading_time + per_l3_compute_time)
 
