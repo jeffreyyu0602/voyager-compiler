@@ -1007,6 +1007,41 @@ def get_level_cost(resource, point, layer, level, verbose=False):
     return level_cost
 
 
+def get_total_cost(resource, point, layer, verbose=False):
+    """
+    Summed memory access energy over every buffer level.
+
+    Equivalent to summing ``get_level_cost`` across all levels, but the three
+    access vectors are built once rather than once per level: they are a
+    function of (resource, point, layer) only -- ``level`` merely indexes the
+    result -- so recomputing them per level repeats identical work.
+    """
+
+    mac_capacity = resource.mac_capacity
+
+    if_accesses = get_if_access(resource, point, layer, mac_capacity)
+    of_accesses = get_of_access(resource, point, layer, mac_capacity)
+    fl_accesses = get_fl_access(resource, point, layer, mac_capacity)
+
+    buffer_access = list(zip(if_accesses, of_accesses, fl_accesses))
+
+    total_cost = 0
+    for level in range(resource.buffer_levels()):
+        level_cost = 0
+        for i in range(3):
+            memory_partition = resource.memory_partitions[level][i]
+            level_cost += (
+                buffer_access[level][i]
+                * resource.access_cost[level][memory_partition]
+            )
+
+        if verbose >= 3:
+            print("Level", level, " access: ", buffer_access[level])
+        total_cost += level_cost
+
+    return total_cost
+
+
 def get_cost(resource, point, layer, verbose=False):
     """
     Get the cost of the given mapping point on given resource.

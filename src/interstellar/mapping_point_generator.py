@@ -14,7 +14,6 @@ import pickle
 from functools import reduce
 
 from .mapping_point import MappingPoint
-from .cache import Cache
 from . import cost_model
 
 from . import loop_enum as le
@@ -260,13 +259,16 @@ def loop_tile(loop_extent, num_level, loop_hint=None):
     return tile_permutations
 
 
-def opt_valid_blocking(blocking_cache, resource, layer, blocking, schedule=None):
+def opt_valid_blocking(
+    resource, layer, blocking, schedule, num_levels, dummy_partitioning
+):
     """
     Checks if a given blocking configuration is valid for a specific layer and resource setup.
+
+    Level 0 is *not* re-checked here: it depends only on the level-0 blocking
+    factors, so the caller tests each distinct level-0 column once and never
+    expands an invalid one.
     """
-    num_levels = resource.buffer_levels()
-    blocking_tuple = list(zip(*blocking))
-    dummy_partitioning = [(1,) * num_levels] * le.NUM
     dummy_mapping_point = MappingPoint(None, list(blocking), dummy_partitioning)
 
     """
@@ -279,25 +281,10 @@ def opt_valid_blocking(blocking_cache, resource, layer, blocking, schedule=None)
                     if schedule.schedule_hint[loop_index][level] is not None:
                         if (
                             schedule.schedule_hint[loop_index][level][1] is not None
-                            and blocking_tuple[level][loop_index]
+                            and blocking[loop_index][level]
                             != schedule.schedule_hint[loop_index][level][1]
                         ):
                             return False
-
-    """
-   Use cache to compute valid of first level
-   """
-    level = 0
-    value_in_cache = blocking_cache.read_cache(level, blocking_tuple[level])
-    if value_in_cache == None:
-        valid = cost_model.valid_blocking_size_current_level(
-            resource, dummy_mapping_point, layer, level
-        )
-        blocking_cache.write_cache(level, blocking_tuple[level], valid)
-    else:
-        valid = value_in_cache
-    if not valid:
-        return False
 
     for level in range(1, num_levels):
         if not cost_model.valid_blocking_size_current_level(
@@ -322,17 +309,34 @@ def blocking_generator_function(resource, layer, schedule=None, verbose=False):
         loop_hint = hint[i] if hint and i in hint else None
         all_tile_permutations.append(loop_tile(layer.sizes[i], num_levels, loop_hint))
 
-    """
-    Generate all possible loop tilings for all loops,
-    then transform the data organizations to match with loop_blocking_list
-    Use cache to buffer the valid status of blocking for the first level
-    """
-    blocking_cache = Cache(1, 100)
-    for tile in itertools.product(*all_tile_permutations):
-        # TODO here the generated is a list of lists, not a list of tuples
-        # if cost_model.valid_blocking_size(resource, dummy_mapping_point, layer):
-        if opt_valid_blocking(blocking_cache, resource, layer, tile, schedule):
-            yield list(tile)
+    # Whether a blocking fits at level 0 depends only on each loop's level-0
+    # factor, so group every loop's permutations by that factor and test each
+    # distinct level-0 column once.  A column that does not fit rejects its whole
+    # subtree, which is never enumerated -- on a Llama projection that prunes
+    # ~90% of the candidates before they are built.
+    grouped = []
+    for tile_permutations in all_tile_permutations:
+        by_level0 = {}
+        for permutation in tile_permutations:
+            by_level0.setdefault(permutation[0], []).append(permutation)
+        grouped.append(list(by_level0.values()))
+
+    dummy_partitioning = [(1,) * num_levels] * le.NUM
+    for column in itertools.product(*grouped):
+        representative = [permutations[0] for permutations in column]
+        if not cost_model.valid_blocking_size_current_level(
+            resource,
+            MappingPoint(None, representative, dummy_partitioning),
+            layer,
+            0,
+        ):
+            continue
+
+        for tile in itertools.product(*column):
+            if opt_valid_blocking(
+                resource, layer, tile, schedule, num_levels, dummy_partitioning
+            ):
+                yield list(tile)
 
 
 def current_level_recursive_partition_blocking_with_hint(
@@ -975,7 +979,6 @@ def opt_mapping_point_generator_function(
 
     Generates a new mapping point each iteration.
     """
-    num_levels = resource.buffer_levels()
     parallel_levels = resource.para_index
     ideal_perf = cost_model.get_ideal_performance(layer, resource)
     blocking_partitioning_generator = blocking_partitioning_generator_function(
@@ -1012,15 +1015,12 @@ def opt_mapping_point_generator_function(
             else:
                 runtime = float("inf")
 
-            cost = 0
-            for level in range(num_levels):
-                cost += cost_model.get_level_cost(
-                    resource,
-                    mapping_point,
-                    layer,
-                    level,
-                    verbose,
-                )
+            cost = cost_model.get_total_cost(
+                resource,
+                mapping_point,
+                layer,
+                verbose,
+            )
 
             # optimize for runtime first, then for energy
             if runtime < smallest_runtime or (

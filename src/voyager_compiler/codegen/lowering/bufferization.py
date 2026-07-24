@@ -34,6 +34,7 @@ from ..mapping_utils import (
     is_shape_changing_nop,
 )
 from .ops import MemoryLevel, oracle_disabled
+from .tiling import prefetch_tilings
 from .utils import (
     _collect_codebook_nodes,
     _passed_whole,
@@ -733,20 +734,16 @@ def bufferize_graph(
     )
 
     graph = model.graph
-    # ``pipelined`` (the tiler's double-buffering decision) selects the input
-    # software-pipeline depth: 2 banks (double buffer) vs 1 (single buffer).
     num_banks = 2 if pipelined else 1
-    # Identical layers build identical nests; cache by structural signature so
-    # ``export`` runs once per distinct shape, not once per node.
     build_cache = {}
 
+    if tiler is not None:
+        prefetch_tilings(
+            [n for n in graph.nodes if is_gemm_op(get_anchor_node(n))],
+            tiler,
+        )
+
     for node in list(graph.nodes):
-        # Dispatch is driven by an *anchor* op: for a fused ``call_module`` it is
-        # the submodule's matrix/pointwise anchor (the builders parse the rest of
-        # the submodule and apply the fused tail in the kernel — num_k == 1 folds
-        # the tail into ``compute``, num_k > 1 accumulates into a scratch ref and
-        # applies it once on the last reduction step); for a bare
-        # ``call_function`` it is the node itself.
         if node.op not in ("call_module", "call_function"):
             continue
 
@@ -775,9 +772,6 @@ def bufferize_graph(
         if cached is not None:
             sub_gm, n_out = cached
         else:
-            # A fused submodule with no matrix/pool anchor runs whole through the
-            # pointwise builder; a bare op only when it is elementwise / a
-            # kept-reduction op (pool only when bare — a fused pool is pointwise).
             if is_conv2d(anchor):
                 sub_gm = build_conv2d(
                     node,
@@ -831,11 +825,7 @@ def bufferize_graph(
             if key is not None:
                 build_cache[key] = (sub_gm, n_out)
 
-        # Stamp logical (quantized) dtypes on the nest, all read off the original
-        # ``node`` (the quantizer already annotated it): seed the placeholders
-        # from the input operands' dtypes, and the per-target output-dtype rule
-        # from every compute op of the original submodule (a bare op = itself).
-        # A single forward pass then spreads them through the nest.
+        # Stamp logical (quantized) dtypes on the nest
         phs = [p for p in sub_gm.graph.nodes if p.op == "placeholder"]
         ph_seed = {
             ph: inp.meta.get("dtype")
@@ -859,11 +849,7 @@ def bufferize_graph(
             )
         logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
 
-        # Scope the nest by the name of the op it replaces -- the only point
-        # where that name is known: the node is erased below, and the cache
-        # shares one ``sub_gm`` between identically-shaped ops (so a builder
-        # cannot stamp it).  ``rename_nest_nodes`` spends it at the end of the
-        # pass.  Placeholders map to pre-existing operands, not to nest nodes.
+        # Scope the nest by the name of the op it replaces
         scope = node.name
         if scope.endswith(_FUSED_SUFFIX):
             scope = scope[: -len(_FUSED_SUFFIX)]
@@ -871,10 +857,6 @@ def bufferize_graph(
             if src.op != "placeholder" and isinstance(new, Node):
                 new.meta["scope"] = (scope, anchor.target)
 
-        # Carry the original node's shape/value onto the nest output(s): later
-        # builders read an operand's ``.value`` directly, and ``propagate=False``
-        # skipped the per-node re-execution that used to set it.  Internal nest
-        # nodes keep the exported ``meta['val']`` (enough for memory planning).
         out_vals = node.value if n_out > 1 else [node.value]
         out_shapes = node.shape if n_out > 1 else [node.shape]
         for r, v, s in zip(results, out_vals, out_shapes):
@@ -883,15 +865,8 @@ def bufferize_graph(
         if n_out == 1:
             if "dtype" in node.meta:
                 results[0].meta["dtype"] = node.meta["dtype"]
-            # Rewiring a node feeding a downstream fused call_module leaves that
-            # submodule's placeholder name/source_node pointing at the now-dead
-            # node; refresh it (as fuse_operator does) so codegen/print resolve
-            # the live node.
             update_submod_user_meta(model, results[0])
         else:
-            # Multi-output fused tail (e.g. quantize_mx): each getitem(idx) user
-            # was rewired to the nest's idx-th output buffer; tag its dtype,
-            # refresh downstream submodules, and drop the now-dead getitem.
             dtypes = node.meta.get("dtype")
             for user in list(node.users):
                 assert (

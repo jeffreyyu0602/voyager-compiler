@@ -13,11 +13,15 @@ to each builder; per-node element widths are read from the nodes themselves.
 
 import logging
 import math
+import multiprocessing
+import os
 import time
 from dataclasses import dataclass, field
 
 import interstellar
 import torch
+
+from voyager_compiler.codegen.shape_prop import ShapeProp
 
 from ..mapping import get_anchor_node
 from ..mapping_utils import (
@@ -850,6 +854,124 @@ def run_interstellar(
     return mapping, per_tile_cycles, access_list
 
 
+def tiling_request(node, tiler):
+    """``(key, anchor, out_dtype, fused_specs, oc_align)`` for ``node`` — all
+    of ``get_tiling``'s preparation, stopping short of the search itself.
+
+    ``None`` when no interstellar run is needed: not a matrix op, or the anchor
+    already carries an ``l2_tiling``.  ``get_tiling`` and the prefetch both go
+    through this, so the cache key they compute cannot drift apart.
+    """
+    anchor = get_anchor_node(node)
+    if not (is_conv2d(anchor) or is_linear(anchor) or is_matmul(anchor)):
+        return None
+    if anchor.meta.get("l2_tiling") is not None:
+        return None
+
+    sub_gm = node.meta.get("submodule")
+    if sub_gm is not None:
+        # ``_fused_operand_specs`` reads the placeholders' shapes, and the
+        # builder only shape-props the submodule just before it calls in.
+        ShapeProp(sub_gm).propagate(
+            *(n.value.clone() for n in node.all_input_nodes)
+        )
+        # Fused-submodule placeholders lack the quant ``meta['dtype']``; copy it
+        # from the outer ``all_input_nodes``
+        ph_dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
+        placeholdes = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]
+        for i, ph in enumerate(placeholdes):
+            ph.meta["dtype"] = ph_dtypes[i]
+
+    out_dtype = node.meta.get("dtype")
+    fused_specs = _fused_operand_specs(node, anchor)
+
+    # A projection GEMM feeding an MHA relayout must tile OC on whole heads
+    # (else ``_detect_mha_relayout`` can't store the tile).  ``oc_align`` is the
+    # ``head_dim`` when the fused tail's permute grows the rank, else ``None``.
+    oc_align = None
+    if sub_gm is not None and not is_conv2d(anchor):
+        nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
+        perm = trailing_mha_perm(nodes)
+        if perm is not None and perm.value.ndim > anchor.value.ndim:
+            oc_align = perm.value.shape[-1]
+
+    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (oc_align,)
+    return key, anchor, out_dtype, fused_specs, oc_align
+
+
+# Populated in the parent before forking; a worker reads its job by index so
+# only the index crosses the process boundary (the FX nodes are inherited).
+_PREFETCH_JOBS = []
+
+
+def _run_prefetch_job(index):
+    """Run one prefetched search in a forked worker.  Returns ``(ok, result)``
+    so a failure leaves the entry uncached and is re-raised by the serial path,
+    where it carries its normal traceback."""
+    _, anchor, out_dtype, fused_specs, oc_align, tiler = _PREFETCH_JOBS[index]
+    try:
+        return True, run_interstellar(
+            anchor,
+            tiler,
+            out_dtype=out_dtype,
+            fused_specs=fused_specs,
+            oc_align=oc_align,
+        )
+    except Exception:
+        return False, None
+
+
+def prefetch_tilings(nodes, tiler):
+    """Map every node's layer up front, concurrently, into ``tiler.cache``.
+
+    Each search is independent and single-threaded Python, so they scale across
+    processes; ``fork`` lets a worker read the FX node it inherited instead of
+    marshalling it, which matters because ``Layer.size_fn`` is a closure and
+    cannot be pickled.  A key that does not match the one ``get_tiling``
+    recomputes during the build simply misses and is redone serially — a stale
+    key costs time, never correctness.
+    """
+    global _PREFETCH_JOBS
+
+    jobs = {}
+    for node in nodes:
+        request = tiling_request(node, tiler)
+        if request is None or request[0] in jobs or request[0] in tiler.cache:
+            continue
+        jobs[request[0]] = request + (tiler,)
+
+    if len(jobs) < 2:
+        return
+
+    _PREFETCH_JOBS = list(jobs.values())
+    start = time.perf_counter()
+    try:
+        context = multiprocessing.get_context("fork")
+        with context.Pool(
+            min(len(_PREFETCH_JOBS), os.cpu_count() or 1)
+        ) as pool:
+            results = pool.map(_run_prefetch_job, range(len(_PREFETCH_JOBS)))
+    except Exception as e:
+        logger.warning(
+            "[tiling] parallel prefetch failed (%s); going serial", e
+        )
+        _PREFETCH_JOBS = []
+        return
+
+    cached = 0
+    for job, (ok, result) in zip(_PREFETCH_JOBS, results):
+        if ok:
+            tiler.cache[job[0]] = result
+            cached += 1
+    _PREFETCH_JOBS = []
+    logger.info(
+        "[tiling] prefetched %d/%d mappings in %.2fs",
+        cached,
+        len(results),
+        time.perf_counter() - start,
+    )
+
+
 def get_tiling(node, tiler=None):
     """Per-dim tile *counts* for a GEMM/conv ``node`` (standalone or fused
     ``call_module``), or ``None`` (not a matrix op / untiled / skipped).
@@ -900,30 +1022,7 @@ def get_tiling(node, tiler=None):
     if tiler is None:
         return None
 
-    sub_gm = node.meta.get("submodule")
-
-    # Fused-submodule placeholders lack the quant ``meta['dtype']``; copy it
-    # from the outer ``all_input_nodes``
-    if sub_gm is not None:
-        ph_dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
-        placeholdes = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]
-        for i, ph in enumerate(placeholdes):
-            ph.meta["dtype"] = ph_dtypes[i]
-
-    out_dtype = node.meta.get("dtype")
-    fused_specs = _fused_operand_specs(node, anchor)
-
-    # A projection GEMM feeding an MHA relayout must tile OC on whole heads
-    # (else ``_detect_mha_relayout`` can't store the tile).  ``oc_align`` is the
-    # ``head_dim`` when the fused tail's permute grows the rank, else ``None``.
-    oc_align = None
-    if sub_gm is not None and not is_conv:
-        nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
-        perm = trailing_mha_perm(nodes)
-        if perm is not None and perm.value.ndim > anchor.value.ndim:
-            oc_align = perm.value.shape[-1]
-
-    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (oc_align,)
+    key, anchor, out_dtype, fused_specs, oc_align = tiling_request(node, tiler)
     if key in tiler.cache:
         mapping, per_tile_cycles, access_list = tiler.cache[key]
         logger.debug(
