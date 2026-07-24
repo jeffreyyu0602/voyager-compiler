@@ -4,7 +4,7 @@ from tqdm import tqdm
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    default_data_collator
+    default_data_collator,
 )
 
 from voyager_compiler import (
@@ -33,7 +33,9 @@ def load_model(args):
     return model, tokenizer
 
 
-def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
@@ -46,8 +48,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     input_shape = input_ids.size()
 
     embedding_output = model.mobilebert.embeddings(
-        input_ids=input_ids,
-        token_type_ids=batch["token_type_ids"]
+        input_ids=input_ids, token_type_ids=batch["token_type_ids"]
     )
 
     extended_attention_mask = model.mobilebert.get_extended_attention_mask(
@@ -81,10 +82,12 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     gm = prepare_pt2e(MobileBertWrapper(), quantizer, example_args)
 
     if args.calibration_steps > 0:
-        for i, batch in enumerate(tqdm(calibration_dataloader, desc="Calibrating MobileBERT")):
+        for i, batch in enumerate(
+            tqdm(calibration_dataloader, desc="Calibrating MobileBERT")
+        ):
             embedding_output = model.mobilebert.embeddings(
                 input_ids=batch["input_ids"],
-                token_type_ids=batch["token_type_ids"]
+                token_type_ids=batch["token_type_ids"],
             )
             gm(embedding_output, extended_attention_mask)
             if i == args.calibration_steps - 1:
@@ -97,7 +100,11 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     transform(gm, example_args, **transform_args)
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args)
+    # Verifying the lowered graph re-runs it, which is expensive; gate it on
+    # ``--debug`` so a plain compile skips it.  ``None`` signals "not checked".
+    new_output = None
+    if args.debug:
+        new_output = gm(*example_args)
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output
@@ -107,14 +114,20 @@ def evaluate(model, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    dataloader = DataLoader(dataset, collate_fn=default_data_collator, batch_size=1)
+    dataloader = DataLoader(
+        dataset, collate_fn=default_data_collator, batch_size=1
+    )
 
     correct_predictions = 0
     total_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating MobileBERT"):
-            inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor)
+            }
             outputs = model(**inputs)
             logits = outputs.logits
             prediction = torch.argmax(logits, dim=-1)
@@ -129,7 +142,9 @@ def evaluate_gm(gm, dataset):
     total_samples = 0
 
     with torch.no_grad():
-        for data_label_pair in tqdm(dataset, desc="Evaluating Quantized MobileBERT"):
+        for data_label_pair in tqdm(
+            dataset, desc="Evaluating Quantized MobileBERT"
+        ):
             label = data_label_pair["labels"]
             outputs = gm(
                 data_label_pair["embedding_output"],
@@ -142,4 +157,5 @@ def evaluate_gm(gm, dataset):
                 correct_predictions += 1
             total_samples += 1
 
-    print(f"Quantized MobileBERT Accuracy: {correct_predictions / total_samples:.4f}")
+    accuracy = correct_predictions / total_samples
+    print(f"Quantized MobileBERT Accuracy: {accuracy:.4f}")

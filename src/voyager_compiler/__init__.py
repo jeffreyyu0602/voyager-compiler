@@ -275,7 +275,6 @@ def compile(
             gen_compute_graph_bufferized,
             plan_memory,
             print_bufferized_graph,
-            report,
         )
         from .codegen.lowering.codegen import compute_op_names
         from .codegen.lowering.tiling import build_interstellar_tiler
@@ -296,23 +295,6 @@ def compile(
         plan_memory(model, config)
         print_bufferized_graph(model)
 
-        # Estimate latency / DRAM traffic from the scheduled graph and dump a
-        # live Excel workbook + Perfetto trace alongside the protobuf.
-        result = report(
-            model,
-            config,
-            output_dir=output_dir,
-            basename=output_file,
-        )
-        print(
-            f"  total latency      : {result.total_latency:,} cycles\n"
-            f"  DRAM read  bytes   : {result.dram_read_bytes:,}\n"
-            f"  DRAM write bytes   : {result.dram_write_bytes:,}\n"
-            f"  DRAM total bytes   : "
-            f"{result.dram_read_bytes + result.dram_write_bytes:,}\n"
-            f"  scheduled events   : {len(result.records):,}"
-        )
-
         path = os.path.join(output_dir, "tensor_files")
         params = gen_code_bufferized(
             model, flatten_args, path if dump_tensors else None
@@ -321,8 +303,6 @@ def compile(
             f.write(text_format.MessageToString(params))
         with open(os.path.join(output_dir, "layers.txt"), "w") as f:
             f.write("\n".join(compute_op_names(model)))
-        with open(os.path.join(output_dir, "bufferized_graph.txt"), "w") as f:
-            f.write(print_bufferized_graph(model, to_string=True))
         gen_compute_graph_bufferized(
             model,
             os.path.join(output_dir, output_file),

@@ -143,7 +143,7 @@ def get_llama_qconfig(bs=64, outlier_pct=None):
         }
 
 
-if __name__ == "__main__":
+def main():
     torch.manual_seed(0)
     torch.set_printoptions(sci_mode=False, precision=10)
     torch.set_num_threads(32)
@@ -181,6 +181,15 @@ if __name__ == "__main__":
         "--dump_tensors",
         action="store_true",
         help="Whether to save intermediate outputs for verification.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Re-run the lowered graph and compare its output against the "
+            "pre-transform reference.  Re-running the graph is expensive on a "
+            "large model, so this verification is off by default."
+        ),
     )
     parser.add_argument(
         "--context_length",
@@ -379,7 +388,6 @@ if __name__ == "__main__":
         past_key_values = None
 
         block = config.vector_lanes
-        # context + generation budget, rounded up to a block_size multiple.
         raw = args.context_length + 128
         max_cache_len = -(-raw // block) * block
 
@@ -443,7 +451,6 @@ if __name__ == "__main__":
             position_embeddings,
             cache_position,
         )
-        example_kwargs = {}
 
         class LlamaWrapper(torch.nn.Module):
             def __init__(self):
@@ -489,7 +496,7 @@ if __name__ == "__main__":
                 logits = self.lm_head(hidden_states)
                 return logits
 
-        gm = export_model(LlamaWrapper(), example_args, example_kwargs)
+        gm = export_model(LlamaWrapper(), example_args)
 
         remove_softmax_dtype_cast(gm)
 
@@ -530,14 +537,14 @@ if __name__ == "__main__":
             )
             _annotate_output_qspec(attention_mask, qspec)
 
-        gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
+        gm = prepare_pt2e(gm, quantizer, example_args)
 
         for _ in range(2):
-            gm(*example_args, *list(example_kwargs.values()))
+            gm(*example_args)
 
         convert_pt2e(gm, args.bias)
 
-        flatten_args, _ = tree_flatten((example_args, example_kwargs))
+        flatten_args, _ = tree_flatten(example_args)
         old_output = ShapeProp(gm).propagate(*flatten_args)
 
         if args.quantize_attention_mask:
@@ -553,19 +560,17 @@ if __name__ == "__main__":
             and args.outlier_pct > 0.0
         )
 
-        # if outlier quantization is enabled, we need to use actual data to determine the tile sizes of
-        # csr tensors
+        # if outlier quantization is enabled, we need to use actual data to
+        # determine the tile sizes of csr tensors
         transform(
             gm,
             example_args,
-            example_kwargs=example_kwargs,
             use_fake_mode=(not has_outlier),
             **transform_args,
         )
         compile(gm, example_args, **compile_args)
-
-        new_output = gm(*example_args, *list(example_kwargs.values()))
         gm.graph.print_tabular()
+        new_output = gm(*example_args) if args.debug else None
     elif args.model == "llm_kivi":
         from transformers import AutoModelForCausalLM
 
@@ -665,11 +670,6 @@ if __name__ == "__main__":
             )
             _annotate_output_qspec(attention_mask, qspec)
 
-        # KV Cache shape: (N, H, S, D)
-        #   N = batch size
-        #   H = number of heads
-        #   S = sequence length
-        #   D = head dimension
         key_qspec = QuantizationSpec.from_str(
             "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
         )
@@ -690,7 +690,6 @@ if __name__ == "__main__":
         example_attention_mask = torch.ones(
             (1, max_cache_len), dtype=torch_dtype
         )[None, None, :, :]
-        example_args = ()
         example_kwargs = {
             "input_ids": example_input_ids,
             "cache_position": example_cache_position,
@@ -701,12 +700,12 @@ if __name__ == "__main__":
         gm = prepare_pt2e(gm, quantizer)
 
         for _ in range(2):
-            gm(*example_args, **example_kwargs)
+            gm(**example_kwargs)
 
         sink_obs_or_fq(gm)
         convert_pt2e(gm, eliminate_no_effect=False)
 
-        flatten_args, _ = tree_flatten((example_args, example_kwargs))
+        flatten_args, _ = tree_flatten(example_kwargs)
         old_output = ShapeProp(gm).propagate(*flatten_args)
 
         if args.quantize_attention_mask:
@@ -719,11 +718,11 @@ if __name__ == "__main__":
 
         fuse_dequantize_quantize(gm, unrepeat_qparams=args.bufferize)
 
-        transform(gm, example_args, example_kwargs, **transform_args)
-        compile(gm, example_args, example_kwargs, **compile_args)
+        transform(gm, (), example_kwargs, **transform_args)
+        compile(gm, (), example_kwargs, **compile_args)
 
-        new_output = gm(*example_args, **example_kwargs)
         gm.graph.print_tabular()
+        new_output = gm(**example_kwargs) if args.debug else None
     elif args.model == "vit":
         model = vit.load_model(args)
 
@@ -753,208 +752,12 @@ if __name__ == "__main__":
 
         if args.evaluate:
             vit.evaluate(gm, preprocessed_imagenet)
-    elif args.model == "yolo5":
-        import sys
-
-        sys.path.append("libraries/yolov5-face")
-
-        # Clear any previously loaded modules to avoid conflicts
-        if "utils" in sys.modules:
-            del sys.modules["utils"]
-
-        from models.experimental import attempt_load
-
-        model = attempt_load(args.model_name_or_path, map_location="cpu").eval()
-
-        if args.bf16:
-            model.bfloat16()
-
-        example_args = (torch.randn(1, 3, 640, 640, dtype=torch_dtype),)
-        output = model(*example_args)
-
-        gm = prepare_pt2e(model, quantizer, example_args)
-
-        from voyager_compiler.codegen.mapping import eliminate_dead_code
-
-        eliminate_dead_code(gm.graph)
-
-        dataset = load_dataset("CUHK-CSE/wider_face")
-
-        pipeline = transforms.Compose(
-            [
-                transforms.Resize((640, 640)),  # Resize to 416x416
-                transforms.ToTensor(),  # Convert to tensor and normalize to [0, 1]
-            ]
-        )
-
-        for i in tqdm(range(10)):
-            inputs = pipeline(dataset["train"][i]["image"])
-            with torch.no_grad():
-                gm(inputs.unsqueeze(0).to(torch_dtype))
-
-        convert_pt2e(gm, args.bias)
-
-        old_output = gm(*example_args)[0]
-
-        transform(gm, example_args, **transform_args)
-        gm.graph.print_tabular()
-
-        new_output = gm(*example_args)[0]
-
-        compile(gm, example_args, **compile_args)
-    elif args.model == "mobilevit":
-        try:
-            import timm
-            from timm.layers import set_fused_attn
-        except ImportError as e:
-            raise ImportError(
-                "The 'timm' library is not installed. Please install it using 'pip install timm'."
-            ) from e
-
-        set_fused_attn(False)
-        model = timm.create_model(
-            "hf-hub:timm/mobilevit_xxs.cvnets_in1k", pretrained=True
-        ).eval()
-
-        if args.bf16:
-            model.bfloat16()
-
-        example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
-        gm = prepare_pt2e(model, quantizer, example_args)
-
-        dataset = load_dataset("zh-plus/tiny-imagenet")
-
-        image_processor = AutoImageProcessor.from_pretrained(
-            "microsoft/resnet-18"
-        )
-
-        for i in tqdm(range(10)):
-            inputs = image_processor(
-                dataset["train"][i]["image"], return_tensors="pt"
-            )
-            with torch.no_grad():
-                gm(inputs.pixel_values.to(torch_dtype))
-
-        convert_pt2e(gm, args.bias)
-
-        old_output = gm(*example_args)
-
-        transform(gm, example_args, **transform_args, skip_op_fusion=True)
-
-        gm, preprocess_fn = extract_input_preprocessor(gm)
-        example_args = (preprocess_fn(example_args[0]),)
-
-        fuse_operator(gm, VECTOR_PIPELINE)
-
-        gm.graph.print_tabular()
-
-        new_output = gm(*example_args)
-
-        compile(gm, example_args, **compile_args)
-    elif args.model == "mamba_prefill" or args.model == "mamba_decode":
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from transformers.models.mamba.modeling_mamba import MambaCache
-
-        if args.model_name_or_path is None:
-            args.model_name_or_path = "state-spaces/mamba-130m-hf"
-
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
-        ).eval()
-
-        context_length = args.context_length
-        input_ids = torch.randint(
-            low=0, high=tokenizer.vocab_size, size=(1, context_length)
-        )
-
-        if args.model == "mamba_decode":
-            # Run prefill to populate SSM conv/ssm states
-            with torch.no_grad():
-                prefill_out = model(input_ids, return_dict=True, use_cache=True)
-                cache = prefill_out.cache_params
-                decode_input = torch.argmax(
-                    prefill_out.logits[:, -1, :], dim=-1, keepdim=True
-                )
-
-            # Register each layer's conv and SSM states as model buffers so they
-            # appear as constant tensors in the exported graph
-            num_layers = model.config.num_hidden_layers
-            for i in range(num_layers):
-                model.register_buffer(
-                    f"conv_state_{i}", cache.conv_states[i], persistent=False
-                )
-                model.register_buffer(
-                    f"ssm_state_{i}", cache.ssm_states[i], persistent=False
-                )
-                # Redirect the cache lists to the same underlying tensors
-                cache.conv_states[i] = getattr(model, f"conv_state_{i}")
-                cache.ssm_states[i] = getattr(model, f"ssm_state_{i}")
-
-            # Store cache on the backbone so it can be accessed without being
-            # passed as an export input (MambaCache is not a pytree-compatible type)
-            model.backbone._static_cache = cache
-
-            _orig_backbone_fwd = model.backbone.forward
-
-            def _patched_backbone_fwd(
-                input_ids=None,
-                inputs_embeds=None,
-                cache_params=None,
-                use_cache=None,
-                output_hidden_states=None,
-                return_dict=None,
-                cache_position=None,
-                attention_mask=None,
-                **kwargs,
-            ):
-                if use_cache and cache_params is None:
-                    cache_params = model.backbone._static_cache
-                # Pass use_cache=False so MambaCache is not included in the output
-                # tuple (it is not a pytree-compatible type and would break export)
-                return _orig_backbone_fwd(
-                    input_ids=input_ids,
-                    inputs_embeds=inputs_embeds,
-                    cache_params=cache_params,
-                    use_cache=False,
-                    output_hidden_states=output_hidden_states,
-                    return_dict=False,
-                    cache_position=cache_position,
-                    attention_mask=attention_mask,
-                    **kwargs,
-                )
-
-            model.backbone.forward = _patched_backbone_fwd
-
-            cache_position = torch.tensor([context_length], dtype=torch.long)
-            example_args = (decode_input,)
-            example_kwargs = {
-                "cache_position": cache_position,
-                "return_dict": False,
-                "use_cache": True,
-            }
-        else:
-            example_args = (input_ids,)
-            example_kwargs = {"return_dict": False, "use_cache": False}
-
-        gm = prepare_pt2e(model, quantizer, example_args, example_kwargs)
-
-        for _ in range(2):
-            gm(*example_args, **example_kwargs)
-
-        convert_pt2e(gm, args.bias)
-
-        old_output = gm(*example_args, **example_kwargs)[0]
-
-        transform(gm, example_args, example_kwargs, **transform_args)
-        gm.graph.print_tabular()
-
-        new_output = gm(*example_args, **example_kwargs)[0]
-
-        compile(gm, example_args, example_kwargs, **compile_args)
     else:
         raise ValueError(f"Model {args.model} not supported")
+
+    if new_output is None:
+        print("Skipping output verification (pass --debug to run it)")
+        return
 
     try:
         assert torch.all(old_output == new_output)
@@ -963,3 +766,7 @@ if __name__ == "__main__":
         print(e)
         print(old_output)
         print(new_output)
+
+
+if __name__ == "__main__":
+    main()

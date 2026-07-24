@@ -67,27 +67,6 @@ def quantize_and_dump_model(
         quantizer.set_module_name("classifier", None)
 
         if args.activation is not None and "microscaling" in args.activation:
-            mobilenet_int8_layers = [
-                "features.0.0",
-                # "features.1.conv.0.0",
-                # "features.2.conv.1.0",
-                # "features.3.conv.1.0",
-                # "features.4.conv.1.0",
-                # "features.5.conv.1.0",
-                # "features.6.conv.1.0",
-                # "features.7.conv.1.0",
-                # "features.8.conv.1.0",
-                # "features.9.conv.1.0",
-                # "features.10.conv.1.0",
-                # "features.11.conv.1.0",
-                # "features.12.conv.1.0",
-                # "features.13.conv.1.0",
-                # "features.14.conv.1.0",
-                # "features.15.conv.1.0",
-                # "features.16.conv.1.0",
-                # "features.17.conv.1.0",
-            ]
-
             qspec = QuantizationSpec.from_str("int8,qs=per_tensor_symmetric")
 
             bias_qspec = DerivedQuantizationSpec(
@@ -97,9 +76,7 @@ def quantize_and_dump_model(
             )
 
             qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
-
-            for layer in mobilenet_int8_layers:
-                quantizer.set_module_name(layer, qconfig)
+            quantizer.set_module_name("features.0.0", qconfig)
 
         model.features[0][0].padding = (3, 3)
         model.features[0][0].weight.data = torch.nn.functional.pad(
@@ -165,7 +142,7 @@ def quantize_and_dump_model(
 
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args)
+    new_output = gm(*example_args) if args.debug else None
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn

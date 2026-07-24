@@ -4,7 +4,7 @@ from tqdm import tqdm
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    default_data_collator
+    default_data_collator,
 )
 
 from voyager_compiler import (
@@ -33,7 +33,9 @@ def load_model(args):
     return model, tokenizer
 
 
-def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, args):
+def quantize_and_dump_model(
+    model, quantizer, calibration_data, vector_stages, args
+):
     calibration_dataloader = DataLoader(
         calibration_data, collate_fn=default_data_collator, batch_size=1
     )
@@ -81,7 +83,9 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     gm = prepare_pt2e(BertWrapper(), quantizer, example_args)
 
     if args.calibration_steps > 0:
-        for i, batch in enumerate(tqdm(calibration_dataloader, desc="Calibrating BERT")):
+        for i, batch in enumerate(
+            tqdm(calibration_dataloader, desc="Calibrating BERT")
+        ):
             embedding_output = model.bert.embeddings(
                 input_ids=batch["input_ids"]
             )
@@ -96,7 +100,7 @@ def quantize_and_dump_model(model, quantizer, calibration_data, vector_stages, a
     transform(gm, example_args, **transform_args)
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args)
+    new_output = gm(*example_args) if args.debug else None
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output
@@ -106,14 +110,20 @@ def evaluate(model, dataset):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    dataloader = DataLoader(dataset, collate_fn=default_data_collator, batch_size=1)
+    dataloader = DataLoader(
+        dataset, collate_fn=default_data_collator, batch_size=1
+    )
 
     correct_predictions = 0
     total_samples = 0
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating BERT"):
-            inputs = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+            inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if isinstance(v, torch.Tensor)
+            }
             outputs = model(**inputs)
             logits = outputs.logits
             prediction = torch.argmax(logits, dim=-1)

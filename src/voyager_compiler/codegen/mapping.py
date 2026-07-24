@@ -405,7 +405,9 @@ def find_sequential_nodes_(
         if not stage_nodes:
             continue
 
-        fusion_candidates = fused_chain + [[n] for n in singleton_nodes]
+        fusion_candidates = fused_chain + [
+            [n] for n in sorted(singleton_nodes, key=order.__getitem__)
+        ]
         new_chains = []
         for nodes in fusion_candidates:
             if len(nodes) == 1 and nodes[0] in fused_nodes:
