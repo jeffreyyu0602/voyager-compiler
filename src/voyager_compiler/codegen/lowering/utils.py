@@ -350,24 +350,18 @@ def _is_writeout_wrapper(n: Node) -> bool:
 
 
 def _on_datapath(n: Node) -> bool:
-    """A node the fused kernel computes over -- compute, cast, or relayout --
-    as opposed to a buffer / DMA primitive, a weight, an index, or a store /
-    unpack.  The store-cone walk threads through these and stops at everything
-    else: placeholders, ``get_attr`` weights, the ``voyager.*`` buffer / DMA
-    ops, a ``getitem`` unpack, a bank-read / model ``select``, and loop-counter
-    arithmetic.
+    """A node the fused kernel computes over -- compute, cast, or relayout.
 
-    Deliberately target-based (not value-based): it runs on the freshly
-    exported body, before shapes are re-propagated, so it must not read
-    ``node.value``.  An interior relayout (a ``view`` / ``transpose``) is on the
-    datapath and rides along; only the buffer boundary ends the walk.
+    A kernel reads tiles from SRAM and ends each result in a ``voyager.insert``,
+    so the buffer primitives are the boundary: everything outside the two
+    compute namespaces stops the walk (``voyager.*``, the HOPs, ``getitem``,
+    loop-counter arithmetic), as does everything that is not a
+    ``call_function`` (placeholders, ``get_attr``).  Target-based, not
+    value-based -- the freshly exported body carries no shapes yet.
     """
     if n.op != "call_function":
         return False
-    t = n.target
-    if t is operator.getitem or t is torch.ops.aten.select.int:
-        return False
-    return getattr(t, "namespace", None) in ("aten", "quantized_ops")
+    return getattr(n.target, "namespace", None) in ("aten", "quantized_ops")
 
 
 def _store_cone(seed: Node) -> set:
@@ -439,15 +433,11 @@ def fuse_store_cones(gm: GraphModule) -> None:
         if seed in consumed:
             continue
         cone = _store_cone(seed)
-        # A view / same-dtype cast and a getitem are no work -- the code
-        # generator drops them -- so a lone real op stores through its own
-        # insert and needs no wrapping.  Skip a cone overlapping one already
-        # fused (a shared operand's compute), which would double-extract it.
-        real = [
-            n
-            for n in cone
-            if not is_nop(n) and n.target is not operator.getitem
-        ]
+        # A view / same-dtype cast is no work -- the code generator drops it --
+        # so a lone real op stores through its own insert and needs no wrapping.
+        # Skip a cone overlapping one already fused (a shared operand's compute),
+        # which would double-extract it.
+        real = [n for n in cone if not is_nop(n)]
         if len(real) < 2 or cone & consumed:
             continue
         _create_and_insert_subgraph(list(cone), gm)

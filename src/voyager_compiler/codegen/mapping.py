@@ -271,9 +271,10 @@ def get_submodule_name(module, nodes: List[Node]):
                 )
             ):
                 anchor_node = n
-        prefix = get_unique_node_name(anchor_node)
-        if len(nodes) > 1:
-            prefix += "_fused"
+        if anchor_node is not None:
+            prefix = get_unique_node_name(anchor_node)
+            if len(nodes) > 1:
+                prefix += "_fused"
 
     get_new_node_name = get_new_node_name_with_prefix(prefix)
     return get_new_node_name(module)
