@@ -27,4 +27,5 @@ def get_compile_args(args):
         "output_file": args.model,
         "dump_tensors": args.dump_tensors,
         "bufferize": args.bufferize,
+        "runtime_tolerance": args.runtime_tolerance,
     }

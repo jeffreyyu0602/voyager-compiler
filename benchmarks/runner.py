@@ -314,6 +314,21 @@ def main():
         f"{len(keys)} unique compiles"
     )
 
+    # Before the first compile: a sweep killed hours in still records what it
+    # ran, and the diff is the one that ran, not the tree at the end.
+    os.makedirs(args.out, exist_ok=True)
+    prov = common.write_provenance(args.out)
+    print(
+        f"[provenance] {prov['short']} "
+        f"({'dirty' if prov['dirty'] else 'clean'}) -> "
+        f"{os.path.join(args.out, 'provenance.txt')}"
+    )
+    if prov["dirty"]:
+        print(
+            "  WARNING: uncommitted changes present; results are not "
+            "reproducible from the commit alone (see uncommitted.diff)."
+        )
+
     results = common.run_points_parallel(
         [unique[k] for k in keys],
         args.jobs,
@@ -330,7 +345,6 @@ def main():
         sheets += _baseline_sheets(args)
     sheets += _metric_sheets(points, metric_by_key)
 
-    os.makedirs(args.out, exist_ok=True)
     # Point results/latest at this run (a fresh timestamped dir by default), so
     # the newest aggregate is always reachable at a stable path.
     latest = os.path.join(common.RESULTS_DIR, "latest")

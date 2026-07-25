@@ -253,6 +253,7 @@ def compile(
     dump_tensors=True,
     dump_snapshot=False,
     bufferize: bool = False,
+    runtime_tolerance=None,
 ):
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
@@ -277,9 +278,17 @@ def compile(
             print_bufferized_graph,
         )
         from .codegen.lowering.codegen import compute_op_names
-        from .codegen.lowering.tiling import build_interstellar_tiler
+        from .codegen.lowering.tiling import (
+            DEFAULT_RUNTIME_TOLERANCE,
+            build_interstellar_tiler,
+        )
 
-        tiler = build_interstellar_tiler(config)
+        tolerance = (
+            DEFAULT_RUNTIME_TOLERANCE
+            if runtime_tolerance is None
+            else runtime_tolerance
+        )
+        tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
 
         gen_compute_graph(
             model, os.path.join(output_dir, output_file + "_prelowered")

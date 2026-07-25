@@ -11,6 +11,7 @@ interstellar directly.  A reduction factor greater than 1 is what drives the
 to each builder; per-node element widths are read from the nodes themselves.
 """
 
+import gc
 import logging
 import math
 import multiprocessing
@@ -41,20 +42,32 @@ from ..tiler import _node_dtype_bits, get_dtype_width
 logger = logging.getLogger(__name__)
 le = interstellar.le
 
+# How much longer than the best modeled runtime a mapping may take and still
+# be chosen; the least-energy one among those wins.  0.0 = only the fastest.
+DEFAULT_RUNTIME_TOLERANCE = 0.01
+
+# Partial-sum width, bits -- shared by the timing model and the tile sizing.
+# ``accumulate_fp32`` is never enabled today; wire it through if that changes.
+PSUM_BITS = 16
+
 
 @dataclass
 class TilerContext:
     """The interstellar architecture + run options, built once and shared by
     every builder so each can map its anchor node on demand.  ``arch`` /
-    ``schedule`` are built from ``config``; ``cache`` is per-run memoization."""
+    ``schedule`` are built from ``config``; ``cache`` is per-run
+    memoization."""
 
     arch: object
     schedule: object
     config: object  # AcceleratorConfig
+    runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     cache: dict = field(default_factory=dict)
 
 
-def build_interstellar_tiler(config, dram_access_cost=1000):
+def build_interstellar_tiler(
+    config, dram_access_cost=1000, runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE
+):
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
 
@@ -115,7 +128,8 @@ def build_interstellar_tiler(config, dram_access_cost=1000):
             "IC": {
                 "level0": {"order": 1, "partitioning_size": ic_dim},
                 "level1": {"order": -1},
-                "level2": {"order": -1},
+                "level2": {"order": 0},
+                "level3": {"order": 0},
             },
             "OC": {
                 "level0": {"order": 0, "partitioning_size": oc_dim},
@@ -144,6 +158,7 @@ def build_interstellar_tiler(config, dram_access_cost=1000):
         arch=architecture,
         schedule=schedule,
         config=config,
+        runtime_tolerance=runtime_tolerance,
     )
 
 
@@ -306,8 +321,6 @@ def make_size_fn(
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
     ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
     """
-    psum_bits = 32
-
     if isinstance(out_dtype, (list, tuple)):
         of_scale_dtype, of_dtype = out_dtype[-2], out_dtype[-1]
     else:
@@ -345,7 +358,7 @@ def make_size_fn(
 
         # The output is a wide partial sum until IC is fully reduced; only the
         # final value carries an output scale.
-        out_bits = psum_bits if is_psum else of_bits
+        out_bits = PSUM_BITS if is_psum else of_bits
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
         bias = extent(le.OC) * bias_bits / 8.0 if bias_bits else 0.0
 
@@ -392,28 +405,30 @@ def make_size_fn(
 class RuntimeCalculator:
     """Runtime cost model for a 4-level hierarchy (PE / L1 / L2 / DRAM).
 
-    Wraps the L0-L2 timing in an outer L3 loop and adds each iteration's DRAM
-    transfers -- input, weight and output, assumed sequential.
+    Wraps the L0-L2 compute in the outer L3 grid loop (K included) and adds
+    its DRAM transfers.  A double-buffered step costs the slower of its DRAM
+    and its compute, framed by an unoverlapped prologue load and epilogue
+    store.
 
-    Deliberately carries no prologue / epilogue term: tilings that keep the
-    array equally busy are meant to score equally, leaving the optimizer's
-    energy tie-break -- which prices DRAM accesses -- to choose between them.
+    The store is charged on the step that issues it, not averaged over the
+    sweep -- a tile can outlast one step of compute, and averaging hides the
+    stall.
 
     Args:
         input_dtype_width: Input element width, bits.
         weight_dtype_width: Weight element width, bits.
         output_dtype_width: Output element width, bits.
+        accum_dtype_width: Partial-sum width, bits, while K accumulates.
         double_buffered_accum_buffer: Overlap the accumulator drain.
-        sram_bandwidth: L2 -> L1 bandwidth, bytes per cycle.
-        dram_bandwidth: DRAM bandwidth, bytes per cycle -- transfer sizes are
-            absolute bytes, so the two share a unit.
-        dram_access_latency_cycles: Fixed per-transfer latency.  Not charged
-            at present -- see the FIXME in ``calculate_runtime``.
-        double_buffered_l2: Overlap DRAM I/O with compute, so an iteration
-            costs ``max(dram, compute)`` and not their sum;
-            ``build_interstellar_tiler`` halves the L2 capacity to match.
+        sram_bandwidth: L2 -> L1 bandwidth, bits per cycle.
+        dram_bandwidth: DRAM bandwidth, bytes per cycle (sizes are bytes).
+        dram_access_latency_cycles: Fixed latency, once per transfer.
+        double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
+            costs ``max(dram, compute)`` and not their sum.
         has_sparse_op: Double the weight load time.
-        has_tail_operands: Hold the vector unit at high precision.
+        tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
+            pairs, from ``_fused_operand_specs``; ``tail_fetch_cycles`` turns
+            them into a per-vector read cost.
     """
 
     def __init__(
@@ -421,33 +436,51 @@ class RuntimeCalculator:
         input_dtype_width: int,
         weight_dtype_width: int,
         output_dtype_width: int,
+        accum_dtype_width: int,
         double_buffered_accum_buffer: bool,
         sram_bandwidth: int,
         dram_bandwidth: int,
         dram_access_latency_cycles: float,
         double_buffered_l2: bool = False,
         has_sparse_op: bool = False,
-        has_tail_operands: bool = False,
+        tail_specs=(),
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
         self.output_dtype_width = output_dtype_width
+        self.accum_dtype_width = accum_dtype_width
         self.double_buffered_accum_buffer = double_buffered_accum_buffer
         self.sram_bandwidth = sram_bandwidth
         self.dram_bandwidth = dram_bandwidth
         self.dram_access_latency_cycles = dram_access_latency_cycles
         self.double_buffered_l2 = double_buffered_l2
         self.has_sparse_op = has_sparse_op
-        self.has_tail_operands = has_tail_operands
+        self.tail_specs = tuple(tail_specs)
 
-    def _compute_terms(self, mapping):
-        """The L0-L2 compute of one L3 tile, split into ``(fill, steady,
-        drain)``: the L1 input/weight buffer prologue, the L2 sweep of
-        weight-reuse tiles, and the vector-unit epilogue.
+    def tail_fetch_cycles(self, mapping):
+        """SRAM cycles to fetch one vector of the fused tail's operands -- the
+        read-side counterpart of ``store_cycles``.  Each operand has a bank of
+        its own, so they are read at once and the slowest sets the rate; one
+        broadcast along OC feeds a whole vector from a single element."""
+        oc_dim = mapping.loop_partitionings[le.OC][0]
+        return max(
+            (
+                math.ceil(
+                    bits
+                    * (oc_dim if le.OC in dims else 1)
+                    / self.sram_bandwidth
+                )
+                for dims, bits in self.tail_specs
+            ),
+            default=0,
+        )
 
-        Kept apart because a double-buffered sweep overlaps the prologue and
-        the epilogue with the neighbouring tiles, so they are amortized over
-        the sweep rather than paid per tile (see ``per_tile_compute_cycles``).
+    def matrix_unit_cycles(self, mapping):
+        """Matrix-unit cycles of one L3 grid step: the L2 sweep of
+        weight-reuse tiles, plus the once-per-sweep overhead (buffer fill,
+        systolic skew, accumulator drain) spread over the steps a
+        double-buffered L2 overlaps it with.  Also the reporting model's
+        per-tile utilization denominator.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -484,7 +517,6 @@ class RuntimeCalculator:
         input_buffer_loading_time = (
             input_buffer_loading_size
             * self.input_dtype_width
-            / 8
             / self.sram_bandwidth
         )
 
@@ -495,7 +527,6 @@ class RuntimeCalculator:
         weight_buffer_loading_time = (
             weight_buffer_loading_size
             * self.weight_dtype_width
-            / 8
             / self.sram_bandwidth
         )
         if self.has_sparse_op:
@@ -504,17 +535,21 @@ class RuntimeCalculator:
         output_size = 1
         for loop in [le.OC, le.OY, le.OX]:
             output_size *= blockings[loop][1]
-        vector_unit_time = output_size
-
-        requires_high_precision = (
-            self.output_dtype_width > self.input_dtype_width
-            or self.has_tail_operands
+        oc_dim = partitionings[le.OC][0]
+        num_k = blockings[le.IC][3]
+        output_width = (
+            self.accum_dtype_width if num_k > 1 else self.output_dtype_width
         )
-        if requires_high_precision:
-            vector_unit_time *= 2
+        store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
+        # The tail runs only on the last K step: with num_k > 1 that step is
+        # charged by ``vector_unit_cycles``, and the rest only accumulate --
+        # adding the output into a psum-width partial sum, reading no operand.
+        if num_k == 1:
+            store_cycles = max(store_cycles, self.tail_fetch_cycles(mapping))
+        vector_unit_time = output_size * store_cycles
 
         using_double_buffer_accum_buffer = (
-            self.double_buffered_accum_buffer and requires_high_precision
+            self.double_buffered_accum_buffer and store_cycles > 1
         )
 
         if not using_double_buffer_accum_buffer:
@@ -537,65 +572,57 @@ class RuntimeCalculator:
             if i != le.IC:
                 l2_blocks *= blockings[i][2]
 
-        if requires_high_precision and not self.double_buffered_accum_buffer:
-            extra_vector_unit_time = output_size
-        else:
-            extra_vector_unit_time = 0
-
-        fill = max(input_buffer_loading_time, weight_buffer_loading_time)
+        buffer_fill = max(input_buffer_loading_time, weight_buffer_loading_time)
+        skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
         steady = l2_blocks * l1_time
         if self.double_buffered_accum_buffer:
             drain = vector_unit_time
         else:
-            drain = extra_vector_unit_time
-        return fill, steady, drain
+            drain = output_size * (store_cycles - 1)
+        overhead = buffer_fill + skew + drain
+
+        if not self.double_buffered_l2:
+            return steady + overhead
+
+        normalize_factor = self._l3_blocks(mapping) if num_k == 1 else num_k
+        return steady + overhead / normalize_factor
+
+    def vector_unit_cycles(self, mapping):
+        """Vector-unit cycles to finish one L3 output tile: the tail's reads
+        and the write-out, at the node's output width rather than the partial
+        sum's.  Charged on the grid step that ends a K sweep, after that
+        step's accumulation.
+        """
+        blockings = mapping.loop_blockings
+        output_size = 1
+        for loop in [le.OC, le.OY, le.OX]:
+            output_size *= blockings[loop][1] * blockings[loop][2]
+        oc_dim = mapping.loop_partitionings[le.OC][0]
+        store_cycles = math.ceil(
+            self.output_dtype_width * oc_dim / self.sram_bandwidth
+        )
+        fetch_cycles = self.tail_fetch_cycles(mapping)
+        vector_unit_time = output_size * max(store_cycles, fetch_cycles)
+        return vector_unit_time
 
     @staticmethod
     def _l3_blocks(mapping):
-        """Number of L3 (DRAM) tiles, the reduction loop excluded."""
-        # FIXME: nothing pins IC to 1 at L3 -- the schedule hint constrains only
-        # FX / FY -- so a K-tiled GEMM runs blockings[IC][3] times more
-        # iterations than this counts and calculate_runtime comes out low by
-        # that factor.  Correcting it alone makes the tiling *worse*: that error
-        # is the only term in the objective that tracks DRAM traffic, since it
-        # rewards splitting K, which is free in bytes and buys the big M / N
-        # tiles that divide the refetch.
+        """Total L3 (DRAM) grid steps, the IC reduction included: with IC
+        innermost at L3 the grid is ``(output tiles) x num_k``, one input and
+        weight load each.  Stores are ``num_k`` times fewer.
+        """
         blockings = mapping.loop_blockings
         l3_blocks = 1
         for i in range(le.NUM):
-            if i != le.IC:
-                l3_blocks *= blockings[i][3]
+            l3_blocks *= blockings[i][3]
         return l3_blocks
-
-    def per_tile_compute_cycles(self, mapping):
-        """Compute cycles one tiled operation really costs in the L3 sweep, DRAM
-        excluded -- both what ``calculate_runtime`` sweeps and the reporting
-        model's utilization denominator.
-
-        With a double-buffered L2 consecutive tiles overlap, so the buffer fill
-        and the vector drain are paid *once for the whole sweep*, not once per
-        tile -- only the first tile fills and only the last drains.  Charging
-        them per tile overstates the cost (and so understates utilization).
-
-        The reporting model excludes DRAM here because the scheduler already
-        models it as ``async_copy`` events; folding it in would double-count.
-        """
-        fill, steady, drain = self._compute_terms(mapping)
-        if not self.double_buffered_l2:
-            return fill + steady + drain
-        l3_blocks = self._l3_blocks(mapping)
-        return (fill + l3_blocks * steady + drain) / l3_blocks
 
     def calculate_runtime(self, architecture, layer, mapping):
         blockings = mapping.loop_blockings
         partitionings = mapping.loop_partitionings
 
-        l3_blocks = self._l3_blocks(mapping)
-        per_l3_compute_time = self.per_tile_compute_cycles(mapping)
-
-        # DRAM transfer size (in absolute bytes) for one L3 iteration (levels
-        # 0-2 only; [3] is the iteration count and belongs in l3_blocks, not in
-        # the tile size).  ``dram_bandwidth`` is bytes/cycle.
+        # DRAM transfer size (in absolute bytes) of one L3 tile: levels 0-2
+        # only, since [3] is the grid trip count, not part of the tile.
         dram_input_size = (
             partitionings[le.IC][0]
             * blockings[le.IC][1]
@@ -630,20 +657,45 @@ class RuntimeCalculator:
             * self.output_dtype_width
             / 8
         )
-        # FIXME: one iteration's operands, but they reload every reduction step
-        # while the output stores only once -- so this both under-counts the
-        # weight refetch and over-counts the store.  Under the double-buffered
-        # max() below the error never surfaces, which is why the objective is
-        # blind to DRAM traffic and the energy tie-break has to decide.
-        dram_loading_time = (
-            dram_input_size + dram_weight_size + dram_output_size
-        ) / self.dram_bandwidth
+        # Every transfer pays a fixed access latency on top of its bytes: two
+        # loads per grid step, one store per finished K sweep.
+        lat = self.dram_access_latency_cycles
+        load = (
+            2 * lat + (dram_input_size + dram_weight_size) / self.dram_bandwidth
+        )
+        store = lat + dram_output_size / self.dram_bandwidth
+
+        l3_blocks = self._l3_blocks(mapping)
+        num_k = blockings[le.IC][3]
+        output_tiles = l3_blocks // num_k
+        matrix_unit_cycles = self.matrix_unit_cycles(mapping)
+        vector_unit_cycles = self.vector_unit_cycles(mapping)
 
         if self.double_buffered_l2:
-            # DRAM I/O and compute overlap: bottleneck is the slower of the two.
-            total_time = l3_blocks * max(dram_loading_time, per_l3_compute_time)
+            if num_k == 1:
+                total_time = (
+                    load
+                    + output_tiles * max(load + store, matrix_unit_cycles)
+                    + store
+                )
+            else:
+                store_steps = output_tiles - 1
+                accum_steps = l3_blocks - 2 * store_steps
+                total_time = (
+                    load
+                    + accum_steps * max(load, matrix_unit_cycles)
+                    + store_steps
+                    * max(load, matrix_unit_cycles + vector_unit_cycles)
+                    + store_steps * max(load + store, matrix_unit_cycles)
+                    + vector_unit_cycles
+                    + store
+                )
         else:
-            total_time = l3_blocks * (dram_loading_time + per_l3_compute_time)
+            total_time = (
+                l3_blocks * (load + matrix_unit_cycles) + output_tiles * store
+            )
+            if num_k > 1:
+                total_time += output_tiles * vector_unit_cycles
 
         return total_time
 
@@ -717,6 +769,7 @@ def _try_optimize(tiler, layer, rc):
             tiler.schedule,
             rc.calculate_runtime,
             verbose=False,
+            runtime_tolerance=tiler.runtime_tolerance,
         )
     except AssertionError as e:
         if _NO_MAPPING not in str(e):
@@ -787,20 +840,21 @@ def run_interstellar(
         f"bs={node.kwargs.get('block_size')}"
     )
 
-    sram_bandwidth = min(tiler.config.pe_array_size) * if_bits / 8
+    sram_bandwidth = min(tiler.config.pe_array_size) * if_bits
 
-    # Use the node's dtype widths so the timing model and the feasibility check
-    # (which sizes the same operands) stay consistent.
+    # The node's own widths, so the timing model and ``make_size_fn`` size the
+    # same operands.
     rc = RuntimeCalculator(
         if_bits,
         fl_bits,
         of_bits,
+        PSUM_BITS,
         tiler.config.double_buffered_accum_buffer,
         sram_bandwidth,
         tiler.config.bytes_per_cycle,
         tiler.config.access_latency_cycles,
         double_buffered_l2=tiler.config.double_buffered_l2,
-        has_tail_operands=bool(fused_specs),
+        tail_specs=fused_specs,
     )
 
     result = None
@@ -839,7 +893,7 @@ def run_interstellar(
         f"IC={b[le.IC][3]} OC={b[le.OC][3]} "
         f"OX={b[le.OX][3]} OY={b[le.OY][3]} ON={b[le.ON][3]}"
     )
-    per_tile_cycles = rc.per_tile_compute_cycles(mapping)
+    per_tile_cycles = rc.matrix_unit_cycles(mapping)
     logger.info(f"[interstellar] {node.name} estimated runtime: {runtime}")
     logger.info(
         f"[interstellar] {node.name} per-tile compute cycles: "
@@ -945,11 +999,18 @@ def prefetch_tilings(nodes, tiler):
 
     _PREFETCH_JOBS = list(jobs.values())
     start = time.perf_counter()
+    # Small cap: the runner already forks per design point, so an uncapped
+    # pool multiplies to jobs x cpu_count.  VOYAGER_TILING_JOBS overrides.
+    workers = min(
+        len(_PREFETCH_JOBS),
+        int(os.environ.get("VOYAGER_TILING_JOBS", "4")),
+        os.cpu_count() or 1,
+    )
+    # Keep the parent heap out of the workers' GC so fork stays copy-on-write.
+    gc.freeze()
     try:
         context = multiprocessing.get_context("fork")
-        with context.Pool(
-            min(len(_PREFETCH_JOBS), os.cpu_count() or 1)
-        ) as pool:
+        with context.Pool(workers) as pool:
             results = pool.map(_run_prefetch_job, range(len(_PREFETCH_JOBS)))
     except Exception as e:
         logger.warning(
@@ -957,6 +1018,8 @@ def prefetch_tilings(nodes, tiler):
         )
         _PREFETCH_JOBS = []
         return
+    finally:
+        gc.unfreeze()
 
     cached = 0
     for job, (ok, result) in zip(_PREFETCH_JOBS, results):

@@ -33,6 +33,7 @@ import operator
 import os
 import re
 import signal
+import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, fields, replace
@@ -84,7 +85,10 @@ from voyager_compiler.codegen.lowering.reporting import (
     write_excel_report,
     write_perfetto,
 )
-from voyager_compiler.codegen.lowering.tiling import build_interstellar_tiler
+from voyager_compiler.codegen.lowering.tiling import (
+    DEFAULT_RUNTIME_TOLERANCE,
+    build_interstellar_tiler,
+)
 from voyager_compiler.hardware import AcceleratorConfig
 from voyager_compiler.codegen.mapping_utils import (
     is_compute_op,
@@ -223,6 +227,9 @@ class SweepConfig:
 
     # Build only this many decoder layers; None uses the real count.
     num_layers_override: Optional[int] = None
+
+    # Extra runtime a tiling may take vs the fastest; 0.0 = fastest only.
+    runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
 
     dump_dir: Optional[str] = None
 
@@ -726,7 +733,9 @@ def _frontend(cfg: SweepConfig):
     )
     ShapeProp(gm).propagate(*flat_args)
 
-    tiler = build_interstellar_tiler(cfg.acc_config)
+    tiler = build_interstellar_tiler(
+        cfg.acc_config, runtime_tolerance=cfg.runtime_tolerance
+    )
     return gm, model, tiler
 
 
@@ -889,7 +898,12 @@ def run_points_parallel(
     results = [None] * len(tasks)
     times = [None] * len(tasks)
     ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as ex:
+    # Recycle each worker after one point: a compile leaves its model + huge
+    # bufferized graph resident, and reused workers accumulate it across
+    # points until memory is exhausted.  One task/child caps peak at jobs x 1.
+    with ProcessPoolExecutor(
+        max_workers=jobs, mp_context=ctx, max_tasks_per_child=1
+    ) as ex:
         futs = {
             ex.submit(_run_point_worker, t): i
             for i, t in enumerate(worker_tasks)
@@ -1117,15 +1131,78 @@ def _display_name(name):
 # -------------------------------------------------------------------------
 # Results directory
 # -------------------------------------------------------------------------
-RESULTS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "results"
-)
+_BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+RESULTS_DIR = os.path.join(_BENCH_DIR, "results")
+
+# Only tracked changes flag a run dirty; untracked scratch files are recorded
+# but would otherwise flag every run.
+_DIRTY_STATUS = ("status", "--porcelain", "--untracked-files=no")
+
+
+def _git(*args) -> str:
+    """Stripped stdout of ``git <args>`` run in the repo, or ``""`` if git
+    fails (not a repo, or git absent)."""
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=_BENCH_DIR,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    return r.stdout.strip()
+
+
+def git_provenance() -> dict:
+    """The commit the sweep runs against, plus its uncommitted state.
+
+    ``dirty`` means a tracked file differs from HEAD; ``diff`` is then the
+    ``git apply``-able patch that recovers it.  ``status`` also lists untracked
+    files."""
+    return {
+        "commit": _git("rev-parse", "HEAD") or "unknown",
+        "short": _git("rev-parse", "--short", "HEAD") or "nogit",
+        "subject": _git("log", "-1", "--format=%s"),
+        "committed": _git("log", "-1", "--format=%ci"),
+        "dirty": bool(_git(*_DIRTY_STATUS)),
+        "status": _git("status", "--porcelain"),
+        "diff": _git("diff", "HEAD"),
+    }
+
+
+def write_provenance(out_dir: str) -> dict:
+    """Write ``provenance.txt`` -- and ``uncommitted.diff`` when dirty, which
+    ``git apply`` replays on top of ``commit`` -- into ``out_dir``, so results
+    trace back to the code that produced them.  Returns the provenance."""
+    p = git_provenance()
+    lines = [
+        f"commit:    {p['commit']}",
+        f"short:     {p['short']}",
+        f"subject:   {p['subject']}",
+        f"committed: {p['committed']}",
+        f"dirty:     {'yes' if p['dirty'] else 'no'}",
+        f"generated: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    ]
+    if p["status"]:
+        lines += ["", "# git status --porcelain", p["status"]]
+    with open(os.path.join(out_dir, "provenance.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    if p["diff"]:
+        with open(os.path.join(out_dir, "uncommitted.diff"), "w") as f:
+            f.write(p["diff"] + "\n")
+    return p
 
 
 def default_out_dir() -> str:
-    """A fresh run directory under ``RESULTS_DIR``, named for the time it was
-    made -- so an interrupted sweep cannot leave a stale ``.xlsx`` behind that
-    reads as current.  ``runner.py`` also repoints ``results/latest`` at the
-    run dir it uses.
+    """A fresh run directory under ``RESULTS_DIR``, named
+    ``<time>-<commit>`` (plus ``-dirty`` when a tracked file differs from
+    HEAD) -- so a run dir names the exact code it came from, and an
+    interrupted sweep cannot leave a stale ``.xlsx`` that reads as current.
+    ``runner.py`` also repoints ``results/latest`` at the run dir it uses.
     """
-    return os.path.join(RESULTS_DIR, time.strftime("%Y%m%d-%H%M%S"))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    short = _git("rev-parse", "--short", "HEAD") or "nogit"
+    dirty = "-dirty" if _git(*_DIRTY_STATUS) else ""
+    return os.path.join(RESULTS_DIR, f"{stamp}-{short}{dirty}")

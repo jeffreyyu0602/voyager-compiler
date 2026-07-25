@@ -13,15 +13,27 @@ from . import buffer_enum as be
 logger = logging.getLogger(__name__)
 
 
-def opt_optimizer(resource, layer, hint=None, runtime_calc_func=None, verbose=False):
+def opt_optimizer(
+    resource,
+    layer,
+    hint=None,
+    runtime_calc_func=None,
+    verbose=False,
+    runtime_tolerance=0.0,
+):
     """
     Evaluate the cost of each mapping point,
     record the mapping_point with the smallest cost
+
+    Args:
+        runtime_tolerance: How much longer than the best runtime a mapping may
+            take and still be considered, as a fraction; see
+            ``opt_mapping_point_generator_function``.
     """
 
     smallest_cost, smallest_runtime, perf, best_mapping_point = (
         mapping_point_generator.opt_mapping_point_generator_function(
-            resource, layer, hint, runtime_calc_func, verbose
+            resource, layer, hint, runtime_calc_func, verbose, runtime_tolerance
         )
     )
     access_list, array_cost = cost_model.get_access(

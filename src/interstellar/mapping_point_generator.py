@@ -972,12 +972,27 @@ def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=
 
 
 def opt_mapping_point_generator_function(
-    resource, layer, schedule=None, runtime_calc_func=None, verbose=False
+    resource,
+    layer,
+    schedule=None,
+    runtime_calc_func=None,
+    verbose=False,
+    runtime_tolerance=0.0,
 ):
     """
     Mapping point generator.
 
-    Generates a new mapping point each iteration.
+    Keeps every candidate no other candidate beats on both runtime and energy
+    -- the ``(runtime, energy)`` Pareto frontier -- and picks the least-energy
+    one whose runtime is within ``(1 + runtime_tolerance)`` of the best.  Where
+    tilings are equally fast -- a compute-bound GEMM keeps the array busy
+    either way -- energy (mostly DRAM traffic) decides, instead of whatever
+    residue the runtime model leaves behind.
+
+    Args:
+        runtime_tolerance: How much longer than the best runtime a mapping may
+            take and still be considered, as a fraction.  0.0 keeps only the
+            fastest mappings, and the least-energy one among them wins.
     """
     parallel_levels = resource.para_index
     ideal_perf = cost_model.get_ideal_performance(layer, resource)
@@ -985,11 +1000,7 @@ def opt_mapping_point_generator_function(
         resource, layer, schedule
     )
 
-    # dummy_partitioning = [(1,) * num_levels] * le.NUM
-
-    smallest_cost = float("inf")
-    smallest_runtime = float("inf")
-    best_mapping_point = None
+    frontier = []  # list of (runtime, energy, mapping_point)
     for blocking_partitioning in blocking_partitioning_generator:
         """
         dummy_mapping_point is used to validate the current blocking_partitioning,
@@ -1022,27 +1033,37 @@ def opt_mapping_point_generator_function(
                 verbose,
             )
 
-            # optimize for runtime first, then for energy
-            if runtime < smallest_runtime or (
-                runtime == smallest_runtime and cost < smallest_cost
-            ):
-                smallest_runtime = runtime
-                smallest_cost = cost
-                best_mapping_point = mapping_point
-                unrolled_loops, utilized = partitioned_loop_string(
-                    partitioning, parallel_levels, para_dim
-                )
-                utilization = get_utilization(utilized, resource)
-                perf = ideal_perf / utilization
+            # An equal (runtime, energy) counts as dominated, so the
+            # first-seen mapping wins the tie, as the old rule did.
+            if any(fr <= runtime and fc <= cost for fr, fc, _ in frontier):
+                continue
+            frontier = [
+                e for e in frontier if not (runtime <= e[0] and cost <= e[1])
+            ]
+            frontier.append((runtime, cost, mapping_point))
 
-                if verbose >= 2:
-                    print("best loop order: ", best_mapping_point.loop_orders)
-                    print("Update smallest cost: ", smallest_cost)
-                    print(
-                        "Update best schedule: ",
-                        utils.print_loop_nest(best_mapping_point),
-                    )
-    assert best_mapping_point, "No valid mapping point found."
+    assert frontier, "No valid mapping point found."
+
+    best_runtime = min(fr for fr, _, _ in frontier)
+    threshold = best_runtime * (1.0 + runtime_tolerance)
+    # Least energy among those fast enough; ties broken by lower runtime.
+    smallest_runtime, smallest_cost, best_mapping_point = min(
+        ((fr, fc, mp) for fr, fc, mp in frontier if fr <= threshold),
+        key=lambda e: (e[1], e[0]),
+    )
+
+    _, utilized = partitioned_loop_string(
+        best_mapping_point.loop_partitionings,
+        parallel_levels,
+        best_mapping_point.para_loop_dim,
+    )
+    perf = ideal_perf / get_utilization(utilized, resource)
+
+    if verbose >= 2:
+        print("best loop order: ", best_mapping_point.loop_orders)
+        print("smallest cost: ", smallest_cost)
+        print("Best schedule: ", utils.print_loop_nest(best_mapping_point))
+
     return smallest_cost, smallest_runtime, perf, best_mapping_point
 
 

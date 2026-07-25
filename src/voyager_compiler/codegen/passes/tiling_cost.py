@@ -128,9 +128,19 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, global_tiling, config):
     cycles, ``D_read`` to load the inputs (a separate transfer per input, each
     paying one DRAM access latency) and ``D_write`` to store the output.
 
-    Double-buffered: the pipeline runs at ``max(D, C)`` per tile, plus the
-    unoverlapped prologue load and epilogue store.  Single-buffered: load,
-    compute and store run back to back.
+    Double-buffered: the DRAM engine (all reads + writes, ``D = read + write``
+    per tile) and the compute engine run concurrently, tile ``i``'s compute
+    overlapping tile ``i+1``'s read and tile ``i-1``'s write.  The makespan is
+    whichever engine is the bottleneck:
+
+    * DRAM-bound -- the DRAM stream never idles, ``N * D``; the first read and
+      last write are just its ends, so compute hides entirely.
+    * compute-bound -- compute never idles, ``N * C``, preceded by the first
+      read and followed by the last write (``+ D``) that cannot overlap it.
+
+    So ``makespan = max(N * D, N * C + D)``, which at ``N == 1`` is ``D + C`` (a
+    lone tile cannot overlap), matching the single-buffered cost.
+    Single-buffered: load, compute and store run back to back, ``N * (D + C)``.
     """
     num_tiles = math.prod(global_tiling)
 
@@ -159,5 +169,5 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, global_tiling, config):
     dram = read + write
 
     if config.double_buffered_l2:
-        return read + num_tiles * max(dram, compute) + write
+        return max(num_tiles * dram, num_tiles * compute + dram)
     return num_tiles * (dram + compute)
