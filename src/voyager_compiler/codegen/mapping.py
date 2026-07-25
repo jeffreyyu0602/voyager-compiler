@@ -671,20 +671,26 @@ def _fuse_reshape_with_input_impl(
     fused_nodes.append(current_node)
 
     can_fuse = False
-    if is_elementwise_op(current_node):
-        can_fuse = not swaps_last_two_dims(reshape_node)
-    elif is_gemm_op(current_node) and bufferize:
-        can_fuse = fused_nodes[-2] in (
-            current_node.args[1],
-            current_node.kwargs.get("weight_scale"),
-            current_node.kwargs.get("other_scale"),
-        )
-    elif is_gemm_op(current_node) and not is_fully_connected(current_node):
-        input_node = fused_nodes[-2]
-        if is_mha_qkv_permute(reshape_node):
-            can_fuse = input_node == current_node.args[0]
-        elif swaps_last_two_dims(reshape_node):
-            can_fuse = input_node in current_node.args[:2]
+    is_transpose = swaps_last_two_dims(reshape_node)
+    is_relayout = is_mha_qkv_permute(reshape_node)
+    if bufferize:
+        # TODO: support fusing reshape with elementwise operations
+        if is_gemm_op(current_node):
+            can_fuse = is_transpose and fused_nodes[-2] in (
+                current_node.args[1],
+                current_node.kwargs.get("weight_scale"),
+                current_node.kwargs.get("other_scale"),
+            )
+    else:
+        # Legacy path
+        if is_elementwise_op(current_node):
+            can_fuse = not is_transpose
+        elif is_gemm_op(current_node) and not is_fully_connected(current_node):
+            input_node = fused_nodes[-2]
+            if is_relayout:
+                can_fuse = input_node == current_node.args[0]
+            elif is_transpose:
+                can_fuse = input_node in current_node.args[:2]
 
     if "tiled_shapes" not in current_node.meta and can_fuse:
         if simulate:
@@ -701,7 +707,7 @@ def _fuse_reshape_with_input_impl(
         logger.warning(f"Cannot fuse {reshape_node} with {current_node}")
 
     if not is_nop(current_node) and not (
-        swaps_last_two_dims(reshape_node)
+        is_transpose
         and current_node.target == torch.ops.aten.select.int
         and current_node.args[1] == 0
     ):
@@ -814,7 +820,7 @@ def fuse_reshape_with_output(
     def _is_tiled(n):
         return "tiled_shapes" in getattr(n, "meta", {})
 
-    if len(curr_node.users) > 1 or _is_tiled(curr_node):
+    if len(curr_node.users) > 1 or (not bufferize and _is_tiled(curr_node)):
         return False
 
     if not _tile_holds_whole_heads(curr_node, reshape_node):
@@ -842,7 +848,7 @@ def fuse_reshape_with_output(
     group = search_group(curr_node, candidates)
 
     if group is not None:
-        if any(_is_tiled(n) for n in group):
+        if not bufferize and any(_is_tiled(n) for n in group):
             return False
         else:
             group.extend(n for n in fused_nodes if n not in group)

@@ -27,12 +27,12 @@ from voyager_compiler.codegen.lowering.utils import (
     _build_fused_gm,
     _compute_input_spec,
     _finalize_exported_gm,
-    _fuse_tail_in_body,
     _lenient_verifier,
     _project,
     _tag_loop_extents,
     _unproject,
     effect_cond,
+    fuse_store_cones,
     voyager,
 )
 from voyager_compiler.codegen.lowering.ops import (
@@ -1789,9 +1789,7 @@ def build_conv2d(
         async_pipeline=async_pipeline,
     )
     if num_k > 1 or info is not None:
-        _fuse_tail_in_body(
-            gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
-        )
+        fuse_store_cones(gm)
     _stamp_anchor_meta(gm, anchor)
     return gm
 
@@ -2144,9 +2142,7 @@ def build_gemm(
         async_pipeline=async_pipeline,
     )
     if num_k > 1 or info is not None or dequant is not None:
-        _fuse_tail_in_body(
-            gm, anchor.target, fuse_anchor_with_tail=(num_k == 1)
-        )
+        fuse_store_cones(gm)
     _stamp_anchor_meta(gm, anchor)
     return gm
 
@@ -2285,7 +2281,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     )
 
     if node.op == "call_module" and anchor is not None:
-        _fuse_tail_in_body(gm, anchor.target)
+        fuse_store_cones(gm)
     return gm
 
 
@@ -2422,5 +2418,5 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     gm = build_pipelined_buffers(
         kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
     )
-    _fuse_tail_in_body(gm, anchor.target)
+    fuse_store_cones(gm)
     return gm
