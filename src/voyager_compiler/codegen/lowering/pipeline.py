@@ -40,7 +40,11 @@ from voyager_compiler.codegen.lowering.ops import (
     commit,
     oracle_disabled,
 )
-from voyager_compiler.codegen.lowering.tiling import get_tiling
+from voyager_compiler.codegen.lowering.tiling import (
+    CONV_L3_ORDER,
+    GEMM_L3_ORDER,
+    get_tiling,
+)
 from voyager_compiler.codegen.shape_prop import ShapeProp
 from voyager_compiler.codegen.mapping_utils import (
     ancestors,
@@ -1091,6 +1095,7 @@ class _FusedInfo:
     anchor_node: torch.fx.Node
     fused_gm: Optional[torch.fx.GraphModule]
     tiling: Optional[Tuple[int, ...]]
+    l3_order: Optional[Tuple[str, ...]]
     input_values: List[torch.Tensor]
     in_specs: List[Optional[_InputSpec]]
     in_sources: List[torch.fx.Node]
@@ -1121,7 +1126,7 @@ def _retile_mha_view(fused_gm, nb, tm) -> None:
     fused_gm.recompile()
 
 
-def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
+def _detect_mha_relayout(fused_ops, anchor, tiling, gm, grid_m, grid_n):
     """If the fused tail ends with an MHA output relayout
     (``is_mha_qkv_permute`` — a ``transpose(1,2)`` / ``permute([0,2,1,3])`` on a
     4-D tensor), return the relaid-out output ``(tile_sizes, index_map,
@@ -1155,7 +1160,6 @@ def _detect_mha_relayout(fused_ops, anchor, tiling, gm):
     head_dim = perm.value.shape[-1]  # head_dim (unchanged by the perm)
     g_out = anchor.value  # gemm output [*batch, M, N]
     nb = g_out.ndim - 2
-    grid_m, grid_n = nb, nb + 1
     M, N = g_out.shape[-2], g_out.shape[-1]
     nm, nn = tiling[nb], tiling[nb + 1]
     tm, tn = M // nm, N // nn
@@ -1183,8 +1187,10 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     The submodule (``node.meta['submodule']``) holds a GEMM/conv anchor followed
     by post-op pointwise ops.  The fused operands / outputs tile at the output
     block, diced from the anchor's per-dim tile factors (``get_tiling``,
-    projected to the output's physical layout).  The factors are stashed on
-    ``_FusedInfo.tiling`` so the builder reuses them (no second tiler run).
+    projected to the output's physical layout).  The factors and the L3 loop
+    order are stashed on ``_FusedInfo`` so the builder reuses them -- no second
+    tiler run, and one order behind both the ``index_map``s built here and the
+    grid the builder emits.
     """
     if node.op != "call_module":
         return None
@@ -1196,18 +1202,25 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         *(n.value.clone() for n in node.all_input_nodes)
     )
 
-    tiling = get_tiling(node, tiler)
+    tiling, l3_order = get_tiling(node, tiler)
+    # ``out_tiling`` is per output *dim* and so is order-independent; only
+    # ``out_index_map``, which names a grid dim per output dim, moves with it.
     if tiling is None:
         out_tiling = None
         out_index_map = None
     elif is_conv:
         ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
         odims = _NHWC if anchor.meta.get("transposed", False) else None
+        order = l3_order or CONV_L3_ORDER
+        gK, gY, gX = (1 + order.index(d) for d in CONV_L3_ORDER)
         out_tiling = _project((1, nk, ny, nx), odims)  # physical output counts
-        out_index_map = _project((0, 1, 2, 3), odims)
+        out_index_map = _project((0, gK, gY, gX), odims)
     else:
+        nb = anchor.value.ndim - 2
+        order = l3_order or GEMM_L3_ORDER
+        grid_m, grid_n = (nb + order.index(d) for d in GEMM_L3_ORDER)
         out_tiling = tiling[:-1]  # gemm (batch.., n_m, n_n, n_k) -> drop K
-        out_index_map = tuple(range(len(out_tiling)))
+        out_index_map = tuple(range(nb)) + (grid_m, grid_n)
 
     anchor_prelude = ancestors(anchor)
     fused_ops = []
@@ -1259,7 +1272,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     ]
 
     if not is_conv and fused_ops and tiling is not None:
-        relayout = _detect_mha_relayout(fused_ops, anchor, tiling, fused_gm)
+        relayout = _detect_mha_relayout(
+            fused_ops, anchor, tiling, fused_gm, grid_m, grid_n
+        )
         if relayout is not None:
             out_tile, out_imap, data_shape = relayout
             output_specs = [
@@ -1279,6 +1294,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         anchor,
         fused_gm,
         tiling,
+        l3_order,
         input_values,
         in_specs,
         in_sources,
@@ -1573,7 +1589,10 @@ def build_conv2d(
     NHWC + HWIO).  Returns the gm or ``None``.
     """
     info = parse_fused_submodule(node, tiler)
-    tiling = info.tiling if info is not None else get_tiling(node, tiler)
+    if info is not None:
+        tiling, l3_order = info.tiling, info.l3_order
+    else:
+        tiling, l3_order = get_tiling(node, tiler)
     if info is None and tiling is None:
         return None
     anchor = info.anchor_node if info is not None else node
@@ -1608,13 +1627,18 @@ def build_conv2d(
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
 
-    # grid dims (logical): 0=N 1=K 2=oH 3=oW 4=C(reduction).  Batch is never
-    # tiled.  The weight's kH/kW axes are loaded whole (index_map ``None``), so
-    # there is no kernel-window grid dim.
-    grid = (1, nk, ny, nx, nc)
+    # Grid dims: batch outermost (never tiled), then K / oH / oW in the L3 loop
+    # order the tiler chose, then C(reduction) innermost -- it accumulates
+    # across consecutive steps, so it cannot move.  The weight's kH/kW axes are
+    # loaded whole (index_map ``None``), so there is no kernel-window grid dim.
+    l3_order = l3_order or CONV_L3_ORDER
+    gN, gC = 0, 4
+    gK, gY, gX = (1 + l3_order.index(d) for d in CONV_L3_ORDER)
+    counts = {"K": nk, "Y": ny, "X": nx}
+    grid = (1,) + tuple(counts[d] for d in l3_order) + (nc,)
     in_spec = _InputSpec(
         _project((tn, tc, ih, iw), in_dims),
-        _project((0, 4, 2, 3), in_dims),  # N->0, C->4, H->oH(2), W->oW(3)
+        _project((gN, gC, gY, gX), in_dims),  # logical N, C, H, W
         (False,) * 4,
         strides=_project((tn, tc, toh * sh, tow * sw), in_dims),
         pad=_project((0, 0, ph, pw), in_dims),
@@ -1622,14 +1646,14 @@ def build_conv2d(
     )
     w_spec = _InputSpec(
         _project((tk, tc, kH, kW), w_dims),
-        # K->1, C->4, kH/kW->None (loaded whole, mapped to no grid dim)
-        _project((1, 4, None, None), w_dims),
+        # kH/kW->None (loaded whole, mapped to no grid dim)
+        _project((gK, gC, None, None), w_dims),
         (False,) * 4,
     )
-    bias_spec = _InputSpec((tk,), (1,), (False,))
+    bias_spec = _InputSpec((tk,), (gK,), (False,))
     # The output(s) tile onto the (N, K, oH, oW) grid dims (C reduction
     # dropped); a fused op may produce several (``quantize_mx``).
-    out_index_map = _project((0, 1, 2, 3), out_dims)
+    out_index_map = _project((gN, gK, gY, gX), out_dims)
     if info is None:
         out_specs = [
             _OutputSpec(
@@ -1678,7 +1702,7 @@ def build_conv2d(
     if target == torch.ops.quantized_ops.conv2d_mx.default:
         in_scale_qspec = _InputSpec(
             _project((tn, tc // bs, ih, iw), in_dims),
-            _project((0, 4, 2, 3), in_dims),
+            _project((gN, gC, gY, gX), in_dims),
             (False,) * 4,
             strides=_project((tn, tc // bs, toh * sh, tow * sw), in_dims),
             pad=_project((0, 0, ph, pw), in_dims),
@@ -1686,7 +1710,7 @@ def build_conv2d(
         )
         wt_scale_qspec = _InputSpec(
             _project((tk, tc // bs, kH, kW), w_dims),
-            _project((1, 4, None, None), w_dims),  # kH/kW whole -> None
+            _project((gK, gC, None, None), w_dims),  # kH/kW whole -> None
             (False,) * 4,
         )
         add_kw_input("input_scale", in_scale_qspec)
@@ -1760,7 +1784,7 @@ def build_conv2d(
     elif fused_gm is None and acc_dtype == out.dtype:
         scratch_specs = []
         kernel = _reduction_inplace_kernel(
-            conv2d_kernel, reduction_dim=4, async_pipeline=async_pipeline
+            conv2d_kernel, reduction_dim=gC, async_pipeline=async_pipeline
         )
     else:
         if single_buffer_tail and not async_pipeline:
@@ -1770,7 +1794,7 @@ def build_conv2d(
         ]
         kernel = _reduction_fused_kernel(
             conv2d_kernel,
-            reduction_dim=4,
+            reduction_dim=gC,
             last_idx=num_k - 1,
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
@@ -1862,7 +1886,10 @@ def build_gemm(
     split.
     """
     info = parse_fused_submodule(node, tiler)
-    tiling = info.tiling if info is not None else get_tiling(node, tiler)
+    if info is not None:
+        tiling, l3_order = info.tiling, info.l3_order
+    else:
+        tiling, l3_order = get_tiling(node, tiler)
     if info is None and tiling is None and not is_bmm(node):
         return None
     anchor = info.anchor_node if info is not None else node
@@ -1896,16 +1923,20 @@ def build_gemm(
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
 
     # torch matmul broadcasts the leading batch dims: each output batch dim is
-    # its own grid dim (0..nb-1), then M / N / K are grid dims nb / nb+1 / nb+2
-    # (K innermost).
+    # its own grid dim (0..nb-1), then M and N in the L3 loop order the tiler
+    # chose, then K innermost -- the reduction accumulates across consecutive
+    # steps, so it cannot move.
     nb = out.ndim - 2
-    gm, gn, gk = nb, nb + 1, nb + 2
+    l3_order = l3_order or GEMM_L3_ORDER
+    gm, gn = (nb + l3_order.index(d) for d in GEMM_L3_ORDER)
+    gk = nb + 2
     out_batch = tuple(out.shape[:nb])
     tb = tuple(int(x) for x in out_ts[:nb])
-    grid = tuple(b // t for b, t in zip(out_batch, tb)) + (
-        M // tm,
-        N // tn,
-        K // tk,
+    counts = {"M": M // tm, "N": N // tn}
+    grid = (
+        tuple(b // t for b, t in zip(out_batch, tb))
+        + tuple(counts[d] for d in l3_order)
+        + (K // tk,)
     )
 
     ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))

@@ -50,6 +50,18 @@ DEFAULT_RUNTIME_TOLERANCE = 0.01
 # ``accumulate_fp32`` is never enabled today; wire it through if that changes.
 PSUM_BITS = 16
 
+# The non-reduction L3 loops a builder's grid may permute, outermost to
+# innermost, in the order it emits when nothing says otherwise.  The reduction
+# is always innermost (the kernels accumulate in place) and the gemm batch dims
+# are always outermost, so neither appears here.
+GEMM_L3_ORDER = ("M", "N")
+CONV_L3_ORDER = ("K", "Y", "X")
+
+# The interstellar loop each of those tags maps onto.  A gemm is modelled as a
+# 1x1 conv, so M rides on OX and N on OC.
+_GEMM_LOOP = {"M": le.OX, "N": le.OC}
+_CONV_LOOP = {"K": le.OC, "Y": le.OY, "X": le.OX}
+
 
 @dataclass
 class TilerContext:
@@ -79,23 +91,30 @@ def build_interstellar_tiler(
     max dtype in a mixed-precision design; narrower dtypes are padded into a
     full slot), so they are element / slot counts and the fit check is
     dtype-independent.  The flat L2/L3 byte pools let sub-byte operands pack, so
-    those stay in bytes.  When ``double_buffered_l2`` is set, two L3 tiles must
-    fit in L2 at once (one computing, one loading), so the effective L2 capacity
-    is halved.
+    those stay in bytes.
+
+    L2 is planned exactly the way ``plan_memory`` allocates it: the capacity is
+    the *physical* scratchpad and, under ``double_buffered_l2``, each source is
+    charged once per ping-pong copy (``size_fn``) rather than the capacity being
+    halved.  Halving cannot express a buffer that is allocated only once -- the
+    reduction scratch -- and it is that omission that let the tiler hand back
+    tilings the allocator could not place.
 
     ``config`` carries physical units (GB); the interstellar model wants bytes,
     so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     """
     ic_dim, oc_dim = config.pe_array_size
-    scratchpad_size = config.scratchpad_size
-    num_banks = config.num_banks
 
-    # Banking applies only at L2 (the on-chip scratchpad). The bank size is the
-    # physical cache split into ``num_banks`` -> derive it from the real cache
-    # size (``scratchpad_size``), not the L2 capacity below (which is fudged by
-    # the double-buffer ``*2`` hack). None = no banking.
-    bank_size = scratchpad_size // num_banks if num_banks is not None else None
+    # Banking applies only at L2 (the on-chip scratchpad).  ``scratchpad_size``
+    # is the per-copy budget, so the physical pool -- and its bank count -- are
+    # doubled when the planner ping-pongs (``plan_memory`` does the same).
+    copies = 2 if config.double_buffered_l2 else 1
+    bank_size = (
+        config.scratchpad_size // config.num_banks
+        if config.num_banks is not None
+        else None
+    )
 
     architecture = interstellar.Resource(
         buf_capacity_list=[
@@ -105,7 +124,7 @@ def build_interstellar_tiler(
                 config.accum_buffer_size * oc_dim,
                 config.weight_buffer_size * oc_dim,
             ],
-            [scratchpad_size],
+            [config.scratchpad_size * copies],
             [config.dram_size * 1024**3],  # GB -> bytes
         ],
         buf_access_cost_list=[
@@ -296,6 +315,8 @@ def make_size_fn(
     fused_specs=(),
     extra_sharing=0,
     oc_align=None,
+    has_tail=False,
+    copies=1,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -311,12 +332,21 @@ def make_size_fn(
         input | input_scale | weight+weight_scale+bias | output+output_scale
               | each fused operand
 
+    Each such source is ping-ponged, so it costs ``copies`` whole banks -- the
+    two halves live in *separate* banks, which is what the planner does and
+    what lets a load overlap the compute reading the other half.  A split
+    reduction with a fused tail also accumulates into a scratch buffer the
+    builders allocate exactly once (``_ScratchSpec``); it is charged a single
+    bank-aligned region on top.  Leaving it out is what let the tiler return
+    tilings ``plan_memory`` could not place.
+
     A bank cannot be split between groups, so each group rounds up to a whole
-    bank -- which puts a floor of ``len(groups) * bank_size`` on the tile,
-    however small it is.  With more groups than banks the two *smallest* are
-    merged until they fit (a tiny scale tensor would otherwise waste a whole
-    bank).  ``extra_sharing`` forces further merges; ``run_interstellar`` raises
-    it when nothing maps even at the minimum.
+    bank -- which puts a floor of ``copies * len(groups) * bank_size`` on the
+    tile, however small it is.  With more groups than banks the two *smallest*
+    are merged until they fit (a tiny scale tensor would otherwise waste a
+    whole bank).  Only whole sources merge, never a source's own two copies --
+    each copy must keep its own bank.  ``extra_sharing`` forces further merges;
+    ``run_interstellar`` raises it when nothing maps even at the minimum.
 
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
     ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
@@ -382,13 +412,26 @@ def make_size_fn(
         # An absent operand (no scale, no bias) occupies no bank.
         groups = [g for g in groups if g[0] > 0]
 
+        # A reduction split across L3 steps accumulates into a scratch buffer
+        # the builders allocate once for the whole kernel, not per ping-pong
+        # half -- so it is charged one region, outside ``copies``.
+        scratch = (
+            of_count * PSUM_BITS / 8.0
+            if has_tail and point.loop_blocking(le.IC)[3] > 1
+            else 0.0
+        )
+
         out = [0.0, 0.0, 0.0]
         if not bank_size:
             for size, slot in groups:
-                out[slot] += size
+                out[slot] += copies * size
+            out[_OF] += scratch
             return tuple(out)
 
-        target = max(1, (num_banks or len(groups)) - extra_sharing)
+        scratch_banks = math.ceil(scratch / bank_size) if scratch else 0
+        # Banks left for the ping-ponged sources, in whole sources.
+        budget = (num_banks or copies * len(groups)) - scratch_banks
+        target = max(1, budget // copies - extra_sharing)
         for _ in range(max(0, len(groups) - target)):
             groups.sort(key=lambda g: g[0])
             (s0, k0), (s1, k1) = groups[0], groups[1]
@@ -396,7 +439,8 @@ def make_size_fn(
             groups = [(s0 + s1, k0 if s0 >= s1 else k1)] + groups[2:]
 
         for size, slot in groups:
-            out[slot] += math.ceil(size / bank_size) * bank_size
+            out[slot] += copies * math.ceil(size / bank_size) * bank_size
+        out[_OF] += scratch_banks * bank_size
         return tuple(out)
 
     return size_fn
@@ -438,6 +482,11 @@ class RuntimeCalculator:
             ``quantize_mx`` tail stores the tile's scales next to its values.
         scale_block_size: Elements per block scale.
     """
+
+    # The L3 loops each DRAM operand's tile spans.  A loop outside them is a
+    # reuse window: the tile does not change while it turns.
+    _IF_DIMS = (le.OX, le.OY, le.IC, le.ON)
+    _FL_DIMS = (le.OC, le.IC, le.FX, le.FY)
 
     def __init__(
         self,
@@ -649,6 +698,30 @@ class RuntimeCalculator:
             l3_blocks *= blockings[i][3]
         return l3_blocks
 
+    @staticmethod
+    def _l3_loads(mapping, dims):
+        """How many times an operand spanning ``dims`` is fetched over the
+        sweep.
+
+        Order the nest outermost to innermost and let ``p`` be the position of
+        the innermost loop the operand spans.  Every loop inside ``p`` re-reads
+        the tile that is already there, so the operand is fetched once per
+        iteration of the loops at or outside ``p``.  Ranks come off the mapping
+        (``loop_orders[d][3]``, 0 = innermost), the same order the builders
+        emit, so the two cannot disagree.
+
+        A loop that is empty at L3 carries the sentinel rank and a blocking of
+        1, so it can only ever multiply in as 1 -- including the case where the
+        operand spans nothing tiled, which correctly gives a single fetch.
+        """
+        orders, blockings = mapping.loop_orders, mapping.loop_blockings
+        innermost = min(orders[d][3] for d in dims)
+        steps = 1
+        for d in range(le.NUM):
+            if orders[d][3] >= innermost:
+                steps *= blockings[d][3]
+        return steps
+
     def calculate_runtime(self, architecture, layer, mapping):
         blockings = mapping.loop_blockings
         partitionings = mapping.loop_partitionings
@@ -718,26 +791,34 @@ class RuntimeCalculator:
             self.vector_unit_cycles(mapping) if self.has_tail else 0
         )
 
-        # An operand is re-fetched only when its block index moves.  The grid
-        # runs ``(batch.., M, N, K)`` with K innermost, so while K is split
-        # both operands change every step; once it is not, N is innermost and
-        # the input tile -- which does not span N -- is held across its
-        # ``n_n`` steps.  The weight tile spans N, so it always reloads.
-        n_n = blockings[le.OC][3]
-        input_steps = l3_blocks if num_k > 1 else l3_blocks // n_n
-        held_steps = l3_blocks - input_steps
+        # An operand is re-fetched only when its block index moves, which the
+        # mapping's L3 order decides -- so read it off the mapping rather than
+        # assuming a nest.  With the reduction split it is innermost and both
+        # operands change every step; otherwise the operand that does not span
+        # the innermost loop is held across that loop's whole run.  Which one
+        # that is depends on the op: with N innermost the input is held (it
+        # does not span N), with a conv's X innermost it is the weight.
+        input_steps = self._l3_loads(mapping, self._IF_DIMS)
+        weight_steps = self._l3_loads(mapping, self._FL_DIMS)
 
         if self.double_buffered_l2:
             if num_k == 1:
                 # Every step finishes an output tile: it stores, runs the tail
-                # and reloads the weight; only ``input_steps`` of them also
-                # reload the input.
-                step = weight_load + tail_load + store
+                # and reloads the streaming operand; only the steps where the
+                # held one moves also pay for it.  Every L3 loop belongs to one
+                # operand or the other, so exactly one of them streams.
+                held_steps = min(input_steps, weight_steps)
+                held_load, streamed_load = (
+                    (input_load, weight_load)
+                    if input_steps < weight_steps
+                    else (weight_load, input_load)
+                )
+                step = streamed_load + tail_load + store
                 total_time = (
                     input_load
                     + weight_load
-                    + input_steps * max(step + input_load, matrix_unit_cycles)
-                    + held_steps * max(step, matrix_unit_cycles)
+                    + held_steps * max(step + held_load, matrix_unit_cycles)
+                    + (l3_blocks - held_steps) * max(step, matrix_unit_cycles)
                     + store
                 )
             else:
@@ -758,7 +839,8 @@ class RuntimeCalculator:
                 )
         else:
             total_time = (
-                l3_blocks * (weight_load + matrix_unit_cycles)
+                l3_blocks * matrix_unit_cycles
+                + weight_steps * weight_load
                 + input_steps * input_load
                 + output_tiles * (tail_load + store)
             )
@@ -936,7 +1018,13 @@ def run_interstellar(
     result = None
     for extra_sharing in range(4 + len(fused_specs)):
         layer.size_fn = make_size_fn(
-            node, out_dtype, fused_specs, extra_sharing, oc_align
+            node,
+            out_dtype,
+            fused_specs,
+            extra_sharing,
+            oc_align,
+            has_tail=has_tail,
+            copies=2 if tiler.config.double_buffered_l2 else 1,
         )
         result = _try_optimize(tiler, layer, rc)
         if result is not None:
@@ -1120,14 +1208,46 @@ def prefetch_tilings(nodes, tiler):
     )
 
 
-def get_tiling(node, tiler=None):
-    """Per-dim tile *counts* for a GEMM/conv ``node`` (standalone or fused
-    ``call_module``), or ``None`` (not a matrix op / untiled / skipped).
+def _l3_order_from_mapping(mapping, canonical, loop_of):
+    """``canonical`` resorted into the L3 loop order ``mapping`` chose.
 
-    conv -> ``(n_y, n_x, n_k, n_c)``; gemm -> ``(batch.., n_m, n_n, n_k)`` — the
-    output-spatial / M / N counts plus the reduction count last (``n_c`` for
-    conv, ``n_k`` for gemm; the builder's ``num_k``).  The builder derives the
-    tile sizes as ``full_dim // count``.
+    ``loop_orders[d][3]`` counts from the innermost (0), so sorting descending
+    puts the outermost first, which is how the builders read a grid.  A loop
+    that is empty at L3 carries interstellar's ``le.NUM - 1`` sentinel rather
+    than a real rank, so ordering it would be meaningless -- those tags keep
+    their canonical slot and only the genuinely tiled ones are permuted.  A
+    size-1 grid dim is inert anyway: the scheduler skips it when it looks for
+    the innermost tiled dim.
+    """
+    orders, blockings = mapping.loop_orders, mapping.loop_blockings
+    if blockings[le.IC][3] > 1 and orders[le.IC][3] != 0:
+        # The reduction kernels accumulate across *consecutive* steps, so a
+        # split reduction has to be innermost.  The schedule hint pins it
+        # (``IC`` level3 order 0); shout rather than emit a wrong nest.
+        raise ValueError(
+            "interstellar returned a split L3 reduction that is not "
+            f"innermost (IC order {orders[le.IC][3]}); the builders cannot "
+            "emit that nest"
+        )
+    tiled = [t for t in canonical if blockings[loop_of[t]][3] > 1]
+    ranked = iter(sorted(tiled, key=lambda t: -orders[loop_of[t]][3]))
+    return tuple(next(ranked) if t in tiled else t for t in canonical)
+
+
+def get_tiling(node, tiler=None):
+    """``(counts, l3_order)`` for a GEMM/conv ``node`` (standalone or fused
+    ``call_module``); ``counts`` is ``None`` for a node that is not a matrix op
+    / is untiled / was skipped.
+
+    ``counts`` holds the per-dim tile counts: conv -> ``(n_y, n_x, n_k, n_c)``;
+    gemm -> ``(batch.., n_m, n_n, n_k)`` — the output-spatial / M / N counts
+    plus the reduction count last (``n_c`` for conv, ``n_k`` for gemm; the
+    builder's ``num_k``).  The builder derives the tile sizes as
+    ``full_dim // count``.
+
+    ``l3_order`` permutes the builder's non-reduction grid dims, outermost to
+    innermost (a permutation of ``CONV_L3_ORDER`` / ``GEMM_L3_ORDER``);
+    ``None`` asks for the canonical order.
 
     Prefers the anchor's ``l2_tiling`` (set by the matrix L2 tiling pass —
     output-dim factors; the reduction is kept whole / decomposed away, so its
@@ -1142,7 +1262,7 @@ def get_tiling(node, tiler=None):
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
     if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
-        return None
+        return None, None
 
     # Interstellar tiles a single (M, N, K) gemm and never tiles the leading
     # batch dims (e.g. attention heads); the builder loops them, so emit a
@@ -1158,17 +1278,17 @@ def get_tiling(node, tiler=None):
                 )
             _, nk, ny, nx, *nc = tiling
             nc = nc[0] if nc else 1
-            return (ny, nx, nk, nc)
+            return (ny, nx, nk, nc), None
         if len(tiling) not in (2, 3):
             raise ValueError(
                 f"{anchor.name} tiling {tiling} must be 2 or 3 elements"
             )
         nm, nn, *nk = tiling
         nk = nk[0] if nk else 1
-        return gemm_batch + (nm, nn, nk)
+        return gemm_batch + (nm, nn, nk), None
 
     if tiler is None:
-        return None
+        return None, None
 
     key, anchor, out_dtype, fused_specs, oc_align, has_tail = tiling_request(
         node, tiler
@@ -1199,7 +1319,7 @@ def get_tiling(node, tiler=None):
         # cache None too (skipped layers)
         tiler.cache[key] = (mapping, per_tile_cycles, access_list)
     if mapping is None:
-        return None
+        return None, None
 
     # The builders copy these onto the nest they build (the anchor is erased on
     # splice): ``per_tile_cycles`` so the reporting cost model can turn it into
@@ -1214,5 +1334,7 @@ def get_tiling(node, tiler=None):
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 
     if is_conv:
-        return (b[le.OY][3], b[le.OX][3], b[le.OC][3], b[le.IC][3])
-    return gemm_batch + (b[le.OX][3], b[le.OC][3], b[le.IC][3])
+        order = _l3_order_from_mapping(mapping, CONV_L3_ORDER, _CONV_LOOP)
+        return (b[le.OY][3], b[le.OX][3], b[le.OC][3], b[le.IC][3]), order
+    order = _l3_order_from_mapping(mapping, GEMM_L3_ORDER, _GEMM_LOOP)
+    return gemm_batch + (b[le.OX][3], b[le.OC][3], b[le.IC][3]), order
