@@ -426,9 +426,17 @@ class RuntimeCalculator:
         double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
             costs ``max(dram, compute)`` and not their sum.
         has_sparse_op: Double the weight load time.
+        has_tail: The node has a fused post-op, so a reduction drains through
+            the vector unit; a bare GEMM reduces in place and does not.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
             pairs, from ``_fused_operand_specs``; ``tail_fetch_cycles`` turns
-            them into a per-vector read cost.
+            them into a per-vector read cost and ``tail_tile_sizes`` into the
+            DRAM they stream per output tile.
+        input_scale_width: Input block-scale width, bits (0 = not microscaled).
+        weight_scale_width: Weight block-scale width, bits.
+        output_scale_width: Output block-scale width, bits -- a fused
+            ``quantize_mx`` tail stores the tile's scales next to its values.
+        scale_block_size: Elements per block scale.
     """
 
     def __init__(
@@ -443,7 +451,12 @@ class RuntimeCalculator:
         dram_access_latency_cycles: float,
         double_buffered_l2: bool = False,
         has_sparse_op: bool = False,
+        has_tail: bool = False,
         tail_specs=(),
+        input_scale_width: int = 0,
+        weight_scale_width: int = 0,
+        output_scale_width: int = 0,
+        scale_block_size: int = 1,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
@@ -455,7 +468,26 @@ class RuntimeCalculator:
         self.dram_access_latency_cycles = dram_access_latency_cycles
         self.double_buffered_l2 = double_buffered_l2
         self.has_sparse_op = has_sparse_op
+        self.has_tail = has_tail
         self.tail_specs = tuple(tail_specs)
+        self.input_scale_width = input_scale_width
+        self.weight_scale_width = weight_scale_width
+        self.output_scale_width = output_scale_width
+        self.scale_block_size = scale_block_size
+
+    def tail_tile_sizes(self, mapping):
+        """DRAM bytes each fused tail operand streams for one output tile --
+        one transfer apiece.  An operand is tiled along the output dims it is
+        not broadcast over, so its tile is the output tile's extent there."""
+        blockings = mapping.loop_blockings
+        partitionings = mapping.loop_partitionings
+        sizes = []
+        for dims, bits in self.tail_specs:
+            count = 1
+            for d in dims:
+                count *= blockings[d][1] * blockings[d][2] * partitionings[d][0]
+            sizes.append(count * bits / 8)
+        return sizes
 
     def tail_fetch_cycles(self, mapping):
         """SRAM cycles to fetch one vector of the fused tail's operands -- the
@@ -621,9 +653,9 @@ class RuntimeCalculator:
         blockings = mapping.loop_blockings
         partitionings = mapping.loop_partitionings
 
-        # DRAM transfer size (in absolute bytes) of one L3 tile: levels 0-2
-        # only, since [3] is the grid trip count, not part of the tile.
-        dram_input_size = (
+        # Elements of one L3 tile: levels 0-2 only, since [3] is the grid trip
+        # count, not part of the tile.
+        input_elems = (
             partitionings[le.IC][0]
             * blockings[le.IC][1]
             * blockings[le.IC][2]
@@ -631,10 +663,8 @@ class RuntimeCalculator:
             * blockings[le.OY][2]
             * blockings[le.OX][1]
             * blockings[le.OX][2]
-            * self.input_dtype_width
-            / 8
         )
-        dram_weight_size = (
+        weight_elems = (
             partitionings[le.IC][0]
             * blockings[le.IC][1]
             * blockings[le.IC][2]
@@ -643,10 +673,8 @@ class RuntimeCalculator:
             * blockings[le.OC][2]
             * blockings[le.FY][1]
             * blockings[le.FX][1]
-            * self.weight_dtype_width
-            / 8
         )
-        dram_output_size = (
+        output_elems = (
             partitionings[le.OC][0]
             * blockings[le.OC][1]
             * blockings[le.OC][2]
@@ -654,45 +682,85 @@ class RuntimeCalculator:
             * blockings[le.OY][2]
             * blockings[le.OX][1]
             * blockings[le.OX][2]
-            * self.output_dtype_width
-            / 8
         )
-        # Every transfer pays a fixed access latency on top of its bytes: two
-        # loads per grid step, one store per finished K sweep.
+
         lat = self.dram_access_latency_cycles
-        load = (
-            2 * lat + (dram_input_size + dram_weight_size) / self.dram_bandwidth
+
+        def transfer(*sizes):
+            """Cycles to move each of ``sizes`` as its own DMA: one fixed
+            access latency apiece plus the bytes.  A microscaling operand's
+            block scales are such a DMA -- a few hundred bytes, a whole
+            latency."""
+            sizes = [s for s in sizes if s]
+            return len(sizes) * lat + sum(sizes) / self.dram_bandwidth
+
+        input_load = transfer(
+            input_elems * self.input_dtype_width / 8,
+            input_elems / self.scale_block_size * self.input_scale_width / 8,
         )
-        store = lat + dram_output_size / self.dram_bandwidth
+        weight_load = transfer(
+            weight_elems * self.weight_dtype_width / 8,
+            weight_elems / self.scale_block_size * self.weight_scale_width / 8,
+        )
+        store = transfer(
+            output_elems * self.output_dtype_width / 8,
+            output_elems / self.scale_block_size * self.output_scale_width / 8,
+        )
+        # The fused tail streams its own operands (a residual, a mask) once per
+        # output tile, on the step that runs it.
+        tail_load = transfer(*self.tail_tile_sizes(mapping))
 
         l3_blocks = self._l3_blocks(mapping)
         num_k = blockings[le.IC][3]
         output_tiles = l3_blocks // num_k
         matrix_unit_cycles = self.matrix_unit_cycles(mapping)
-        vector_unit_cycles = self.vector_unit_cycles(mapping)
+        vector_unit_cycles = (
+            self.vector_unit_cycles(mapping) if self.has_tail else 0
+        )
+
+        # An operand is re-fetched only when its block index moves.  The grid
+        # runs ``(batch.., M, N, K)`` with K innermost, so while K is split
+        # both operands change every step; once it is not, N is innermost and
+        # the input tile -- which does not span N -- is held across its
+        # ``n_n`` steps.  The weight tile spans N, so it always reloads.
+        n_n = blockings[le.OC][3]
+        input_steps = l3_blocks if num_k > 1 else l3_blocks // n_n
+        held_steps = l3_blocks - input_steps
 
         if self.double_buffered_l2:
             if num_k == 1:
+                # Every step finishes an output tile: it stores, runs the tail
+                # and reloads the weight; only ``input_steps`` of them also
+                # reload the input.
+                step = weight_load + tail_load + store
                 total_time = (
-                    load
-                    + output_tiles * max(load + store, matrix_unit_cycles)
+                    input_load
+                    + weight_load
+                    + input_steps * max(step + input_load, matrix_unit_cycles)
+                    + held_steps * max(step, matrix_unit_cycles)
                     + store
                 )
             else:
+                load = input_load + weight_load
                 store_steps = output_tiles - 1
                 accum_steps = l3_blocks - 2 * store_steps
                 total_time = (
                     load
                     + accum_steps * max(load, matrix_unit_cycles)
                     + store_steps
-                    * max(load, matrix_unit_cycles + vector_unit_cycles)
+                    * max(
+                        load + tail_load,
+                        matrix_unit_cycles + vector_unit_cycles,
+                    )
                     + store_steps * max(load + store, matrix_unit_cycles)
                     + vector_unit_cycles
                     + store
                 )
         else:
             total_time = (
-                l3_blocks * (load + matrix_unit_cycles) + output_tiles * store
+                l3_blocks * (weight_load + matrix_unit_cycles)
+                + input_steps * input_load
+                + output_tiles * (tail_load + store)
             )
             if num_k > 1:
                 total_time += output_tiles * vector_unit_cycles
@@ -783,6 +851,7 @@ def run_interstellar(
     out_dtype=None,
     fused_specs=(),
     oc_align=None,
+    has_tail=False,
 ):
     """Run interstellar with the 4-level DRAM architecture for a single
     GEMM/conv node.
@@ -808,6 +877,8 @@ def run_interstellar(
             tiled residual / mask).
         oc_align (int, optional): ``head_dim`` for a projection GEMM feeding an
             MHA output relayout — its OC tile is constrained to whole heads.
+        has_tail: The anchor carries a fused post-op, so its reduction drains
+            through the vector unit (see ``RuntimeCalculator``).
 
     Returns:
         ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
@@ -821,14 +892,14 @@ def run_interstellar(
     if layer is None:
         return None, None, None
 
-    of_dtype = (
-        out_dtype[-1] if isinstance(out_dtype, (list, tuple)) else out_dtype
-    )
+    mx_out = isinstance(out_dtype, (list, tuple))
+    of_dtype = out_dtype[-1] if mx_out else out_dtype
     if_bits = _node_dtype_bits(node.args[0])
     fl_bits = _node_dtype_bits(node.args[1])
     of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
     if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
     fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
+    of_scale_bits = get_dtype_width(out_dtype[-2]) if mx_out else 0
 
     logger.info(
         f"[interstellar] {node.name}: "
@@ -854,7 +925,12 @@ def run_interstellar(
         tiler.config.bytes_per_cycle,
         tiler.config.access_latency_cycles,
         double_buffered_l2=tiler.config.double_buffered_l2,
+        has_tail=has_tail,
         tail_specs=fused_specs,
+        input_scale_width=if_scale_bits,
+        weight_scale_width=fl_scale_bits,
+        output_scale_width=of_scale_bits,
+        scale_block_size=node.kwargs.get("block_size") or 1,
     )
 
     result = None
@@ -909,7 +985,7 @@ def run_interstellar(
 
 
 def tiling_request(node, tiler):
-    """``(key, anchor, out_dtype, fused_specs, oc_align)`` for ``node`` — all
+    """``(key, anchor, out_dtype, fused_specs, oc_align, has_tail)`` — all
     of ``get_tiling``'s preparation, stopping short of the search itself.
 
     ``None`` when no interstellar run is needed: not a matrix op, or the anchor
@@ -949,8 +1025,14 @@ def tiling_request(node, tiler):
         if perm is not None and perm.value.ndim > anchor.value.ndim:
             oc_align = perm.value.shape[-1]
 
-    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (oc_align,)
-    return key, anchor, out_dtype, fused_specs, oc_align
+    # A bare anchor and a fused one map differently (the fused reduction
+    # drains through the vector unit), so ``has_tail`` is part of the key.
+    has_tail = sub_gm is not None
+    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (
+        oc_align,
+        has_tail,
+    )
+    return key, anchor, out_dtype, fused_specs, oc_align, has_tail
 
 
 # Populated in the parent before forking; a worker reads its job by index so
@@ -962,7 +1044,9 @@ def _run_prefetch_job(index):
     """Run one prefetched search in a forked worker.  Returns ``(ok, result)``
     so a failure leaves the entry uncached and is re-raised by the serial path,
     where it carries its normal traceback."""
-    _, anchor, out_dtype, fused_specs, oc_align, tiler = _PREFETCH_JOBS[index]
+    _, anchor, out_dtype, fused_specs, oc_align, has_tail, tiler = (
+        _PREFETCH_JOBS[index]
+    )
     try:
         return True, run_interstellar(
             anchor,
@@ -970,6 +1054,7 @@ def _run_prefetch_job(index):
             out_dtype=out_dtype,
             fused_specs=fused_specs,
             oc_align=oc_align,
+            has_tail=has_tail,
         )
     except Exception:
         return False, None
@@ -1085,7 +1170,9 @@ def get_tiling(node, tiler=None):
     if tiler is None:
         return None
 
-    key, anchor, out_dtype, fused_specs, oc_align = tiling_request(node, tiler)
+    key, anchor, out_dtype, fused_specs, oc_align, has_tail = tiling_request(
+        node, tiler
+    )
     if key in tiler.cache:
         mapping, per_tile_cycles, access_list = tiler.cache[key]
         logger.debug(
@@ -1102,6 +1189,7 @@ def get_tiling(node, tiler=None):
             out_dtype=out_dtype,
             fused_specs=fused_specs,
             oc_align=oc_align,
+            has_tail=has_tail,
         )
         logger.info(
             "[tiling] %s: interstellar took %.2fs",
