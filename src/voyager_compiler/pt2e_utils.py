@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import Dict, Tuple, Callable, Any, Union, List
 
 import torch
+import torch.nn as nn
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.fx import GraphModule, Node
 from torch.fx.graph import map_arg
@@ -24,6 +25,7 @@ __all__ = [
     "fetch_attr",
     "get_device_map",
     "get_aten_graph_module",
+    "get_conv_bn_layers",
     "get_node_name_to_scope",
     "insert_align_device_nodes",
     "print_node_scope_tabular",
@@ -487,3 +489,22 @@ def print_node_scope_tabular(gm: GraphModule):
     ]
     print(tabulate(node_specs,
                    headers=['opcode', 'name', 'target', 'scope']))
+
+
+def get_conv_bn_layers(model):
+    layers = []
+    module_names = list(model._modules)
+    for k, name in enumerate(module_names):
+        if len(list(model._modules[name]._modules)) > 0:
+            conv_bn_pairs = get_conv_bn_layers(model._modules[name])
+            layers.extend(
+                [
+                    [f"{name}.{conv}", f"{name}.{bn}"]
+                    for conv, bn in conv_bn_pairs
+                ]
+            )
+        elif isinstance(model._modules[name], nn.BatchNorm2d) and isinstance(
+            model._modules[module_names[k - 1]], nn.Conv2d
+        ):
+            layers.append([module_names[k - 1], name])
+    return layers

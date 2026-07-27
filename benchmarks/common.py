@@ -75,25 +75,23 @@ from voyager_compiler import (
     swap_llama_attention,
     transform,
 )
-from voyager_compiler.codegen.lowering import (
+from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     plan_memory,
 )
-from voyager_compiler.codegen.lowering.reporting import (
+from voyager_compiler.codegen.reporting import (
     compress_schedule,
     estimate_schedule,
     write_excel_report,
     write_perfetto,
 )
-from voyager_compiler.codegen.lowering.tiling import (
+from voyager_compiler.codegen.transform.bufferize.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
 from voyager_compiler.hardware import AcceleratorConfig
-from voyager_compiler.codegen.mapping_utils import (
-    is_compute_op,
-    is_fully_connected,
-)
+from voyager_compiler.codegen.aten_classifier import is_compute_op
+from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.shape_prop import ShapeProp
 
 try:
@@ -703,8 +701,6 @@ def _frontend(cfg: SweepConfig):
         patterns=FUSION_PIPELINE,
         config=cfg.acc_config,
         transform_layout=True,
-        use_interstellar_tiling=True,
-        bufferize=True,
         context_len=cfg.kv_len if is_decode else None,
         max_gen=DECODE_MAX_GEN if is_decode else None,
     )

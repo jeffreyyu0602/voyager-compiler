@@ -5,17 +5,16 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from .utils import get_arg_value
-from ..mapping import duplicate_shared_nodes
-from ..mapping_utils import (
+from ..node_info import get_arg_value
+from .operator_fusion import duplicate_shared_nodes
+from ..aten_classifier import is_elementwise_op
+from ..node_info import (
     is_conv2d,
     is_depthwise_conv,
-    is_elementwise_op,
     is_fully_connected,
     is_linear,
     is_matmul,
     is_nop,
-    is_pooling,
     is_reshape_op,
     quant_param_arg_nodes,
     swaps_last_two_dims,
@@ -214,22 +213,6 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
     elif node.target is torch.ops.quantized_ops.conv2d_mx.default:
         node.kwargs = {**node.kwargs, "layout": "nhwc"}
         node.meta["transposed"] = True
-
-    def update_shape(d, key, order):
-        if key in d:
-            d[key] = tuple(d[key][i] for i in order)
-
-    shapes = node.meta.get("tiled_shapes")
-    if shapes is not None and (is_pooling(node) or is_conv2d(node)):
-        for key in ("input", "input_scale", "output"):
-            update_shape(shapes, key, NCHW_TO_NHWC)
-        if not is_depthwise_conv(node):
-            update_shape(shapes, "weight", WEIGHT_NCHW_TO_HWIO)
-            update_shape(shapes, "weight_scale", WEIGHT_NCHW_TO_HWIO)
-        update_shape(node.meta, "l2_tiling", NCHW_TO_NHWC)
-        if stride := node.meta.get("tile_strides"):
-            update_shape(stride, "input", NCHW_TO_NHWC)
-            update_shape(stride, "input_scale", NCHW_TO_NHWC)
 
 
 def normalize_conv2d_layout(model: GraphModule):
@@ -600,17 +583,6 @@ def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
     return mv_layout if is_fully_connected(node) else mm_layout
 
 
-def _update_shapes(node: Node) -> None:
-    """Updates the tiled_shapes metadata for a transposed node."""
-    if (tiled_shapes := node.meta.get("tiled_shapes")) is None:
-        return
-
-    for key in ["weight", "other", "weight_scale"]:
-        if key in tiled_shapes:
-            d0, d1 = tiled_shapes[key]
-            tiled_shapes[key] = (d1, d0)
-
-
 def _process_linear_node(model: GraphModule, node: Node) -> None:
     """Flip a linear's KC-native weight storage to CK and retarget the
     node to the layout twin, whose weight arrives swapped.  The caller
@@ -636,7 +608,6 @@ def _process_linear_node(model: GraphModule, node: Node) -> None:
     if node.target == torch.ops.aten.linear.default:
         node.target = torch.ops.quantized_ops.linear.default
 
-    _update_shapes(node)
     node.meta["transposed"] = True
 
 
@@ -659,7 +630,6 @@ def _process_matmul_node(
     elif node.target == torch.ops.quantized_ops.matmul_mx.default:
         node.kwargs = {**node.kwargs, "weight_layout": "kc"}
 
-    _update_shapes(node)
     node.meta["transposed"] = True
 
 

@@ -18,35 +18,41 @@ import torch
 from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler import export_model
-from voyager_compiler.codegen.lowering.utils import (
-    _HWIO,
+from voyager_compiler.codegen.transform.bufferize.utils import (
     _InputSpec,
-    _NHWC,
     _OutputSpec,
     _ScratchSpec,
-    _build_fused_gm,
-    _compute_input_spec,
-    _finalize_exported_gm,
-    _lenient_verifier,
-    _project,
-    _tag_loop_extents,
-    _unproject,
-    effect_cond,
-    fuse_store_cones,
     voyager,
 )
-from voyager_compiler.codegen.lowering.ops import (
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _finalize_exported_gm,
+    _lenient_verifier,
+    _tag_loop_extents,
+)
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _HWIO,
+    _NHWC,
+    _unproject,
+)
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _build_fused_gm,
+    _compute_input_spec,
+    _project,
+    effect_cond,
+    fuse_store_cones,
+)
+from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     commit,
     oracle_disabled,
 )
-from voyager_compiler.codegen.lowering.tiling import (
+from voyager_compiler.codegen.transform.bufferize.tiling import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
     get_tiling,
 )
 from voyager_compiler.codegen.shape_prop import ShapeProp
-from voyager_compiler.codegen.mapping_utils import (
+from voyager_compiler.codegen.node_info import (
     ancestors,
     is_bmm,
     is_conv2d,
@@ -57,12 +63,12 @@ from voyager_compiler.codegen.mapping_utils import (
     swaps_last_two_dims,
     trailing_mha_perm,
 )
-from voyager_compiler.codegen.passes.tiling import compute_output_tiled_shapes
-from voyager_compiler.codegen.passes.utils import _pair, get_arg_value
+from voyager_compiler.codegen.node_info import compute_output_tiled_shapes
+from voyager_compiler.codegen.node_info import _pair, get_arg_value
 
 # Top-level: these modules do not import this one at module scope
 # (bufferization imports the builders function-locally), so no cycle.
-from voyager_compiler.codegen.mapping import get_anchor_node
+from voyager_compiler.codegen.node_info import get_anchor_node
 
 _SRAM = int(MemoryLevel.SRAM)
 

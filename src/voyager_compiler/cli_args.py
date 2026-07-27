@@ -366,7 +366,7 @@ def add_compile_args(parser=None):
         help="Vector unit lane count; defaults to the PE array columns.",
     )
 
-    # -- tiling / bufferized lowering ---------------------------------------
+    # -- tiling / lowering --------------------------------------------------
     parser.add_argument(
         "--disable_reshape_fusion",
         action="store_true",
@@ -376,21 +376,6 @@ def add_compile_args(parser=None):
         "--split_spmm",
         action="store_true",
         help="Split linear_mx with outliers into dense + SpMM operations.",
-    )
-    parser.add_argument(
-        "--bufferize",
-        action="store_true",
-        help=(
-            "Use the bufferized FX lowering path: rewrite tiled "
-            "GEMM/conv/pointwise into while_loop nests over voyager.* "
-            "primitives, then emit from that graph."
-        ),
-    )
-    parser.add_argument(
-        "--use_interstellar_tiling",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Tile GEMM/conv on demand via interstellar during bufferization.",
     )
     parser.add_argument(
         "--runtime_tolerance",
@@ -407,7 +392,7 @@ def add_compile_args(parser=None):
         "--report",
         action="store_true",
         help="After compile, estimate the schedule and dump <basename>.xlsx + "
-        ".perfetto.json (requires --bufferize).",
+        ".perfetto.json.",
     )
     parser.add_argument(
         "--report_output_dir",

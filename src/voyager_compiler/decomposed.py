@@ -222,7 +222,7 @@ def conv2d_mx(
     weight_code: Optional[torch.Tensor] = None,
     layout: str = "nchw",
 ) -> torch.Tensor:
-    from .codegen.passes.utils import _pair
+    from .codegen.node_info import _pair
 
     assert layout in ("nchw", "nhwc"), layout
 

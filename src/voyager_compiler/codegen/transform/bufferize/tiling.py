@@ -18,14 +18,15 @@ import multiprocessing
 import os
 import time
 from dataclasses import dataclass, field
+from typing import Optional
 
 import interstellar
 import torch
 
 from voyager_compiler.codegen.shape_prop import ShapeProp
 
-from ..mapping import get_anchor_node
-from ..mapping_utils import (
+from ...node_info import get_anchor_node
+from ...node_info import (
     is_bmm,
     is_conv2d,
     is_depthwise_conv,
@@ -35,9 +36,9 @@ from ..mapping_utils import (
     quant_param_arg_nodes,
     trailing_mha_perm,
 )
-from ..passes.utils import _pair, get_arg_value
+from ...node_info import _pair, get_arg_value
 from .utils import _unproject, _NHWC, _HWIO
-from ..tiler import _node_dtype_bits, get_dtype_width
+from ....pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -61,6 +62,37 @@ CONV_L3_ORDER = ("K", "Y", "X")
 # 1x1 conv, so M rides on OX and N on OC.
 _GEMM_LOOP = {"M": le.OX, "N": le.OC}
 _CONV_LOOP = {"K": le.OC, "Y": le.OY, "X": le.OX}
+
+
+def get_dtype_width(dtype) -> int:
+    """Element width in bits, derived from the canonical ``dtype_byte_size``
+    so the dtype-name parsing lives in exactly one place."""
+    return round(dtype_byte_size(dtype) * 8)
+
+
+def _node_dtype_bits(node, default: Optional[int] = None) -> int:
+    """
+    Element width in bits for an FX node's tensor, read from the graph.
+
+    Prefers node.meta["dtype"] (the compiler's tracked storage dtype, e.g. an
+    NF4 weight), falling back to the runtime tensor dtype node.value.dtype.  A
+    multi-output node (meta dtype / value is a list, e.g. quantize_mx) uses its
+    primary (last) output.
+    """
+    if node is not None:
+        dtype = node.meta.get("dtype")
+        if isinstance(dtype, (list, tuple)):
+            dtype = dtype[-1]
+        if dtype is None:
+            val = getattr(node, "value", None)
+            if isinstance(val, (list, tuple)):
+                val = val[-1] if val else None
+            dtype = getattr(val, "dtype", None)
+        if dtype is not None:
+            return round(dtype_byte_size(dtype) * 8)
+    if default is None:
+        raise ValueError(f"node {node} has no dtype to size the operand")
+    return default
 
 
 @dataclass

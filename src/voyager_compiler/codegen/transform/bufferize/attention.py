@@ -44,17 +44,17 @@ from typing import Optional, Tuple
 
 import torch
 
-from voyager_compiler.codegen.lowering.pipeline import (
+from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _DEFAULT_NUM_BANKS,
     build_pipelined_buffers,
 )
-from voyager_compiler.codegen.lowering.utils import (
+from voyager_compiler.codegen.transform.bufferize.utils import (
     _InputSpec,
     _OutputSpec,
     _ScratchSpec,
     voyager,
 )
-from voyager_compiler.codegen.passes.utils import get_arg_value
+from voyager_compiler.codegen.node_info import get_arg_value
 
 # Additive fill for masked-out score positions (drives ``exp`` to ~0 without
 # ``-inf`` NaNs when a whole row is masked); Pallas uses the same trick.
@@ -260,7 +260,7 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
     in it, so a value read by a later pass stays a boundary input, not absorbed.
     Single-op cones (reductions, a lone ``maximum`` / ``mul``) are left as-is.
     """
-    from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
+    from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 
     for n in list(gm.graph.nodes):
         if n.op == "get_attr":
@@ -307,7 +307,7 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
                         group.append(inp)
                         changed = True
         if len(group) >= 2:
-            _create_and_insert_subgraph(group, gm)
+            create_and_insert_subgraph(group, gm)
     gm.graph.lint()
     gm.recompile()
 

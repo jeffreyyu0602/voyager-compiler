@@ -23,14 +23,20 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
-from ...mapping_utils import is_compute_op, is_nop
-from ...passes.utils import get_arg_value
-from ..bufferization import _produces_tensor, _viewed_buffer
-from ..codegen import COMMIT, COND, WHILE_LOOP, _loop_extents, _norm_extent
+from ..node_info import is_compute_op, is_nop
+from ..node_info import get_arg_value
+from ..transform.bufferize.bufferization import _produces_tensor, _viewed_buffer
+from ..transform.bufferize.emit import (
+    COMMIT,
+    COND,
+    WHILE_LOOP,
+    _loop_extents,
+    _norm_extent,
+)
 from .cost import _shape, _val, tile_bytes
 from .model import ScheduleResult
 from .scheduler import ResourceState
-from ....hardware import AcceleratorConfig
+from ...hardware import AcceleratorConfig
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default

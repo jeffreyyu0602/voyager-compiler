@@ -17,11 +17,8 @@ from typing import Callable, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from voyager_compiler.codegen.lowering import ops
-from voyager_compiler.codegen.mapping_utils import (
-    is_nop,
-    quant_param_arg_nodes,
-)
+from voyager_compiler.codegen.transform.bufferize import ops
+from voyager_compiler.codegen.node_info import is_nop, quant_param_arg_nodes
 
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -239,7 +236,7 @@ def _compute_input_spec(
     NHWC permutation), since their grid carries a reduction dim the output
     doesn't span.
     """
-    from voyager_compiler.codegen.passes.tiling import compute_tiled_shape
+    from voyager_compiler.codegen.node_info import compute_tiled_shape
 
     # 0-D or single-element tensors are passed through (no spec).
     if len(input_shape) == 0 or (len(input_shape) == 1 and input_shape[0] == 1):
@@ -396,7 +393,7 @@ def fuse_store_cones(gm: GraphModule) -> None:
     software-pipelined, or async-flattened -- the buffer stores that separate
     those cases are exactly the cone boundaries, so one rule spans them all.
     """
-    from voyager_compiler.codegen.mapping import _create_and_insert_subgraph
+    from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 
     for node in list(gm.graph.nodes):
         if node.op == "get_attr":
@@ -440,7 +437,7 @@ def fuse_store_cones(gm: GraphModule) -> None:
         real = [n for n in cone if not is_nop(n)]
         if len(real) < 2 or cone & consumed:
             continue
-        _create_and_insert_subgraph(list(cone), gm)
+        create_and_insert_subgraph(list(cone), gm)
         consumed |= cone
 
     gm.graph.lint()

@@ -4,7 +4,21 @@ from torch.utils._pytree import tree_flatten
 
 from .cli_args import *
 from .codegen import *
-from .codegen.mapping_utils import flush_tensor_files
+from .codegen.transform.bufferize import (
+    bufferize_graph,
+    gen_code_bufferized,
+    gen_compute_graph_bufferized,
+    plan_memory,
+    print_bufferized_graph,
+)
+from .codegen.transform.bufferize.emit import (
+    compute_op_names,
+    flush_tensor_files,
+)
+from .codegen.transform.bufferize.tiling import (
+    DEFAULT_RUNTIME_TOLERANCE,
+    build_interstellar_tiler,
+)
 from .hardware import AcceleratorConfig
 from .decomposed import *
 from .fake_quantize import *
@@ -119,8 +133,6 @@ def transform(
     fuse_reshape=True,
     split_spmm=False,
     use_fake_mode=True,
-    use_interstellar_tiling=False,
-    bufferize=False,
     context_len=None,
     max_gen=None,
 ):
@@ -159,15 +171,7 @@ def transform(
     # bufferizer to process.
     remove_prunable_ops(model)
 
-    if not bufferize:
-        split_multi_head_attention(model)
-        convert_expand_to_memory_copy(model)
-        convert_cat_and_stack_as_stack_on_dim0(model)
-        convert_cat_with_mismatched_shapes_to_stack(model)
-
-    fuse_quantize_dequantize_with_previous_op(
-        model, bufferize, context_len, max_gen
-    )
+    fuse_quantize_dequantize_with_previous_op(model, context_len, max_gen)
 
     # -------------------------------------------------------------------------
     # 2. Hardware Alignment (Padding)
@@ -185,11 +189,7 @@ def transform(
     # annotates each GEMM/conv with ``l2_tiling`` (the bufferized builders read
     # it).
     if config.scratchpad_size is not None:
-        run_matrix_op_l2_tiling(
-            model,
-            config,
-            use_interstellar_tiling=use_interstellar_tiling,
-        )
+        run_matrix_op_l2_tiling(model, config)
 
     # -------------------------------------------------------------------------
     # 4. Data Layout Transformation
@@ -215,7 +215,7 @@ def transform(
     # 5. Vector Operation Tiling
     # -------------------------------------------------------------------------
     # TODO: Used for unit test. Will be removed in the future
-    from .codegen.passes.lowering import split_dense_spmm_node
+    from .codegen.transform.rewrites import split_dense_spmm_node
 
     if split_spmm:
         split_dense_spmm_node(model)
@@ -235,7 +235,7 @@ def transform(
     # Conv+ReLU) into single kernels to reduce memory access overhead.
 
     if not skip_op_fusion:
-        fuse_operator(model, patterns, fuse_reshape, bufferize)
+        fuse_operator(model, patterns, fuse_reshape)
 
     rename_nodes_with_param_names(model)
     deduplicate_nodes(model)
@@ -251,8 +251,6 @@ def compile(
     output_dir=None,
     output_file="compute_graph",
     dump_tensors=True,
-    dump_snapshot=False,
-    bufferize: bool = False,
     runtime_tolerance=None,
 ):
     if config is None:
@@ -263,91 +261,43 @@ def compile(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*flatten_args)
 
-    # ---------------------------------------------------------------------
-    # Optional add-on: bufferized FX lowering + loop-aware code generation.
-    # Rewrites tiled GEMM/pointwise nodes into explicit while_loop nests over
-    # buf.* primitives, then emits protobuf / graph / text from that FX graph.
-    # Terminal alternative to the per-node run_memory_mapping + gen_code path.
-    # ---------------------------------------------------------------------
-    if bufferize:
-        from .codegen.lowering import (
-            bufferize_graph,
-            gen_code_bufferized,
-            gen_compute_graph_bufferized,
-            plan_memory,
-            print_bufferized_graph,
-        )
-        from .codegen.lowering.codegen import compute_op_names
-        from .codegen.lowering.tiling import (
-            DEFAULT_RUNTIME_TOLERANCE,
-            build_interstellar_tiler,
-        )
-
-        tolerance = (
-            DEFAULT_RUNTIME_TOLERANCE
-            if runtime_tolerance is None
-            else runtime_tolerance
-        )
-        tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
-
-        gen_compute_graph(
-            model, os.path.join(output_dir, output_file + "_prelowered")
-        )
-
-        # Reuse the tiler's double-buffering decision: when L2 is double-buffered the
-        # tiles already assume two-buffer occupancy, so emit software-pipelined loops.
-        bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
-
-        # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
-        # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).  Writes
-        # meta['memory'] / meta['scratchpad'] that the proto emitter reads.
-        plan_memory(model, config)
-        print_bufferized_graph(model)
-
-        path = os.path.join(output_dir, "tensor_files")
-        params = gen_code_bufferized(
-            model, flatten_args, path if dump_tensors else None
-        )
-        with open(os.path.join(output_dir, "model.txt"), "w") as f:
-            f.write(text_format.MessageToString(params))
-        with open(os.path.join(output_dir, "layers.txt"), "w") as f:
-            f.write("\n".join(compute_op_names(model)))
-        gen_compute_graph_bufferized(
-            model,
-            os.path.join(output_dir, output_file),
-            timeout=5 * 60,
-        )
-        flush_tensor_files()
-        return params
-
-    total_memory = (
-        None
-        if config.dram_size is None
-        else int(config.dram_size * 1024**3)  # GB -> bytes
+    tolerance = (
+        DEFAULT_RUNTIME_TOLERANCE
+        if runtime_tolerance is None
+        else runtime_tolerance
     )
-    allocator = MemoryAllocator(total_memory, bank_width=config.bank_width)
-    run_memory_mapping(model, config, allocator)
+    tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
 
-    if dump_snapshot:
-        allocator.dump_snapshots(os.path.join(output_dir, "memory.png"))
+    gen_compute_graph(
+        model, os.path.join(output_dir, output_file + "_prelowered")
+    )
+
+    # Reuse the tiler's double-buffering decision: when L2 is double-buffered
+    # the tiles already assume two-buffer occupancy, so emit software-pipelined
+    # loops.
+    bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
+
+    # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
+    # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).
+    # Writes meta['memory'] / meta['scratchpad'] that the proto emitter reads.
+    plan_memory(model, config)
+    print_bufferized_graph(model)
 
     path = os.path.join(output_dir, "tensor_files")
-    params = gen_code(model, flatten_args, path if dump_tensors else None)
+    params = gen_code_bufferized(
+        model, flatten_args, path if dump_tensors else None
+    )
 
     with open(os.path.join(output_dir, "model.txt"), "w") as f:
         f.write(text_format.MessageToString(params))
-
-    operations = [
-        op.op.name if op.WhichOneof("op_type") == "op" else op.fused_op.name
-        for op in params.ops
-        if op.op.op != "nop"
-    ]
-
     with open(os.path.join(output_dir, "layers.txt"), "w") as f:
-        f.write("\n".join(operations))
+        f.write("\n".join(compute_op_names(model)))
 
-    if len(model.graph.nodes) < 10000:
-        gen_compute_graph(model, os.path.join(output_dir, output_file))
+    gen_compute_graph_bufferized(
+        model,
+        os.path.join(output_dir, output_file),
+        timeout=5 * 60,
+    )
 
     flush_tensor_files()
     return params

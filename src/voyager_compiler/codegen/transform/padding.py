@@ -8,12 +8,12 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
-from .utils import get_arg_value
-from ..mapping_utils import (
+from ..node_info import get_arg_value
+from ..aten_classifier import is_elementwise_op
+from ..node_info import (
     _BROADCAST_OPS,
     is_conv2d,
     is_depthwise_conv,
-    is_elementwise_op,
     is_gemm_op,
     is_matmul,
 )

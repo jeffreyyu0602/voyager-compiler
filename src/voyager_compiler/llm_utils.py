@@ -16,8 +16,8 @@ from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotar
 from .decomposed import expand
 from .pt2e_utils import fetch_attr, propagate_shape
 from .quantize_pt2e import create_getattr_from_value
-from .codegen.mapping_utils import is_gemm_op, is_nop, is_reshape_op
-from .codegen.passes.utils import get_arg_value
+from .codegen.node_info import is_gemm_op, is_nop, is_reshape_op
+from .codegen.node_info import get_arg_value
 
 
 __all__ = [
@@ -877,21 +877,18 @@ def run_qparam_through_nodes(model, input, nodes, axes, block_size):
     return env[nodes[-1]], axes
 
 
-def fuse_dequantize_quantize(
-    model: torch.fx.GraphModule, unrepeat_qparams: bool = False
-):
+def fuse_dequantize_quantize(model: torch.fx.GraphModule):
     """
     Fuses consecutive dequantize -> quantize operations in a quantized model
     for optimization.
 
+    A broadcast qparam (GQA's ``repeat_kv``) is stored once per KV head rather
+    than once per query head, with the repeat put back as graph ops: a smaller
+    buffer for a longer graph, which pays off because the GEMM folds the repeat
+    into its tile addressing instead of copying.
+
     Args:
         model (GraphModule): The FX-traced model to optimize.
-        unrepeat_qparams (bool): Store a broadcast qparam (GQA's ``repeat_kv``)
-            once per KV head instead of once per query head, and put the repeat
-            back as graph ops.  Trades a smaller buffer for a longer graph, and
-            only pays off where the consumer can fold the repeat into its
-            addressing rather than copying -- which the bufferized path can and
-            the legacy path cannot.
 
     Returns:
         GraphModule: The optimized model with fused operations.
@@ -1008,7 +1005,7 @@ def fuse_dequantize_quantize(
         qparam_dtype = scale_node.meta.get("dtype")
 
         def create_qparam(value, name):
-            if unrepeat_qparams and expand_node is not None:
+            if expand_node is not None:
                 repeated = store_qparam_unrepeated(
                     model, value, expand_node, name, node, qparam_dtype
                 )

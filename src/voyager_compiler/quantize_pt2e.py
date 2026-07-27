@@ -33,14 +33,14 @@ from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
 )
 
 from .codegen.aten_classifier import is_compute_op
-from .codegen.passes.utils import get_arg_value
-from .codegen.mapping_utils import (
+from .codegen.node_info import get_arg_value
+from .codegen.node_info import (
     _BROADCAST_OPS,
     is_gemm_op,
+    is_matmul,
     is_mha_qkv_permute,
     is_nop,
     is_reshape_op,
-    is_matmul,
     reshape_preserves_full_blocks,
 )
 from .decomposed import quantized_ops_lib
@@ -1245,8 +1245,8 @@ def _split_quantized_cache(
             -- the compiler was told a shape the graph was not exported with.
     """
     # ``codegen.mapping`` imports this module, so these break that cycle.
-    from .codegen.mapping import (
-        _create_and_insert_subgraph,
+    from .codegen.subgraph import (
+        create_and_insert_subgraph,
         replace_node_with_graph_module,
     )
     from .pt2e_utils import fetch_attr, get_aten_graph_module
@@ -1374,7 +1374,7 @@ def _split_quantized_cache(
             )
             return main + residue
 
-    new_node = _create_and_insert_subgraph(cone, model)
+    new_node = create_and_insert_subgraph(cone, model)
     example = tuple(n.value.clone() for n in new_node.all_input_nodes)
     gm = get_aten_graph_module(SplitCache(), example)
     value_remap = {}
@@ -1594,7 +1594,6 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
 
 def fuse_quantize_dequantize_with_previous_op(
     model: GraphModule,
-    bufferize: bool = False,
     context_len: Optional[int] = None,
     max_gen: Optional[int] = None,
 ):
@@ -1610,10 +1609,6 @@ def fuse_quantize_dequantize_with_previous_op(
 
     Args:
         model: The graph module to rewrite in place.
-        bufferize: Whether the bufferized backend is the target.  Only it can
-            lower a ``quantize_mx`` that has moved -- it fuses onto the store
-            of the GEMM it lands on -- so this gates lifting one at all, and
-            the KV-cache fold/split that follows.
         context_len: Positions already written in the decode cache the graph
             was exported with.  ``None`` outside decode.
         max_gen: Generation slots that follow those positions.  ``None``
@@ -1630,8 +1625,7 @@ def fuse_quantize_dequantize_with_previous_op(
         if node.target not in _QUANTIZE_OPS:
             continue
         if node.target is _QUANTIZE_MX:
-            if bufferize:
-                _hoist_microscaling(model, node)
+            _hoist_microscaling(model, node)
             continue
         # A blocked plain quantize would need the same axis bookkeeping as
         # quantize_mx, which it does not have; only per-tensor is lifted.
@@ -1640,11 +1634,10 @@ def fuse_quantize_dequantize_with_previous_op(
             continue
         _hoist_forked(model, node)
 
-    if bufferize:
-        graph.eliminate_dead_code()
-        for node in list(graph.nodes):
-            if node.target is _QUANTIZE_MX:
-                _fold_quantize_into_cache(model, node, context_len, max_gen)
+    graph.eliminate_dead_code()
+    for node in list(graph.nodes):
+        if node.target is _QUANTIZE_MX:
+            _fold_quantize_into_cache(model, node, context_len, max_gen)
 
     graph.lint()
     graph.eliminate_dead_code()

@@ -31,29 +31,29 @@ import torch
 from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler import export_model
-from voyager_compiler.codegen.lowering.attention import (
+from voyager_compiler.codegen.transform.bufferize.attention import (
     _MASK_FILL,
     _fuse_passes,
     fold_mask_tensor,
     plan_gqa_fold,
 )
-from voyager_compiler.codegen.lowering.ops import (
+from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     commit,
     oracle_disabled,
 )
-from voyager_compiler.codegen.lowering.pipeline import (
+from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _guarded_wait,
     select_bank,
 )
-from voyager_compiler.codegen.lowering.utils import (
+from voyager_compiler.codegen.transform.bufferize.utils import voyager
+from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
-    voyager,
 )
 from voyager_compiler.codegen.shape_prop import ShapeProp
-from voyager_compiler.codegen.passes.utils import get_arg_value
+from voyager_compiler.codegen.node_info import get_arg_value
 
 _SRAM = int(MemoryLevel.SRAM)
 

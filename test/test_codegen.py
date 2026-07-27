@@ -44,7 +44,7 @@ from voyager_compiler.codegen import (
     replace_rmsnorm_with_layer_norm,
     remove_softmax_dtype_cast,
 )
-from voyager_compiler.codegen.mapping_utils import is_fully_connected
+from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.llm_utils import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
@@ -716,7 +716,7 @@ def main():
                 example_kwargs["attention_mask"]
             )
 
-        fuse_dequantize_quantize(gm, unrepeat_qparams=args.bufferize)
+        fuse_dequantize_quantize(gm)
 
         transform(gm, (), example_kwargs, **transform_args)
         compile(gm, (), example_kwargs, **compile_args)

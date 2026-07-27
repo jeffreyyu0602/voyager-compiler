@@ -17,7 +17,8 @@ from typing import (
 import torch
 from torch import fx
 
-from .mapping_utils import (
+from .node_info import (
+    get_anchor_node,
     ancestors,
     is_elementwise_op,
     is_nop,
@@ -170,8 +171,6 @@ class IterationSpaceNormalizer:
         if output_node is None:
             raise NormalizationError("Child graph has no output node")
         output = self._describe_output(output_node)
-
-        from .mapping import get_anchor_node
 
         anchor = get_anchor_node(call_node)
         # Keep only a *strong* anchor (gemm/conv/layernorm/softmax); a pointwise

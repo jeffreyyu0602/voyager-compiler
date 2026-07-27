@@ -25,9 +25,9 @@ import math
 import torch
 from torch.fx import Node
 
-from ..mapping import get_anchor_node, get_node_bytes, get_node_to_key_map
-from ..mapping_utils import is_fully_connected
-from ...pt2e_utils import dtype_byte_size
+from ...node_info import get_anchor_node, get_node_bytes, get_node_to_key_map
+from ...node_info import is_fully_connected
+from ....pt2e_utils import dtype_byte_size
 
 # Passes an op makes over its data; it fetches its operands once per pass.
 # Single source of truth: reporting/cost.py imports this via

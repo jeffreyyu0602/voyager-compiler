@@ -32,19 +32,49 @@ reuse, store->load elision, double buffering, the interstellar schedule).
 import logging
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.fx import GraphModule, Node
 
 from .bufferization import _viewed_buffer
 from .utils import _collect_codebook_nodes, _passed_whole, _subgraph
-from ..memory import MemorySpace, Segment, _align_size
-from ..passes.utils import get_arg_value
-from ...pt2e_utils import dtype_byte_size
-from .ops import UNBANKED
+from ...node_info import _align_size, get_arg_value
+from ....pt2e_utils import dtype_byte_size
+from .ops import MemoryLevel, UNBANKED
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Segment:
+    start: Union[float, int]
+    end: Union[float, int]
+    memory_space: Optional[int] = None
+    node: Optional[torch.fx.Node] = None
+
+    def __post_init__(self) -> None:
+        s_raw = self.start
+        e_raw = self.end
+
+        s = int(s_raw)  # truncate toward zero (matches your original)
+        e = math.ceil(e_raw)  # round end up
+
+        if s != s_raw:
+            logger.warning(
+                "Segment start %r is not an integer. Rounding to %d.", s_raw, s
+            )
+        if e != e_raw:
+            logger.warning(
+                "Segment end %r is not an integer. Rounding up to %d.", e_raw, e
+            )
+
+        if e < s:
+            raise ValueError(f"Segment end ({e}) is less than start ({s}).")
+
+        self.start = s
+        self.end = e
+
 
 voyager = torch.ops.voyager
 _ALLOC = voyager.alloc.default
@@ -230,7 +260,7 @@ def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     offset = 0
     for b in persistent:
         size = _nbytes(b, bank_width)
-        b.meta["memory"] = Segment(offset, offset + size, MemorySpace.DRAM, b)
+        b.meta["memory"] = Segment(offset, offset + size, MemoryLevel.DRAM, b)
         offset += size
 
     # Reusable activation buffers: greedy best-fit, laid out after the
@@ -240,7 +270,7 @@ def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     for b in reusable:
         start = offset + placed[b]
         size = _nbytes(b, bank_width)
-        b.meta["memory"] = Segment(start, start + size, MemorySpace.DRAM, b)
+        b.meta["memory"] = Segment(start, start + size, MemoryLevel.DRAM, b)
 
     return offset + reuse_bytes
 
@@ -439,9 +469,7 @@ def _plan_scratchpad(
     ]
     bases, total = _greedy_best_fit(items)
     for root, base in bases.items():
-        seg = Segment(
-            base, base + bufs[root].size, MemorySpace.SCRATCHPAD, root
-        )
+        seg = Segment(base, base + bufs[root].size, MemoryLevel.SRAM, root)
         for m in bufs[root].members:
             m.meta.setdefault("scratchpad", seg)
 

@@ -19,11 +19,11 @@ from voyager_compiler import (
     fuse_operator,
 )
 from voyager_compiler.codegen import (
-    get_conv_bn_layers,
     pad_vit_embeddings_output,
     remove_softmax_dtype_cast,
     remove_zero_attention_mask,
 )
+from voyager_compiler.pt2e_utils import get_conv_bn_layers
 
 from .utils import get_compile_args, get_transform_args
 

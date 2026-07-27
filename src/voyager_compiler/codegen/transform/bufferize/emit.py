@@ -37,21 +37,26 @@ import operator
 import os
 from typing import Dict, List, Optional
 
+from concurrent.futures import ThreadPoolExecutor
+
 import graphviz
 import torch
 from torch.fx import GraphModule, Node
 from torch.fx.operator_schemas import normalize_function
 
+import logging
+
+import numpy as np
+
 import interstellar
 
-from ..mapping_utils import (
+from ...node_info import (
     QMAP_PARAMS,
+    get_arg_value,
     is_nop,
     quant_param_arg_nodes,
-    save_tensor,
 )
-from ..passes.utils import get_arg_value
-from ..voyager_ir_pb2 import (
+from ...voyager_ir_pb2 import (
     Argument,
     LevelAccessCount,
     LevelTiling,
@@ -71,10 +76,12 @@ from ..voyager_ir_pb2 import (
     TensorBoxRef,
     Tiling,
 )
-from ..shape_prop import ShapeProp
+from ...shape_prop import ShapeProp
 from .bufferization import _is_compute
 from .ops import oracle_disabled
 from .utils import _collect_codebook_nodes, _passed_whole
+
+logger = logging.getLogger(__name__)
 
 WHILE_LOOP = torch.ops.higher_order.while_loop
 COND = torch.ops.higher_order.cond
@@ -100,6 +107,75 @@ def _target_name(target, short: bool = False) -> str:
         name = target._schema.name
         return name.split("::")[-1] if short else name
     return getattr(target, "__name__", str(target))
+
+
+# ===========================================================================
+# 0. Asynchronous tensor-file dumping
+# ===========================================================================
+# Every model input / parameter is written beside ``model.txt`` so the
+# hardware can be driven with real data.  The writes go to a thread pool;
+# ``flush_tensor_files`` blocks until they are all on disk.
+
+
+# Global variable to store the custom save function
+_custom_save_function = None
+
+
+def register_save_function(custom_function):
+    """
+    Decorator to register a custom function for saving tensors.
+    The custom function should accept two arguments: tensor and filename.
+    """
+    global _custom_save_function
+    if not callable(custom_function):
+        raise ValueError("The custom function must be callable.")
+    _custom_save_function = custom_function
+    print(f"Custom save function '{custom_function.__name__}' registered.")
+    return custom_function
+
+
+_executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+
+
+def _write_numpy(np_array: np.ndarray, filename: str, shape: tuple):
+    """Worker function: write the tensor and log when done."""
+    try:
+        np_array.tofile(filename)
+        logger.info(f"✅ Saved tensor {shape} -> {filename}")
+    except Exception as e:
+        logger.error(f"❌ Failed to save tensor {shape} -> {filename}: {e}")
+
+
+_pending_writes = []
+
+
+def _save_tensor(tensor: torch.Tensor, filename: str):
+    """Asynchronously save tensor to a binary file."""
+    t = tensor.detach().cpu().contiguous().to(torch.float32)
+    np_array = t.numpy()
+    _pending_writes.append(
+        _executor.submit(_write_numpy, np_array, filename, tuple(t.shape))
+    )
+
+
+def flush_tensor_files():
+    """Block until every queued tensor file is on disk — the writes are handed
+    to a thread pool, so a caller that reads ``tensor_files/`` as soon as
+    ``compile`` returns would otherwise race them."""
+    for future in _pending_writes:
+        future.result()
+    _pending_writes.clear()
+
+
+def save_tensor(tensor, filename):
+    """
+    Save the tensor to a file using the custom save function if defined,
+    otherwise use the default _save_tensor function.
+    """
+    if _custom_save_function is not None:
+        _custom_save_function(tensor, filename)
+    else:
+        _save_tensor(tensor, filename)
 
 
 # ===========================================================================
@@ -1376,3 +1452,110 @@ def print_bufferized_graph(model: GraphModule, to_string: bool = False):
         return text
     print(text)
     return text
+
+
+# ==========================================================================
+# Plain (pre-lowered) FX graph rendering
+# ==========================================================================
+
+
+def _wrap_long_name(name: str, max_len: int = 20) -> str:
+    if len(name) <= max_len:
+        return name
+    lines = []
+    start = 0
+    while start + max_len < len(name):
+        end = start + max_len
+        break_at = end
+        for i in range(end, start, -1):
+            if not name[i].isalpha():
+                break_at = i + 1
+                break
+        lines.append(name[start:break_at])
+        start = break_at
+    lines.append(name[start:])
+    return "&#92;n".join(lines)
+
+
+def gen_compute_graph(model, output_file="compute_graph", max_users=10):
+    nodes = {}
+    edges = []
+    named_modules = dict(model.named_modules(remove_duplicate=False))
+
+    for node in model.graph.nodes:
+        if node.op == "get_attr" and "qmap" in node.name:
+            continue
+
+        header = _wrap_long_name(node.name)
+
+        if isinstance(node.value, torch.Tensor):
+            header += f"&#92;n{str(tuple(node.value.shape))}"
+            if (dtype := node.meta.get("dtype", None)) is not None:
+                header += f"&#92;n{dtype}"
+            elif node.value.dtype not in [torch.float, torch.bfloat16]:
+                header += f"&#92;n{node.value.dtype}"
+        elif isinstance(node.value, (tuple, list)):
+            shape_str = ", ".join([str(tuple(t.shape)) for t in node.value])
+            header += f"&#92;n{shape_str}"
+
+            dtypes = [t.dtype for t in node.value]
+            if (dtype := node.meta.get("dtype", None)) is not None:
+                dtypes = [dt or dtypes[i] for i, dt in enumerate(dtype)]
+
+            if any(
+                dtype not in [torch.float, torch.bfloat16] for dtype in dtypes
+            ):
+                header += f"&#92;n{', '.join([str(d) for d in dtypes])}"
+        else:
+            continue
+
+        body = None
+        if node.op == "call_module":
+            gm = named_modules[node.target]
+            if isinstance(gm, torch.fx.GraphModule):
+                body = "&#92;n".join(
+                    [n.name for n in gm.graph.nodes if n.op == "call_function"]
+                )
+        label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
+        label = label.replace("<", r"\<").replace(">", r"\>")
+
+        nodes[node.name] = {
+            "label": label,
+            "shape": "Mrecord",
+        }
+
+        users = list(node.users)
+        num_users = len(users)
+        if num_users > max_users:
+            num_splits = (num_users + max_users - 1) // max_users
+            for i in range(num_splits):
+                sub_node = f"{node.name}_split_{i}"
+                sub_label = f"{{{sub_node}}}"
+                sub_label = sub_label.replace("<", r"\<").replace(">", r"\>")
+
+                # Create a sub-node for this group of users
+                nodes[sub_node] = {
+                    "label": sub_label,
+                    "shape": "Mrecord",
+                }
+
+                edges.append((node.name, sub_node))
+
+                # Add edges from sub-node to its users
+                start_idx = i * max_users
+                end_idx = min(start_idx + max_users, num_users)
+                for u in users[start_idx:end_idx]:
+                    edges.append((sub_node, u.name))
+        else:
+            for u in users:
+                edges.append((node.name, u.name))
+
+    g = graphviz.Digraph()
+    # g.attr(bgcolor="transparent")
+
+    for node, attrs in nodes.items():
+        g.node(node, **attrs)
+
+    g.edges(edges)
+
+    g.render(output_file, format="svg", cleanup=True)

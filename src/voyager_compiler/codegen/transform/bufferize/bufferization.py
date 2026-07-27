@@ -21,9 +21,10 @@ import torch
 import torch.fx as fx
 from torch.fx import GraphModule, Node
 
-from ...pt2e_utils import update_submod_user_meta
-from ..mapping import get_anchor_node, replace_node_with_graph_module
-from ..mapping_utils import (
+from ....pt2e_utils import update_submod_user_meta
+from ...node_info import get_anchor_node
+from ...subgraph import replace_node_with_graph_module
+from ...node_info import (
     quant_param_arg_nodes,
     is_compute_op,
     is_conv2d,

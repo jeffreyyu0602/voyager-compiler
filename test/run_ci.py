@@ -2,11 +2,11 @@
 """Local pre-push CI for the voyager codegen commands.
 
 Runs every actively-used ``test_codegen.py`` invocation (the ones reached
-through the accelerator's ``codegen.mk``) on the *non-bufferized* path,
-without dumping tensors, and drops each run's artifacts into a date+time
-folder under a user-supplied output location.  If a prior run exists in that
-location, the freshly produced ``model.txt`` of each command is compared
-against the previous run's and any mismatch (or compile failure) is reported.
+through the accelerator's ``codegen.mk``) without dumping tensors, and drops
+each run's artifacts into a date+time folder under a user-supplied output
+location.  If a prior run exists in that location, the freshly produced
+``model.txt`` of each command is compared against the previous run's and any
+mismatch (or compile failure) is reported.
 
 Usage (from the repo root, with the conda env active)::
 
@@ -41,8 +41,8 @@ DIFF_EXCERPT_LINES = 60
 #         --pe_array_size <unrolling> <extra>
 #         --model_output_dir <run_dir>/<label>
 # The shared per-scheme quantization/compile flags live once in SCHEME_ARGS
-# (no --dump_tensors, no --bufferize). To add coverage, add a Command (and a
-# new scheme to SCHEME_ARGS if needed).
+# (no --dump_tensors). To add coverage, add a Command (and a new scheme to
+# SCHEME_ARGS if needed).
 # ---------------------------------------------------------------------------
 
 # Shared quantization/compile flags per scheme.
@@ -66,6 +66,11 @@ SCHEME_ARGS = {
         "--cache_size 1048576 --num_banks 8 --conv2d_im2col"
     ),
 }
+
+# The interstellar tiler sizes its blocking against a scratchpad and a bank
+# count, and has no answer when they are unset.  Only MXNF4 names its own, so
+# every other scheme is given these -- the same pair MXNF4 asks for.
+DEFAULT_TILER_ARGS = {"--cache_size": "1048576", "--num_banks": "8"}
 
 # Reused per-command extra-flag groups.
 _SINGLE = "--compile_single_layer"
@@ -157,8 +162,7 @@ def _build(command, run_dir):
     """Expand a Command into ``(label, dest, argv)`` for this run.
 
     The argv runs this repo's test_codegen.py with --model_output_dir pointed
-    into the timestamped run folder; --dump_tensors / --bufferize are never
-    added.
+    into the timestamped run folder; --dump_tensors is never added.
     """
     label = _label(command)
     dest = run_dir / label
@@ -167,6 +171,9 @@ def _build(command, run_dir):
     argv += shlex.split(SCHEME_ARGS[command.scheme])
     argv += ["--pe_array_size", command.unrolling]
     argv += shlex.split(command.extra)
+    for flag, value in DEFAULT_TILER_ARGS.items():
+        if flag not in argv:
+            argv += [flag, value]
     argv += ["--model_output_dir", str(dest)]
     return label, dest, argv
 

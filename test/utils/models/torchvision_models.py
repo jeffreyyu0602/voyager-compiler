@@ -17,7 +17,7 @@ from voyager_compiler import (
     extract_input_preprocessor,
     fuse_operator,
 )
-from voyager_compiler.codegen import get_conv_bn_layers
+from voyager_compiler.pt2e_utils import get_conv_bn_layers
 
 from .utils import get_transform_args, get_compile_args
 
