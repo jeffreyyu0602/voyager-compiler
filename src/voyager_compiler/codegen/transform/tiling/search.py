@@ -20,8 +20,8 @@ from ...node_info import (
     trailing_mha_perm,
     weight_is_ck,
 )
-from .banking import BANK_GROUPS, require_allocation, scratchpad_bytes
-from .cost import gemv_tile_latency, vector_tile_latency
+from .banking import GEMV_BANK_GROUPS, require_allocation, scratchpad_bytes
+from .cost import vector_tile_latency
 from ....layout_ops import NHWC_OP_VARIANTS
 
 logger = logging.getLogger(__name__)
@@ -31,55 +31,6 @@ __all__ = [
     "pool_op_tiling",
     "vector_op_tiling",
 ]
-
-
-def _prime_factors(n: int):
-    f, p = [], 2
-    while p * p <= n:
-        while n % p == 0:
-            f.append(p)
-            n //= p
-        p += 1 if p == 2 else 2  # 2,3,5,7,...
-    if n > 1:
-        f.append(n)
-    return f
-
-
-def construct_tiled_shape(full_shape, tiled_dim: int, dims):
-    """
-    Reconstruct full-rank tiled shape.
-
-    Args:
-      full_shape: tuple/list[int] original shape (len N)
-      tiled_dim: int, flattened size of the compressed (tiled) dims
-      dims: iterable[int], indices of dims that were flattened into tiled_dim
-
-    Returns:
-      Tuple[int] of length N
-    """
-    full_shape = tuple(full_shape)
-    N = len(full_shape)
-    if N == 0:
-        raise ValueError("full_shape must have at least one dimension.")
-
-    # Normalize & validate compressed dims
-    comp = sorted(set(int(i) for i in dims))
-    if not comp:
-        raise ValueError("dims cannot be empty.")
-    if any(i < 0 or i >= N for i in comp):
-        raise IndexError(f"dims must be in [0, {N-1}]. Got {dims}.")
-
-    # Distribute prime factors of R across compressed dims (greedy balance)
-    tiled = {i: 1 for i in comp}
-    for p in _prime_factors(tiled_dim):
-        for i in reversed(comp):
-            if full_shape[i] % p == 0:
-                tiled[i] *= p
-                break
-
-    # Build final shape
-    out = [tiled[i] if i in comp else full_shape[i] for i in range(N)]
-    return tuple(out)
 
 
 def get_valid_tiling(
@@ -149,6 +100,120 @@ def get_valid_tiling(
             yield current()
 
 
+def _search_tiling(
+    node,
+    full_shape,
+    shape_builder_fn,
+    cache_size,
+    num_banks,
+    bank_width,
+    order=None,
+    last_dim=None,
+    multiple_of=None,
+    cost_fn=None,
+):
+    """
+    Generic driver over the valid tilings, scoring each by the scratchpad it
+    needs (``scratchpad_bytes``: one bank per operand group, the two smallest
+    merged while they outnumber the banks).
+
+    ``get_valid_tiling`` yields candidates largest -> smallest.  Without
+    ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
+    fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
+    tiled_shapes, tiling) -> latency`` -- every fitting candidate is
+    scored and the minimum-latency one is returned (DRAM-aware two-step search).
+    """
+    bank_size = None if num_banks is None else cache_size // num_banks
+
+    # Every operand group costs a whole bank, so ``G`` groups floor the
+    # footprint at ``G * bank_size``: with as many groups as banks nothing
+    # fits at any tile size.  Retry with progressively more sharing and keep
+    # the first (least-shared) tiling that maps.
+    for extra_sharing in range(len(GEMV_BANK_GROUPS)):
+        best = None  # (score, tile_sizes)
+        for tile_sizes, tiling in get_valid_tiling(
+            full_shape,
+            multiple_of=multiple_of,
+            order=order,
+            last_dim=last_dim,
+        ):
+            tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
+
+            total_size = scratchpad_bytes(
+                node,
+                tiled_shapes,
+                bank_width,
+                bank_size,
+                num_banks,
+                extra_sharing,
+            )
+
+            if total_size > cache_size:
+                continue
+
+            if cost_fn is None:
+                return tile_sizes
+
+            score = cost_fn(node, tile_sizes, tiled_shapes, tiling)
+            if best is None or score < best[0]:
+                best = (score, tile_sizes)
+
+        if best is not None:
+            return best[1]
+
+    logger.debug(f"Failed to tile {node} with cache size {cache_size}.")
+    return None
+
+
+def _prime_factors(n: int):
+    f, p = [], 2
+    while p * p <= n:
+        while n % p == 0:
+            f.append(p)
+            n //= p
+        p += 1 if p == 2 else 2  # 2,3,5,7,...
+    if n > 1:
+        f.append(n)
+    return f
+
+
+def construct_tiled_shape(full_shape, tiled_dim: int, dims):
+    """
+    Reconstruct full-rank tiled shape.
+
+    Args:
+      full_shape: tuple/list[int] original shape (len N)
+      tiled_dim: int, flattened size of the compressed (tiled) dims
+      dims: iterable[int], indices of dims that were flattened into tiled_dim
+
+    Returns:
+      Tuple[int] of length N
+    """
+    full_shape = tuple(full_shape)
+    N = len(full_shape)
+    if N == 0:
+        raise ValueError("full_shape must have at least one dimension.")
+
+    # Normalize & validate compressed dims
+    comp = sorted(set(int(i) for i in dims))
+    if not comp:
+        raise ValueError("dims cannot be empty.")
+    if any(i < 0 or i >= N for i in comp):
+        raise IndexError(f"dims must be in [0, {N-1}]. Got {dims}.")
+
+    # Distribute prime factors of R across compressed dims (greedy balance)
+    tiled = {i: 1 for i in comp}
+    for p in _prime_factors(tiled_dim):
+        for i in reversed(comp):
+            if full_shape[i] % p == 0:
+                tiled[i] *= p
+                break
+
+    # Build final shape
+    out = [tiled[i] if i in comp else full_shape[i] for i in range(N)]
+    return tuple(out)
+
+
 def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     bs = node.kwargs.get("block_size", 1)
 
@@ -203,71 +268,6 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     }
 
 
-def _search_tiling(
-    node,
-    full_shape,
-    shape_builder_fn,
-    cache_size,
-    num_banks,
-    bank_width,
-    order=None,
-    last_dim=None,
-    multiple_of=None,
-    cost_fn=None,
-):
-    """
-    Generic driver over the valid tilings, scoring each by the scratchpad it
-    needs (``scratchpad_bytes``: one bank per operand group, the two smallest
-    merged while they outnumber the banks).
-
-    ``get_valid_tiling`` yields candidates largest -> smallest.  Without
-    ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
-    fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
-    tiled_shapes, tiling) -> latency`` -- every fitting candidate is
-    scored and the minimum-latency one is returned (DRAM-aware two-step search).
-    """
-    bank_size = None if num_banks is None else cache_size // num_banks
-
-    # Every operand group costs a whole bank, so ``G`` groups floor the
-    # footprint at ``G * bank_size``: with as many groups as banks nothing
-    # fits at any tile size.  Retry with progressively more sharing and keep
-    # the first (least-shared) tiling that maps.
-    for extra_sharing in range(len(BANK_GROUPS)):
-        best = None  # (score, tile_sizes)
-        for tile_sizes, tiling in get_valid_tiling(
-            full_shape,
-            multiple_of=multiple_of,
-            order=order,
-            last_dim=last_dim,
-        ):
-            tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
-
-            total_size = scratchpad_bytes(
-                node,
-                tiled_shapes,
-                bank_width,
-                bank_size,
-                num_banks,
-                extra_sharing,
-            )
-
-            if total_size > cache_size:
-                continue
-
-            if cost_fn is None:
-                return tile_sizes
-
-            score = cost_fn(node, tile_sizes, tiled_shapes, tiling)
-            if best is None or score < best[0]:
-                best = (score, tile_sizes)
-
-        if best is not None:
-            return best[1]
-
-    logger.warning(f"Failed to tile {node} with cache size {cache_size}.")
-    return None
-
-
 def _build_gemv_shape_map(node, tile_sizes, tiling):
     """``_build_gemm_shape_map`` for the whole kernel a GEMV builds, keyed by
     the FX node each tile belongs to.
@@ -279,6 +279,8 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     whatever fusion left of it -- a ``quantize_mx`` tail makes it a pair, an
     MHA relayout re-cuts ``N`` into heads -- diced by the same blocks.
     """
+    from ..bufferize.tiling import _operand_placeholders
+
     anchor = get_anchor_node(node)
     tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
     out_tile = tiles.pop("output")
@@ -286,9 +288,19 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
 
     if node is not anchor:
-        for n in node.all_input_nodes:
-            if n not in shapes and require_allocation(n):
-                shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
+        # An operand reaching the anchor through a GQA expand or a dequantize
+        # takes its role on that node, not on the placeholder the kernel loads,
+        # so trace the anchor's own back and skip them by position.
+        own = set(_operand_placeholders(anchor))
+        placeholders = [
+            p
+            for p in node.meta["submodule"].graph.nodes
+            if p.op == "placeholder"
+        ]
+        for n, p in zip(node.all_input_nodes, placeholders):
+            if p in own or n in shapes or not require_allocation(n):
+                continue
+            shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
 
     if len(_output_shape(node)) == len(anchor.shape):
         shapes[node] = compute_output_tiled_shapes(node, divisor)
@@ -354,25 +366,22 @@ def gemv_op_tiling(node, config):
 
     logger.info(f"Running L2 tiling for GEMV: {node}")
 
-    # With DRAM info, rank the fitting tiles by a pipeline latency model
-    # instead of taking the largest that fits (see ``cost``).
-    cost_fn = (
-        partial(gemv_tile_latency, config=config)
-        if config.dram_bandwidth is not None
-        else None
-    )
-
-    tile_sizes = _search_tiling(
+    search = partial(
+        _search_tiling,
         node=node,
         full_shape=(X, C, K),
         multiple_of=(block_size, math.lcm(config.vector_lanes, head_dim or 1)),
-        order=(2, 0, 1),
         shape_builder_fn=_build_gemv_shape_map,
         cache_size=config.scratchpad_size,
         num_banks=config.num_banks,
         bank_width=config.bank_width,
-        cost_fn=cost_fn,
     )
+
+    # C whole leaves the input vector loop-invariant, so its guarded load
+    # fetches it once however many output tiles there are: tile K alone if any
+    # such tile fits.  Failing that, split C as far as it takes to buy the
+    # largest K tile, since the input is then re-read once per output tile.
+    tile_sizes = search(order=(2,)) or search(order=(1, 2))
     if tile_sizes is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "

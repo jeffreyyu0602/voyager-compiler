@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import re
 
 import torch
 
@@ -11,6 +10,7 @@ from ...node_info import (
     get_anchor_node,
     get_node_to_key_map,
     is_gemm_op,
+    quant_param_arg_nodes,
 )
 from ....pt2e_utils import dtype_byte_size
 
@@ -101,11 +101,15 @@ def compute_tensor_size(
 
 
 def require_allocation(node: torch.fx.Node) -> bool:
-    if re.fullmatch(r"(code|qmap)(_\d+)?", node.name):
-        return False
+    # A consumer's quantization lookup table is resident, not a streamed tile.
+    # Ask the op that reads it -- the anchor, for a fused kernel, whose params
+    # are its placeholders and resolve back through ``meta['source_node']``.
+    for user in node.users:
+        params = quant_param_arg_nodes(get_anchor_node(user))
+        if any(p.meta.get("source_node", p) is node for p in params):
+            return False
 
-    val = getattr(node, "value", None)
-    if val is None:
+    if (val := getattr(node, "value", None)) is None:
         return True
 
     if not isinstance(val, torch.Tensor):
@@ -117,15 +121,17 @@ def require_allocation(node: torch.fx.Node) -> bool:
     return True
 
 
-# One bank per operand *group*: a tensor shares a bank with the metadata that
-# is only ever read alongside it -- a weight with its block scales and bias,
-# an output with its output scales, a CSR matrix with its index arrays.  The
-# activation and its block scales stay apart: the vector unit reads them on
-# separate ports.
-BANK_GROUPS = (
-    ("input",),
-    ("input_scale",),
-    ("weight", "other", "weight_scale", "bias"),
+# One bank per operand *group*, grouped by the read bandwidth each needs.  A
+# GEMV streams its weight -- a fresh element per MAC, nothing reused -- so it
+# takes a bank of its own.  The input and its scales are reused across
+# ``vector_lanes`` outputs, so one fetch feeds a whole lane group and they need
+# a fraction of the weight's bandwidth: nothing like a GEMM, where the input
+# streams too.  The weight scales do matter, one per block, but the output is
+# only written on the step that finishes a tile, so the two rarely contend.
+GEMV_BANK_GROUPS = (
+    ("input", "input_scale"),
+    ("weight", "other"),
+    ("output", "weight_scale", "bias"),
     ("A_data", "A_indices", "A_indptr"),
 )
 
@@ -133,20 +139,21 @@ BANK_GROUPS = (
 def operand_roles(node) -> dict:
     """Each operand FX node -> the role it plays, for grouping into banks.
 
-    Named from the outside a fused ``call_module``'s operands have no roles, so
-    a taxonomy written in roles cannot reach them -- a weight would never land
-    in the bank ``BANK_GROUPS`` gives it alongside its scales and bias, and a
-    fused op would be banked differently from the bare one it came from.
-    Reading them off the anchor names them: ``get_node_to_key_map`` resolves
-    each of its placeholder operands back through ``meta['source_node']`` to
-    the outer node, which is the one the shape map is keyed by.  What the tail
-    brought of its own the anchor never reads, so it stays unnamed and takes a
-    bank of its own.  A bare node is its own anchor.
+    A fused ``call_module``'s operands have no roles of their own, so read them
+    off the anchor: ``get_node_to_key_map`` traces each placeholder back through
+    ``meta['source_node']`` to the outer node the shape map is keyed by.  What
+    the tail brought of its own the anchor never reads, so it stays unnamed and
+    takes a bank of its own.  A bare node is its own anchor.
     """
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor):
         return {}
-    return get_node_to_key_map(anchor)
+    roles = get_node_to_key_map(anchor)
+    # The output is named on the outer node -- what the shape map keys it by --
+    # in place of the anchor's own entry, which is inside the submodule.
+    del roles[anchor]
+    roles[node] = "output"
+    return roles
 
 
 def scratchpad_bytes(
@@ -161,9 +168,10 @@ def scratchpad_bytes(
     """Scratchpad bytes one candidate tile occupies.
 
     Every group takes a whole bank, since a bank cannot be split, and the two
-    smallest merge while the groups outnumber the banks.  ``BANK_GROUPS`` names
-    one op's roles, so an operand it misses -- a ``where`` mask, what a fused
-    tail brings of its own -- takes a bank of its own.
+    smallest merge while the groups outnumber the banks.
+    ``GEMV_BANK_GROUPS`` names one op's roles, so an operand it misses -- a
+    ``where`` mask, what a fused tail brings of its own -- takes a bank of its
+    own.
 
     Args:
         node: The op being tiled; its own entry is the output.
@@ -179,13 +187,13 @@ def scratchpad_bytes(
     Returns:
         Bytes the tile needs with every group rounded to whole banks.
     """
-    # ``groups`` is the bank layout, one entry per bank: the BANK_GROUPS that
-    # match, then any operand they do not name on its own.  A ``where`` lays out
-    # as ("input",) | ("other", ...) | ("output", ...) | ("condition",).
+    # ``groups`` is the bank layout, one entry per bank: the groups that match,
+    # then any operand they do not name on its own.  A ``where`` lays out as
+    # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
     roles = operand_roles(node)
     groups = [
         [n for n in tiled_shapes if roles.get(n) in group]
-        for group in BANK_GROUPS
+        for group in GEMV_BANK_GROUPS
     ]
     grouped = {n for group in groups for n in group}
     groups += [[n] for n in tiled_shapes if n not in grouped]
