@@ -6,7 +6,12 @@ import re
 
 import torch
 
-from ...node_info import _align_size
+from ...node_info import (
+    _align_size,
+    get_anchor_node,
+    get_node_to_key_map,
+    is_gemm_op,
+)
 from ....pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
@@ -122,12 +127,29 @@ BANK_GROUPS = (
     ("input_scale",),
     ("weight", "other", "weight_scale", "bias"),
     ("A_data", "A_indices", "A_indptr"),
-    ("output", "output_scale"),
 )
 
 
+def operand_roles(node) -> dict:
+    """Each operand FX node -> the role it plays, for grouping into banks.
+
+    Named from the outside a fused ``call_module``'s operands have no roles, so
+    a taxonomy written in roles cannot reach them -- a weight would never land
+    in the bank ``BANK_GROUPS`` gives it alongside its scales and bias, and a
+    fused op would be banked differently from the bare one it came from.
+    Reading them off the anchor names them: ``get_node_to_key_map`` resolves
+    each of its placeholder operands back through ``meta['source_node']`` to
+    the outer node, which is the one the shape map is keyed by.  What the tail
+    brought of its own the anchor never reads, so it stays unnamed and takes a
+    bank of its own.  A bare node is its own anchor.
+    """
+    anchor = get_anchor_node(node)
+    if not is_gemm_op(anchor):
+        return {}
+    return get_node_to_key_map(anchor)
+
+
 def scratchpad_bytes(
-    key_to_node,
     node,
     tiled_shapes,
     bank_width,
@@ -140,13 +162,12 @@ def scratchpad_bytes(
 
     Every group takes a whole bank, since a bank cannot be split, and the two
     smallest merge while the groups outnumber the banks.  ``BANK_GROUPS`` names
-    one op's roles, so a role it misses -- a ``where`` mask, a fused group's
-    extra inputs -- takes a bank of its own.
+    one op's roles, so an operand it misses -- a ``where`` mask, what a fused
+    tail brings of its own -- takes a bank of its own.
 
     Args:
-        key_to_node: Operand role -> FX node, which carries the dtype.
         node: The op being tiled; its own entry is the output.
-        tiled_shapes: Operand role -> tiled shape.
+        tiled_shapes: Operand FX node -> tiled shape.
         bank_width: Per-tensor alignment, bytes.
         bank_size: Bytes per bank; ``None`` is unbanked, so just sum.
         num_banks: Banks available to merge down to.
@@ -159,20 +180,22 @@ def scratchpad_bytes(
         Bytes the tile needs with every group rounded to whole banks.
     """
     # ``groups`` is the bank layout, one entry per bank: the BANK_GROUPS that
-    # match, then any unnamed role on its own.  A ``where`` lays out as
-    # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
-    named = {key for group in BANK_GROUPS for key in group}
-    groups = BANK_GROUPS + tuple(
-        (key,) for key in tiled_shapes if key not in named
-    )
+    # match, then any operand they do not name on its own.  A ``where`` lays out
+    # as ("input",) | ("other", ...) | ("output", ...) | ("condition",).
+    roles = operand_roles(node)
+    groups = [
+        [n for n in tiled_shapes if roles.get(n) in group]
+        for group in BANK_GROUPS
+    ]
+    grouped = {n for group in groups for n in group}
+    groups += [[n] for n in tiled_shapes if n not in grouped]
 
     sizes = []
     for group in groups:
         total = 0
-        for key in group:
-            shape = tiled_shapes.get(key)
-            n = key_to_node.get(key)
-            if shape is None or n is None or not require_allocation(n):
+        for n in group:
+            shape = tiled_shapes[n]
+            if shape is None or not require_allocation(n):
                 continue
             total += compute_tensor_size(
                 n, shape, n is node, bank_width, vector_lanes

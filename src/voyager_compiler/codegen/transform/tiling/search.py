@@ -1,32 +1,33 @@
 import logging
 import math
 from functools import partial
-from typing import List, Tuple, Generator, Optional, Union
+from typing import Tuple, Generator, Optional
 
 import torch
 
-from ...node_info import get_arg_value, _pair
 from ...node_info import (
-    get_node_to_key_map,
-    is_mha_qkv_permute,
-    normalize_shape,
-)
-from ...node_info import (
+    _pair,
+    compute_output_tiled_shapes,
+    compute_tiled_shape,
     get_anchor_node,
+    get_arg_value,
     is_bmm,
     is_elementwise_op,
     is_fully_connected,
     is_matmul,
     is_pooling,
+    normalize_shape,
+    trailing_mha_perm,
+    weight_is_ck,
 )
 from .banking import BANK_GROUPS, require_allocation, scratchpad_bytes
-from .cost import vector_tile_latency
+from .cost import gemv_tile_latency, vector_tile_latency
 from ....layout_ops import NHWC_OP_VARIANTS
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "run_gemv_tiling",
+    "gemv_op_tiling",
     "pool_op_tiling",
     "vector_op_tiling",
 ]
@@ -163,9 +164,8 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     batch_dims = tiled_input_shape[:-2]
 
     is_mat = is_matmul(node)
-    weight_transposed = is_mat ^ node.meta.get("transposed", False)
 
-    if weight_transposed:
+    if weight_is_ck(node):
         weight_shape = (c_tiled, k_tiled)
         weight_scale_shape = (c_scaled, k_tiled)
     else:
@@ -203,26 +203,6 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     }
 
 
-def _log_tiling_details(node, tiled_shapes, extra_sharing=0):
-    def fmt(s):
-        if s is None:
-            return "?"
-        return str(tuple(s)).replace(" ", "")
-
-    shared = f" (sharing {extra_sharing})" if extra_sharing else ""
-    logger.info(f"Selected tiling for {node}{shared}:")
-
-    for n in node.all_input_nodes:
-        if n in tiled_shapes and require_allocation(n):
-            orig_shape = fmt(n.shape)
-            tile_shape = fmt(tiled_shapes[n])
-            logger.info(f"  In[{n}]: {orig_shape} -> {tile_shape}")
-
-    orig_shape = fmt(node.shape)
-    tile_shape = fmt(tiled_shapes[node])
-    logger.info(f"  Out[{node}]: {orig_shape} -> {tile_shape}")
-
-
 def _search_tiling(
     node,
     full_shape,
@@ -246,7 +226,6 @@ def _search_tiling(
     tiled_shapes, tiling) -> latency`` -- every fitting candidate is
     scored and the minimum-latency one is returned (DRAM-aware two-step search).
     """
-    key_to_node = {v: k for k, v in get_node_to_key_map(node).items()}
     bank_size = None if num_banks is None else cache_size // num_banks
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
@@ -254,19 +233,16 @@ def _search_tiling(
     # fits at any tile size.  Retry with progressively more sharing and keep
     # the first (least-shared) tiling that maps.
     for extra_sharing in range(len(BANK_GROUPS)):
-        best = None  # (score, tile_sizes, node_to_shape)
+        best = None  # (score, tile_sizes)
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
             multiple_of=multiple_of,
             order=order,
             last_dim=last_dim,
         ):
-            logger.debug(f"Trying tiling {tiling} with tile sizes {tile_sizes}")
-
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
             total_size = scratchpad_bytes(
-                key_to_node,
                 node,
                 tiled_shapes,
                 bank_width,
@@ -278,160 +254,142 @@ def _search_tiling(
             if total_size > cache_size:
                 continue
 
-            node_to_shape = normalize_shape(node, tiled_shapes)
-
             if cost_fn is None:
-                _log_tiling_details(node, node_to_shape, extra_sharing)
                 return tile_sizes
 
             score = cost_fn(node, tile_sizes, tiled_shapes, tiling)
             if best is None or score < best[0]:
-                best = (score, tile_sizes, node_to_shape)
+                best = (score, tile_sizes)
 
         if best is not None:
-            _, tile_sizes, node_to_shape = best
-            _log_tiling_details(node, node_to_shape, extra_sharing)
-            return tile_sizes
+            return best[1]
 
     logger.warning(f"Failed to tile {node} with cache size {cache_size}.")
     return None
 
 
-def mha_projection_head_dim(node) -> Optional[int]:
-    """``head_dim`` of the MHA relayout a projection gemm feeds, else ``None``.
+def _build_gemv_shape_map(node, tile_sizes, tiling):
+    """``_build_gemm_shape_map`` for the whole kernel a GEMV builds, keyed by
+    the FX node each tile belongs to.
 
-    A projection's ``N`` is really ``(heads, head_dim)`` -- the reshape splits
-    it and the permute makes the heads outer -- so its ``N`` tile has to hold
-    whole heads.  A context matmul keeps its rank across the permute and carries
-    no such constraint.  The tail is still flat here (fusion runs later), so
-    walk the single-user chain to reach the permute.
+    The anchor's own operands are sized by the role they play there, resolved
+    to the nodes the kernel really loads.  A fused kernel loads more than them:
+    the tail streams a residual or a mask of its own, which has no role and is
+    diced by the output block, the way the builder dices it.  The output is
+    whatever fusion left of it -- a ``quantize_mx`` tail makes it a pair, an
+    MHA relayout re-cuts ``N`` into heads -- diced by the same blocks.
     """
-    ndim = len(node.shape)
-    curr = node
-    for _ in range(4):
-        users = list(curr.users)
-        if len(users) != 1:
-            return None
-        curr = users[0]
-        if is_mha_qkv_permute(curr):
-            return curr.shape[-1] if len(curr.shape) > ndim else None
-    return None
+    anchor = get_anchor_node(node)
+    tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
+    out_tile = tiles.pop("output")
+    shapes = normalize_shape(anchor, tiles)
+    divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
+
+    if node is not anchor:
+        for n in node.all_input_nodes:
+            if n not in shapes and require_allocation(n):
+                shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
+
+    if len(_output_shape(node)) == len(anchor.shape):
+        shapes[node] = compute_output_tiled_shapes(node, divisor)
+    else:
+        # An MHA relayout re-cut ``N`` into ``(heads, head_dim)``: the tile
+        # holds whole heads, so the count belongs on the head dim and not on
+        # the last one ``compute_tiled_shape`` right-aligns it to.  No dim
+        # survives the permute, but the number of blocks does, and these
+        # shapes are only ever read for their product.
+        blocks = math.prod(divisor)
+        values = node.value
+        values = values if isinstance(values, (list, tuple)) else [values]
+        out = [((math.prod(v.shape) + blocks - 1) // blocks,) for v in values]
+        shapes[node] = out if len(out) > 1 else out[0]
+
+    return shapes
 
 
-def run_gemv_tiling(model, config):
-    """
-    Annotate the batch-1 fully-connected (matrix-vector) GEMMs with the
-    ``l2_tiling`` factors that fit their operands in cache.
+def gemv_op_tiling(node, config):
+    """Per-dim tile counts for a matrix-vector GEMM, bare or fused.
 
-    Convs and matrix-matrix GEMMs are left alone: interstellar tiles those on
-    demand during bufferization, off the same ``l2_tiling`` key.
+    Called from ``get_tiling`` during bufferization, so it sees the layout the
+    transform settled on and the operands fusion left on the kernel.
+    Interstellar maps a systolic array and skips a batch-1 GEMM -- that one runs
+    on the vector unit -- so this is the whole tile search for one.
 
     Args:
-        model: A model object with a FX Graph containing GEMM nodes.
-        config (AcceleratorConfig): The hardware description (vector lane count,
-            scratchpad size, banking).
+        node: The op to tile -- a fully-connected GEMM, or a fused
+            ``call_module`` around one.
+        config (AcceleratorConfig): The hardware description.
+
+    Returns:
+        ``(n_m, n_n, n_k)`` -- the M, output and reduction tile counts -- or
+        ``None`` when the op is not a GEMV.
+
+    Raises:
+        RuntimeError: when no tiling of its operands fits the scratchpad.
     """
-    graph = model.graph
+    anchor = get_anchor_node(node)
+    if anchor is None or not is_fully_connected(anchor):
+        return None
 
-    for node in list(graph.nodes):
-        if not is_fully_connected(node):
-            continue
+    input_shape = anchor.args[0].shape
+    X = input_shape[-2] if is_bmm(anchor) else math.prod(input_shape[:-1])
+    C = input_shape[-1]
+    weight_shape = anchor.args[1].shape
+    K = weight_shape[-1] if weight_is_ck(anchor) else weight_shape[-2]
 
-        input_shape = node.args[0].shape
-        X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
-        C = input_shape[-1]
-        weight_shape = node.args[1].shape
-        K = weight_shape[-1] if is_matmul(node) else weight_shape[0]
+    # An N tile that cuts a head in half cannot be stored in the permuted
+    # layout the bufferizer folds the relayout into.  Fusion has already run,
+    # so the permute is the tail of the submodule rather than a user.
+    head_dim = None
+    if (submod := node.meta.get("submodule")) is not None:
+        perm = trailing_mha_perm(
+            [n for n in submod.graph.nodes if n.op == "call_function"]
+        )
+        if perm is not None and perm.value.ndim > anchor.value.ndim:
+            head_dim = perm.value.shape[-1]
 
-        # An N tile that cuts a head in half cannot be stored in the permuted
-        # layout the bufferizer folds the relayout into.
-        head_dim = mha_projection_head_dim(node)
+    # A C tile short of a whole microscaling block leaves the scale tile
+    # with no elements to expand against the input.
+    block_size = anchor.kwargs.get("block_size") or 1
 
-        # A C tile short of a whole microscaling block leaves the scale tile
-        # with no elements to expand against the input.
-        block_size = node.kwargs.get("block_size") or 1
+    logger.info(f"Running L2 tiling for GEMV: {node}")
 
-        logger.info(f"Running L2 tiling for GEMV: {node}")
-        tile_sizes = _search_tiling(
-            node=node,
-            full_shape=(X, C, K),
-            multiple_of=(
-                block_size,
-                math.lcm(config.vector_lanes, head_dim or 1),
-            ),
-            order=(2, 0, 1),
-            shape_builder_fn=_build_gemm_shape_map,
-            cache_size=config.scratchpad_size,
-            num_banks=config.num_banks,
-            bank_width=config.bank_width,
+    # With DRAM info, rank the fitting tiles by a pipeline latency model
+    # instead of taking the largest that fits (see ``cost``).
+    cost_fn = (
+        partial(gemv_tile_latency, config=config)
+        if config.dram_bandwidth is not None
+        else None
+    )
+
+    tile_sizes = _search_tiling(
+        node=node,
+        full_shape=(X, C, K),
+        multiple_of=(block_size, math.lcm(config.vector_lanes, head_dim or 1)),
+        order=(2, 0, 1),
+        shape_builder_fn=_build_gemv_shape_map,
+        cache_size=config.scratchpad_size,
+        num_banks=config.num_banks,
+        bank_width=config.bank_width,
+        cost_fn=cost_fn,
+    )
+    if tile_sizes is None:
+        raise RuntimeError(
+            f"{node}: no tiling of its operands fits the scratchpad "
+            f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
 
-        if tile_sizes is None:
-            logger.warning(f"Failed to tile GEMV node: {node}")
-            continue
-
-        x_tiled, c_tiled, k_tiled = tile_sizes
-        node.meta["l2_tiling"] = (X // x_tiled, K // k_tiled, C // c_tiled)
-
-    graph.lint()
-    graph.eliminate_dead_code()
-    model.recompile()
-    return model
-
-
-def compute_tiled_shape(shape, divisor):
-    ndim = len(shape)
-    m = len(divisor)
-
-    # Align divisor to shape dimensions
-    if m < ndim:
-        divisor = (1,) * (ndim - m) + divisor
-    elif m > ndim:
-        divisor = divisor[-ndim:]
-
-    return tuple(s // d if s > 1 else s for s, d in zip(shape, divisor))
-
-
-def compute_output_tiled_shapes(node, tiling, override_shapes=None):
-    """
-    Computes tiled shape for an output node
-
-    Args:
-        node: The output node containing value and shape.
-        tiling: The tiling divisor/size configuration.
-        override_shapes: Optional shapes to use instead of node's value shapes.
-    """
-    if isinstance(node.value, torch.Tensor):
-        return compute_tiled_shape(override_shapes or node.shape, tiling)
-    elif isinstance(node.value, (tuple, list)):
-        shapes = []
-        has_sparse_outputs = len(node.value) > 2
-
-        for i, tensor in enumerate(node.value):
-            old_shape = override_shapes[i] if override_shapes else tensor.shape
-            if has_sparse_outputs and i < 3:
-                if i == 2:
-                    old_shape = old_shape[:-1] + (old_shape[-1] - 1,)
-                output_shape = old_shape + (1,)
-                s = compute_tiled_shape(output_shape, tiling)[-2]
-                if i == 2:
-                    s = s + 1
-                shapes.append(old_shape[:-1] + (s,))
-            else:
-                shapes.append(compute_tiled_shape(old_shape, tiling))
-        return tuple(shapes)
-
-    return None
+    x_tiled, c_tiled, k_tiled = tile_sizes
+    return X // x_tiled, K // k_tiled, C // c_tiled
 
 
 def _build_vector_op_shape_map(node, tile_sizes, divisor):
-    node_to_key = get_node_to_key_map(node)
-    shapes_map = {}
-    for n, k in node_to_key.items():
-        if k == "output":
-            shapes_map[k] = compute_output_tiled_shapes(node, divisor)
-        elif require_allocation(n):
-            shapes_map[k] = compute_tiled_shape(tuple(n.shape), divisor)
+    shapes_map = {
+        n: compute_tiled_shape(tuple(n.shape), divisor)
+        for n in node.all_input_nodes
+        if require_allocation(n)
+    }
+    shapes_map[node] = compute_output_tiled_shapes(node, divisor)
     return shapes_map
 
 
@@ -564,6 +522,21 @@ def _pool_input_extent(tile, stride, dilation, kernel_size):
     return (tile - 1) * stride + dilation * (kernel_size - 1) + 1
 
 
+def _pool_shapes(node, anchor, in_tile, out_tile):
+    """The pool's halo and output tiles keyed by the FX node each belongs to,
+    plus whatever a fused tail loads of its own -- diced by the output block,
+    the way the builder dices it.  ``anchor`` resolves the halo to the node the
+    kernel really loads, which a fused ``call_module`` cannot name itself."""
+    shapes = normalize_shape(anchor, {"input": in_tile})
+    divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
+    if node is not anchor:
+        for n in node.all_input_nodes:
+            if n not in shapes and require_allocation(n):
+                shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
+    shapes[node] = compute_output_tiled_shapes(node, divisor)
+    return shapes
+
+
 def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     """
     Compute tiled input/output shapes for non-adaptive pooling ops.
@@ -576,15 +549,16 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
     The shape tuple ordering mirrors the node's actual tensor layout so that
     banking / scratchpad-size estimates are correct.
 
-    Returns a dict with keys matching normalized op argument names:
-        "input"   -> shape of the input tile
-        "output" -> shape of the output tile
+    Returns the input and output tiles keyed by the FX node each belongs to.
+    The geometry comes off the anchor, so a fused ``call_module`` reads its
+    pool's stride and kernel rather than its own operand list.
     """
+    anchor = get_anchor_node(node)
     tile_N, tile_H, tile_W, tile_C = tile_sizes
 
-    stride = _pair(get_arg_value(node, 2, "stride", 1))
-    dilation = _pair(get_arg_value(node, 4, "dilation", 1))
-    kernel_size = _pair(get_arg_value(node, 1, "kernel_size"))
+    stride = _pair(get_arg_value(anchor, 2, "stride", 1))
+    dilation = _pair(get_arg_value(anchor, 4, "dilation", 1))
+    kernel_size = _pair(get_arg_value(anchor, 1, "kernel_size"))
 
     tile_H_in = _pool_input_extent(
         tile_H, stride[0], dilation[0], kernel_size[0]
@@ -593,16 +567,14 @@ def _build_non_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
         tile_W, stride[1], dilation[1], kernel_size[1]
     )
 
-    if node.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
-        return {
-            "input": (tile_N, tile_H_in, tile_W_in, tile_C),
-            "output": (tile_N, tile_H, tile_W, tile_C),
-        }
+    if anchor.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
+        in_tile = (tile_N, tile_H_in, tile_W_in, tile_C)
+        out_tile = (tile_N, tile_H, tile_W, tile_C)
     else:  # NCHW: (N, C, H, W)
-        return {
-            "input": (tile_N, tile_C, tile_H_in, tile_W_in),
-            "output": (tile_N, tile_C, tile_H, tile_W),
-        }
+        in_tile = (tile_N, tile_C, tile_H_in, tile_W_in)
+        out_tile = (tile_N, tile_C, tile_H, tile_W)
+
+    return _pool_shapes(node, anchor, in_tile, out_tile)
 
 
 def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
@@ -614,33 +586,33 @@ def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
 
     Handles both NHWC (quantized_ops) and NCHW (aten) layouts.
 
-    Returns a dict with keys matching normalized op argument names:
-        "input"   -> shape of the input tile
-        "output" -> shape of the output tile
+    Returns the input and output tiles keyed by the FX node each belongs to.
+    The spatial extents come off the anchor, so a fused ``call_module`` reads
+    its pool's window rather than whatever fusion left on its own output.
     """
+    anchor = get_anchor_node(node)
     tile_N, tile_C = tile_sizes
-    if node.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
-        H_in, W_in = node.args[0].shape[1], node.args[0].shape[2]
-        H_out, W_out = node.shape[1], node.shape[2]
-        return {
-            "input": (tile_N, H_in, W_in, tile_C),
-            "output": (tile_N, H_out, W_out, tile_C),
-        }
+    if anchor.target in NHWC_OP_VARIANTS.values():  # NHWC: (N, H, W, C)
+        H_in, W_in = anchor.args[0].shape[1], anchor.args[0].shape[2]
+        H_out, W_out = anchor.shape[1], anchor.shape[2]
+        in_tile = (tile_N, H_in, W_in, tile_C)
+        out_tile = (tile_N, H_out, W_out, tile_C)
     else:  # NCHW: (N, C, H, W)
-        H_in, W_in = node.args[0].shape[2], node.args[0].shape[3]
-        H_out, W_out = node.shape[2], node.shape[3]
-        return {
-            "input": (tile_N, tile_C, H_in, W_in),
-            "output": (tile_N, tile_C, H_out, W_out),
-        }
+        H_in, W_in = anchor.args[0].shape[2], anchor.args[0].shape[3]
+        H_out, W_out = anchor.shape[2], anchor.shape[3]
+        in_tile = (tile_N, tile_C, H_in, W_in)
+        out_tile = (tile_N, tile_C, H_out, W_out)
+
+    return _pool_shapes(node, anchor, in_tile, out_tile)
 
 
 def pool_op_tiling(node, config):
     """Per-dim tile counts for a pooling op, bare or fused.
 
     Called from ``build_pool`` during bufferization, so it sees whatever fusion
-    left behind.  A fused submodule is searched as a whole: its inputs key on
-    their node names, so every operand the kernel loads is sized.
+    left behind.  A fused submodule is searched as a whole: the pool's halo is
+    resolved through the anchor and the tail's own operands are diced by the
+    output block, so every operand the kernel loads is sized.
 
     Args:
         node: The op to tile -- a pooling op, or a fused ``call_module`` around

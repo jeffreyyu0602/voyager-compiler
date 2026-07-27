@@ -97,6 +97,18 @@ def is_matmul(node: Node) -> bool:
     ]
 
 
+def weight_is_ck(node: Node) -> bool:
+    """Whether ``node``'s right operand is physically stored ``[contraction,
+    out]``.
+
+    ``is_matmul`` gives the op's native layout (matmul CK, linear KC) and
+    ``meta['transposed']`` says the layout transform flipped it, so the two
+    compose by XOR.  The twins the flip retargets to keep answering
+    ``is_linear`` / ``is_matmul``, which makes the meta the only signal.
+    """
+    return is_matmul(node) != bool(node.meta.get("transposed", False))
+
+
 def is_bmm(node: Node) -> bool:
     if is_matmul(node):
         input_shape = node.args[0].shape
@@ -482,11 +494,6 @@ def get_node_to_key_map(node):
     their own node names.  Roles that share a bank are named per op and a node
     name is never one of them, so each fused input is sized on its own.
     """
-    if node.op == "call_module":
-        node_to_key = {n: n.name for n in node.all_input_nodes}
-        node_to_key[node] = "output"
-        return node_to_key
-
     args_and_kwargs = normalize_function(
         node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )

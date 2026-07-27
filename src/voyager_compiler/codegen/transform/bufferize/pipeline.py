@@ -61,11 +61,11 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_conv2d,
     is_linear,
-    is_matmul,
     quant_param_arg_nodes,
     repeat_of,
     swaps_last_two_dims,
     trailing_mha_perm,
+    weight_is_ck,
 )
 from voyager_compiler.codegen.node_info import compute_output_tiled_shapes
 from voyager_compiler.codegen.node_info import _pair, get_arg_value
@@ -1949,7 +1949,7 @@ def build_gemm(
         + (K // tk,)
     )
 
-    ck = is_matmul(anchor) != bool(anchor.meta.get("transposed", False))
+    ck = weight_is_ck(anchor)
     _proj = lambda n, k: (k, n) if ck else (n, k)
 
     def _batch(shape):

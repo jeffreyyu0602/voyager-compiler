@@ -1,4 +1,4 @@
-"""DRAM-aware latency model for vector-op L2 tiling.
+"""DRAM-aware latency model for vector-unit L2 tiling.
 
 ``run_vector_op_node_l2_tiling`` used to keep the *largest* tile that fits
 on-chip.  Under double-buffering that is the worst choice: the first tile's
@@ -25,8 +25,8 @@ import math
 import torch
 from torch.fx import Node
 
-from ...node_info import get_anchor_node, get_node_bytes, get_node_to_key_map
-from ...node_info import is_fully_connected
+from .banking import operand_roles, require_allocation
+from ...node_info import get_anchor_node, get_node_bytes, is_fully_connected
 from ....pt2e_utils import dtype_byte_size
 
 # Passes an op makes over its data; it fetches its operands once per pass.
@@ -118,13 +118,13 @@ def _tile_elems(shape):
     return math.prod(shape)
 
 
-def vector_tile_latency(node, tile_sizes, tiled_shapes, global_tiling, config):
+def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     """Estimated cycles to run ``node`` under a candidate tiling.
 
-    ``config`` is the ``AcceleratorConfig``.  ``tiled_shapes`` maps operand key
-    -> tile shape (``"output"`` plus each allocated activation input; resident
-    params are absent).  ``global_tiling`` is the per-dim tile *count*, so
-    ``N = prod(global_tiling)`` is the number of tiles.  Per tile: ``C`` compute
+    ``config`` is the ``AcceleratorConfig``.  ``tiled_shapes`` maps operand FX
+    node -> tile shape (``node`` itself plus each allocated activation input;
+    resident params are absent).  ``tiling`` is the per-dim tile *count*, so
+    ``N = prod(tiling)`` is the number of tiles.  Per tile: ``C`` compute
     cycles, ``D_read`` to load the inputs (a separate transfer per input, each
     paying one DRAM access latency) and ``D_write`` to store the output.
 
@@ -142,20 +142,19 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, global_tiling, config):
     lone tile cannot overlap), matching the single-buffered cost.
     Single-buffered: load, compute and store run back to back, ``N * (D + C)``.
     """
-    num_tiles = math.prod(global_tiling)
+    num_tiles = math.prod(tiling)
 
-    out_shape = tiled_shapes["output"]
-    key_to_node = {k: n for n, k in get_node_to_key_map(node).items()}
-    out_bytes = _operand_bytes(out_shape, key_to_node["output"])
-    num_inputs = len(tiled_shapes) - 1  # every key but "output"
+    out_shape = tiled_shapes[node]
+    out_bytes = _operand_bytes(out_shape, node)
+    num_inputs = len(tiled_shapes) - 1  # every operand but the output
     in_bytes = sum(
-        _operand_bytes(shp, key_to_node[k])
-        for k, shp in tiled_shapes.items()
-        if k != "output"
+        _operand_bytes(shp, n)
+        for n, shp in tiled_shapes.items()
+        if n is not node
     )
 
     in_elems = max(
-        (_tile_elems(s) for k, s in tiled_shapes.items() if k != "output"),
+        (_tile_elems(s) for n, s in tiled_shapes.items() if n is not node),
         default=0,
     )
     tile_ops = max(_tile_elems(out_shape), in_elems)
@@ -171,3 +170,72 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, global_tiling, config):
     if config.double_buffered_l2:
         return max(num_tiles * dram, num_tiles * compute + dram)
     return num_tiles * (dram + compute)
+
+
+# Operand roles whose tile moves with the reduction, so the kernel fetches a
+# fresh one every grid step.  Every other role -- a bias, whatever a fused tail
+# brings of its own (no role at all) -- is indexed by the output block alone and
+# is read once per output tile, on the step that finishes it.
+_REDUCTION_ROLES = frozenset(
+    {
+        "input",
+        "input_scale",
+        "weight",
+        "other",
+        "weight_scale",
+    }
+)
+
+
+def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
+    """Estimated cycles to run a matrix-vector GEMM under a candidate tiling.
+
+    ``tiling`` is ``(n_x, n_c, n_k)`` -- the tile counts over ``(X, C,
+    K)``, ``n_c`` being the reduction -- so the kernel takes ``n_x * n_c * n_k``
+    grid steps to finish ``n_x * n_k`` output tiles.  The reduction is innermost
+    (``build_gemm`` accumulates across consecutive steps), which is what splits
+    the operands: one diced by it streams a new tile every step, the rest are
+    read once per output tile alongside the store.  ``operand_roles`` says which
+    is which -- whatever a fused tail brings of its own has no role and is never
+    a streamed one.  Each operand is its own DMA and pays its own access
+    latency, so a smaller tile buys more of them.
+
+    A GEMV runs on the vector unit, so a tile costs its MACs spread over the
+    lanes and de-rated by ``vector_op_utilization`` -- the same charge
+    ``reporting/cost.op_info`` gives the op, so the two models cannot disagree.
+
+    Double-buffered, the DRAM engine and the vector unit run concurrently and
+    the makespan is whichever is the bottleneck, framed by the prologue read and
+    the epilogue write that overlap nothing.  At ``n_c == 1`` with no bias and
+    no fused tail this is ``vector_tile_latency``'s ``max(N*D, N*C + D)``.
+    """
+    n_x, n_c, n_k = tiling
+    steps = n_x * n_c * n_k
+    out_tiles = n_x * n_k
+
+    lat = config.access_latency_cycles
+    bpc = config.bytes_per_cycle
+
+    roles = operand_roles(node)
+    streamed, per_output = [], []
+    for n, shape in tiled_shapes.items():
+        if n is node or shape is None or not require_allocation(n):
+            continue
+        tile_bytes = _operand_bytes(shape, n)
+        if roles.get(n) in _REDUCTION_ROLES:
+            streamed.append(tile_bytes)
+        else:
+            per_output.append(tile_bytes)
+
+    read = len(streamed) * lat + sum(streamed) / bpc
+    tail = len(per_output) * lat + sum(per_output) / bpc
+    write = lat + _operand_bytes(tiled_shapes[node], node) / bpc
+
+    lanes = config.vector_lanes
+    util = vector_op_utilization(node, lanes, bpc)
+    compute = math.ceil(math.ceil(math.prod(tile_sizes) / lanes) / util)
+
+    dram = steps * read + out_tiles * (tail + write)
+    if config.double_buffered_l2:
+        return max(dram, steps * compute + read + write)
+    return dram + steps * compute

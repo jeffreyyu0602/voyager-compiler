@@ -166,9 +166,6 @@ def transform(
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, *config.pe_array_size)
 
-    if config.scratchpad_size is not None:
-        run_gemv_tiling(model, config)
-
     # Systolic-array-friendly operand layouts.
     if transform_layout:
         normalize_conv2d_layout(model)

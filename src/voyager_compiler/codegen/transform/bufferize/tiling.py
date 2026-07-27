@@ -25,8 +25,10 @@ import torch
 
 from voyager_compiler.codegen.shape_prop import ShapeProp
 
-from ...node_info import get_anchor_node
 from ...node_info import (
+    _pair,
+    get_anchor_node,
+    get_arg_value,
     is_bmm,
     is_conv2d,
     is_depthwise_conv,
@@ -35,8 +37,9 @@ from ...node_info import (
     is_matmul,
     quant_param_arg_nodes,
     trailing_mha_perm,
+    weight_is_ck,
 )
-from ...node_info import _pair, get_arg_value
+from ..tiling.search import gemv_op_tiling
 from .utils import _unproject, _NHWC, _HWIO
 from ....pt2e_utils import dtype_byte_size
 
@@ -917,9 +920,9 @@ def _extract_layer_from_node(node):
         width = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
 
         # Weight (other operand) is (.., K, N): reduction K and output N are its
-        # last two dims, flipped by ``is_matmul XOR transposed`` (rank-agnostic,
-        # so a batched (B, K, N) weight reads K/N, not the batch dim).
-        if is_matmul(node) ^ transposed:
+        # last two dims, flipped when it is stored CK (rank-agnostic, so a
+        # batched (B, K, N) weight reads K/N, not the batch dim).
+        if weight_is_ck(node):
             input_channels, output_channels = weight_shape[-2], weight_shape[-1]
         else:
             output_channels, input_channels = weight_shape[-2], weight_shape[-1]
@@ -1111,14 +1114,15 @@ def tiling_request(node, tiler):
     """``(key, anchor, out_dtype, fused_specs, oc_align, has_tail)`` — all
     of ``get_tiling``'s preparation, stopping short of the search itself.
 
-    ``None`` when no interstellar run is needed: not a matrix op, or the anchor
-    already carries an ``l2_tiling``.  ``get_tiling`` and the prefetch both go
-    through this, so the cache key they compute cannot drift apart.
+    ``None`` when no interstellar run is needed: not a matrix op, a GEMV (which
+    ``gemv_op_tiling`` searches instead), or an anchor that already carries an
+    ``l2_tiling``.  ``get_tiling`` and the prefetch both go through this, so the
+    cache key they compute cannot drift apart.
     """
     anchor = get_anchor_node(node)
     if not (is_conv2d(anchor) or is_linear(anchor) or is_matmul(anchor)):
         return None
-    if anchor.meta.get("l2_tiling") is not None:
+    if is_fully_connected(anchor) or anchor.meta.get("l2_tiling") is not None:
         return None
 
     sub_gm = node.meta.get("submodule")
@@ -1284,24 +1288,24 @@ def get_tiling(node, tiler=None):
     innermost (a permutation of ``CONV_L3_ORDER`` / ``GEMM_L3_ORDER``);
     ``None`` asks for the canonical order.
 
-    Prefers the anchor's ``l2_tiling`` (set by the matrix L2 tiling pass —
+    Prefers the anchor's ``l2_tiling`` (the attention builders' explicit
     output-dim factors; the reduction is kept whole / decomposed away, so its
     factor is 1).  ``l2_tiling`` may carry the reduction factor explicitly — a
     3-tuple gemm ``(n_m, n_n, n_k)`` / a 5-tuple conv ``(n_N, n_k, n_y, n_x,
-    n_c)`` — to drive a ``num_k > 1`` reduction sweep.  Otherwise runs
-    interstellar via ``tiler`` (caching each layer's mapping).  Interstellar
-    tiles a single (M, N, K) gemm and never tiles the leading batch dims (e.g.
-    attention heads); the builder loops them, so their counts are the full
-    extent (one tile per batch element).
+    n_c)`` — to drive a ``num_k > 1`` reduction sweep.  Otherwise searches: a
+    GEMV through ``gemv_op_tiling``, everything else through interstellar via
+    ``tiler`` (caching each layer's mapping).  Neither tiles the leading batch
+    dims (e.g. attention heads); the builder loops them, so their counts are the
+    full extent (one tile per batch element).
     """
     anchor = get_anchor_node(node)
     is_conv = is_conv2d(anchor)
     if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
         return None, None
 
-    # Interstellar tiles a single (M, N, K) gemm and never tiles the leading
-    # batch dims (e.g. attention heads); the builder loops them, so emit a
-    # full-extent count -- one tile per batch element.
+    # Neither search tiles the leading batch dims (e.g. attention heads); the
+    # builder loops them, so emit a full-extent count -- one tile per batch
+    # element.
     gemm_batch = tuple(anchor.value.shape[: anchor.value.ndim - 2])
 
     if (tiling := anchor.meta.get("l2_tiling")) is not None:
@@ -1324,6 +1328,11 @@ def get_tiling(node, tiler=None):
 
     if tiler is None:
         return None, None
+
+    # Interstellar maps a systolic array and skips a batch-1 GEMM; that one runs
+    # on the vector unit and has a search of its own.
+    if is_fully_connected(anchor):
+        return gemm_batch + gemv_op_tiling(node, tiler.config), None
 
     key, anchor, out_dtype, fused_specs, oc_align, has_tail = tiling_request(
         node, tiler
