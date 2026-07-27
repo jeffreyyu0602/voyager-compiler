@@ -857,15 +857,18 @@ class RuntimeCalculator:
                 load = input_load + weight_load
                 store_steps = output_tiles - 1
                 accum_steps = l3_blocks - 2 * store_steps
+
+                prefetch = load + tail_load
+                compute = max(matrix_unit_cycles, prefetch) + matrix_unit_cycles
+                dma = (
+                    max(matrix_unit_cycles + vector_unit_cycles, prefetch)
+                    + store
+                    + load
+                )
                 total_time = (
                     load
                     + accum_steps * max(load, matrix_unit_cycles)
-                    + store_steps
-                    * max(
-                        load + tail_load,
-                        matrix_unit_cycles + vector_unit_cycles,
-                    )
-                    + store_steps * max(load + store, matrix_unit_cycles)
+                    + store_steps * max(compute, dma)
                     + vector_unit_cycles
                     + store
                 )
