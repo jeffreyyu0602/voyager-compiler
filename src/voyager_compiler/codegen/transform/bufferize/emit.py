@@ -651,9 +651,7 @@ class _Emitter:
             if value is None:
                 continue  # an unset optional: absent, not null
             if isinstance(value, Node) and value in qmaps:
-                continue  # a qmap lookup table is not emitted
-            if key == "semaphore" and node.target is _ASYNC_COPY:
-                continue  # what it *posts* -- on the Operation, not an operand
+                continue  # a qmap lookup table is not emittedan operand
             call.kwargs[key].CopyFrom(self._argument(value, env, internal))
         return call
 
