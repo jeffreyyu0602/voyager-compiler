@@ -35,6 +35,7 @@ import re
 import signal
 import subprocess
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, fields, replace
 from typing import (
@@ -818,6 +819,7 @@ def safe_run(
             return run_design_point_fast(cfg, tuple(probe_layers))
         return run_design_point(cfg)
     except Exception as e:  # noqa: BLE001 - a sweep must survive one bad point
+        traceback.print_exc()
         print(f"  [skip] {label}: {type(e).__name__}: {e}", flush=True)
         return None
 

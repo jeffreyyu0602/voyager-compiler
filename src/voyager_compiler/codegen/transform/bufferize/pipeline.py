@@ -46,6 +46,10 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     commit,
     oracle_disabled,
 )
+from voyager_compiler.codegen.transform.tiling.search import (
+    pool_op_tiling,
+    vector_op_tiling,
+)
 from voyager_compiler.codegen.transform.bufferize.tiling import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
@@ -2210,7 +2214,7 @@ def _apply_relayout(node, *seqs, invert=False):
     return tuple(tuple(s[p] for p in perm) for s in seqs)
 
 
-def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
+def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
     standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
@@ -2218,7 +2222,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     ``None``.
     """
     anchor = get_anchor_node(node)
-    tiling = anchor.meta.get("l2_tiling") if anchor is not None else None
+    tiling = vector_op_tiling(node, tiler.config)
     if node.op != "call_module" and tiling is None:
         return None
 
@@ -2329,7 +2333,7 @@ _POOL2D_SUPPORTED = {
 }
 
 
-def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
+def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     """Pipeline builder for a 2-D max/avg pool node, bare or fused with post-op
     pointwise ops: a map over the (N, C, oH, oW) output grid whose input tile is
     a strided receptive-field halo (boundary padding folded into the load), so
@@ -2345,7 +2349,7 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS):
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
 
-    tiling = anchor.meta.get("l2_tiling")
+    tiling = pool_op_tiling(node, tiler.config)
     if node.op != "call_module" and tiling is None:
         return None
 

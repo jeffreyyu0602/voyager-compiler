@@ -788,7 +788,7 @@ def bufferize_graph(
                     tiler=tiler,
                 )
             elif is_pooling(anchor):
-                sub_gm = build_pool(node, num_banks=num_banks)
+                sub_gm = build_pool(node, num_banks=num_banks, tiler=tiler)
             elif anchor.target is _SDPA:
                 sub_gm = (
                     build_attention_fa3(node, tiler=tiler)
@@ -800,7 +800,7 @@ def bufferize_graph(
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):
-                sub_gm = build_pointwise(node, num_banks=num_banks)
+                sub_gm = build_pointwise(node, num_banks=num_banks, tiler=tiler)
             else:
                 sub_gm = None
 

@@ -19,6 +19,7 @@ from .codegen.transform.bufferize.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
+from .codegen.transform.rewrites import split_dense_spmm_node
 from .hardware import AcceleratorConfig
 from .decomposed import *
 from .fake_quantize import *
@@ -139,8 +140,7 @@ def transform(
     if example_kwargs is None:
         example_kwargs = {}
 
-    # A null config (no hardware specified) skips padding / tiling, as passing
-    # no ``unroll_dims`` / ``cache_size`` used to.
+    # A null config (no hardware) skips padding and tiling.
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
@@ -151,52 +151,25 @@ def transform(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
-    # -------------------------------------------------------------------------
-    # 1. Lowering & Decomposition
-    # -------------------------------------------------------------------------
-    # Break down complex operators (like MultiHeadAttention) into simpler
-    # primitives and handle memory copy/concat operations.
-
-    # Fold constant generators (input-free ``arange`` / ``zeros`` / … from e.g.
-    # RoPE position setup) into ``get_attr`` buffers so they are not lowered or
-    # scheduled as compute ops.
+    # Fold input-free ``arange`` / ``zeros`` (RoPE setup) into ``get_attr``.
     fold_constant_generators(model)
 
-    # Flatten autocast / no_grad (set_grad_enabled) wrap HOPs that torch.export
-    # leaves around e.g. Llama's RoPE, so the wrap is not lowered as an op.
+    # Flatten the autocast / no_grad wrap HOPs ``torch.export`` leaves behind.
     inline_autocast_modules(model)
 
-    # Delete identity ops (full slices, unit expands, same-dtype casts, zero-prob
-    # dropout) that survive fusion — fewer nodes for every later pass and the
-    # bufferizer to process.
+    # Delete identity ops: full slices, unit expands, no-op casts, p=0 dropout.
     remove_prunable_ops(model)
 
     fuse_quantize_dequantize_with_previous_op(model, context_len, max_gen)
 
-    # -------------------------------------------------------------------------
-    # 2. Hardware Alignment (Padding)
-    # -------------------------------------------------------------------------
-    # Pad dimensions to align with hardware unrolling constraints (SIMD, systolic
-    # array dimensions, etc.) to ensure efficient execution.
+    # Pad dimensions to the hardware unrolling.
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, *config.pe_array_size)
 
-    # -------------------------------------------------------------------------
-    # 3. Matrix Operation Tiling
-    # -------------------------------------------------------------------------
-    # Apply L2 tiling logic specifically for matrix operations (GEMM/Conv) to
-    # optimize for the specific cache size and memory bank configuration. This
-    # annotates each GEMM/conv with ``l2_tiling`` (the bufferized builders read
-    # it).
     if config.scratchpad_size is not None:
-        run_matrix_op_l2_tiling(model, config)
+        run_gemv_tiling(model, config)
 
-    # -------------------------------------------------------------------------
-    # 4. Data Layout Transformation
-    # -------------------------------------------------------------------------
-    # Transform GEMM and convolution inputs/weights into layouts friendly
-    # for systolic-array based hardware (e.g., transposing weights).
-
+    # Systolic-array-friendly operand layouts.
     if transform_layout:
         normalize_conv2d_layout(model)
 
@@ -208,14 +181,8 @@ def transform(
 
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
 
-    # Remove redundant reshapes that have no effect on tensor semantics
+    # Drop reshapes that do not change tensor semantics.
     eliminate_reshape_with_no_effect(model)
-
-    # -------------------------------------------------------------------------
-    # 5. Vector Operation Tiling
-    # -------------------------------------------------------------------------
-    # TODO: Used for unit test. Will be removed in the future
-    from .codegen.transform.rewrites import split_dense_spmm_node
 
     if split_spmm:
         split_dense_spmm_node(model)
@@ -223,17 +190,7 @@ def transform(
     if config.pe_array_size is not None:
         pad_vector_op_dimensions(model, config.vector_lanes)
 
-    # Apply L2 tiling logic for vector-based operations.
-    if config.scratchpad_size is not None:
-        run_pool_op_l2_tiling(model, config)
-        run_vector_op_l2_tiling(model, config)
-
-    # -------------------------------------------------------------------------
-    # 6. Operator Fusion
-    # -------------------------------------------------------------------------
-    # Perform final operator lowering and fuse sequences of operations (e.g.,
-    # Conv+ReLU) into single kernels to reduce memory access overhead.
-
+    # Fuse op sequences (e.g. Conv+ReLU) into one kernel.
     if not skip_op_fusion:
         fuse_operator(model, patterns, fuse_reshape)
 
@@ -272,14 +229,8 @@ def compile(
         model, os.path.join(output_dir, output_file + "_prelowered")
     )
 
-    # Reuse the tiler's double-buffering decision: when L2 is double-buffered
-    # the tiles already assume two-buffer occupancy, so emit software-pipelined
-    # loops.
     bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
 
-    # Assign concrete DRAM / Scratchpad addresses to the explicit buffers/tiles
-    # (greedy best-fit DRAM reuse; bank-aware, region-scoped scratchpad).
-    # Writes meta['memory'] / meta['scratchpad'] that the proto emitter reads.
     plan_memory(model, config)
     print_bufferized_graph(model)
 

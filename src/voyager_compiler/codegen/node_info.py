@@ -476,6 +476,17 @@ def get_node_bytes(n: Node):
 
 
 def get_node_to_key_map(node):
+    """Each operand FX node -> the role it plays for ``node``.
+
+    A fused ``call_module`` has no signature to normalize, so its inputs key on
+    their own node names.  Roles that share a bank are named per op and a node
+    name is never one of them, so each fused input is sized on its own.
+    """
+    if node.op == "call_module":
+        node_to_key = {n: n.name for n in node.all_input_nodes}
+        node_to_key[node] = "output"
+        return node_to_key
+
     args_and_kwargs = normalize_function(
         node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )

@@ -24,9 +24,9 @@ from .transform.rewrites import (
     replace_rmsnorm_with_layer_norm,
 )
 from .transform.tiling.search import (
-    run_matrix_op_l2_tiling,
-    run_pool_op_l2_tiling,
-    run_vector_op_l2_tiling,
+    run_gemv_tiling,
+    vector_op_tiling,
+    pool_op_tiling,
 )
 
 __all__ = [
@@ -49,7 +49,7 @@ __all__ = [
     "replace_conv2d_with_im2col",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
-    "run_matrix_op_l2_tiling",
-    "run_pool_op_l2_tiling",
-    "run_vector_op_l2_tiling",
+    "run_gemv_tiling",
+    "vector_op_tiling",
+    "pool_op_tiling",
 ]

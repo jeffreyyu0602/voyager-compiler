@@ -12,47 +12,41 @@ from ....pt2e_utils import dtype_byte_size
 logger = logging.getLogger(__name__)
 
 
-def _find_user_with_target(node: torch.fx.Node, targets):
-    if not isinstance(targets, set):
-        if isinstance(targets, (list, tuple)):
-            targets = set(targets)
-        else:
-            targets = {targets}
-
+def _find_user_target(node: torch.fx.Node, targets):
     for user in node.users:
         if user.target in targets and user.args[0] == node:
-            return user
+            return user.target
 
         # Check for users of fused dequantization nodes
         if (
             user.target == torch.ops.quantized_ops.dequantize.default
             and user.meta.get("fused") is True
         ):
-            found = _find_user_with_target(user, targets)
+            found = _find_user_target(user, targets)
             if found is not None:
                 return found
 
         if user.op == "call_module":
-            # Map this node to the submodule placeholder by argument
-            # position, not by name: a producer can be renamed in the parent
-            # graph after fusion (e.g. by extract_input_preprocessor) while
-            # the submodule placeholder keeps its original name.
             gm = user.meta["submodule"]
             placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
             idx = next(i for i, arg in enumerate(user.args) if arg is node)
-            found = _find_user_with_target(placeholders[idx], targets)
+            found = _find_user_target(placeholders[idx], targets)
             if found is not None:
                 return found
 
     return None
 
 
+ALLOC_TARGETS = (
+    torch.ops.aten.conv2d.default,
+    torch.ops.quantized_ops.conv2d.default,
+    torch.ops.aten.softmax.int,
+    torch.ops.aten.layer_norm.default,
+)
+
+
 def compute_tensor_size(
-    node,
-    shape=None,
-    is_scratchpad_output=False,
-    bank_width=None,
-    unroll_dim=None,
+    node, shape, is_output=False, bank_width=None, vector_lanes=None
 ):
     val = node.value
     if isinstance(val, torch.Tensor):
@@ -60,55 +54,41 @@ def compute_tensor_size(
         numel = math.prod(shape) if shape is not None else val.numel()
         tensor_size = numel * dtype_byte_size(dtype)
 
-        conv_targets = (
-            torch.ops.aten.conv2d.default,
-            torch.ops.quantized_ops.conv2d.default,
-        )
-        conv_user = _find_user_with_target(node, conv_targets)
+        target = _find_user_target(node, ALLOC_TARGETS)
 
-        if conv_user is not None:
-            dim = 1 if conv_user.target == torch.ops.aten.conv2d.default else -1
+        # Extra space for a conv2d's replicated input, and for the
+        # intermediates a softmax / layer_norm keeps beside its own input.
+        if target in ALLOC_TARGETS[:2]:
+            dim = 1 if target == ALLOC_TARGETS[0] else -1
             if val.shape[dim] == 3:
-                logger.debug(f"Increase memory for conv2d input {node} by 3x")
+                logger.debug(f"Increase space for conv2d input {node}")
                 tensor_size *= 3
-
-        # Allocate extra memory for intermediate results like mean and variance.
-        # TODO: Should only do this when allocating scratchpad memory for the
-        # specific operation. E.g. if a node is consumed by both a softmax and
-        # an add node, we shouldn't increase the size for the add path.
-        if not is_scratchpad_output:
-            if _find_user_with_target(node, torch.ops.aten.softmax.int):
-                logger.debug(f"Increase memory for softmax input {node} by 2x")
+        elif not is_output:
+            if target == ALLOC_TARGETS[2]:
+                logger.debug(f"Increase space for softmax input {node}")
                 tensor_size = tensor_size * 2
-
-            if _find_user_with_target(node, torch.ops.aten.layer_norm.default):
-                logger.debug(
-                    f"Increase memory for layer_norm input {node} by 2x"
-                )
+            elif target == ALLOC_TARGETS[3]:
+                logger.debug(f"Increase space for layer_norm input {node}")
                 tensor_size = (tensor_size + numel) * 2
 
         return _align_size(tensor_size, bank_width)
 
     if isinstance(val, (tuple, list)):
         if shape is not None:
-            key = "tiled_output_sizes"
             numel = [math.prod(s) for s in shape]
         else:
-            key = "output_sizes"
             numel = [t.numel() for t in val]
 
         # Sparse outputs need to be aligned with hardware unroll dimension
-        if unroll_dim is not None:
-            numel = [_align_size(s, unroll_dim) for s in numel]
+        if vector_lanes is not None:
+            numel = [_align_size(s, vector_lanes) for s in numel]
 
         dtypes = node.meta.get("dtype") or [None for _ in val]
-
         sizes = [
             _align_size(n * dtype_byte_size(dt or t.dtype), bank_width)
             for t, n, dt in zip(val, numel, dtypes)
         ]
 
-        node.meta[key] = tuple(sizes)
         return sum(sizes)
 
     logger.warning(f"Node {node} has a non-tensor output")
@@ -154,29 +134,40 @@ def scratchpad_bytes(
     bank_size,
     num_banks,
     extra_sharing=0,
-    unroll_dim=None,
+    vector_lanes=None,
 ):
     """Scratchpad bytes one candidate tile occupies.
 
-    Each group of ``BANK_GROUPS`` that has any tensor gets a bank of its own
-    and rounds up to a whole one, since a bank cannot be split between groups.
-    With more groups than banks the two *smallest* are merged and the merge
-    repeats until they fit -- a few hundred bytes of block scales would
-    otherwise cost a whole bank while a real operand had none.
+    Every group takes a whole bank, since a bank cannot be split, and the two
+    smallest merge while the groups outnumber the banks.  ``BANK_GROUPS`` names
+    one op's roles, so a role it misses -- a ``where`` mask, a fused group's
+    extra inputs -- takes a bank of its own.
 
-    ``extra_sharing`` merges that many groups further.  It is not a nicety:
-    every group costs a whole bank, so ``G`` groups put a floor of
-    ``G * bank_size`` on the footprint, and at ``G == num_banks`` that floor
-    is the entire scratchpad -- no tile fits, however small.  The caller
-    raises ``extra_sharing`` until something maps.
+    Args:
+        key_to_node: Operand role -> FX node, which carries the dtype.
+        node: The op being tiled; its own entry is the output.
+        tiled_shapes: Operand role -> tiled shape.
+        bank_width: Per-tensor alignment, bytes.
+        bank_size: Bytes per bank; ``None`` is unbanked, so just sum.
+        num_banks: Banks available to merge down to.
+        extra_sharing: Merge this many groups further.  ``G`` groups floor the
+            footprint at ``G * bank_size``, so at ``G == num_banks`` no tile
+            fits however small and the caller has to raise it.
+        vector_lanes: Sparse-output alignment, elements.
 
-    ``tiled_shapes`` is keyed by operand role (what ``shape_func`` returns);
-    ``key_to_node`` maps a role to its FX node, which carries the dtype and
-    the sizing allowances ``compute_tensor_size`` applies.  ``bank_size`` of
-    ``None`` means the design is unbanked: just sum the tiles.
+    Returns:
+        Bytes the tile needs with every group rounded to whole banks.
     """
+    # ``groups`` is the bank layout, one entry per bank: the BANK_GROUPS that
+    # match, then any unnamed role on its own.  A ``where`` lays out as
+    # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
+    named = {key for group in BANK_GROUPS for key in group}
+    groups = BANK_GROUPS + tuple(
+        (key,) for key in tiled_shapes if key not in named
+    )
+
     sizes = []
-    for group in BANK_GROUPS:
+    for group in groups:
         total = 0
         for key in group:
             shape = tiled_shapes.get(key)
@@ -184,7 +175,7 @@ def scratchpad_bytes(
             if shape is None or n is None or not require_allocation(n):
                 continue
             total += compute_tensor_size(
-                n, shape, n is node, bank_width, unroll_dim
+                n, shape, n is node, bank_width, vector_lanes
             )
         if total:
             sizes.append(total)

@@ -7,16 +7,15 @@ import torch
 
 from ...node_info import get_arg_value, _pair
 from ...node_info import (
-    get_node_bytes,
     get_node_to_key_map,
     is_mha_qkv_permute,
     normalize_shape,
 )
 from ...node_info import (
+    get_anchor_node,
     is_bmm,
     is_elementwise_op,
     is_fully_connected,
-    is_linear,
     is_matmul,
     is_pooling,
 )
@@ -27,13 +26,10 @@ from ....layout_ops import NHWC_OP_VARIANTS
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "run_matrix_op_l2_tiling",
-    "run_pool_op_l2_tiling",
-    "run_vector_op_l2_tiling",
-    "run_vector_op_node_l2_tiling",
+    "run_gemv_tiling",
+    "pool_op_tiling",
+    "vector_op_tiling",
 ]
-
-DEFAULT_CACHE_SIZE = 8 * 1024 * 1024  # 8 MiB
 
 
 def _prime_factors(n: int):
@@ -87,152 +83,69 @@ def construct_tiled_shape(full_shape, tiled_dim: int, dims):
 
 def get_valid_tiling(
     input_shape: Tuple[int, ...],
-    min_sizes: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    multiple_of: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    order: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    fixed_dims: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    multiple_of: Optional[Tuple[int, ...]] = None,
+    order: Optional[Tuple[int, ...]] = None,
     last_dim: Optional[int] = None,
-    reverse: bool = False,
-    round_robin: bool = False,
 ) -> Generator[Tuple[Tuple[int, ...], Tuple[int, ...]], None, None]:
-    """
-    Yields tile shapes by progressively reducing dimensions in a specified order.
+    """Yield tile shapes from the full shape downwards.
+
+    Reduces one dimension at a time to its next valid size, in ``order``,
+    leaving the dimensions already reduced at their smallest.  A size is valid
+    when it divides the dimension and is a multiple of ``multiple_of``.
 
     Args:
-        input_shape: The original shape (e.g., (1024, 1024)).
-        min_sizes: Minimum size for each dimension. If the list is shorter than
-                   input_shape, it is padded with 1s on the left.
-        multiple_of: Required multiple for each dimension's tile size. If the list
-                     is shorter than input_shape, it is padded with 1s on the left
-                     (1 means no constraint). E.g., multiple_of=(1, 16) requires the
-                     last dimension's tile to be a multiple of 16.
-        order: Explicit order of dimension indices to reduce.
-        fixed_dims: Indices of dims that should remain at full size.
-        last_dim: Convenience arg to fix dimensions starting from this index.
-        reverse: If True, reverses the traversal order (ignored if `order` is provided).
-        round_robin: If True, cycles through dimensions reducing them one step at a time.
-                     If False, fully reduces one dimension before moving to the next.
+        input_shape: The shape being tiled.
+        multiple_of: Required tile multiple per dim, right-aligned to the shape
+            and padded with 1s (1 is free).
+        order: Dim indices to reduce, first reduced first; default is left to
+            right.
+        last_dim: Dims from here onwards stay at full size.
 
     Yields:
-        (current_shape, tiling_factors)
+        ``(tile_shape, tiling_factors)``, largest tile first.
     """
     ndim = len(input_shape)
 
-    # --- 1. Normalize Inputs ---
-
-    # helper: resolving negative indices to positive
-    def resolve_idx(i):
+    def resolve(i):
         return i + ndim if i < 0 else i
 
-    # Set up fixed dimensions set
-    fixed_indices = set()
-    if fixed_dims:
-        fixed_indices.update(resolve_idx(d) for d in fixed_dims)
-    if last_dim is not None:
-        start = resolve_idx(last_dim)
-        fixed_indices.update(range(start, ndim))
+    fixed = (
+        set(range(resolve(last_dim), ndim)) if last_dim is not None else set()
+    )
+    traversal = [resolve(i) for i in order] if order else list(range(ndim))
 
-    # Set up traversal order
-    if order:
-        traversal_order = [resolve_idx(i) for i in order]
-    else:
-        traversal_order = list(range(ndim))
-        if reverse:
-            traversal_order.reverse()
-
-    # Align min_sizes to input_shape length (pad left with 1s)
-    targets = list(min_sizes) if min_sizes else []
-    if len(targets) < ndim:
-        targets = [1] * (ndim - len(targets)) + targets
-
-    # Align multiple_of to input_shape length (pad left with 1s — 1 means no constraint)
     multiples = list(multiple_of) if multiple_of else []
-    if len(multiples) < ndim:
-        multiples = [1] * (ndim - len(multiples)) + multiples
+    multiples = [1] * (ndim - len(multiples)) + multiples
 
-    # --- 2. Pre-calculate Valid Factors ---
+    # Valid tile sizes per dim, largest first.  A fixed dim has only one.
+    sizes = {}
+    for dim, extent in enumerate(input_shape):
+        if dim in fixed:
+            sizes[dim] = [extent]
+            continue
+        valid = [
+            s
+            for s in range(extent, 0, -1)
+            if extent % s == 0 and s % multiples[dim] == 0
+        ]
+        if not valid:
+            logger.warning(
+                f"No valid tiling for dim {dim} (size={extent}, "
+                f"multiple_of={multiples[dim]}); keeping full size."
+            )
+            valid = [extent]
+        sizes[dim] = valid
 
-    # We calculate all valid tiling sizes for every dimension upfront.
-    # A factor is valid if it divides the dimension, >= min_size, and is a
-    # multiple of the required multiple (if specified).
-    # Example: input 128, multiple_of=16 -> [128, 64, 32, 16]
-    dim_factors = {}
-    for i in range(ndim):
-        limit = max(1, targets[i])  # Ensure min_size is at least 1
-        size = input_shape[i]
-        limit = min(limit, size)  # Cap limit to size
+    tile = [sizes[dim][0] for dim in range(ndim)]
 
-        if i in fixed_indices:
-            factors = [size]
-        else:
-            mult = multiples[i]
-            # Generate factors in descending order, respecting divisibility and multiple_of
-            factors = [
-                f
-                for f in range(size, limit - 1, -1)
-                if size % f == 0 and f % mult == 0
-            ]
-            if not factors:
-                logger.warning(
-                    f"No valid tiling found for dim {i} (size={size}, min={limit}, "
-                    f"multiple_of={mult}); keeping full size."
-                )
-                factors = [size]
+    def current():
+        return tuple(tile), tuple(e // t for e, t in zip(input_shape, tile))
 
-        dim_factors[i] = factors
-
-    # --- 3. Traversal Logic ---
-
-    # Current state: indices pointing to the current factor used for each dimension
-    # initialized to 0 (which corresponds to the full input size)
-    current_factor_indices = {i: 0 for i in range(ndim)}
-
-    def get_current_state():
-        """Constructs the shape and tiling tuple based on current indices."""
-        shape = tuple(
-            dim_factors[i][current_factor_indices[i]] for i in range(ndim)
-        )
-        tiling = tuple(input_shape[i] // shape[i] for i in range(ndim))
-        return shape, tiling
-
-    # Yield the initial full shape
-    yield get_current_state()
-
-    if not round_robin:
-        # --- Sequential Mode ---
-        # Reduce Dim A fully, then move to Dim B, etc.
-        for dim_idx in traversal_order:
-            if dim_idx in fixed_indices:
-                continue
-
-            factors = dim_factors[dim_idx]
-            # Iterate through the remaining factors for this dimension
-            for i in range(1, len(factors)):
-                current_factor_indices[dim_idx] = i
-                yield get_current_state()
-
-    else:
-        # --- Round Robin Mode ---
-        # Reduce Dim A (step 1), yield. Reduce Dim B (step 1), yield. Repeat.
-        active_dims = [d for d in traversal_order if d not in fixed_indices]
-
-        while True:
-            progress_made = False
-
-            for dim_idx in active_dims:
-                current_idx = current_factor_indices[dim_idx]
-                max_idx = len(dim_factors[dim_idx]) - 1
-
-                # If this dimension can be reduced further
-                if current_idx < max_idx:
-                    # Move one step down in size
-                    current_factor_indices[dim_idx] += 1
-                    progress_made = True
-                    yield get_current_state()
-
-            # If we went through all dims and none could change, we are done
-            if not progress_made:
-                break
+    yield current()
+    for dim in traversal:
+        for size in sizes[dim][1:]:  # a fixed dim has nothing left to give
+            tile[dim] = size
+            yield current()
 
 
 def _build_gemm_shape_map(node, tile_sizes, divisor=None):
@@ -310,32 +223,16 @@ def _log_tiling_details(node, tiled_shapes, extra_sharing=0):
     logger.info(f"  Out[{node}]: {orig_shape} -> {tile_shape}")
 
 
-def _merge_tiling(a, b):
-    if b is None:
-        return a
-
-    n = max(len(a), len(b))
-    a = (1,) * (n - len(a)) + a
-    b = (1,) * (n - len(b)) + b
-
-    return tuple(ai * bi for ai, bi in zip(a, b))
-
-
 def _search_tiling(
     node,
     full_shape,
-    min_sizes,
-    shape_func,
+    shape_builder_fn,
     cache_size,
+    num_banks,
     bank_width,
-    bank_size,
-    num_banks=None,
     order=None,
     last_dim=None,
-    fixed_dims=None,
-    base_tiling=None,
     multiple_of=None,
-    extra_size_fn=None,
     cost_fn=None,
 ):
     """
@@ -346,10 +243,11 @@ def _search_tiling(
     ``get_valid_tiling`` yields candidates largest -> smallest.  Without
     ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
     fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
-    tiled_shapes, global_tiling) -> latency`` -- every fitting candidate is
+    tiled_shapes, tiling) -> latency`` -- every fitting candidate is
     scored and the minimum-latency one is returned (DRAM-aware two-step search).
     """
     key_to_node = {v: k for k, v in get_node_to_key_map(node).items()}
+    bank_size = None if num_banks is None else cache_size // num_banks
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
     # footprint at ``G * bank_size``: with as many groups as banks nothing
@@ -359,19 +257,13 @@ def _search_tiling(
         best = None  # (score, tile_sizes, node_to_shape)
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
-            min_sizes=min_sizes,
             multiple_of=multiple_of,
             order=order,
             last_dim=last_dim,
-            fixed_dims=fixed_dims,
         ):
-            global_tiling = _merge_tiling(tiling, base_tiling)
+            logger.debug(f"Trying tiling {tiling} with tile sizes {tile_sizes}")
 
-            logger.debug(
-                f"Trying tiling {global_tiling} with tile sizes {tile_sizes}"
-            )
-
-            tiled_shapes = shape_func(node, tile_sizes, global_tiling)
+            tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
             total_size = scratchpad_bytes(
                 key_to_node,
@@ -383,9 +275,6 @@ def _search_tiling(
                 extra_sharing,
             )
 
-            if extra_size_fn is not None:
-                total_size += extra_size_fn(node, tile_sizes, tiled_shapes)
-
             if total_size > cache_size:
                 continue
 
@@ -395,7 +284,7 @@ def _search_tiling(
                 _log_tiling_details(node, node_to_shape, extra_sharing)
                 return tile_sizes
 
-            score = cost_fn(node, tile_sizes, tiled_shapes, global_tiling)
+            score = cost_fn(node, tile_sizes, tiled_shapes, tiling)
             if best is None or score < best[0]:
                 best = (score, tile_sizes, node_to_shape)
 
@@ -429,93 +318,7 @@ def mha_projection_head_dim(node) -> Optional[int]:
     return None
 
 
-def search_gemm_tiling(
-    node,
-    pe_array_size,
-    cache_size,
-    bank_width,
-    bank_size,
-    num_banks=None,
-    k_multiple=1,
-):
-    input_shape = node.args[0].shape
-    X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
-    C = input_shape[-1]
-
-    is_mat = is_matmul(node)
-    weight_shape = node.args[1].shape
-    K = weight_shape[-1] if is_mat else weight_shape[0]
-
-    x_min_size = min(sum(pe_array_size), X)
-
-    num_c_tile = 1
-    if bank_size is not None:
-        input_bytes = get_node_bytes(node.args[0])
-        c_max_size = bank_size / input_bytes / x_min_size
-        for (c,), (num_c_tile,) in get_valid_tiling(
-            (C,), min_sizes=(pe_array_size[0],)
-        ):
-            if c <= c_max_size:
-                break
-        else:
-            logger.warning(
-                f"Cannot find valid C tiling for {node} that fits bank size {bank_size}."
-            )
-
-    full_shape = (X, C // num_c_tile, K)
-    min_sizes = (x_min_size, pe_array_size[0], pe_array_size[1])
-    order = (2, 0, 1)
-
-    logger.info(f"Running L2 tiling for matrix op: {node}")
-
-    common_args = dict(
-        node=node,
-        full_shape=full_shape,
-        min_sizes=min_sizes,
-        multiple_of=(
-            pe_array_size[0],
-            math.lcm(pe_array_size[1], k_multiple),
-        ),
-        order=order,
-        shape_func=_build_gemm_shape_map,
-        cache_size=cache_size,
-        bank_width=bank_width,
-        bank_size=bank_size,
-        num_banks=num_banks,
-        base_tiling=(1, num_c_tile, 1),
-    )
-
-    def _gemm_residual_size(node, tile_sizes, tiled_shapes):
-        """Extra L2 cost of the accumulator buffer when C is tiled."""
-        _, c_tiled, _ = tile_sizes
-        if c_tiled < C:
-            return math.prod(tiled_shapes["output"]) * get_node_bytes(node)
-        return 0
-
-    # Tiling for non-first sub-GEMMs (budget for the accumulator)
-    tile_sizes = _search_tiling(
-        **common_args, extra_size_fn=_gemm_residual_size
-    )
-
-    if tile_sizes is None:
-        return None
-
-    c_tiled = tile_sizes[1]
-
-    if c_tiled < C and c_tiled != C // num_c_tile:
-        # Tiling for the first sub-GEMM (no accumulator buffer)
-        search_args = {
-            **common_args,
-            "full_shape": (full_shape[0], c_tiled, full_shape[2]),
-            "base_tiling": (1, C // c_tiled, 1),
-            "fixed_dims": (1,),  # Fix C dim to ensure same C tile size
-        }
-        tile_sizes = _search_tiling(**search_args)
-
-    return tile_sizes
-
-
-def run_matrix_op_l2_tiling(model, config):
+def run_gemv_tiling(model, config):
     """
     Annotate the batch-1 fully-connected (matrix-vector) GEMMs with the
     ``l2_tiling`` factors that fit their operands in cache.
@@ -525,47 +328,49 @@ def run_matrix_op_l2_tiling(model, config):
 
     Args:
         model: A model object with a FX Graph containing GEMM nodes.
-        config (AcceleratorConfig): The hardware description (PE array size,
+        config (AcceleratorConfig): The hardware description (vector lane count,
             scratchpad size, banking).
     """
     graph = model.graph
 
-    pe_array_size = config.pe_array_size
-    cache_size = config.scratchpad_size
-    if cache_size is None:
-        cache_size = DEFAULT_CACHE_SIZE
-    num_banks = config.num_banks
-    bank_size = None if num_banks is None else cache_size // num_banks
-
     for node in list(graph.nodes):
-        if not (is_linear(node) or is_matmul(node)):
-            continue
         if not is_fully_connected(node):
             continue
+
+        input_shape = node.args[0].shape
+        X = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
+        C = input_shape[-1]
+        weight_shape = node.args[1].shape
+        K = weight_shape[-1] if is_matmul(node) else weight_shape[0]
 
         # An N tile that cuts a head in half cannot be stored in the permuted
         # layout the bufferizer folds the relayout into.
         head_dim = mha_projection_head_dim(node)
-        tile_sizes = search_gemm_tiling(
-            node,
-            pe_array_size,
-            cache_size,
-            None,
-            bank_size,
-            num_banks,
-            k_multiple=head_dim or 1,
+
+        # A C tile short of a whole microscaling block leaves the scale tile
+        # with no elements to expand against the input.
+        block_size = node.kwargs.get("block_size") or 1
+
+        logger.info(f"Running L2 tiling for GEMV: {node}")
+        tile_sizes = _search_tiling(
+            node=node,
+            full_shape=(X, C, K),
+            multiple_of=(
+                block_size,
+                math.lcm(config.vector_lanes, head_dim or 1),
+            ),
+            order=(2, 0, 1),
+            shape_builder_fn=_build_gemm_shape_map,
+            cache_size=config.scratchpad_size,
+            num_banks=config.num_banks,
+            bank_width=config.bank_width,
         )
 
         if tile_sizes is None:
-            logger.warning(f"Failed to tile GEMM node: {node}")
+            logger.warning(f"Failed to tile GEMV node: {node}")
             continue
 
         x_tiled, c_tiled, k_tiled = tile_sizes
-        in_shape = node.args[0].shape
-        X = in_shape[-2] if is_bmm(node) else math.prod(in_shape[:-1])
-        C = in_shape[-1]
-        w_shape = node.args[1].shape
-        K = w_shape[-1] if is_matmul(node) else w_shape[0]
         node.meta["l2_tiling"] = (X // x_tiled, K // k_tiled, C // c_tiled)
 
     graph.lint()
@@ -630,14 +435,14 @@ def _build_vector_op_shape_map(node, tile_sizes, divisor):
     return shapes_map
 
 
-def run_vector_op_node_l2_tiling(node, config):
-    vector_unit_width = config.vector_lanes
-    cache_size = config.scratchpad_size
-    if cache_size is None:
-        cache_size = DEFAULT_CACHE_SIZE
-    num_banks = config.num_banks
-    bank_width = config.bank_width
+def _vector_op_tiling_limits(node, vector_unit_width):
+    """``(last_dim, multiple_of)`` for a vector op's tile search, or ``None``
+    when ``node`` is not an op this pass tiles.
 
+    Args:
+        node: The vector op whose dimensions are being constrained.
+        vector_unit_width: Lanes the last dim has to fill.
+    """
     if not is_elementwise_op(node) and node.target not in [
         torch.ops.aten.softmax.int,
         torch.ops.aten.layer_norm.default,
@@ -647,12 +452,11 @@ def run_vector_op_node_l2_tiling(node, config):
         torch.ops.quantized_ops.quantize_mx.default,
         torch.ops.quantized_ops.quantize_mx_outlier.default,
     ]:
-        return
+        return None
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
-    min_sizes = (vector_unit_width,)
-    multiple_of = None
+    multiple_of = (vector_unit_width,)
     if node.target == torch.ops.aten.softmax.int:
         last_dim = get_arg_value(node, 1, "dim", -1)
     elif node.target == torch.ops.aten.layer_norm.default:
@@ -673,14 +477,6 @@ def run_vector_op_node_l2_tiling(node, config):
         # respects the hardware unroll.
         last_dim = None
         axes = set(a % ndim for a in (axes or ()))
-        min_sizes = tuple(
-            (
-                max(block_size, vector_unit_width)
-                if i == ndim - 1
-                else block_size if i in axes else 1
-            )
-            for i in range(ndim)
-        )
         multiple_of = tuple(
             (
                 math.lcm(block_size if i in axes else 1, vector_unit_width)
@@ -694,11 +490,44 @@ def run_vector_op_node_l2_tiling(node, config):
     elif node.target == torch.ops.aten.permute.default:
         last_dim = next((i for i, d in enumerate(node.args[1]) if i != d), None)
 
-    output_shape = (
+    return last_dim, multiple_of
+
+
+def _output_shape(node):
+    return (
         node.value.shape
         if isinstance(node.value, torch.Tensor)
         else node.value[-1].shape
     )
+
+
+def vector_op_tiling(node, config):
+    """Per-dim tile counts for a vector op, bare or fused.
+
+    Called from the builders during bufferization, so it sees whatever fusion
+    left behind however it ran.  A fused submodule is searched as a whole: its
+    inputs key on their node names, so every operand the kernel loads is sized,
+    not just the anchor's.  The anchor only supplies the dim constraints.
+
+    Args:
+        node: The op to tile -- a vector op, or a fused ``call_module`` around
+            one.  Its output shape drives the grid.
+        config (AcceleratorConfig): The hardware description.
+
+    Returns:
+        Tile counts over ``node``'s output, or ``None`` when the op is not one
+        this tiles.
+
+    Raises:
+        RuntimeError: when no tiling of the op's operands fits the scratchpad.
+    """
+    anchor = get_anchor_node(node)
+    if anchor is None:
+        return None
+    limits = _vector_op_tiling_limits(anchor, config.vector_lanes)
+    if limits is None:
+        return None
+    last_dim, multiple_of = limits
 
     logger.info(f"Running L2 tiling for vector op: {node}")
 
@@ -710,45 +539,24 @@ def run_vector_op_node_l2_tiling(node, config):
         else None
     )
 
+    output_shape = _output_shape(node)
     tile_sizes = _search_tiling(
         node=node,
         full_shape=output_shape,
-        min_sizes=min_sizes,
         multiple_of=multiple_of,
         last_dim=last_dim,
-        shape_func=_build_vector_op_shape_map,
-        cache_size=cache_size,
-        bank_width=bank_width,
-        bank_size=None if num_banks is None else cache_size // num_banks,
-        num_banks=num_banks,
+        shape_builder_fn=_build_vector_op_shape_map,
+        cache_size=config.scratchpad_size,
+        num_banks=config.num_banks,
+        bank_width=config.bank_width,
         cost_fn=cost_fn,
     )
-
-    if tile_sizes is not None:
-        node.meta["l2_tiling"] = tuple(
-            s // ts for s, ts in zip(output_shape, tile_sizes)
+    if tile_sizes is None:
+        raise RuntimeError(
+            f"{node}: no tiling of its operands fits the scratchpad "
+            f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-
-
-def run_vector_op_l2_tiling(model, config):
-    """
-    Perform tiling on vector operations to fit intermediate data into cache.
-
-    Args:
-        model: A model object with a FX Graph containing vector operation nodes.
-        config (AcceleratorConfig): The hardware description.  When it carries a
-            DRAM bandwidth, tiles are chosen by the latency model (``tiling_cost``)
-            rather than by largest-that-fits.
-    """
-    graph = model.graph
-
-    for node in list(graph.nodes):
-        run_vector_op_node_l2_tiling(node, config)
-
-    graph.lint()
-    graph.eliminate_dead_code()
-    model.recompile()
-    return model
+    return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
 
 
 def _pool_input_extent(tile, stride, dilation, kernel_size):
@@ -827,85 +635,68 @@ def _build_adaptive_pool_shape_map(node, tile_sizes, divisor=None):
         }
 
 
-def run_pool_op_l2_tiling(model, config):
-    """
-    Perform tiling on pooling operations to fit intermediate data into Scratchpad.
+def pool_op_tiling(node, config):
+    """Per-dim tile counts for a pooling op, bare or fused.
 
-    Dispatches to the appropriate tiling strategy based on whether the op is
-    adaptive (tiles N and C) or non-adaptive (tiles N, H, W, and C).
+    Called from ``build_pool`` during bufferization, so it sees whatever fusion
+    left behind.  A fused submodule is searched as a whole: its inputs key on
+    their node names, so every operand the kernel loads is sized.
 
     Args:
-        model: A model object with a FX Graph containing pooling nodes.
-        config (AcceleratorConfig): The hardware description (vector lane count,
-            scratchpad size, banking).
+        node: The op to tile -- a pooling op, or a fused ``call_module`` around
+            one.
+        config (AcceleratorConfig): The hardware description.
+
+    Returns:
+        Tile counts over ``(N, H_out, W_out, C)`` for a non-adaptive pool or
+        ``(N, C)`` for an adaptive one, or ``None`` when the op is not a pool.
+
+    Raises:
+        RuntimeError: when no tiling of the op's operands fits the scratchpad.
     """
-    graph = model.graph
+    anchor = get_anchor_node(node)
+    if anchor is None or not is_pooling(anchor):
+        return None
 
     vector_unit_width = config.vector_lanes
-    cache_size = config.scratchpad_size
-    if cache_size is None:
-        cache_size = DEFAULT_CACHE_SIZE
-    num_banks = config.num_banks
-    bank_width = config.bank_width
-    bank_size = None if num_banks is None else cache_size // num_banks
 
-    for node in list(graph.nodes):
-        if not is_pooling(node):
-            continue
+    # The NHWC twins keep the name of the aten op they replace (see layout_ops)
+    # and differ only in namespace, so matching on the op name covers both.
+    name = str(anchor.target)
+    nhwc = anchor.target in NHWC_OP_VARIANTS.values()
 
-        # The NHWC twins keep the name of the aten op they replace (see
-        # layout_ops) and differ only in namespace, so matching on the op
-        # name covers both layouts.
-        name = str(node.target)
+    if name.endswith("max_pool2d.default"):
+        if nhwc:
+            N, H_out, W_out, C = anchor.shape
+        else:
+            N, C, H_out, W_out = anchor.shape
+        logger.info(f"Running L2 tiling for non-adaptive pool op: {node}")
+        full_shape = (N, H_out, W_out, C)
+        multiple_of = (1, 1, 1, vector_unit_width)
+        order = (3, 0, 1, 2)
+        shape_builder_fn = _build_non_adaptive_pool_shape_map
+    elif "adaptive" in name:
+        full_shape = (anchor.shape[0], anchor.shape[-1 if nhwc else 1])
+        logger.info(f"Running L2 tiling for adaptive pool op: {node}")
+        multiple_of = (1, vector_unit_width)
+        order = (1, 0)
+        shape_builder_fn = _build_adaptive_pool_shape_map
+    else:
+        return None
 
-        if name.endswith("max_pool2d.default"):
-            if node.target in NHWC_OP_VARIANTS.values():
-                N, H_out, W_out, C = node.shape
-            else:
-                N, C, H_out, W_out = node.shape
-            logger.info(f"Running L2 tiling for non-adaptive pool op: {node}")
-            full_shape = (N, H_out, W_out, C)
-            tile_sizes = _search_tiling(
-                node=node,
-                full_shape=full_shape,
-                min_sizes=(1, 1, 1, vector_unit_width),
-                order=(3, 0, 1, 2),
-                shape_func=_build_non_adaptive_pool_shape_map,
-                cache_size=cache_size,
-                bank_width=bank_width,
-                bank_size=bank_size,
-                num_banks=num_banks,
-            )
-            if tile_sizes is not None:
-                node.meta["l2_tiling"] = tuple(
-                    s // ts for s, ts in zip(full_shape, tile_sizes)
-                )
-
-        elif "adaptive" in name:
-            N = node.shape[0]
-            C = (
-                node.shape[-1]
-                if node.target in NHWC_OP_VARIANTS.values()
-                else node.shape[1]
-            )
-            logger.info(f"Running L2 tiling for adaptive pool op: {node}")
-            tile_sizes = _search_tiling(
-                node=node,
-                full_shape=(N, C),
-                min_sizes=(1, vector_unit_width),
-                order=(1, 0),
-                shape_func=_build_adaptive_pool_shape_map,
-                cache_size=cache_size,
-                bank_width=bank_width,
-                bank_size=bank_size,
-                num_banks=num_banks,
-            )
-            if tile_sizes is not None:
-                node.meta["l2_tiling"] = tuple(
-                    s // ts for s, ts in zip((N, C), tile_sizes)
-                )
-
-    graph.lint()
-    graph.eliminate_dead_code()
-    model.recompile()
-    return model
+    tile_sizes = _search_tiling(
+        node=node,
+        full_shape=full_shape,
+        multiple_of=multiple_of,
+        order=order,
+        shape_builder_fn=shape_builder_fn,
+        cache_size=config.scratchpad_size,
+        num_banks=config.num_banks,
+        bank_width=config.bank_width,
+    )
+    if tile_sizes is None:
+        raise RuntimeError(
+            f"{node}: no tiling of its operands fits the scratchpad "
+            f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
+        )
+    return tuple(s // ts for s, ts in zip(full_shape, tile_sizes))
