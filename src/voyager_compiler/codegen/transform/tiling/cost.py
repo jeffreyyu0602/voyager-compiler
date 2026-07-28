@@ -118,6 +118,15 @@ def _tile_elems(shape):
     return math.prod(shape)
 
 
+def _num_transfers(shape):
+    """DMAs a tiled operand costs -- one per tensor, so a ``quantize_mx`` pair
+    is two, each paying its own access latency for a tile of scales that is a
+    few hundred bytes."""
+    if shape and isinstance(shape[0], (tuple, list)):
+        return len(shape)
+    return 1
+
+
 def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     """Estimated cycles to run ``node`` under a candidate tiling.
 
@@ -125,32 +134,39 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     node -> tile shape (``node`` itself plus each allocated activation input;
     resident params are absent).  ``tiling`` is the per-dim tile *count*, so
     ``N = prod(tiling)`` is the number of tiles.  Per tile: ``C`` compute
-    cycles, ``D_read`` to load the inputs (a separate transfer per input, each
-    paying one DRAM access latency) and ``D_write`` to store the output.
+    cycles, ``D_read`` to load the inputs and ``D_write`` to store the output,
+    one transfer per *tensor* -- a ``quantize_mx`` output stores its scales as
+    a second DMA -- each paying one DRAM access latency.
 
     Double-buffered: the DRAM engine (all reads + writes, ``D = read + write``
     per tile) and the compute engine run concurrently, tile ``i``'s compute
     overlapping tile ``i+1``'s read and tile ``i-1``'s write.  The makespan is
     whichever engine is the bottleneck:
 
-    * DRAM-bound -- the DRAM stream never idles, ``N * D``; the first read and
-      last write are just its ends, so compute hides entirely.
+    * DRAM-bound -- the DRAM stream runs flat out, ``N * D``, plus the one
+      stall it cannot avoid: at fill both buffer slots are read before any
+      output exists, so the first store waits on the first compute,
+      ``max(0, C - read)``.  Compute hides entirely behind the rest.
     * compute-bound -- compute never idles, ``N * C``, preceded by the first
       read and followed by the last write (``+ D``) that cannot overlap it.
+      Fill needs no term here: compute is the busy engine, so the DRAM idle
+      costs nothing.
 
-    So ``makespan = max(N * D, N * C + D)``, which at ``N == 1`` is ``D + C`` (a
-    lone tile cannot overlap), matching the single-buffered cost.
+    So ``makespan = max(N * D + fill, N * C + D)``, which at ``N == 1`` is
+    ``D + C`` (a lone tile cannot overlap), matching the single-buffered cost.
     Single-buffered: load, compute and store run back to back, ``N * (D + C)``.
     """
     num_tiles = math.prod(tiling)
 
     out_shape = tiled_shapes[node]
     out_bytes = _operand_bytes(out_shape, node)
-    num_inputs = len(tiled_shapes) - 1  # every operand but the output
     in_bytes = sum(
         _operand_bytes(shp, n)
         for n, shp in tiled_shapes.items()
         if n is not node
+    )
+    num_reads = sum(
+        _num_transfers(shp) for n, shp in tiled_shapes.items() if n is not node
     )
 
     in_elems = max(
@@ -163,12 +179,23 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     util = vector_op_utilization(node, lanes, bpc)
     compute = math.ceil(math.ceil(tile_ops / lanes) / util)
 
-    read = num_inputs * config.access_latency_cycles + in_bytes / bpc
-    write = config.access_latency_cycles + out_bytes / bpc
+    lat = config.access_latency_cycles
+    read = num_reads * lat + in_bytes / bpc
+    write = _num_transfers(out_shape) * lat + out_bytes / bpc
     dram = read + write
 
     if config.double_buffered_l2:
-        return max(num_tiles * dram, num_tiles * compute + dram)
+        # A memory-bound sweep stalls the DRAM stream at both ends: at fill it
+        # holds only reads, so the first store waits on the first compute; at
+        # drain only stores, so the last store waits on the last compute.
+        # Neither costs anything while compute is the busy engine, and at
+        # ``N == 1`` they would be the same wait counted twice.
+        stalls = (
+            max(0.0, compute - read) + max(0.0, compute - write)
+            if dram >= compute
+            else 0.0
+        )
+        return max(num_tiles * dram + stalls, num_tiles * compute + dram)
     return num_tiles * (dram + compute)
 
 

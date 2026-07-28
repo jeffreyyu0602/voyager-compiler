@@ -102,12 +102,15 @@ def compute_tensor_size(
 
 def require_allocation(node: torch.fx.Node) -> bool:
     # A consumer's quantization lookup table is resident, not a streamed tile.
-    # Ask the op that reads it -- the anchor, for a fused kernel, whose params
-    # are its placeholders and resolve back through ``meta['source_node']``.
+    # Ask every op that reads it: in a fused kernel the table belongs to the
+    # tail's ``quantize_mx`` as often as to the anchor, and its params are
+    # placeholders that resolve back through ``meta['source_node']``.
     for user in node.users:
-        params = quant_param_arg_nodes(get_anchor_node(user))
-        if any(p.meta.get("source_node", p) is node for p in params):
-            return False
+        gm = user.meta.get("submodule")
+        for op in gm.graph.nodes if gm is not None else [user]:
+            params = quant_param_arg_nodes(op)
+            if any(p.meta.get("source_node", p) is node for p in params):
+                return False
 
     if (val := getattr(node, "value", None)) is None:
         return True
@@ -115,7 +118,7 @@ def require_allocation(node: torch.fx.Node) -> bool:
     if not isinstance(val, torch.Tensor):
         return False
 
-    if node.op == "get_attr" and val.numel() == 1:
+    if node.op in ["placeholder", "get_attr"] and val.numel() == 1:
         return False
 
     return True
