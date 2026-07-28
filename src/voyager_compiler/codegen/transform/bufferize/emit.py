@@ -1295,6 +1295,12 @@ def _print_cond(
           <false region>
           yield <false results>
         }
+
+    Only the result slots the enclosing graph reads back are yielded.  A branch
+    that just writes buffers still has to return *something* to ``torch.cond``,
+    and that placeholder value (the ``0`` a guard branch returns) is dead — so
+    such a branch prints no ``yield`` at all.  A guard's false branch is then
+    left with nothing to print, and its ``else`` region is dropped entirely.
     """
     pred = _fmt_arg(node.args[0])
     operands = list(node.args[3]) if len(node.args) > 3 else []
@@ -1317,26 +1323,32 @@ def _print_cond(
     true_mod, true_binds = _branch(node.args[1])
     false_mod, false_binds = _branch(node.args[2])
 
+    getitems = [u for u in node.users if u.target is operator.getitem]
+    if len(getitems) < len(node.users):
+        # A user reading the result tuple whole keeps every slot live.
+        live = list(range(len(_outputs_of(true_mod))))
+    else:
+        live = sorted({g.args[1] for g in getitems if g.users})
+
+    def _render_branch(mod) -> List[str]:
+        body: List[str] = []
+        if not isinstance(mod, GraphModule):
+            return body
+        _print_graph(
+            mod, body, indent + 1, skip_placeholders=True, terminator=None
+        )
+        if live:
+            results = _outputs_of(mod)
+            body.append(f"{pad}  yield {_fmt_arg([results[i] for i in live])}")
+        return body
+
     lines.append(
         f"{pad}{node.name}{_type_str(node)} = if {pred} ({true_binds}) {{"
     )
-    if isinstance(true_mod, GraphModule):
-        _print_graph(
-            true_mod,
-            lines,
-            indent + 1,
-            skip_placeholders=True,
-            terminator="yield",
-        )
-    lines.append(f"{pad}}} else ({false_binds}) {{")
-    if isinstance(false_mod, GraphModule):
-        _print_graph(
-            false_mod,
-            lines,
-            indent + 1,
-            skip_placeholders=True,
-            terminator="yield",
-        )
+    lines.extend(_render_branch(true_mod))
+    if false_body := _render_branch(false_mod):
+        lines.append(f"{pad}}} else ({false_binds}) {{")
+        lines.extend(false_body)
     lines.append(f"{pad}}}")
 
 
@@ -1351,6 +1363,10 @@ def _print_commit(
           <body>
           return <results>
         }
+
+    A region that only writes buffers still has to return something (an empty
+    list), which nothing downstream reads — so the ``return`` is printed only
+    when the enclosing graph reads the commit's result.
     """
     subgraph, operands = node.args[0], list(node.args[1:])
     mod = named.get(str(subgraph.target)) or getattr(
@@ -1368,11 +1384,20 @@ def _print_commit(
     post = node.kwargs.get("post", None)
     if post is not None:
         tags += f" post={_fmt_arg(post)}"
+    read = any(
+        user.target is not operator.getitem or user.users for user in node.users
+    )
     lines.append(
         f"{pad}{node.name}{_type_str(node)} = commit {tags} ({binds}) {{"
     )
     if isinstance(mod, GraphModule):
-        _print_graph(mod, lines, indent + 1, skip_placeholders=True)
+        _print_graph(
+            mod,
+            lines,
+            indent + 1,
+            skip_placeholders=True,
+            terminator="return" if read else None,
+        )
     lines.append(f"{pad}}}")
 
 
@@ -1381,8 +1406,11 @@ def _print_graph(
     lines: List[str],
     indent: int,
     skip_placeholders: bool = False,
-    terminator: str = "return",
+    terminator: Optional[str] = "return",
 ) -> None:
+    """Render ``gm``'s nodes into ``lines``.  ``terminator`` is the keyword the
+    output node prints with, or ``None`` to drop it — a ``cond`` branch prints
+    its own ``yield``, over the live result slots only."""
     pad = "  " * indent
     named = dict(gm.named_modules())
 
@@ -1394,7 +1422,8 @@ def _print_graph(
                 lines.append(f"{pad}arg {node.name}{_type_str(node)}")
             continue
         if node.op == "output":
-            lines.append(f"{pad}{terminator} {_fmt_arg(node.args[0])}")
+            if terminator is not None:
+                lines.append(f"{pad}{terminator} {_fmt_arg(node.args[0])}")
             continue
         if node.op == "get_attr":
             sub = getattr(gm, str(node.target), None)
