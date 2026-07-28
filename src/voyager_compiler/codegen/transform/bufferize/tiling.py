@@ -39,16 +39,13 @@ from ...node_info import (
     trailing_mha_perm,
     weight_is_ck,
 )
-from ..tiling.search import gemv_op_tiling
+from ..tiling.cost import _step_classes, _sweep_cycles
+from ..tiling.search import DEFAULT_RUNTIME_TOLERANCE, gemv_op_tiling
 from .utils import _unproject, _NHWC, _HWIO
 from ....pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
-
-# How much longer than the best modeled runtime a mapping may take and still
-# be chosen; the least-energy one among those wins.  0.0 = only the fastest.
-DEFAULT_RUNTIME_TOLERANCE = 0.01
 
 # Partial-sum width, bits -- shared by the timing model and the tile sizing.
 # ``accumulate_fp32`` is never enabled today; wire it through if that changes.
@@ -505,6 +502,14 @@ class RuntimeCalculator:
         double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
             costs ``max(dram, compute)`` and not their sum.
         has_sparse_op: Double the weight load time.
+        batch: Grid steps the builder loops *outside* the mapping -- a bmm's
+            leading dims, which share no operand, unlike interstellar's own
+            ``ON`` (a conv's image batch, over one set of filters).  The
+            mapping covers one such step, so the sweep is it repeated
+            ``batch`` times with every operand re-fetched.
+        weight_batch: Distinct weight tiles over those ``batch`` steps, fewer
+            when a group shares one -- eight KV heads reaching an attention
+            matmul as thirty-two.  ``None`` = one apiece.
         has_tail: The node has a fused post-op, so a reduction drains through
             the vector unit; a bare GEMM reduces in place and does not.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
@@ -535,6 +540,8 @@ class RuntimeCalculator:
         dram_access_latency_cycles: float,
         double_buffered_l2: bool = False,
         has_sparse_op: bool = False,
+        batch: int = 1,
+        weight_batch: Optional[int] = None,
         has_tail: bool = False,
         tail_specs=(),
         input_scale_width: int = 0,
@@ -552,12 +559,15 @@ class RuntimeCalculator:
         self.dram_access_latency_cycles = dram_access_latency_cycles
         self.double_buffered_l2 = double_buffered_l2
         self.has_sparse_op = has_sparse_op
+        self.batch = batch
+        self.weight_batch = batch if weight_batch is None else weight_batch
         self.has_tail = has_tail
         self.tail_specs = tuple(tail_specs)
         self.input_scale_width = input_scale_width
         self.weight_scale_width = weight_scale_width
         self.output_scale_width = output_scale_width
         self.scale_block_size = scale_block_size
+        self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
         """DRAM bytes each fused tail operand streams for one output tile --
@@ -591,7 +601,7 @@ class RuntimeCalculator:
             default=0,
         )
 
-    def matrix_unit_cycles(self, mapping):
+    def matrix_cycles(self, mapping):
         """Matrix-unit cycles of one L3 grid step: the L2 sweep of
         weight-reuse tiles, plus the once-per-sweep overhead (buffer fill,
         systolic skew, accumulator drain) spread over the steps a
@@ -658,7 +668,7 @@ class RuntimeCalculator:
         )
         store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
         # The tail runs only on the last K step: with num_k > 1 that step is
-        # charged by ``vector_unit_cycles``, and the rest only accumulate --
+        # charged by ``vector_cycles``, and the rest only accumulate --
         # adding the output into a psum-width partial sum, reading no operand.
         if num_k == 1:
             store_cycles = max(store_cycles, self.tail_fetch_cycles(mapping))
@@ -703,23 +713,25 @@ class RuntimeCalculator:
         normalize_factor = self._l3_blocks(mapping) if num_k == 1 else num_k
         return steady + overhead / normalize_factor
 
-    def vector_unit_cycles(self, mapping):
-        """Vector-unit cycles to finish one L3 output tile: the tail's reads
-        and the write-out, at the node's output width rather than the partial
-        sum's.  Charged on the grid step that ends a K sweep, after that
-        step's accumulation.
+    def vector_cycles(self, mapping):
+        """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
+        step that ends a K sweep, after that step's accumulation.
+
+        One lane group per cycle, sized by the widest element the tail touches
+        -- the partial sum it reads, not the narrower value a ``quantize_mx``
+        writes.  Divides by ``dram_bandwidth``, not ``sram_bandwidth``: that is
+        what ``vector_op_utilization`` charges, and it prices this same tail in
+        the reporting model.
         """
         blockings = mapping.loop_blockings
         output_size = 1
         for loop in [le.OC, le.OY, le.OX]:
             output_size *= blockings[loop][1] * blockings[loop][2]
         oc_dim = mapping.loop_partitionings[le.OC][0]
-        store_cycles = math.ceil(
-            self.output_dtype_width * oc_dim / self.sram_bandwidth
-        )
-        fetch_cycles = self.tail_fetch_cycles(mapping)
-        vector_unit_time = output_size * max(store_cycles, fetch_cycles)
-        return vector_unit_time
+        widths = [self.output_dtype_width, self.accum_dtype_width]
+        widths += [bits for _, bits in self.tail_specs]
+        lane_bytes = max(widths) / 8 * oc_dim
+        return output_size * math.ceil(lane_bytes / self.dram_bandwidth)
 
     @staticmethod
     def _l3_blocks(mapping):
@@ -756,6 +768,20 @@ class RuntimeCalculator:
             if orders[d][3] >= innermost:
                 steps *= blockings[d][3]
         return steps
+
+    def _batch_loads(self, mapping, dims, distinct):
+        """Fetches of an operand spanning ``dims`` over the whole sweep, the
+        batch loop the builder wraps the mapping in included.
+
+        Diced inside a batch step, the operand re-reads in full on every one:
+        the next step restarts the sequence, so its first block differs from
+        the last one loaded and the guard never fires.  Held whole, the tile
+        survives into the next step and only a change of block costs --
+        ``distinct`` of them over the batch, which is fewer than ``batch``
+        for an operand a group shares and 1 for one they all share.
+        """
+        per_step = self._l3_loads(mapping, dims) if dims else 1
+        return per_step * (self.batch if per_step > 1 else distinct)
 
     def calculate_runtime(self, architecture, layer, mapping):
         blockings = mapping.loop_blockings
@@ -802,90 +828,115 @@ class RuntimeCalculator:
             sizes = [s for s in sizes if s]
             return len(sizes) * lat + sum(sizes) / self.dram_bandwidth
 
-        input_load = transfer(
+        input_sizes = (
             input_elems * self.input_dtype_width / 8,
             input_elems / self.scale_block_size * self.input_scale_width / 8,
         )
-        weight_load = transfer(
+        weight_sizes = (
             weight_elems * self.weight_dtype_width / 8,
             weight_elems / self.scale_block_size * self.weight_scale_width / 8,
         )
-        store = transfer(
+        output_sizes = (
             output_elems * self.output_dtype_width / 8,
             output_elems / self.scale_block_size * self.output_scale_width / 8,
         )
-        # The fused tail streams its own operands (a residual, a mask) once per
-        # output tile, on the step that runs it.
-        tail_load = transfer(*self.tail_tile_sizes(mapping))
+        input_load = transfer(*input_sizes)
+        weight_load = transfer(*weight_sizes)
+        store = transfer(*output_sizes)
 
-        l3_blocks = self._l3_blocks(mapping)
-        num_k = blockings[le.IC][3]
-        output_tiles = l3_blocks // num_k
-        matrix_unit_cycles = self.matrix_unit_cycles(mapping)
-        vector_unit_cycles = (
-            self.vector_unit_cycles(mapping) if self.has_tail else 0
+        # A tail operand spans output dims alone, so its count already runs
+        # over the output steps -- the only ones that read it.
+        tail_sizes = self.tail_tile_sizes(mapping)
+        tail_dmas = [
+            (
+                transfer(size),
+                self._batch_loads(
+                    mapping, dims, self.batch if le.ON in dims else 1
+                ),
+            )
+            for (dims, _), size in zip(self.tail_specs, tail_sizes)
+        ]
+
+        matrix_cycles = self.matrix_cycles(mapping)
+        vector_cycles = self.vector_cycles(mapping) if self.has_tail else 0
+
+        input_steps = self._batch_loads(mapping, self._IF_DIMS, self.batch)
+        weight_steps = self._batch_loads(
+            mapping, self._FL_DIMS, self.weight_batch
         )
 
-        # An operand is re-fetched only when its block index moves, which the
-        # mapping's L3 order decides -- so read it off the mapping rather than
-        # assuming a nest.  With the reduction split it is innermost and both
-        # operands change every step; otherwise the operand that does not span
-        # the innermost loop is held across that loop's whole run.  Which one
-        # that is depends on the op: with N innermost the input is held (it
-        # does not span N), with a conv's X innermost it is the weight.
-        input_steps = self._l3_loads(mapping, self._IF_DIMS)
-        weight_steps = self._l3_loads(mapping, self._FL_DIMS)
+        # The mapping covers one batch element; the builder loops the rest.
+        l3_blocks = self._l3_blocks(mapping) * self.batch
+        num_k = blockings[le.IC][3]
+        output_tiles = l3_blocks // num_k
 
-        if self.double_buffered_l2:
-            if num_k == 1:
-                # Every step finishes an output tile: it stores, runs the tail
-                # and reloads the streaming operand; only the steps where the
-                # held one moves also pay for it.  Every L3 loop belongs to one
-                # operand or the other, so exactly one of them streams.
-                held_steps = min(input_steps, weight_steps)
-                held_load, streamed_load = (
-                    (input_load, weight_load)
-                    if input_steps < weight_steps
-                    else (weight_load, input_load)
-                )
-                step = streamed_load + tail_load + store
-                total_time = (
-                    input_load
-                    + weight_load
-                    + held_steps * max(step + held_load, matrix_unit_cycles)
-                    + (l3_blocks - held_steps) * max(step, matrix_unit_cycles)
-                    + store
-                )
-            else:
-                load = input_load + weight_load
-                store_steps = output_tiles - 1
-                accum_steps = l3_blocks - 2 * store_steps
+        # Traffic the sweep moves, for a caller ranking by DRAM rather than by
+        # time, and to check the reuse counts against a profile.  Every
+        # candidate mapping is priced through here, so it describes the last
+        # one scored -- read it straight after the call that priced the mapping
+        # in question.
+        self.dram_bytes = {
+            "input": input_steps * sum(input_sizes),
+            "weight": weight_steps * sum(weight_sizes),
+            "output": output_tiles * sum(output_sizes),
+            "tail": sum(t * s for (_, t), s in zip(tail_dmas, tail_sizes)),
+        }
 
-                prefetch = load + tail_load
-                compute = max(matrix_unit_cycles, prefetch) + matrix_unit_cycles
-                dma = (
-                    max(matrix_unit_cycles + vector_unit_cycles, prefetch)
-                    + store
-                    + load
-                )
-                total_time = (
-                    load
-                    + accum_steps * max(load, matrix_unit_cycles)
-                    + store_steps * max(compute, dma)
-                    + vector_unit_cycles
-                    + store
-                )
-        else:
-            total_time = (
-                l3_blocks * matrix_unit_cycles
-                + weight_steps * weight_load
-                + input_steps * input_load
-                + output_tiles * (tail_load + store)
-            )
+        dmas = [
+            (store, output_tiles),
+            (input_load, input_steps),
+            (weight_load, weight_steps),
+            *tail_dmas,
+        ]
+
+        if not self.double_buffered_l2:
+            total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
             if num_k > 1:
-                total_time += output_tiles * vector_unit_cycles
+                total_time += output_tiles * vector_cycles
+            return total_time
 
+        if num_k == 1:
+            # Every step finishes a tile: one schedule covers the sweep.
+            return _sweep_cycles(dmas, l3_blocks, matrix_cycles)
+
+        load = input_load + weight_load
+        # The sweep's last step has no tile after it to prefetch, so it costs
+        # compute alone: hold it out of the count and let the epilogue charge
+        # it, with the tail and store that drain behind it.
+        accum_steps = l3_blocks - 2 * (output_tiles - 1) - 1
+        classes = _step_classes(tail_dmas, output_tiles)
+        # Hold out the first output step in the same way -- the prologue fetches
+        # its tail, with nothing running yet to hide it behind.  Taking what
+        # that step owed leaves every tail fetch counted exactly once.
+        first_tail = classes[-1][0]
+        classes[-1] = (classes[-1][0], classes[-1][1] - 1)
+
+        total_time = load + first_tail + accum_steps * max(load, matrix_cycles)
+        # One window per remaining tile, spanning two grid steps: the matrix
+        # unit finishes this tile and starts the next, while DRAM fits that
+        # tile's tail read, its store and the next prefetch into the same span.
+        # The busier side sets the price, and only the tail differs from one
+        # window to the next -- hence one price per class.
+        for tail, count in classes:
+            prefetch = load + tail
+            compute = max(matrix_cycles, prefetch) + matrix_cycles
+            dma = max(matrix_cycles + vector_cycles, prefetch) + store + load
+            total_time += count * max(compute, dma)
+        total_time += matrix_cycles + vector_cycles + store
         return total_time
+
+
+def _weight_repeat(node):
+    """Batch steps that share one weight tile -- four query heads reading one
+    GQA KV head.  ``_peel_weight`` decides the repeat the builder folds into
+    the block index, so ask it rather than keep a second opinion.
+    """
+    # Local import: ``pipeline`` imports ``get_tiling`` from this module.
+    from .pipeline import _peel_weight
+
+    weight = node.args[1]
+    repeat = _peel_weight(weight)[2]
+    return math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
 
 
 def _extract_layer_from_node(node):
@@ -1012,6 +1063,9 @@ def run_interstellar(
     if layer is None:
         return None, None, None
 
+    # The layer describes one batch element; ``build_gemm`` loops the rest.
+    batch = math.prod(node.value.shape[:-2]) if is_bmm(node) else 1
+
     mx_out = isinstance(out_dtype, (list, tuple))
     of_dtype = out_dtype[-1] if mx_out else out_dtype
     if_bits = _node_dtype_bits(node.args[0])
@@ -1045,6 +1099,8 @@ def run_interstellar(
         tiler.config.bytes_per_cycle,
         tiler.config.access_latency_cycles,
         double_buffered_l2=tiler.config.double_buffered_l2,
+        batch=batch,
+        weight_batch=batch // _weight_repeat(node),
         has_tail=has_tail,
         tail_specs=fused_specs,
         input_scale_width=if_scale_bits,
@@ -1095,7 +1151,7 @@ def run_interstellar(
         f"IC={b[le.IC][3]} OC={b[le.OC][3]} "
         f"OX={b[le.OX][3]} OY={b[le.OY][3]} ON={b[le.ON][3]}"
     )
-    per_tile_cycles = rc.matrix_unit_cycles(mapping)
+    per_tile_cycles = rc.matrix_cycles(mapping)
     logger.info(f"[interstellar] {node.name} estimated runtime: {runtime}")
     logger.info(
         f"[interstellar] {node.name} per-tile compute cycles: "

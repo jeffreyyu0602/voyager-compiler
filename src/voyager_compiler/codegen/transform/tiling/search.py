@@ -21,7 +21,7 @@ from ...node_info import (
     weight_is_ck,
 )
 from .banking import GEMV_BANK_GROUPS, require_allocation, scratchpad_bytes
-from .cost import vector_tile_latency
+from .cost import gemv_tile_latency, vector_tile_latency
 from ....layout_ops import NHWC_OP_VARIANTS
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,11 @@ __all__ = [
     "pool_op_tiling",
     "vector_op_tiling",
 ]
+
+# How much longer than the best modeled runtime a tiling may take and still be
+# chosen; the least-traffic one among those wins.  0.0 = only the fastest.
+# Shared with the interstellar tiler, which selects the same way.
+DEFAULT_RUNTIME_TOLERANCE = 0.01
 
 
 def get_valid_tiling(
@@ -111,6 +116,7 @@ def _search_tiling(
     last_dim=None,
     multiple_of=None,
     cost_fn=None,
+    tolerance=0.0,
 ):
     """
     Generic driver over the valid tilings, scoring each by the scratchpad it
@@ -120,8 +126,13 @@ def _search_tiling(
     ``get_valid_tiling`` yields candidates largest -> smallest.  Without
     ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
     fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
-    tiled_shapes, tiling) -> latency`` -- every fitting candidate is
-    scored and the minimum-latency one is returned (DRAM-aware two-step search).
+    tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every fitting candidate
+    is scored and the one moving the fewest bytes wins among those within
+    ``(1 + tolerance)`` of the best latency.  Latency alone is not enough: a
+    compute-bound op is equally fast however its operands are diced, so the
+    residue the model leaves behind would buy any amount of traffic for a
+    rounding error.  This is how the interstellar tiler picks a mapping too
+    (``mapping_point_generator``, with energy in place of bytes).
     """
     bank_size = None if num_banks is None else cache_size // num_banks
 
@@ -130,7 +141,7 @@ def _search_tiling(
     # fits at any tile size.  Retry with progressively more sharing and keep
     # the first (least-shared) tiling that maps.
     for extra_sharing in range(len(GEMV_BANK_GROUPS)):
-        best = None  # (score, tile_sizes)
+        scored = []  # (latency, dram_bytes, tile_sizes)
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
             multiple_of=multiple_of,
@@ -154,12 +165,15 @@ def _search_tiling(
             if cost_fn is None:
                 return tile_sizes
 
-            score = cost_fn(node, tile_sizes, tiled_shapes, tiling)
-            if best is None or score < best[0]:
-                best = (score, tile_sizes)
+            latency, traffic = cost_fn(node, tile_sizes, tiled_shapes, tiling)
+            scored.append((latency, traffic, tile_sizes))
 
-        if best is not None:
-            return best[1]
+        if scored:
+            budget = min(s[0] for s in scored) * (1.0 + tolerance)
+            return min(
+                (s for s in scored if s[0] <= budget),
+                key=lambda s: (s[1], s[0]),
+            )[2]
 
     logger.debug(f"Failed to tile {node} with cache size {cache_size}.")
     return None
@@ -302,14 +316,13 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
                 continue
             shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
 
-    if len(_output_shape(node)) == len(anchor.shape):
+    if tuple(_output_shape(node)) == tuple(anchor.shape):
         shapes[node] = compute_output_tiled_shapes(node, divisor)
     else:
-        # An MHA relayout re-cut ``N`` into ``(heads, head_dim)``: the tile
-        # holds whole heads, so the count belongs on the head dim and not on
-        # the last one ``compute_tiled_shape`` right-aligns it to.  No dim
-        # survives the permute, but the number of blocks does, and these
-        # shapes are only ever read for their product.
+        # An MHA relayout re-cut ``N`` into ``(heads, head_dim)``, so
+        # ``divisor`` -- indexed against the anchor's dims -- no longer lines
+        # up.  The block count survives, and these shapes are only ever read
+        # for their product.
         blocks = math.prod(divisor)
         values = node.value
         values = values if isinstance(values, (list, tuple)) else [values]
@@ -375,12 +388,21 @@ def gemv_op_tiling(node, config):
         cache_size=config.scratchpad_size,
         num_banks=config.num_banks,
         bank_width=config.bank_width,
+        cost_fn=(
+            partial(gemv_tile_latency, config=config)
+            if config.dram_bandwidth is not None
+            else None
+        ),
+        tolerance=DEFAULT_RUNTIME_TOLERANCE,
     )
 
     # C whole leaves the input vector loop-invariant, so its guarded load
     # fetches it once however many output tiles there are: tile K alone if any
     # such tile fits.  Failing that, split C as far as it takes to buy the
     # largest K tile, since the input is then re-read once per output tile.
+    # ``get_valid_tiling`` reduces in ``order``, leaving what it already
+    # reduced at its smallest, so C whole is only ever reachable from the first
+    # pass -- the cost function ranks within one, it cannot cross them.
     tile_sizes = search(order=(2,)) or search(order=(1, 2))
     if tile_sizes is None:
         raise RuntimeError(
