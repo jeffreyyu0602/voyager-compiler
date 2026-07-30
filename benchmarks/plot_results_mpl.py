@@ -34,7 +34,7 @@ import numpy as np
 from openpyxl import load_workbook
 
 DEFAULT_WORKBOOK = "benchmarks/results/latest/results.xlsx"
-DEFAULT_OUT = "figures"
+DEFAULT_OUT = "benchmarks/figures"
 
 # Both metrics divide by 1e9: latency cycles @ 1 GHz -> seconds, bytes -> GB.
 # The per-module breakdown stays in cycles, shown in millions.
@@ -51,9 +51,11 @@ TICK_PT = 22
 TEXT_PT = 19
 TITLE_PT = 20
 # A merged prefill-over-decode figure: the per-mode label sits just under the
-# shared suptitle, with a small gap between the stacked panels.
+# shared suptitle, with a small gap between the stacked panels -- wider when
+# the panels do not share an x-axis, so the upper one's labels clear the lower.
 PAIR_TITLE_PT = 20
 PAIR_HSPACE = 0.05
+PAIR_HSPACE_UNSHARED = 0.1
 # Headroom above the top mark, leaving the value labels somewhere to go.  The
 # two axes of the latency+DRAM chart get *different* headroom on purpose: most
 # sweeps here are DRAM-bound at a near-constant GB/s, so latency is DRAM
@@ -225,7 +227,7 @@ def _save(fig, out_dir, stem):
     return [path]
 
 
-def _axis_latency_dram(fig, ax, labels, latency, dram, title, log):
+def _axis_latency_dram(fig, ax, labels, latency, dram, title, log, xlabel=None):
     """Draw latency (bars, left/seconds) + total DRAM traffic (line, right/GB)
     onto ``ax`` and its twinx.  Returns ``(handles, names)`` for a shared
     legend; the caller owns the figure, so this neither legends nor saves."""
@@ -249,6 +251,8 @@ def _axis_latency_dram(fig, ax, labels, latency, dram, title, log):
     ax.set_ylabel("Latency (s)", fontsize=LABEL_PT, fontweight="bold")
     _limits(ax, list(seconds), log, headroom=LATENCY_HEADROOM)
     _bold_ticks(ax, labels, x, pt, crowded)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=TEXT_PT, fontweight="bold")
     _label_bars(ax, bars, seconds, vpt, COLORS[0])
 
     right = ax.twinx()
@@ -293,7 +297,7 @@ def _axis_latency_dram(fig, ax, labels, latency, dram, title, log):
     return [bars, line], ["Latency", "DRAM Traffic"]
 
 
-def _axis_stacked(fig, ax, labels, series, ylabel, title, log):
+def _axis_stacked(fig, ax, labels, series, ylabel, title, log, xlabel=None):
     """Draw a stacked bar per category onto ``ax``; ``series`` is ordered
     ``(name, values)``.  Returns ``(handles, names)`` for a shared legend."""
     x = np.arange(len(labels))
@@ -326,6 +330,8 @@ def _axis_stacked(fig, ax, labels, series, ylabel, title, log):
     # stack; on a crowded axis the totals turn upright to stay apart.
     _limits(ax, list(bottom), log, headroom=CROWDED_HEADROOM)
     _bold_ticks(ax, labels, x, pt, crowded)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=TEXT_PT, fontweight="bold")
     _label_bars(ax, bars, bottom, vpt, "black", rot=90 if crowded else 0)
     ax.set_title(title, fontsize=TITLE_PT, fontweight="bold")
     return handles, [n for n, _ in series]
@@ -340,66 +346,65 @@ def draw_stacked(labels, series, ylabel, title, log, out_dir, stem):
     return _save(fig, out_dir, stem)
 
 
-def draw_pair(calls, suptitle, base_figsize, out_dir, stem):
+def draw_pair(calls, suptitle, base_figsize, out_dir, stem, sharex=True):
     """One figure with a subplot per entry of ``calls`` stacked top to bottom --
-    prefill above decode -- under one shared ``suptitle``.  Both modes plot the
-    same sweep points, so the panels share one x-axis (labeled once, at the
-    bottom); each ``call(fig, ax)`` draws one mode, titles its panel with the
-    mode, and returns ``(handles, names)`` for the shared legend."""
+    prefill above decode -- under one shared ``suptitle``.  Each ``call(fig,
+    ax)`` draws one mode, titles its panel with the mode, and returns
+    ``(handles, names)`` for the shared legend.  With ``sharex`` the panels
+    plot the same points and share one x-axis, labeled once at the bottom;
+    without it each panel carries its own tick + axis labels (the pe sweep,
+    whose modes read different axes)."""
     w, h = base_figsize
     fig, axes = plt.subplots(
         len(calls),
         1,
         figsize=(w, h * len(calls)),
         layout="constrained",
-        sharex=True,
+        sharex=sharex,
     )
-    # Room between the panels so the lower one's mode title clears the upper.
-    fig.get_layout_engine().set(hspace=PAIR_HSPACE)
+    fig.get_layout_engine().set(
+        hspace=PAIR_HSPACE if sharex else PAIR_HSPACE_UNSHARED
+    )
     axes = np.atleast_1d(axes)
     handles = names = None
     for ax, call in zip(axes, calls):
         handles, names = call(fig, ax)
         # The mode label sits under the shared suptitle, a step smaller.
         ax.title.set_fontsize(PAIR_TITLE_PT)
-        # sharex hides the inner panels' x labels; keep only the bottom's.
-        ax.label_outer()
+        # A shared x-axis is labeled once, at the bottom.
+        if sharex:
+            ax.label_outer()
     fig.suptitle(suptitle, fontsize=TITLE_PT, fontweight="bold")
     _legend(fig, handles, names, ncol=len(names))
     return _save(fig, out_dir, stem)
 
 
 def _latency_axis(fig, ax, entry, log):
-    """Adapt a metric-sheet ``(block, mode, lat_title, brk_title)`` entry to
+    """Adapt a metric-sheet ``(block, mode, lat, brk, labels, xlabel)`` entry to
     :func:`_axis_latency_dram` -- one ``draw_pair`` panel, titled by its mode.
     """
-    block, mode, *_ = entry
+    block, mode, _lat, _brk, labels, xlabel = entry
     return _axis_latency_dram(
         fig,
         ax,
-        [r["point"] for r in block],
+        labels,
         [r["total_latency"] for r in block],
         [r["dram_total"] for r in block],
         mode.capitalize(),
         log,
+        xlabel,
     )
 
 
 def _breakdown_axis(fig, ax, entry, log):
     """Adapt a metric-sheet entry to the DRAM Weight/Activation/KV stack."""
-    block, mode, *_ = entry
+    block, mode, _lat, _brk, labels, xlabel = entry
     series = [
         (name, [(r[field] or 0) / BYTES_PER_GB for r in block])
         for name, field in DRAM_SERIES
     ]
     return _axis_stacked(
-        fig,
-        ax,
-        [r["point"] for r in block],
-        series,
-        "DRAM (GB)",
-        mode.capitalize(),
-        log,
+        fig, ax, labels, series, "DRAM (GB)", mode.capitalize(), log, xlabel
     )
 
 
@@ -440,10 +445,23 @@ def _shared_title(title):
     return title
 
 
+def _axis_spec(group, mode, points):
+    """A ``(panel, mode)``'s ``(tick labels, x-axis label)``.  Only the hardware
+    ``pe`` sweep relabels: prefill fills the whole NxN array (``16x16``, "PE
+    Array Size"), decode is vector-bound and reads one dimension as lanes (the
+    trailing number, "Vector Lanes").  Every other sweep keeps its points,
+    unlabeled and shared across the two panels."""
+    if group == "pe":
+        if mode == "decode":
+            return [p.split("x")[-1] for p in points], "Vector Lanes"
+        return list(points), "PE Array Size"
+    return list(points), None
+
+
 def plot_metric_sheet(ws, log, out_dir):
     """One sweep sheet: per group, a latency+DRAM figure and a DRAM-breakdown
-    figure, each with prefill on the left and decode on the right under a
-    single shared title (the workbook's, minus the per-mode word)."""
+    figure, each with prefill above decode under a single shared title (the
+    workbook's, minus the per-mode word)."""
     rows = _rows(ws)
     titles = _chart_titles(ws)
     written = []
@@ -451,7 +469,9 @@ def plot_metric_sheet(ws, log, out_dir):
     # Charts were added group-major, prefill before decode, latency then
     # breakdown.  Walk that order to pair each (group, mode) with its two
     # titles, collecting the modes of a group side by side.
-    grouped = {}  # group -> [entry per mode]; entry = (block, mode, lat, brk)
+    grouped = (
+        {}
+    )  # group -> [entry]; entry = (block, mode, lat, brk, labels, xl)
     idx = 0
     for group in dict.fromkeys(r["group"] for r in rows):
         for mode in MODES:
@@ -463,16 +483,24 @@ def plot_metric_sheet(ws, log, out_dir):
             lat = titles[idx] if idx < len(titles) else ws.title
             brk = titles[idx + 1] if idx + 1 < len(titles) else ws.title
             idx += 2
-            grouped.setdefault(group, []).append((block, mode, lat, brk))
+            labels, xlabel = _axis_spec(
+                group, mode, [r["point"] for r in block]
+            )
+            grouped.setdefault(group, []).append(
+                (block, mode, lat, brk, labels, xlabel)
+            )
 
     for group, entries in grouped.items():
-        base = _layout([r["point"] for r in entries[0][0]])[0]
+        base = _layout(entries[0][4])[0]
+        # Share one x-axis only when both panels label it the same way.
+        sharex = len({(tuple(e[4]), e[5]) for e in entries}) == 1
         written += draw_pair(
             [partial(_latency_axis, entry=e, log=log) for e in entries],
             _shared_title(entries[0][2]),
             base,
             out_dir,
             _stem(ws.title, group, "latency_dram"),
+            sharex,
         )
         written += draw_pair(
             [partial(_breakdown_axis, entry=e, log=log) for e in entries],
@@ -480,6 +508,7 @@ def plot_metric_sheet(ws, log, out_dir):
             base,
             out_dir,
             _stem(ws.title, group, "dram_breakdown"),
+            sharex,
         )
     return written
 

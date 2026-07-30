@@ -200,7 +200,7 @@ def draw_stacked(panels, xlabel, suptitle, logx, out_dir, stem):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--workbook", default=style.DEFAULT_WORKBOOK)
-    p.add_argument("--out", default="tmp")
+    p.add_argument("--out", default=style.DEFAULT_OUT)
     p.add_argument(
         "--verify",
         action="store_true",
