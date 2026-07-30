@@ -33,8 +33,7 @@ from ...node_info import (
     is_conv2d,
     is_depthwise_conv,
     is_fully_connected,
-    is_linear,
-    is_matmul,
+    is_gemm_op,
     quant_param_arg_nodes,
     trailing_mha_perm,
     weight_is_ck,
@@ -213,14 +212,15 @@ def build_interstellar_tiler(
     )
 
 
-def _layer_cache_key(node, out_dtype, fused=()):
-    """A hashable key capturing everything (besides the fixed architecture) that
-    determines a node's interstellar mapping: op, operand / output shapes, the
-    conv stride/padding/dilation, the operand + scale element widths, the
-    microscaling block size, and the fused post-op operand descriptors.
-    Identical layers thus share one optimizer run.  ``out_dtype`` is the outer
-    node's output dtype (a ``(scale, value)`` list for a fused mx output);
-    list-ified to a tuple so the key stays hashable."""
+def _layer_cache_key(node):
+    """A hashable key for what the *node alone* says about its interstellar
+    mapping: op, operand / output shapes, the conv stride/padding/dilation, the
+    operand + scale element widths and the microscaling block size.  Identical
+    layers thus share one optimizer run.
+
+    The architecture is fixed for a run, so it is left out; so is anything the
+    caller knows and the node does not -- the output dtype, the fused post-op
+    operands -- which the caller appends to what it gets back."""
     val = node.value
     out_shape = tuple(val.shape) if isinstance(val, torch.Tensor) else None
     key = [
@@ -233,8 +233,6 @@ def _layer_cache_key(node, out_dtype, fused=()):
         _node_dtype_bits(node.kwargs.get("input_scale"), 0),
         _node_dtype_bits(node.kwargs.get("weight_scale"), 0),
         node.kwargs.get("block_size"),
-        tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
-        tuple(fused),
     ]
     if is_conv2d(node):
         key += [
@@ -378,7 +376,7 @@ def make_size_fn(
     are merged until they fit (a tiny scale tensor would otherwise waste a
     whole bank).  Only whole sources merge, never a source's own two copies --
     each copy must keep its own bank.  ``extra_sharing`` forces further merges;
-    ``run_interstellar`` raises it when nothing maps even at the minimum.
+    ``_run_search`` raises it when nothing maps even at the minimum.
 
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
     ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
@@ -503,10 +501,7 @@ class RuntimeCalculator:
             costs ``max(dram, compute)`` and not their sum.
         has_sparse_op: Double the weight load time.
         batch: Grid steps the builder loops *outside* the mapping -- a bmm's
-            leading dims, which share no operand, unlike interstellar's own
-            ``ON`` (a conv's image batch, over one set of filters).  The
-            mapping covers one such step, so the sweep is it repeated
-            ``batch`` times with every operand re-fetched.
+            leading dims, which share no operand.
         weight_batch: Distinct weight tiles over those ``batch`` steps, fewer
             when a group shares one -- eight KV heads reaching an attention
             matmul as thirty-two.  ``None`` = one apiece.
@@ -926,19 +921,6 @@ class RuntimeCalculator:
         return total_time
 
 
-def _weight_repeat(node):
-    """Batch steps that share one weight tile -- four query heads reading one
-    GQA KV head.  ``_peel_weight`` decides the repeat the builder folds into
-    the block index, so ask it rather than keep a second opinion.
-    """
-    # Local import: ``pipeline`` imports ``get_tiling`` from this module.
-    from .pipeline import _peel_weight
-
-    weight = node.args[1]
-    repeat = _peel_weight(weight)[2]
-    return math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
-
-
 def _extract_layer_from_node(node):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
@@ -954,37 +936,26 @@ def _extract_layer_from_node(node):
     if is_conv2d(node):
         w_dims = _HWIO if transposed else None
         in_dims = _NHWC if transposed else None
-        output_channels, input_channels, kH, kW = _unproject(
-            weight_shape, w_dims
-        )
+        out_channels, in_channels, kH, kW = _unproject(weight_shape, w_dims)
         _, _, height, width = _unproject(node.shape, in_dims)
 
-        if input_channels == 3:
+        if in_channels == 3:
             return None
 
         stride_h, stride_w = _pair(get_arg_value(node, 3, "stride", 1))
     else:
-        if len(weight_shape) < 2:
-            return None
+        width = node.shape[-2] if is_bmm(node) else math.prod(node.shape[:-1])
 
-        input_shape = node.args[0].shape
-        width = input_shape[-2] if is_bmm(node) else math.prod(input_shape[:-1])
-
-        # Weight (other operand) is (.., K, N): reduction K and output N are its
-        # last two dims, flipped when it is stored CK (rank-agnostic, so a
-        # batched (B, K, N) weight reads K/N, not the batch dim).
         if weight_is_ck(node):
-            input_channels, output_channels = weight_shape[-2], weight_shape[-1]
+            in_channels, out_channels = weight_shape[-2:]
         else:
-            output_channels, input_channels = weight_shape[-2], weight_shape[-1]
+            out_channels, in_channels = weight_shape[-2:]
 
-        kH, kW = 1, 1
-        height = 1
-        stride_h, stride_w = 1, 1
+        kH = kW = height = stride_h = stride_w = 1
 
     return interstellar.Layer(
-        nifm=input_channels,
-        nofm=output_channels,
+        nifm=in_channels,
+        nofm=out_channels,
         wofm=width,
         hofm=height,
         wfil=kW,
@@ -994,101 +965,132 @@ def _extract_layer_from_node(node):
     )
 
 
-# The optimizer reports "nothing fits" with a bare assert, so match it narrowly:
-# every other AssertionError in interstellar is a real invariant break.
-_NO_MAPPING = "No valid mapping point found"
+@dataclass
+class _Search:
+    """One node's mapping search, prepared and ready to run.
+
+    Every step that reads the FX node -- shapes, dtypes, the GQA weight repeat
+    -- happens while this is built, so ``_run_search`` needs only
+    ``interstellar``.  It must stay that way: ``prefetch_tilings`` runs it in a
+    forked worker, where dispatching a torch op deadlocks.
+
+    Attributes:
+        name: The anchor node's name, for logging.
+        tiler: The shared ``TilerContext``.
+        layer: The interstellar ``Layer`` to map.
+        rc: The ``RuntimeCalculator`` scoring each candidate mapping.
+        size_fns: Successive bank-sharing relaxations, least-shared first;
+            the first that maps wins.
+    """
+
+    name: str
+    tiler: TilerContext
+    layer: object
+    rc: RuntimeCalculator
+    size_fns: list
 
 
-def _try_optimize(tiler, layer, rc):
-    """Map ``layer``, or ``None`` when no tiling fits the on-chip budget."""
-    try:
-        return interstellar.optimizer.opt_optimizer(
-            tiler.arch,
-            layer,
-            tiler.schedule,
-            rc.calculate_runtime,
-            verbose=False,
-            runtime_tolerance=tiler.runtime_tolerance,
-        )
-    except AssertionError as e:
-        if _NO_MAPPING not in str(e):
-            raise
-        return None
+def _prepare_search(node, tiler):
+    """Everything a GEMM/conv ``node`` needs before its mapping search.
 
+    Reads the node -- shapes, dtypes, the fused tail's operands, the GQA weight
+    repeat -- to build the interstellar layer, the timing model and the size
+    functions, plus the cache key naming the result.  Runs in the parent, so
+    what it hands back needs only ``interstellar`` (see :class:`_Search`).
 
-def run_interstellar(
-    node,
-    tiler,
-    out_dtype=None,
-    fused_specs=(),
-    oc_align=None,
-    has_tail=False,
-):
-    """Run interstellar with the 4-level DRAM architecture for a single
-    GEMM/conv node.
-
-    Extracts layer dims from the node's current (pre-tiling) shapes, runs the
-    optimizer, and logs the resulting L1/L2/L3 tile sizes.  The L2 -> L1 bus
-    carries ``min(unroll)`` input elements per cycle -- the rate the array's
-    narrow side consumes them at -- so its width is
-    ``min(unroll) * if_bits / 8`` bytes per cycle.
-
-    Each operand ideally gets a bank of its own, but a bank cannot be split, so
-    a layer with more operands than banks has no tiling at any size.  Retry with
-    progressively more bank sharing and keep the first (least-shared) mapping.
-
-    Args:
-        node: The GEMM/conv anchor to map.
-        tiler (TilerContext): The shared architecture, schedule and unroll.
-        out_dtype: The outer (fused) node's output dtype; a ``(scale, value)``
-            list for a fused mx output.
-        fused_specs: The fused tail's own tiled operands, from
-            ``_fused_operand_specs``; they need banks of their own.  A non-empty
-            list also keeps the vector unit at high precision (the tail reads a
-            tiled residual / mask).
-        oc_align (int, optional): ``head_dim`` for a projection GEMM feeding an
-            MHA output relayout — its OC tile is constrained to whole heads.
-        has_tail: The anchor carries a fused post-op, so its reduction drains
-            through the vector unit (see ``RuntimeCalculator``).
+    The layer dims come from the node's current (pre-tiling) shapes, and the
+    timing model and the size functions are built from its own widths so the
+    two size the same operands.  The L2 -> L1 bus carries ``min(unroll)`` input
+    elements per cycle -- the rate the array's narrow side consumes them at --
+    so its width is ``min(unroll) * if_bits / 8`` bytes per cycle.
 
     Returns:
-        ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
-        (its ``loop_blockings`` give the per-level tile factors), the compute
-        cycles of one L3 tile under it (the reporting model's utilization
-        denominator), and the per-level ``(input, output, weight)`` access
-        counts the ``Tiling`` proto reports.  All ``None`` if the node is
-        skipped.
+        ``(key, search)``, or ``None`` when no interstellar run is needed: not
+        a matrix op, a GEMV (``gemv_op_tiling`` searches those instead), or an
+        anchor that already carries an ``l2_tiling``.  ``search`` is ``None``
+        when there is nothing left to run -- ``key`` is already in
+        ``tiler.cache``, or interstellar skips the layer -- so a caller tells
+        the two apart by looking the key up; either way the key names the
+        entry.
     """
-    layer = _extract_layer_from_node(node)
-    if layer is None:
-        return None, None, None
+    from .pipeline import _peel_weight
 
-    # The layer describes one batch element; ``build_gemm`` loops the rest.
-    batch = math.prod(node.value.shape[:-2]) if is_bmm(node) else 1
+    anchor = get_anchor_node(node)
+    if (
+        not is_gemm_op(anchor)
+        or is_fully_connected(anchor)
+        or anchor.meta.get("l2_tiling") is not None
+    ):
+        return None
+
+    sub_gm = node.meta.get("submodule")
+    if sub_gm is not None:
+        ShapeProp(sub_gm).propagate(
+            *(n.value.clone() for n in node.all_input_nodes)
+        )
+        dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
+        phs = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]
+        for i, ph in enumerate(phs):
+            ph.meta["dtype"] = dtypes[i]
+
+    out_dtype = node.meta.get("dtype")
+    fused_specs = _fused_operand_specs(node, anchor)
+    has_tail = sub_gm is not None
+
+    # A projection GEMM feeding an MHA relayout must tile OC on whole heads
+    # else _detect_mha_relayout can't store the tile.
+    oc_align = None
+    if sub_gm is not None and not is_conv2d(anchor):
+        nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
+        perm = trailing_mha_perm(nodes)
+        if perm is not None and perm.value.ndim > anchor.value.ndim:
+            oc_align = perm.value.shape[-1]
+
+    key = _layer_cache_key(anchor) + (
+        tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
+        tuple(fused_specs),
+        has_tail,
+        oc_align,
+    )
+
+    if key in tiler.cache:
+        return key, None
+
+    layer = _extract_layer_from_node(anchor)
+    if layer is None:
+        return key, None
 
     mx_out = isinstance(out_dtype, (list, tuple))
     of_dtype = out_dtype[-1] if mx_out else out_dtype
-    if_bits = _node_dtype_bits(node.args[0])
-    fl_bits = _node_dtype_bits(node.args[1])
-    of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
-    if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
-    fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
+    if_bits = _node_dtype_bits(anchor.args[0])
+    fl_bits = _node_dtype_bits(anchor.args[1])
+    of_bits = (
+        get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(anchor)
+    )
+    if_scale_bits = _node_dtype_bits(anchor.kwargs.get("input_scale"), 0)
+    fl_scale_bits = _node_dtype_bits(anchor.kwargs.get("weight_scale"), 0)
     of_scale_bits = get_dtype_width(out_dtype[-2]) if mx_out else 0
 
     logger.info(
-        f"[interstellar] {node.name}: "
+        f"[interstellar] {anchor.name}: "
         f"IC={layer.nifm} OC={layer.nofm} "
         f"H={layer.hofm} W={layer.wofm} "
         f"kH={layer.hfil} kW={layer.wfil} | "
         f"if={if_bits}b fl={fl_bits}b of={of_bits}b "
         f"if_scale={if_scale_bits}b fl_scale={fl_scale_bits}b "
-        f"bs={node.kwargs.get('block_size')}"
+        f"bs={anchor.kwargs.get('block_size')}"
     )
 
     sram_bandwidth = min(tiler.config.pe_array_size) * if_bits
 
-    # The node's own widths, so the timing model and ``make_size_fn`` size the
-    # same operands.
+    batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
+
+    weight = anchor.args[1]
+    repeat = _peel_weight(weight)[2]
+    weight_repeat = (
+        math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
+    )
+
     rc = RuntimeCalculator(
         if_bits,
         fl_bits,
@@ -1100,19 +1102,21 @@ def run_interstellar(
         tiler.config.access_latency_cycles,
         double_buffered_l2=tiler.config.double_buffered_l2,
         batch=batch,
-        weight_batch=batch // _weight_repeat(node),
+        weight_batch=batch // weight_repeat,
         has_tail=has_tail,
         tail_specs=fused_specs,
         input_scale_width=if_scale_bits,
         weight_scale_width=fl_scale_bits,
         output_scale_width=of_scale_bits,
-        scale_block_size=node.kwargs.get("block_size") or 1,
+        scale_block_size=anchor.kwargs.get("block_size") or 1,
     )
 
-    result = None
-    for extra_sharing in range(4 + len(fused_specs)):
-        layer.size_fn = make_size_fn(
-            node,
+    # Built up front rather than per attempt: each one reads the node, which
+    # only the parent may do.  They close over it, so they cannot be pickled --
+    # hence a forked worker rather than a spawned one.
+    size_fns = [
+        make_size_fn(
+            anchor,
             out_dtype,
             fused_specs,
             extra_sharing,
@@ -1120,125 +1124,121 @@ def run_interstellar(
             has_tail=has_tail,
             copies=2 if tiler.config.double_buffered_l2 else 1,
         )
-        result = _try_optimize(tiler, layer, rc)
-        if result is not None:
-            if extra_sharing:
-                logger.info(
-                    f"[interstellar] {node.name}: no tiling fits one bank per "
-                    f"operand; sharing {extra_sharing} more"
-                )
-            break
-    if result is None:
-        raise RuntimeError(
-            f"{node.name}: no tiling fits on chip even with every operand "
-            f"sharing one bank"
-        )
-    _, runtime, mapping, _ = result
+        for extra_sharing in range(4 + len(fused_specs))
+    ]
+    return key, _Search(anchor.name, tiler, layer, rc, size_fns)
+
+
+def _run_search(search):
+    """Map ``search``'s layer, relaxing bank sharing until one fits.
+
+    Each operand ideally gets a bank of its own, but a bank cannot be split, so
+    a layer with more operands than banks has no tiling at any size.  Retry
+    with progressively more bank sharing and keep the first (least-shared)
+    mapping.
+
+    Dispatches no torch op, so it is safe in a forked worker (:class:`_Search`).
+
+    Returns:
+        ``(index, runtime, mapping)`` -- which ``size_fns`` entry mapped, its
+        estimated runtime, and the ``MappingPoint`` itself.
+
+    Raises:
+        RuntimeError: No tiling fits even at maximum sharing.
+    """
+    for index, size_fn in enumerate(search.size_fns):
+        search.layer.size_fn = size_fn
+        try:
+            result = interstellar.optimizer.opt_optimizer(
+                search.tiler.arch,
+                search.layer,
+                search.tiler.schedule,
+                search.rc.calculate_runtime,
+                verbose=False,
+                runtime_tolerance=search.tiler.runtime_tolerance,
+            )
+        except AssertionError as e:
+            # The optimizer reports "nothing fits" with a bare assert, so match
+            # it narrowly: every other AssertionError in interstellar is a real
+            # invariant break.
+            if "No valid mapping point found" not in str(e):
+                raise
+            continue
+        if index:
+            logger.info(
+                f"[interstellar] {search.name}: no tiling fits one bank "
+                f"per operand; sharing {index} more"
+            )
+        _, runtime, mapping, _ = result
+        return index, runtime, mapping
+    raise RuntimeError(
+        f"{search.name}: no tiling fits on chip even with every operand "
+        f"sharing one bank"
+    )
+
+
+def _finish_search(search, found):
+    """Log ``found``'s tile sizes and price it, in the parent.
+
+    ``get_cost`` sizes tiles through ``layer.size_fn``, so the winning
+    relaxation is set on the layer first -- a forked search set it only on the
+    worker's copy.
+
+    Returns:
+        ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
+        (its ``loop_blockings`` give the per-level tile factors), the compute
+        cycles of one L3 tile under it (the reporting model's utilization
+        denominator), and the per-level ``(input, output, weight)`` access
+        counts the ``Tiling`` proto reports.
+    """
+    index, runtime, mapping = found
+    search.layer.size_fn = search.size_fns[index]
 
     b = mapping.loop_blockings
     logger.info(
-        f"[interstellar] {node.name} L1 tiles: "
+        f"[interstellar] {search.name} L1 tiles: "
         f"IC={b[le.IC][1]} OC={b[le.OC][1]} "
         f"OX={b[le.OX][1]} OY={b[le.OY][1]} ON={b[le.ON][1]}"
     )
     logger.info(
-        f"[interstellar] {node.name} L2 tiles: "
+        f"[interstellar] {search.name} L2 tiles: "
         f"IC={b[le.IC][2]} OC={b[le.OC][2]} "
         f"OX={b[le.OX][2]} OY={b[le.OY][2]} ON={b[le.ON][2]}"
     )
     logger.info(
-        f"[interstellar] {node.name} L3 tiles: "
+        f"[interstellar] {search.name} L3 tiles: "
         f"IC={b[le.IC][3]} OC={b[le.OC][3]} "
         f"OX={b[le.OX][3]} OY={b[le.OY][3]} ON={b[le.ON][3]}"
     )
-    per_tile_cycles = rc.matrix_cycles(mapping)
-    logger.info(f"[interstellar] {node.name} estimated runtime: {runtime}")
+    per_tile_cycles = search.rc.matrix_cycles(mapping)
+    logger.info(f"[interstellar] {search.name} estimated runtime: {runtime}")
     logger.info(
-        f"[interstellar] {node.name} per-tile compute cycles: "
+        f"[interstellar] {search.name} per-tile compute cycles: "
         f"{per_tile_cycles}"
     )
     logger.info(interstellar.utils.format_tiling(mapping))
 
     _, _, access_list = interstellar.cost_model.get_cost(
-        tiler.arch, mapping, layer
+        search.tiler.arch, mapping, search.layer
     )
-
     return mapping, per_tile_cycles, access_list
 
 
-def tiling_request(node, tiler):
-    """``(key, anchor, out_dtype, fused_specs, oc_align, has_tail)`` — all
-    of ``get_tiling``'s preparation, stopping short of the search itself.
-
-    ``None`` when no interstellar run is needed: not a matrix op, a GEMV (which
-    ``gemv_op_tiling`` searches instead), or an anchor that already carries an
-    ``l2_tiling``.  ``get_tiling`` and the prefetch both go through this, so the
-    cache key they compute cannot drift apart.
-    """
-    anchor = get_anchor_node(node)
-    if not (is_conv2d(anchor) or is_linear(anchor) or is_matmul(anchor)):
-        return None
-    if is_fully_connected(anchor) or anchor.meta.get("l2_tiling") is not None:
-        return None
-
-    sub_gm = node.meta.get("submodule")
-    if sub_gm is not None:
-        # ``_fused_operand_specs`` reads the placeholders' shapes, and the
-        # builder only shape-props the submodule just before it calls in.
-        ShapeProp(sub_gm).propagate(
-            *(n.value.clone() for n in node.all_input_nodes)
-        )
-        # Fused-submodule placeholders lack the quant ``meta['dtype']``; copy it
-        # from the outer ``all_input_nodes``
-        ph_dtypes = [n.meta.get("dtype") for n in node.all_input_nodes]
-        placeholdes = [n for n in sub_gm.graph.nodes if n.op == "placeholder"]
-        for i, ph in enumerate(placeholdes):
-            ph.meta["dtype"] = ph_dtypes[i]
-
-    out_dtype = node.meta.get("dtype")
-    fused_specs = _fused_operand_specs(node, anchor)
-
-    # A projection GEMM feeding an MHA relayout must tile OC on whole heads
-    # (else ``_detect_mha_relayout`` can't store the tile).  ``oc_align`` is the
-    # ``head_dim`` when the fused tail's permute grows the rank, else ``None``.
-    oc_align = None
-    if sub_gm is not None and not is_conv2d(anchor):
-        nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
-        perm = trailing_mha_perm(nodes)
-        if perm is not None and perm.value.ndim > anchor.value.ndim:
-            oc_align = perm.value.shape[-1]
-
-    # A bare anchor and a fused one map differently (the fused reduction
-    # drains through the vector unit), so ``has_tail`` is part of the key.
-    has_tail = sub_gm is not None
-    key = _layer_cache_key(anchor, out_dtype, tuple(fused_specs)) + (
-        oc_align,
-        has_tail,
-    )
-    return key, anchor, out_dtype, fused_specs, oc_align, has_tail
-
-
-# Populated in the parent before forking; a worker reads its job by index so
-# only the index crosses the process boundary (the FX nodes are inherited).
+# Prepared in the parent before forking; a worker reads its job by index so
+# only the index crosses the process boundary (the searches are inherited).
 _PREFETCH_JOBS = []
+
+# How long the pool may take before the serial path takes the work back; the
+# searches carry no deadline of their own.
+PREFETCH_TIMEOUT_S = 300.0
 
 
 def _run_prefetch_job(index):
-    """Run one prefetched search in a forked worker.  Returns ``(ok, result)``
+    """Run one prefetched search in a forked worker.  Returns ``(ok, found)``
     so a failure leaves the entry uncached and is re-raised by the serial path,
     where it carries its normal traceback."""
-    _, anchor, out_dtype, fused_specs, oc_align, has_tail, tiler = (
-        _PREFETCH_JOBS[index]
-    )
     try:
-        return True, run_interstellar(
-            anchor,
-            tiler,
-            out_dtype=out_dtype,
-            fused_specs=fused_specs,
-            oc_align=oc_align,
-            has_tail=has_tail,
-        )
+        return True, _run_search(_PREFETCH_JOBS[index])
     except Exception:
         return False, None
 
@@ -1246,55 +1246,83 @@ def _run_prefetch_job(index):
 def prefetch_tilings(nodes, tiler):
     """Map every node's layer up front, concurrently, into ``tiler.cache``.
 
-    Each search is independent and single-threaded Python, so they scale across
-    processes; ``fork`` lets a worker read the FX node it inherited instead of
-    marshalling it, which matters because ``Layer.size_fn`` is a closure and
+    Only the search is forked out; the nodes are read here, in the parent (see
+    :class:`_Search`).  ``fork`` lets a worker use the ``size_fn`` closures it
+    inherited instead of marshalling them, which matters because a closure
     cannot be pickled.  A key that does not match the one ``get_tiling``
     recomputes during the build simply misses and is redone serially — a stale
-    key costs time, never correctness.
+    key costs time, never correctness, and the same holds for a pool abandoned
+    on timeout.
     """
     global _PREFETCH_JOBS
 
     jobs = {}
     for node in nodes:
-        request = tiling_request(node, tiler)
-        if request is None or request[0] in jobs or request[0] in tiler.cache:
+        prepared = _prepare_search(node, tiler)
+        if prepared is None:
             continue
-        jobs[request[0]] = request + (tiler,)
+        key, search = prepared
+        if key in tiler.cache:
+            continue
+        if search is None:
+            tiler.cache[key] = (None, None, None)  # interstellar skips it
+            continue
+        jobs[key] = search
 
     if len(jobs) < 2:
         return
 
-    _PREFETCH_JOBS = list(jobs.values())
+    keys = list(jobs)
+    searches = [jobs[k] for k in keys]
+    _PREFETCH_JOBS = searches
     start = time.perf_counter()
     # Small cap: the runner already forks per design point, so an uncapped
     # pool multiplies to jobs x cpu_count.  VOYAGER_TILING_JOBS overrides.
     workers = min(
-        len(_PREFETCH_JOBS),
+        len(searches),
         int(os.environ.get("VOYAGER_TILING_JOBS", "4")),
         os.cpu_count() or 1,
     )
     # Keep the parent heap out of the workers' GC so fork stays copy-on-write.
     gc.freeze()
+    pool = None
+    results = None
     try:
         context = multiprocessing.get_context("fork")
-        with context.Pool(workers) as pool:
-            results = pool.map(_run_prefetch_job, range(len(_PREFETCH_JOBS)))
+        pool = context.Pool(workers)
+        results = pool.map_async(_run_prefetch_job, range(len(searches))).get(
+            PREFETCH_TIMEOUT_S
+        )
+    except multiprocessing.TimeoutError:
+        logger.warning(
+            "[tiling] parallel prefetch did not finish in %.0fs; going serial",
+            PREFETCH_TIMEOUT_S,
+        )
     except Exception as e:
         logger.warning(
             "[tiling] parallel prefetch failed (%s); going serial", e
         )
-        _PREFETCH_JOBS = []
-        return
     finally:
+        if pool is not None:
+            # Terminate, not close: a worker still running on timeout has to
+            # go with the pool.
+            pool.terminate()
+            pool.join()
         gc.unfreeze()
+        _PREFETCH_JOBS = []
+
+    if results is None:
+        return
 
     cached = 0
-    for job, (ok, result) in zip(_PREFETCH_JOBS, results):
-        if ok:
-            tiler.cache[job[0]] = result
-            cached += 1
-    _PREFETCH_JOBS = []
+    for key, search, (ok, found) in zip(keys, searches, results):
+        if not ok:
+            continue
+        try:
+            tiler.cache[key] = _finish_search(search, found)
+        except Exception:  # redone, and re-raised, by the serial path
+            continue
+        cached += 1
     logger.info(
         "[tiling] prefetched %d/%d mappings in %.2fs",
         cached,
@@ -1355,9 +1383,9 @@ def get_tiling(node, tiler=None):
     full extent (one tile per batch element).
     """
     anchor = get_anchor_node(node)
-    is_conv = is_conv2d(anchor)
-    if not (is_conv or is_linear(anchor) or is_matmul(anchor)):
+    if not is_gemm_op(anchor):
         return None, None
+    is_conv = is_conv2d(anchor)
 
     # Neither search tiles the leading batch dims (e.g. attention heads); the
     # builder loops them, so emit a full-extent count -- one tile per batch
@@ -1390,9 +1418,7 @@ def get_tiling(node, tiler=None):
     if is_fully_connected(anchor):
         return gemm_batch + gemv_op_tiling(node, tiler.config), None
 
-    key, anchor, out_dtype, fused_specs, oc_align, has_tail = tiling_request(
-        node, tiler
-    )
+    key, search = _prepare_search(node, tiler)
     if key in tiler.cache:
         mapping, per_tile_cycles, access_list = tiler.cache[key]
         logger.debug(
@@ -1403,21 +1429,19 @@ def get_tiling(node, tiler=None):
     else:
         logger.info("[tiling] %s: running interstellar", anchor.name)
         t0 = time.perf_counter()
-        mapping, per_tile_cycles, access_list = run_interstellar(
-            anchor,
-            tiler,
-            out_dtype=out_dtype,
-            fused_specs=fused_specs,
-            oc_align=oc_align,
-            has_tail=has_tail,
-        )
+        if search is None:
+            mapping = per_tile_cycles = access_list = None
+        else:
+            mapping, per_tile_cycles, access_list = _finish_search(
+                search, _run_search(search)
+            )
         logger.info(
             "[tiling] %s: interstellar took %.2fs",
             anchor.name,
             time.perf_counter() - t0,
         )
-        # cache None too (skipped layers)
         tiler.cache[key] = (mapping, per_tile_cycles, access_list)
+
     if mapping is None:
         return None, None
 
