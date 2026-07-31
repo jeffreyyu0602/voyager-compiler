@@ -32,10 +32,10 @@ from voyager_compiler.codegen.node_info import (
     is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
-    peel_weight,
     quant_param_arg_nodes,
     trailing_mha_perm,
     weight_is_ck,
+    weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
     _node_dtype_bits,
@@ -45,6 +45,7 @@ from voyager_compiler.codegen.transform.tiling.cost import (
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     DEFAULT_RUNTIME_TOLERANCE,
+    _operand_placeholders,
     gemv_op_tiling,
 )
 from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
@@ -232,27 +233,6 @@ def _output_pos_to_loop_dim(anchor):
         return [le.ON, le.OC, le.OY, le.OX]  # NCHW
     ndim = anchor.value.ndim
     return [le.ON] * (ndim - 2) + [le.OX, le.OC]
-
-
-def _operand_placeholders(root):
-    """External placeholder operands feeding ``root``'s subtree (``root``
-    inclusive), tracing through pre-processing ops (``dequantize`` / reshape)
-    and skipping each op's quantization codebook / qmap args.
-    """
-    leaves, stack, visited = [], [root], set()
-    while stack:
-        n = stack.pop()
-        if n in visited:
-            continue
-        visited.add(n)
-        if n.op == "placeholder":
-            leaves.append(n)
-            continue
-        codebooks = quant_param_arg_nodes(n)
-        for inp in n.all_input_nodes:
-            if inp not in codebooks:
-                stack.append(inp)
-    return leaves
 
 
 def _fused_operand_specs(node, anchor):
@@ -1060,7 +1040,7 @@ def _prepare_search(node, tiler):
     batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
 
     weight = anchor.args[1]
-    repeat = peel_weight(weight)[2]
+    repeat = weight_transforms(weight)[2]
     weight_repeat = (
         math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
     )

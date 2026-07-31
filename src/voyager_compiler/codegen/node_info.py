@@ -18,21 +18,44 @@ from voyager_compiler.codegen.aten_classifier import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-
 aten = torch.ops.aten
 
 # Sentinel ``aten.slice`` uses for ``end`` to mean "to the end of the dim".
 INT64_MAX = torch.iinfo(torch.int64).max
 
-
-# Quantization lookup-table args across the quantized_ops
-# quantize/dequantize/quantize_mx family. They are indexed by value, not by
-# iteration position, so they are passed whole (never tiled / position-mapped).
-# qmaps are mapped by the accelerator itself, so they are neither emitted nor
-# dumped; codebooks are passed whole and dumped.
+# Arg names of the quantization lookup tables the quantized_ops
+# quantize / dequantize / quantize_mx family takes.
 QMAP_PARAMS = {"qmap", "scale_qmap", "input_qmap", "output_qmap"}
 CODEBOOK_PARAMS = {"code", "input_code", "weight_code", "output_code"}
 QUANT_PARAMS = QMAP_PARAMS | CODEBOOK_PARAMS
+
+
+# --------------------------------------------------------------------------
+# Graph walking
+# --------------------------------------------------------------------------
+
+
+def get_anchor_node(node):
+    """The compute anchor of ``node``: for a fused ``call_module`` (its submodule
+    in ``node.meta['submodule']``, set at fusion), the GEMM/conv/pool/pointwise
+    op inside the submodule (``None`` if it has none); for any other node,
+    ``node`` itself.
+    """
+    if node.op != "call_module":
+        return node
+    submod = node.meta.get("submodule")
+    if not isinstance(submod, GraphModule):
+        return None
+    anchor_node = None
+    for n in submod.graph.nodes:
+        if is_gemm_op(n):
+            return n
+        if n.op == "call_function" and (
+            anchor_node is None
+            or anchor_node.target == torch.ops.quantized_ops.dequantize.default
+        ):
+            anchor_node = n
+    return anchor_node
 
 
 def ancestors(node: Node) -> set:
@@ -69,6 +92,11 @@ def quant_param_arg_nodes(node: Node, params: set = QUANT_PARAMS) -> set:
     return result
 
 
+# --------------------------------------------------------------------------
+# Op-kind predicates
+# --------------------------------------------------------------------------
+
+
 def is_gemm_op(node: Node) -> bool:
     return is_conv2d(node) or is_linear(node) or is_matmul(node)
 
@@ -99,18 +127,6 @@ def is_matmul(node: Node) -> bool:
         torch.ops.quantized_ops.matmul.default,
         torch.ops.quantized_ops.matmul_mx.default,
     ]
-
-
-def weight_is_ck(node: Node) -> bool:
-    """Whether ``node``'s right operand is physically stored ``[contraction,
-    out]``.
-
-    ``is_matmul`` gives the op's native layout (matmul CK, linear KC) and
-    ``meta['transposed']`` says the layout transform flipped it, so the two
-    compose by XOR.  The twins the flip retargets to keep answering
-    ``is_linear`` / ``is_matmul``, which makes the meta the only signal.
-    """
-    return is_matmul(node) != bool(node.meta.get("transposed", False))
 
 
 def is_bmm(node: Node) -> bool:
@@ -159,44 +175,6 @@ def is_pooling(node: Node) -> bool:
     ]
 
 
-def is_mha_qkv_permute(node):
-    """
-    Check if the node is a permutation used in multi-head attention (MHA)
-    operations. It has characteristics that last dimension is a power of 2 and
-    the permuted dimensions are the middle two dimensions (2 and 3) of a 4D
-    tensor.
-    """
-    # Don't support head dimension not being a power of 2
-    if (
-        not hasattr(node, "shape")
-        or len(node.shape) != 4
-        or not math.log2(node.shape[-1]).is_integer()
-    ):
-        return False
-
-    if node.target == torch.ops.aten.permute.default:
-        dims = node.args[1]
-        return len(dims) == 4 and dims == [0, 2, 1, 3]
-
-    if node.target == torch.ops.aten.transpose.int:
-        dims = {x if x >= 0 else x + 4 for x in node.args[1:]}
-        return node.value.ndim == 4 and dims == {1, 2}
-
-    return False
-
-
-def trailing_mha_perm(fused_ops):
-    """The MHA qkv permute at the end of ``fused_ops`` (peeled of a trailing
-    microscaling ``quantize_mx``), or ``None`` if the tail is not such a
-    relayout."""
-    if not fused_ops:
-        return None
-    perm = fused_ops[-1]
-    if perm.target is torch.ops.quantized_ops.quantize_mx.default:
-        perm = perm.args[0]
-    return perm if is_mha_qkv_permute(perm) else None
-
-
 def is_reshape_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.transpose.int,
@@ -204,27 +182,89 @@ def is_reshape_op(node: Node) -> bool:
     ]
 
 
-def reshape_preserves_full_blocks(
-    input_shape: tuple[int, ...],
-    input_axis: int,
-    output_shape: tuple[int, ...],
-    output_axis: int,
-    group_size: int,
-) -> bool:
-    if math.prod(input_shape) != math.prod(output_shape):
-        return False
-
-    if group_size == 1:
+def is_prunable_op(node: Node) -> bool:
+    """Operations that can be safely deleted from fx.Graph."""
+    if node.target == torch.ops.aten.alias.default:
         return True
 
-    input_minor = math.prod(input_shape[input_axis + 1 :])
-    output_minor = math.prod(output_shape[output_axis + 1 :])
+    # A slice from 0 to the end of the input tensor
+    if node.target == torch.ops.aten.slice.Tensor:
+        dim = get_arg_value(node, 1, "dim", 0)
+        start = get_arg_value(node, 2, "start")
+        end = get_arg_value(node, 3, "end")
+        step = get_arg_value(node, 4, "step", 1)
+        if start is not None and start != 0 or step != 1:
+            return False
+        if end is not None and hasattr(node.args[0], "shape"):
+            return end >= node.args[0].shape[dim]
+        return (start is None and end is None) or end == INT64_MAX
 
+    if node.target == torch.ops.aten.expand.default:
+        return all(x == 1 or x == -1 for x in node.args[1])
+
+    # Dropout with zero probability is the identity.
+    if node.target == torch.ops.aten.dropout.default:
+        return get_arg_value(node, 1, "p") == 0.0
+
+    # A same-dtype ``to.dtype`` is a pure pass-through.
+    if node.target == torch.ops.aten.to.dtype:
+        dtype = get_arg_value(node, 1, "dtype")
+        inp = node.args[0]
+        val = getattr(inp, "value", inp.meta.get("val"))
+        return isinstance(val, torch.Tensor) and dtype == val.dtype
+
+    return False
+
+
+def is_nop(node: Node) -> bool:
+    """
+    The following operations do not require any computation nor handling
+    on the memory placement side. Generate a NOP instruction for these ops
+    to keep the compute graph intact.
+    """
+    if is_prunable_op(node):
+        return True
+
+    # A select operation that selects the entire tensor
+    if node.target == torch.ops.aten.select.int:
+        shape = getattr(node.args[0], "shape", None)
+        return shape is not None and shape[node.args[1]] == 1
+
+    return node.target in [
+        torch.ops.aten.as_strided.default,
+        torch.ops.aten.contiguous.default,
+        torch.ops.aten.flatten.using_ints,
+        torch.ops.aten.lift_fresh_copy.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.dims,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.view.default,
+    ]
+
+
+def is_shape_changing_nop(node: Node) -> bool:
+    """A ``nop`` (no compute) whose output shape differs from its input shape
+    — a ``view`` / ``reshape`` / ``squeeze`` / ``unsqueeze`` / size-1 ``select``
+    that regroups or drops dims.  Such a node sitting *between* two fused
+    compute stages breaks the single-iteration-space assumption and is relocated
+    to the fused module's boundary by the iteration-space normalizer (see
+    ``normalize.py``).  A shape-*preserving* nop (same in/out shape) can stay
+    inside the fused chain.
+    """
+    if not is_nop(node):
+        return False
+    inp = node.args[0]
     return (
-        input_minor == output_minor
-        and input_shape[input_axis] % group_size == 0
-        and output_shape[output_axis] % group_size == 0
+        hasattr(node, "shape")
+        and hasattr(inp, "shape")
+        and tuple(node.shape) != tuple(inp.shape)
     )
+
+
+# --------------------------------------------------------------------------
+# Operand transforms
+# --------------------------------------------------------------------------
 
 
 _BROADCAST_OPS = (
@@ -253,24 +293,6 @@ def is_relayout_op(node: Node) -> bool:
         )
         and len(node.all_input_nodes) == 1
     )
-
-
-def swaps_last_two_dims(node: Node) -> bool:
-    """Whether ``node`` transposes its input's last two dims — the ``Kᵀ`` an
-    attention ``Q @ Kᵀ`` leaves on its weight."""
-    if node.op != "call_function":
-        return False
-    src = node.args[0]
-    if (value := _tensor_value(src)) is None:
-        return False
-    ndim = value.ndim
-    if node.target is torch.ops.aten.transpose.int:
-        return {a % ndim for a in node.args[1:3]} == {ndim - 2, ndim - 1}
-    if node.target is torch.ops.aten.permute.default:
-        swapped = list(range(ndim))
-        swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
-        return list(node.args[1]) == swapped
-    return False
 
 
 def _repeat_through(source: Node, ops, out: torch.Tensor):
@@ -365,84 +387,123 @@ def repeat_of(node: Node):
     return None
 
 
-def is_prunable_op(node: Node) -> bool:
-    """Operations that can be safely deleted from fx.Graph."""
-    if node.target == torch.ops.aten.alias.default:
-        return True
+def swaps_last_two_dims(node: Node) -> bool:
+    """Whether ``node`` transposes its input's last two dims — the ``Kᵀ`` an
+    attention ``Q @ Kᵀ`` leaves on its weight."""
+    if node.op != "call_function":
+        return False
+    src = node.args[0]
+    if (value := _tensor_value(src)) is None:
+        return False
+    ndim = value.ndim
+    if node.target is torch.ops.aten.transpose.int:
+        return {a % ndim for a in node.args[1:3]} == {ndim - 2, ndim - 1}
+    if node.target is torch.ops.aten.permute.default:
+        swapped = list(range(ndim))
+        swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
+        return list(node.args[1]) == swapped
+    return False
 
-    # A slice from 0 to the end of the input tensor
-    if node.target == torch.ops.aten.slice.Tensor:
-        dim = get_arg_value(node, 1, "dim", 0)
-        start = get_arg_value(node, 2, "start")
-        end = get_arg_value(node, 3, "end")
-        step = get_arg_value(node, 4, "step", 1)
-        if start is not None and start != 0 or step != 1:
-            return False
-        if end is not None and hasattr(node.args[0], "shape"):
-            return end >= node.args[0].shape[dim]
-        return (start is None and end is None) or end == INT64_MAX
 
-    if node.target == torch.ops.aten.expand.default:
-        return all(x == 1 or x == -1 for x in node.args[1])
+def is_mha_qkv_permute(node):
+    """
+    Check if the node is a permutation used in multi-head attention (MHA)
+    operations. It has characteristics that last dimension is a power of 2 and
+    the permuted dimensions are the middle two dimensions (2 and 3) of a 4D
+    tensor.
+    """
+    # Don't support head dimension not being a power of 2
+    if (
+        not hasattr(node, "shape")
+        or len(node.shape) != 4
+        or not math.log2(node.shape[-1]).is_integer()
+    ):
+        return False
 
-    # Dropout with zero probability is the identity.
-    if node.target == torch.ops.aten.dropout.default:
-        return get_arg_value(node, 1, "p") == 0.0
+    if node.target == torch.ops.aten.permute.default:
+        dims = node.args[1]
+        return len(dims) == 4 and dims == [0, 2, 1, 3]
 
-    # A same-dtype ``to.dtype`` is a pure pass-through.
-    if node.target == torch.ops.aten.to.dtype:
-        dtype = get_arg_value(node, 1, "dtype")
-        inp = node.args[0]
-        val = getattr(inp, "value", inp.meta.get("val"))
-        return isinstance(val, torch.Tensor) and dtype == val.dtype
+    if node.target == torch.ops.aten.transpose.int:
+        dims = {x if x >= 0 else x + 4 for x in node.args[1:]}
+        return node.value.ndim == 4 and dims == {1, 2}
 
     return False
 
 
-def is_nop(node: Node) -> bool:
+def trailing_mha_perm(fused_ops):
+    """The MHA qkv permute at the end of ``fused_ops`` (peeled of a trailing
+    microscaling ``quantize_mx``), or ``None`` if the tail is not such a
+    relayout."""
+    if not fused_ops:
+        return None
+    perm = fused_ops[-1]
+    if perm.target is torch.ops.quantized_ops.quantize_mx.default:
+        perm = perm.args[0]
+    return perm if is_mha_qkv_permute(perm) else None
+
+
+def weight_is_ck(node: Node) -> bool:
+    """Whether ``node``'s right operand is physically stored ``[contraction,
+    out]``.
+
+    ``is_matmul`` gives the op's native layout (matmul CK, linear KC) and
+    ``meta['transposed']`` says the layout transform flipped it, so the two
+    compose by XOR.  The twins the flip retargets to keep answering
+    ``is_linear`` / ``is_matmul``, which makes the meta the only signal.
     """
-    The following operations do not require any computation nor handling
-    on the memory placement side. Generate a NOP instruction for these ops
-    to keep the compute graph intact.
+    return is_matmul(node) != bool(node.meta.get("transposed", False))
+
+
+def weight_transforms(node: Node):
+    """The transforms fused onto a GEMM weight, and the operand beneath them.
+
+    An attention ``Q @ Kᵀ`` fuses ``K.transpose(-2, -1)`` onto the weight, and
+    GQA fuses the repeat that turns 8 KV heads into 32.  Neither is emitted:
+    ``transposed`` folds into the DMA (the fetch swaps its last two dims and
+    ``async_copy`` ``.mT``s the tile into the bank), ``repeat`` into the block
+    index (``grid_index // repeat[d]``, so four query heads share one KV tile).
+
+    A ``dequantize`` -- a KIVI KV cache, packed in DRAM -- does *not* fold into
+    the addressing, because it computes: it comes back for the builder to run on
+    the fetched tile, which is what lets the cache stay packed all the way into
+    the bank.
+
+    Only transforms over an external operand — a placeholder, i.e. something
+    the fused submodule is handed rather than computes — count; anything else
+    comes back unchanged.
+
+    Returns:
+        ``(node, transposed, repeat, dequant)``: the operand the transforms
+        read, followed by the transforms themselves.
     """
-    if is_prunable_op(node):
-        return True
+    inner = node
+    dequant = None
+    if inner.target is torch.ops.quantized_ops.dequantize.default:
+        dequant = inner
+        inner = inner.args[0]
 
-    # A select operation that selects the entire tensor
-    if node.target == torch.ops.aten.select.int:
-        shape = getattr(node.args[0], "shape", None)
-        return shape is not None and shape[node.args[1]] == 1
+    # A ``Kᵀ`` sits under the decode, never over it (``_insert_transpose_op``
+    # hoists it there).  The decode is none the wiser: the tile the fetch
+    # transposes into the bank is the one it was written against.
+    transposed = swaps_last_two_dims(inner)
+    if transposed:
+        inner = inner.args[0]
 
-    return node.target in [
-        torch.ops.aten.as_strided.default,
-        torch.ops.aten.contiguous.default,
-        torch.ops.aten.flatten.using_ints,
-        torch.ops.aten.lift_fresh_copy.default,
-        torch.ops.aten.reshape.default,
-        torch.ops.aten.squeeze.dim,
-        torch.ops.aten.squeeze.dims,
-        torch.ops.aten.unsqueeze.default,
-        torch.ops.aten.view.default,
-    ]
+    if inner.op == "placeholder":
+        return inner, transposed, None, dequant
+
+    found = repeat_of(inner)
+    if found is not None and found[0].op == "placeholder":
+        source, _, repeat = found
+        return source, transposed, repeat, dequant
+
+    return node, False, None, None
 
 
-def is_shape_changing_nop(node: Node) -> bool:
-    """A ``nop`` (no compute) whose output shape differs from its input shape
-    — a ``view`` / ``reshape`` / ``squeeze`` / ``unsqueeze`` / size-1 ``select``
-    that regroups or drops dims.  Such a node sitting *between* two fused
-    compute stages breaks the single-iteration-space assumption and is relocated
-    to the fused module's boundary by the iteration-space normalizer (see
-    ``normalize.py``).  A shape-*preserving* nop (same in/out shape) can stay
-    inside the fused chain.
-    """
-    if not is_nop(node):
-        return False
-    inp = node.args[0]
-    return (
-        hasattr(node, "shape")
-        and hasattr(inp, "shape")
-        and tuple(node.shape) != tuple(inp.shape)
-    )
+# --------------------------------------------------------------------------
+# Argument and dtype access
+# --------------------------------------------------------------------------
 
 
 def get_arg_value(
@@ -471,51 +532,6 @@ def _ntuple(n, name="parse"):
 _pair = _ntuple(2, "_pair")
 
 
-def peel_weight(node: Node):
-    """Resolve a GEMM weight operand through the ops fused onto it — a
-    last-two-dim transpose, a grouped-query broadcast, a dequantize — to the
-    external operand they read.
-
-    Returns ``(node, transposed, repeat, dequant)``.  An attention ``Q @ Kᵀ``
-    fuses ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that
-    turns 8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the
-    DMA (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile
-    into the bank), ``repeat`` into the block index (``grid_index // repeat[d]``,
-    so four query heads share one KV tile).
-
-    A ``dequantize`` -- a KIVI KV cache, packed in DRAM -- does *not* fold into
-    the addressing, because it computes: it comes back for the builder to run on
-    the fetched tile, which is what lets the cache stay packed all the way into
-    the bank.
-
-    Only ops over an external operand — a placeholder, i.e. something the fused
-    submodule is handed rather than computes — peel; anything else comes back
-    unchanged.
-    """
-    inner = node
-    dequant = None
-    if inner.target is torch.ops.quantized_ops.dequantize.default:
-        dequant = inner
-        inner = inner.args[0]
-
-    # A ``Kᵀ`` sits under the decode, never over it (``_insert_transpose_op``
-    # hoists it there).  The decode is none the wiser: the tile the fetch
-    # transposes into the bank is the one it was written against.
-    transposed = swaps_last_two_dims(inner)
-    if transposed:
-        inner = inner.args[0]
-
-    if inner.op == "placeholder":
-        return inner, transposed, None, dequant
-
-    found = repeat_of(inner)
-    if found is not None and found[0].op == "placeholder":
-        source, _, repeat = found
-        return source, transposed, repeat, dequant
-
-    return node, False, None, None
-
-
 def dtype_byte_size(dtype):
     """Bytes occupied by one element of ``dtype`` (fractional for sub-byte).
 
@@ -541,6 +557,17 @@ def dtype_byte_size(dtype):
     return bit_width / 8.0
 
 
+# --------------------------------------------------------------------------
+# Shape and tiling geometry
+# --------------------------------------------------------------------------
+
+
+def normalize_shape(node, shape):
+    node_to_key = get_node_to_key_map(node)
+    shape = {n: shape[k] for n, k in node_to_key.items() if k in shape}
+    return shape
+
+
 def get_node_to_key_map(node):
     """Each operand FX node -> the role it plays for ``node``.
 
@@ -560,33 +587,27 @@ def get_node_to_key_map(node):
     return node_to_key
 
 
-def normalize_shape(node, shape):
-    node_to_key = get_node_to_key_map(node)
-    shape = {n: shape[k] for n, k in node_to_key.items() if k in shape}
-    return shape
+def reshape_preserves_full_blocks(
+    input_shape: tuple[int, ...],
+    input_axis: int,
+    output_shape: tuple[int, ...],
+    output_axis: int,
+    group_size: int,
+) -> bool:
+    if math.prod(input_shape) != math.prod(output_shape):
+        return False
 
+    if group_size == 1:
+        return True
 
-def get_anchor_node(node):
-    """The compute anchor of ``node``: for a fused ``call_module`` (its submodule
-    in ``node.meta['submodule']``, set at fusion), the GEMM/conv/pool/pointwise
-    op inside the submodule (``None`` if it has none); for any other node,
-    ``node`` itself.
-    """
-    if node.op != "call_module":
-        return node
-    submod = node.meta.get("submodule")
-    if not isinstance(submod, GraphModule):
-        return None
-    anchor_node = None
-    for n in submod.graph.nodes:
-        if is_gemm_op(n):
-            return n
-        if n.op == "call_function" and (
-            anchor_node is None
-            or anchor_node.target == torch.ops.quantized_ops.dequantize.default
-        ):
-            anchor_node = n
-    return anchor_node
+    input_minor = math.prod(input_shape[input_axis + 1 :])
+    output_minor = math.prod(output_shape[output_axis + 1 :])
+
+    return (
+        input_minor == output_minor
+        and input_shape[input_axis] % group_size == 0
+        and output_shape[output_axis] % group_size == 0
+    )
 
 
 def compute_tiled_shape(shape, divisor):

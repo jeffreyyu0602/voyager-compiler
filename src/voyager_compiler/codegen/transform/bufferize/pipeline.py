@@ -17,8 +17,6 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 from torch._higher_order_ops.while_loop import while_loop
 
-# Top-level: these modules do not import this one at module scope
-# (bufferization imports the builders function-locally), so no cycle.
 from voyager_compiler.codegen.node_info import (
     _pair,
     ancestors,
@@ -27,10 +25,10 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
-    peel_weight,
     quant_param_arg_nodes,
     trailing_mha_perm,
     weight_is_ck,
+    weight_transforms,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
@@ -1857,7 +1855,7 @@ def build_gemm(
     # folded into how its tile is addressed rather than emitted; the spec itself
     # stays in the matmul (Kᵀ) layout.  A fused ``dequantize`` (a packed KV
     # cache) is compute, so it runs on the fetched tile instead.
-    weight_node, transposed, weight_repeat, dequant = peel_weight(
+    weight_node, transposed, weight_repeat, dequant = weight_transforms(
         anchor.args[1]
     )
 
@@ -1976,7 +1974,7 @@ def build_gemm(
             return
         # A scale wears the same relayouts as the tensor it scales, so it peels
         # the same way.
-        v, transposed, repeat, _ = peel_weight(v)
+        v, transposed, repeat, _ = weight_transforms(v)
         if spec is not None:
             spec.transposed = transposed
             spec.repeat = repeat
@@ -2023,7 +2021,7 @@ def build_gemm(
                 continue
             spec = None
             if v not in tables:
-                v, t, r, _ = peel_weight(v)
+                v, t, r, _ = weight_transforms(v)
                 spec = _spec(v.value.shape, dq_tile, _proj(gn, gk))
                 spec.transposed = t
                 spec.repeat = r

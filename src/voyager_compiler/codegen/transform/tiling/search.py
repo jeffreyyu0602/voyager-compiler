@@ -17,6 +17,7 @@ from voyager_compiler.codegen.node_info import (
     is_matmul,
     is_pooling,
     normalize_shape,
+    quant_param_arg_nodes,
     trailing_mha_perm,
     weight_is_ck,
 )
@@ -289,6 +290,27 @@ def _build_gemm_shape_map(node, tile_sizes, divisor=None):
     }
 
 
+def _operand_placeholders(root):
+    """External placeholder operands feeding ``root``'s subtree (``root``
+    inclusive), tracing through pre-processing ops (``dequantize`` / reshape)
+    and skipping each op's quantization codebook / qmap args.
+    """
+    leaves, stack, visited = [], [root], set()
+    while stack:
+        n = stack.pop()
+        if n in visited:
+            continue
+        visited.add(n)
+        if n.op == "placeholder":
+            leaves.append(n)
+            continue
+        codebooks = quant_param_arg_nodes(n)
+        for inp in n.all_input_nodes:
+            if inp not in codebooks:
+                stack.append(inp)
+    return leaves
+
+
 def _build_gemv_shape_map(node, tile_sizes, tiling):
     """``_build_gemm_shape_map`` for the whole kernel a GEMV builds, keyed by
     the FX node each tile belongs to.
@@ -300,10 +322,6 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     whatever fusion left of it -- a ``quantize_mx`` tail makes it a pair, an
     MHA relayout re-cuts ``N`` into heads -- diced by the same blocks.
     """
-    from voyager_compiler.codegen.transform.tiling.tiler import (
-        _operand_placeholders,
-    )
-
     anchor = get_anchor_node(node)
     tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
     out_tile = tiles.pop("output")

@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Interpreter, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
+from torch.library import Library, impl
 from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
 from voyager_compiler.codegen.aten_classifier import is_elementwise_op
@@ -129,8 +130,6 @@ def remove_prunable_ops(model: GraphModule) -> None:
 
 
 def replace_interpolate():
-    from torch.library import Library, impl
-
     template = (
         "interpolate(Tensor input, SymInt[] size, float[]? scale_factor = None,"
         "str mode = 'nearest', bool? align_corners = None, "

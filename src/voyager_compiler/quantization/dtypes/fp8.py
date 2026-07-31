@@ -1,4 +1,5 @@
 import math
+import re
 
 import torch
 
@@ -225,8 +226,6 @@ def _quantize_elemwise_core(
 
 
 def get_float_fq_fn(dtype):
-    import re
-
     if match := re.match(r"fp(\d+)_e(\d+)m(\d+)", dtype):
         nbits, ebits, mbits = map(int, match.groups())
         assert nbits == ebits + mbits + 1

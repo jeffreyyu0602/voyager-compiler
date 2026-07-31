@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import re
 from typing import Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import Quantizer
 
+from voyager_compiler.export_utils import get_node_name_to_scope
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     OP_TO_ANNOTATOR,
     QuantizationConfig,
@@ -29,7 +31,6 @@ def _get_module_name_filter(module_name: str):
     >> print(module_name_filter(node))
     True  # the node is from "blocks.sub" based on the fully qualified name "blocks.sub.linear1"
     """
-    import re
 
     def module_name_filter(n: Node) -> bool:
         # example: {
@@ -124,10 +125,6 @@ def _get_module_name_object_type_order_filter(
     >>     model, "mobilebert.encoder.layer[0].attention.self", torch.ops.aten.linear.default, 0)
     >> print(module_name_object_type_order_filter(node))
     """
-    import re
-
-    from voyager_compiler.export_utils import get_node_name_to_scope
-
     node_name_to_scope = get_node_name_to_scope(model)
 
     def module_name_object_type_order_filter(n: Node) -> bool:

@@ -24,7 +24,7 @@ from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_fully_connected,
-    peel_weight,
+    weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.banking import (
     operand_roles,
@@ -273,7 +273,7 @@ def _operand_spans(node, dims, nb):
     """
     shape = tuple(node.shape)
     own = shape[: max(0, len(shape) - 2)]
-    repeat = peel_weight(node)[2]
+    repeat = weight_transforms(node)[2]
 
     spans = {}
     for j, size in enumerate(own):

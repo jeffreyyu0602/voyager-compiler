@@ -36,12 +36,28 @@ from voyager_compiler.codegen.subgraph import (
     replace_node_with_graph_module,
     update_submod_user_meta,
 )
+from voyager_compiler.codegen.transform.bufferize.attention import (
+    build_attention,
+)
+from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
+    build_attention_fa3,
+)
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     oracle_disabled,
 )
+from voyager_compiler.codegen.transform.bufferize.pipeline import (
+    _map_kernel,
+    build_conv2d,
+    build_gemm,
+    build_pipelined_buffers,
+    build_pointwise,
+    build_pool,
+)
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
+    _InputSpec,
+    _OutputSpec,
     _passed_whole,
     _subgraph,
 )
@@ -730,19 +746,6 @@ def bufferize_graph(
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
     """
-    from voyager_compiler.codegen.transform.bufferize.attention import (
-        build_attention,
-    )
-    from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
-        build_attention_fa3,
-    )
-    from voyager_compiler.codegen.transform.bufferize.pipeline import (
-        build_conv2d,
-        build_gemm,
-        build_pointwise,
-        build_pool,
-    )
-
     graph = model.graph
     num_banks = 2 if pipelined else 1
     build_cache = {}
@@ -982,15 +985,6 @@ def _build_for_untiled(node: Node):
     Returns ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to
     load/store (``getitem``, a non-tensor output).
     """
-    from voyager_compiler.codegen.transform.bufferize.pipeline import (
-        _map_kernel,
-        build_pipelined_buffers,
-    )
-    from voyager_compiler.codegen.transform.bufferize.utils import (
-        _InputSpec,
-        _OutputSpec,
-    )
-
     if node.target is operator.getitem:
         return None
     val = getattr(node, "value", None)

@@ -15,12 +15,15 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import torch
+import torch._export.verifier as _verifier
 from torch.fx import GraphModule, Node
 
-from voyager_compiler.codegen.node_info import is_nop, quant_param_arg_nodes
-
-# Registers voyager.* before ``torch.ops.voyager`` is bound below.
-from voyager_compiler.codegen.transform.bufferize import ops  # noqa: F401
+from voyager_compiler.codegen.node_info import (
+    compute_tiled_shape,
+    is_nop,
+    quant_param_arg_nodes,
+)
+from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -238,8 +241,6 @@ def _compute_input_spec(
     NHWC permutation), since their grid carries a reduction dim the output
     doesn't span.
     """
-    from voyager_compiler.codegen.node_info import compute_tiled_shape
-
     # 0-D or single-element tensors are passed through (no spec).
     if len(input_shape) == 0 or (len(input_shape) == 1 and input_shape[0] == 1):
         return None
@@ -317,8 +318,6 @@ def _lenient_verifier():
     rejects.  Those placeholders are never executed, so it is safe to skip the
     check for them (genuine missing-val errors on used nodes still raise).
     """
-    import torch._export.verifier as _verifier
-
     orig = _verifier._check_val
 
     def _check(node):
@@ -395,8 +394,6 @@ def fuse_store_cones(gm: GraphModule) -> None:
     software-pipelined, or async-flattened -- the buffer stores that separate
     those cases are exactly the cone boundaries, so one rule spans them all.
     """
-    from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
-
     for node in list(gm.graph.nodes):
         if node.op == "get_attr":
             sub = getattr(gm, str(node.target), None)

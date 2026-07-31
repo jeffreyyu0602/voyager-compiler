@@ -36,6 +36,7 @@ non-bufferized path).  Three ideas carry the whole translation:
 import logging
 import operator
 import os
+import signal
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
@@ -1153,8 +1154,6 @@ def gen_compute_graph_bufferized(
     if timeout is None:
         _render()
         return
-
-    import signal
 
     class _RenderTimeout(Exception):
         pass

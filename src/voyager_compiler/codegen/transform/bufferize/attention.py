@@ -45,6 +45,7 @@ from typing import Optional, Tuple
 import torch
 
 from voyager_compiler.codegen.node_info import get_arg_value
+from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _DEFAULT_NUM_BANKS,
     build_pipelined_buffers,
@@ -260,8 +261,6 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
     in it, so a value read by a later pass stays a boundary input, not absorbed.
     Single-op cones (reductions, a lone ``maximum`` / ``mul``) are left as-is.
     """
-    from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
-
     for n in list(gm.graph.nodes):
         if n.op == "get_attr":
             sub = getattr(gm, str(n.target), None)
