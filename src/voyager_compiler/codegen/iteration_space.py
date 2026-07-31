@@ -27,8 +27,7 @@ from .node_info import (
     quant_param_arg_nodes,
     reshape_preserves_full_blocks,
 )
-from .shape_prop import ShapeProp
-from ..pt2e_utils import propagate_shape, set_node_value
+from ..shape_prop import ShapeProp, propagate_shape, set_node_value
 
 logger = logging.getLogger(__name__)
 

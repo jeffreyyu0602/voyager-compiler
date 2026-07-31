@@ -10,7 +10,7 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from ...hardware import AcceleratorConfig
+from ...hardware_config import AcceleratorConfig
 
 
 @dataclass

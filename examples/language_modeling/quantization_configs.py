@@ -1,7 +1,7 @@
 import logging
 import torch
 from voyager_compiler import QuantizationSpec, QuantizationConfig
-from voyager_compiler.fake_quantize import FusedAmaxObsFakeQuantize
+from voyager_compiler.quantization.fake_quantize import FusedAmaxObsFakeQuantize
 
 
 logger = logging.getLogger(__name__)

@@ -23,7 +23,7 @@ from typing import Optional
 import interstellar
 import torch
 
-from voyager_compiler.codegen.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp
 
 from ...node_info import (
     _pair,
@@ -34,14 +34,23 @@ from ...node_info import (
     is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
+    peel_weight,
     quant_param_arg_nodes,
     trailing_mha_perm,
     weight_is_ck,
 )
-from ..tiling.cost import _step_classes, _sweep_cycles
-from ..tiling.search import DEFAULT_RUNTIME_TOLERANCE, gemv_op_tiling
-from .utils import _unproject, _NHWC, _HWIO
-from ....pt2e_utils import dtype_byte_size
+from .cost import (
+    _node_dtype_bits,
+    _step_classes,
+    _sweep_cycles,
+    get_dtype_width,
+)
+from .search import DEFAULT_RUNTIME_TOLERANCE, gemv_op_tiling
+from ....ops.layout import (
+    NCHW_TO_NHWC,
+    WEIGHT_NCHW_TO_HWIO,
+    unproject,
+)
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -61,37 +70,6 @@ CONV_L3_ORDER = ("K", "Y", "X")
 # 1x1 conv, so M rides on OX and N on OC.
 _GEMM_LOOP = {"M": le.OX, "N": le.OC}
 _CONV_LOOP = {"K": le.OC, "Y": le.OY, "X": le.OX}
-
-
-def get_dtype_width(dtype) -> int:
-    """Element width in bits, derived from the canonical ``dtype_byte_size``
-    so the dtype-name parsing lives in exactly one place."""
-    return round(dtype_byte_size(dtype) * 8)
-
-
-def _node_dtype_bits(node, default: Optional[int] = None) -> int:
-    """
-    Element width in bits for an FX node's tensor, read from the graph.
-
-    Prefers node.meta["dtype"] (the compiler's tracked storage dtype, e.g. an
-    NF4 weight), falling back to the runtime tensor dtype node.value.dtype.  A
-    multi-output node (meta dtype / value is a list, e.g. quantize_mx) uses its
-    primary (last) output.
-    """
-    if node is not None:
-        dtype = node.meta.get("dtype")
-        if isinstance(dtype, (list, tuple)):
-            dtype = dtype[-1]
-        if dtype is None:
-            val = getattr(node, "value", None)
-            if isinstance(val, (list, tuple)):
-                val = val[-1] if val else None
-            dtype = getattr(val, "dtype", None)
-        if dtype is not None:
-            return round(dtype_byte_size(dtype) * 8)
-    if default is None:
-        raise ValueError(f"node {node} has no dtype to size the operand")
-    return default
 
 
 @dataclass
@@ -934,10 +912,10 @@ def _extract_layer_from_node(node):
     transposed = node.meta.get("transposed", False)
 
     if is_conv2d(node):
-        w_dims = _HWIO if transposed else None
-        in_dims = _NHWC if transposed else None
-        out_channels, in_channels, kH, kW = _unproject(weight_shape, w_dims)
-        _, _, height, width = _unproject(node.shape, in_dims)
+        w_dims = WEIGHT_NCHW_TO_HWIO if transposed else None
+        in_dims = NCHW_TO_NHWC if transposed else None
+        out_channels, in_channels, kH, kW = unproject(weight_shape, w_dims)
+        _, _, height, width = unproject(node.shape, in_dims)
 
         if in_channels == 3:
             return None
@@ -1013,8 +991,6 @@ def _prepare_search(node, tiler):
         the two apart by looking the key up; either way the key names the
         entry.
     """
-    from .pipeline import _peel_weight
-
     anchor = get_anchor_node(node)
     if (
         not is_gemm_op(anchor)
@@ -1086,7 +1062,7 @@ def _prepare_search(node, tiler):
     batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
 
     weight = anchor.args[1]
-    repeat = _peel_weight(weight)[2]
+    repeat = peel_weight(weight)[2]
     weight_repeat = (
         math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
     )

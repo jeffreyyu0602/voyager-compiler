@@ -42,3 +42,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "voyager_compiler" = ["*.txt", "*.json"]
+# Subpackage data (the posit lookup tables under quantization/dtypes/posit_gold).
+"voyager_compiler.*" = ["*.txt", "*.json", "*.proto"]

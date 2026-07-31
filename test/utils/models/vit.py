@@ -23,7 +23,7 @@ from voyager_compiler.codegen import (
     remove_softmax_dtype_cast,
     remove_zero_attention_mask,
 )
-from voyager_compiler.pt2e_utils import get_conv_bn_layers
+from voyager_compiler.quantization.quantize import get_conv_bn_layers
 
 from .utils import get_compile_args, get_transform_args
 

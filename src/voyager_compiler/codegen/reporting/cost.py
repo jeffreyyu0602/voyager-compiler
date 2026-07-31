@@ -14,11 +14,15 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import get_anchor_node
-from ..node_info import is_conv2d, is_fully_connected, is_gemm_op
+from ..node_info import (
+    dtype_byte_size,
+    get_anchor_node,
+    is_conv2d,
+    is_fully_connected,
+    is_gemm_op,
+)
 from ..transform.tiling.cost import vector_op_utilization
-from ...pt2e_utils import dtype_byte_size
-from ...hardware import AcceleratorConfig
+from ...hardware_config import AcceleratorConfig
 from .model import OpInfo
 
 

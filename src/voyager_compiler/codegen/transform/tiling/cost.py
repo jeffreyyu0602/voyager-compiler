@@ -14,14 +14,19 @@ copy of that formula (and of ``OP_PASSES``).
 """
 
 import math
+from typing import Optional
 
 import interstellar
 import torch
 from torch.fx import Node
 
 from .banking import operand_roles, require_allocation
-from ...node_info import get_anchor_node, get_node_bytes, is_fully_connected
-from ....pt2e_utils import dtype_byte_size
+from ...node_info import (
+    dtype_byte_size,
+    get_anchor_node,
+    is_fully_connected,
+    peel_weight,
+)
 
 le = interstellar.le
 
@@ -49,15 +54,53 @@ def _val(node):
     return None
 
 
-def _widths(node):
-    """Element byte widths of ``node`` -- one per output for a multi-output
-    node (its ``meta['dtype']`` is then a list), else a single width."""
-    dt = node.meta.get("dtype") if isinstance(node, Node) else None
-    if isinstance(dt, (list, tuple)):
-        return [dtype_byte_size(d) for d in dt if d is not None]
-    if dt is not None:
-        return [dtype_byte_size(dt)]
-    return [dtype_byte_size(_val(node).dtype)]
+def get_dtype_width(dtype) -> int:
+    """Element width in bits, derived from the canonical ``dtype_byte_size``
+    so the dtype-name parsing lives in exactly one place."""
+    return round(dtype_byte_size(dtype) * 8)
+
+
+def _node_dtype_bits(node, default: Optional[int] = None):
+    """Element width in bits of ``node``'s tensor, read from the graph.
+
+    Prefers the compiler's tracked storage dtype (``meta['dtype']``, e.g. an
+    NF4 weight) over the traced tensor dtype.  A multi-output node --
+    ``quantize_mx`` gives ``(scale, quantized)`` -- carries one tracked dtype
+    per output and gives one width per output in that order; every other node
+    gives a single width.
+
+    Args:
+        node: The FX node to size, or ``None`` for an absent operand.
+        default: Width to return when there is no node to size; omit to raise.
+
+    Returns:
+        The element width in bits, or one per output for a multi-output node.
+
+    Raises:
+        ValueError: If ``node`` is not an FX node and ``default`` is ``None``.
+    """
+    if not isinstance(node, Node):
+        if default is None:
+            raise ValueError(f"node {node} has no dtype to size the operand")
+        return default
+
+    dtype = node.meta.get("dtype")
+    value = getattr(node, "value", None)
+    if value is None:
+        value = node.meta.get("val")
+
+    if isinstance(dtype, (list, tuple)):
+        # One tracked dtype per output; a ``None`` entry is an output left at
+        # the dtype it was traced with.
+        return [
+            get_dtype_width(d if d is not None else v.dtype)
+            for d, v in zip(dtype, value)
+        ]
+    if dtype is not None:
+        return get_dtype_width(dtype)
+    if isinstance(value, (list, tuple)):
+        return [get_dtype_width(v.dtype) for v in value]
+    return get_dtype_width(value.dtype)
 
 
 def vector_op_utilization(node, vector_lanes, bytes_per_cycle):
@@ -83,15 +126,16 @@ def vector_op_utilization(node, vector_lanes, bytes_per_cycle):
     anchor = get_anchor_node(node) or node
     if is_fully_connected(anchor):
         weight = anchor.args[1]
-        widths = _widths(weight.meta.get("source_node", weight))
+        widths = [_node_dtype_bits(weight.meta.get("source_node", weight))]
     else:
         widths = [
-            w
+            _node_dtype_bits(n)
             for n in [node, *node.all_input_nodes]
             if _val(n) is not None
-            for w in _widths(n)
         ]
-    total_bytes = vector_lanes * max(widths, default=2.0)
+    # A multi-output node contributes one width per output.
+    bits = [b for w in widths for b in (w if isinstance(w, list) else [w])]
+    total_bytes = vector_lanes * max(bits, default=16) / 8
     num_passes = OP_PASSES.get(anchor.target, 1)
     fetch_cycles = num_passes * math.ceil(total_bytes / bytes_per_cycle)
     return min(1.0, 1.0 / fetch_cycles)
@@ -99,12 +143,12 @@ def vector_op_utilization(node, vector_lanes, bytes_per_cycle):
 
 def _operand_bytes(shape, node):
     """Physical bytes of a tiled operand.  ``shape`` is a single tile shape, or
-    a sequence of per-output shapes for a multi-output node (``get_node_bytes``
-    then yields one width per output)."""
-    width = get_node_bytes(node)
-    if isinstance(width, (int, float)):
-        return math.ceil(math.prod(shape) * width)
-    return sum(math.ceil(math.prod(s) * w) for s, w in zip(shape, width))
+    a sequence of per-output shapes for a multi-output node, which then pays for
+    each output at its own width."""
+    bits = _node_dtype_bits(node)
+    if isinstance(bits, int):
+        return math.ceil(math.prod(shape) * bits / 8)
+    return sum(math.ceil(math.prod(s) * w / 8) for s, w in zip(shape, bits))
 
 
 def _tile_elems(shape):
@@ -224,14 +268,9 @@ def _operand_spans(node, dims, nb):
     and the expand never runs.  ``dims`` names the trailing dims its role is
     diced by.
     """
-    # Local import: ``bufferize.pipeline`` imports this package's ``search``,
-    # which imports this module.  ``_peel_weight`` is what decides the repeat
-    # the builder folds, so ask it rather than keep a second opinion.
-    from ..bufferize.pipeline import _peel_weight
-
     shape = tuple(node.shape)
     own = shape[: max(0, len(shape) - 2)]
-    repeat = _peel_weight(node)[2]
+    repeat = peel_weight(node)[2]
 
     spans = {}
     for j, size in enumerate(own):

@@ -1,65 +1,144 @@
+"""Lower a quantized PyTorch model onto a Voyager-generated accelerator.
+
+``transform()`` runs the hardware-lowering passes over an exported FX graph;
+``compile()`` bufferizes, plans memory and emits the ``voyager`` IR.  Both
+operate in place and leave the graph executable, so every stage can be checked
+numerically against the original.
+"""
+
+import os
+from typing import Callable, Optional, Tuple
+
+import torch
 from google.protobuf import text_format
+from torch.fx import Node
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.utils._pytree import tree_flatten
 
-from .cli_args import *
-from .codegen import *
+# Defines torch.ops.quantized_ops.* (and the hardware-layout twins).  This must
+# come first: the imports below reference those targets, and the op namespace
+# resolves lazily, so an unregistered target fails at call time rather than
+# here.
+from . import ops as _register_ops  # noqa: F401
+
+from .cli_args import (
+    add_compile_args,
+    add_experiment_args,
+    add_quantization_args,
+)
+from .codegen import (
+    deduplicate_nodes,
+    eliminate_reshape_with_no_effect,
+    extract_input_preprocessor,
+    fold_constant_generators,
+    fuse_dequantize_quantize,
+    fuse_operator,
+    fuse_quantize_dequantize_with_previous_op,
+    gen_compute_graph,
+    inline_autocast_modules,
+    normalize_conv2d_layout,
+    normalize_gemm_weight_layout,
+    pad_matrix_op_dimensions,
+    pad_vector_op_dimensions,
+    pad_vit_embeddings_output,
+    remove_prunable_ops,
+    remove_softmax_dtype_cast,
+    remove_zero_attention_mask,
+    rename_nodes_with_param_names,
+    replace_conv2d_with_im2col,
+    replace_interpolate,
+    replace_rmsnorm_with_layer_norm,
+    split_dense_spmm_node,
+)
 from .codegen.transform.bufferize import (
     bufferize_graph,
+    compute_op_names,
+    flush_tensor_files,
     gen_code_bufferized,
     gen_compute_graph_bufferized,
     plan_memory,
     print_bufferized_graph,
 )
-from .codegen.transform.bufferize.emit import (
-    compute_op_names,
-    flush_tensor_files,
-)
-from .codegen.transform.bufferize.tiling import (
+from .codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
-from .codegen.transform.rewrites import split_dense_spmm_node
-from .hardware import AcceleratorConfig
-from .decomposed import *
-from .fake_quantize import *
-from .fp8 import *
-from .histogram import *
-from .llm_utils import *
-from .normal_float import *
-from .posit import *
-from .pt2e_utils import *
-from .qconfig import *
-from .quantize import *
-from .quantize_pt2e import *
-from .quantizer import *
-from .utils import *
+from .export_utils import (
+    TorchExportableModuleWithStaticCache,
+    convert_and_export_with_split_cache,
+    export_model,
+    get_aten_graph_module,
+    get_node_name_to_scope,
+    print_node_scope_tabular,
+)
+from .hardware_config import AcceleratorConfig
+from .modeling import (
+    dispatch_model,
+    get_device_map,
+    insert_align_device_nodes,
+)
+from .quantization import (
+    DerivedQuantizationSpec,
+    FusedAmaxObsFakeQuantize,
+    QConfig,
+    QScheme,
+    QuantizationConfig,
+    QuantizationSpec,
+    convert,
+    convert_pt2e,
+    derive_bias_qparams_fn,
+    get_default_quantizer,
+    get_qconfig,
+    prepare,
+    prepare_pt2e,
+    propagate_config,
+    quantize,
+    replace_softmax,
+    sink_obs_or_fq,
+)
+from .quantization.dtypes import (
+    quantize_to_fp8_e4m3,
+    quantize_to_fp8_e5m2,
+    quantize_to_nf,
+    quantize_to_posit,
+)
+from .quantization.modules import swap_llama_attention
+from .shape_prop import ShapeProp, fetch_attr, propagate_shape
+from .utils import with_execution_context
 
 __all__ = [
+    "AcceleratorConfig",
+    "DerivedQuantizationSpec",
     "FusedAmaxObsFakeQuantize",
+    "OpMatcher",
     "QConfig",
+    "QScheme",
+    "QuantizationConfig",
     "QuantizationSpec",
+    "ShapeProp",
     "TorchExportableModuleWithStaticCache",
     "add_compile_args",
     "add_experiment_args",
     "add_quantization_args",
+    "compile",
     "convert",
     "convert_and_export_with_split_cache",
+    "convert_pt2e",
     "deduplicate_nodes",
     "derive_bias_qparams_fn",
     "dispatch_model",
-    "dtype_byte_size",
     "export_model",
+    "extract_input_preprocessor",
     "fetch_attr",
-    "generate",
+    "fuse_dequantize_quantize",
+    "fuse_operator",
     "get_aten_graph_module",
     "get_default_quantizer",
     "get_device_map",
     "get_node_name_to_scope",
     "get_qconfig",
     "insert_align_device_nodes",
-    "plot_histogram",
-    "plot_layer_range",
+    "pad_vit_embeddings_output",
     "prepare",
     "prepare_pt2e",
     "print_node_scope_tabular",
@@ -70,9 +149,15 @@ __all__ = [
     "quantize_to_fp8_e5m2",
     "quantize_to_nf",
     "quantize_to_posit",
+    "remove_softmax_dtype_cast",
+    "remove_zero_attention_mask",
+    "replace_conv2d_with_im2col",
+    "replace_interpolate",
+    "replace_rmsnorm_with_layer_norm",
     "replace_softmax",
     "sink_obs_or_fq",
     "swap_llama_attention",
+    "transform",
     "with_execution_context",
 ]
 

@@ -1,10 +1,15 @@
+from pathlib import Path
+
 import torch
 from torch import nn
 
 
-POSIT_EXP_FILE = "src/voyager_compiler/posit_gold/posit16_1_exp.txt"
-POSIT_EXP_SHIFTED_FILE = "src/voyager_compiler/posit_gold/posit16_1_exp_shifted.txt"
-POSIT_RECIPROCAL_FILE = "src/voyager_compiler/posit_gold/posit16_1_reciprocal.txt"
+# Resolved against this file, not the CWD, so an installed package works.
+_POSIT_GOLD = Path(__file__).resolve().parent.parent / "dtypes" / "posit_gold"
+
+POSIT_EXP_FILE = _POSIT_GOLD / "posit16_1_exp.txt"
+POSIT_EXP_SHIFTED_FILE = _POSIT_GOLD / "posit16_1_exp_shifted.txt"
+POSIT_RECIPROCAL_FILE = _POSIT_GOLD / "posit16_1_reciprocal.txt"
 
 def _convert(input: torch.Tensor, values: torch.Tensor):
     # Keep 8 exponent bits and 14 fraction bits, which is the maximum number

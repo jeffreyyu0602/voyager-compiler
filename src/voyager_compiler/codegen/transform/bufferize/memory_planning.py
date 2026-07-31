@@ -39,8 +39,7 @@ from torch.fx import GraphModule, Node
 
 from .bufferization import _viewed_buffer
 from .utils import _collect_codebook_nodes, _passed_whole, _subgraph
-from ...node_info import _align_size, get_arg_value
-from ....pt2e_utils import dtype_byte_size
+from ...node_info import _align_size, dtype_byte_size, get_arg_value
 from .ops import MemoryLevel, UNBANKED
 
 logger = logging.getLogger(__name__)

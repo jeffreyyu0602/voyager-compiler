@@ -6,7 +6,7 @@ import torch
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import Quantizer
 
-from voyager_compiler.quantizer.xnnpack_quantizer_utils import (
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     _convert_scalars_to_attrs,
     OP_TO_ANNOTATOR,
     QuantizationConfig,
@@ -124,7 +124,7 @@ def _get_module_name_object_type_order_filter(
     >> print(module_name_object_type_order_filter(node))
     """
     import re
-    from ..pt2e_utils import get_node_name_to_scope
+    from ...export_utils import get_node_name_to_scope
     node_name_to_scope = get_node_name_to_scope(model)
 
     def module_name_object_type_order_filter(n: Node) -> bool:

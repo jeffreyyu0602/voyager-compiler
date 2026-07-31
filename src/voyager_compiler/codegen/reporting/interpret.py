@@ -23,8 +23,7 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import is_compute_op, is_nop
-from ..node_info import get_arg_value
+from ..node_info import get_arg_value, is_compute_op, is_nop
 from ..transform.bufferize.bufferization import _produces_tensor, _viewed_buffer
 from ..transform.bufferize.emit import (
     COMMIT,
@@ -36,7 +35,7 @@ from ..transform.bufferize.emit import (
 from .cost import _shape, _val, tile_bytes
 from .model import ScheduleResult
 from .scheduler import ResourceState
-from ...hardware import AcceleratorConfig
+from ...hardware_config import AcceleratorConfig
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default

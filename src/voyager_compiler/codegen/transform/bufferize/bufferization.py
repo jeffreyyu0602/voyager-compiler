@@ -21,10 +21,8 @@ import torch
 import torch.fx as fx
 from torch.fx import GraphModule, Node
 
-from ....pt2e_utils import update_submod_user_meta
-from ...node_info import get_anchor_node
-from ...subgraph import replace_node_with_graph_module
 from ...node_info import (
+    get_anchor_node,
     quant_param_arg_nodes,
     is_compute_op,
     is_conv2d,
@@ -34,8 +32,12 @@ from ...node_info import (
     is_pooling,
     is_shape_changing_nop,
 )
+from ...subgraph import (
+    replace_node_with_graph_module,
+    update_submod_user_meta,
+)
 from .ops import MemoryLevel, oracle_disabled
-from .tiling import prefetch_tilings
+from ..tiling.tiler import prefetch_tilings
 from .utils import (
     _collect_codebook_nodes,
     _passed_whole,

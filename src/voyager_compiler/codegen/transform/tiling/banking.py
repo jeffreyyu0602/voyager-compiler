@@ -7,12 +7,12 @@ import torch
 
 from ...node_info import (
     _align_size,
+    dtype_byte_size,
     get_anchor_node,
     get_node_to_key_map,
     is_gemm_op,
     quant_param_arg_nodes,
 )
-from ....pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
 

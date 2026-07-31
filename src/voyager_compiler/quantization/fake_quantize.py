@@ -7,16 +7,16 @@ import torch
 from torch import Tensor
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
-import voyager_compiler as qt
-from voyager_compiler.decomposed import expand, vmap, quantize_mx
-from voyager_compiler.fp8 import (
+from ..ops import expand, quantize_mx, vmap
+from .dtypes import (
     _quantize_elemwise_core,
     quantize_to_fp8_e4m3,
     quantize_to_fp8_e5m2,
+    quantize_to_nf,
+    quantize_to_posit,
 )
-from voyager_compiler.mx_utils import _reshape_to_blocks
-from voyager_compiler.normal_float import quantize_to_nf
-from voyager_compiler.posit import quantize_to_posit
+from .mx_utils import _reshape_to_blocks
+from .qspec import QScheme
 
 
 __all__ = [
@@ -30,7 +30,8 @@ logger = logging.getLogger(__name__)
 
 def get_quantization_map(dtype, device=None):
     """Return a quantization map for the given dtype."""
-    values = torch.arange(2 ** 16, dtype=torch.int16, device=device).view(torch.bfloat16)
+    values = torch.arange(2**16, dtype=torch.int16, device=device)
+    values = values.view(torch.bfloat16)
     if dtype is None:
         return values
 
@@ -40,27 +41,27 @@ def get_quantization_map(dtype, device=None):
         return values.to(torch_dtype).to(torch.bfloat16)
 
     # Integer data types
-    if (match := re.fullmatch(r'int(\d+)', dtype, re.IGNORECASE)):
+    if match := re.fullmatch(r"int(\d+)", dtype, re.IGNORECASE):
         nbits = int(match.group(1))
-        quant_min, quant_max = -2 ** (nbits - 1), 2 ** (nbits - 1) - 1
+        quant_min, quant_max = -(2 ** (nbits - 1)), 2 ** (nbits - 1) - 1
         return torch.clamp(torch.round(values), quant_min, quant_max)
 
     # Unsigned integer
-    if (match := re.fullmatch(r'uint(\d+)', dtype, re.IGNORECASE)):
+    if match := re.fullmatch(r"uint(\d+)", dtype, re.IGNORECASE):
         nbits = int(match.group(1))
-        quant_min, quant_max = 0, 2 ** nbits - 1
+        quant_min, quant_max = 0, 2**nbits - 1
         return torch.clamp(torch.round(values), quant_min, quant_max)
 
     # Custom implementation for NVIDIA FP8 format
-    if (match := re.fullmatch(r'(?:fp8\.)?(e4m3|e5m2)', dtype, re.IGNORECASE)):
+    if match := re.fullmatch(r"(?:fp8\.)?(e4m3|e5m2)", dtype, re.IGNORECASE):
         fp8_format = match.group(1).lower()
-        if fp8_format == 'e4m3':
+        if fp8_format == "e4m3":
             return quantize_to_fp8_e4m3(values)
         else:
             return quantize_to_fp8_e5m2(values)
 
     # Floating point implementation adopted from microscaling code
-    if (match := re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype)):
+    if match := re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype):
         nbits, ebits, mbits = map(int, match.groups())
         assert nbits == ebits + mbits + 1 or nbits == ebits + mbits
 
@@ -71,7 +72,7 @@ def get_quantization_map(dtype, device=None):
         mbits = mbits + 2
         emax = 2 ** (ebits - 1) - 1 if ebits > 4 else 2 ** (ebits - 1)
         if dtype != "fp8_e4m3":
-            max_norm = 2**emax * float(2**(mbits-1) - 1) / 2**(mbits-2)
+            max_norm = 2**emax * float(2 ** (mbits - 1) - 1) / 2 ** (mbits - 2)
         else:
             max_norm = 2**emax * 1.75  # FP8 has custom max_norm
 
@@ -81,13 +82,16 @@ def get_quantization_map(dtype, device=None):
 
     # Posit data types invented by John Gustafson
     # https://www.johndcook.com/blog/2018/04/11/anatomy-of-a-posit-number/
-    if (match := re.fullmatch(r'posit(\d+)_(\d+)', dtype)):
+    if match := re.fullmatch(r"posit(\d+)_(\d+)", dtype):
         nbits, es = match.groups()
-        return quantize_to_posit(values, int(nbits), int(es), round_to_even=True)
+        return quantize_to_posit(
+            values, int(nbits), int(es), round_to_even=True
+        )
 
     # NormalFloat by Tim Dettmers and adopted from the bitsandbytes library
-    # This data type will return two tensors: a mapping to NF index and a value map
-    if (match := re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype)):
+    # This data type returns two tensors: a mapping to the NF index, and
+    # a value map
+    if match := re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype):
         nbits = int(match.group(1))
         int_bits = int(match.group(2)) if match.group(2) else None
         return quantize_to_nf(values, nbits, int_bits=int_bits)
@@ -122,7 +126,7 @@ class MXFakeQuantFunction(torch.autograd.Function):
             block_size,
             quant_max,
             force_scale_power_of_two,
-            scale_qmap=scale_qmap
+            scale_qmap=scale_qmap,
         )
         scale.resize_(sf.shape).copy_(sf)
         input = input * expand(sf, input.shape, block_size)
@@ -130,7 +134,8 @@ class MXFakeQuantFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None, None, None, None, None, None, None
+        """Straight-through estimator: only ``input`` takes a gradient."""
+        return (grad_output,) + (None,) * 8
 
 
 class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
@@ -191,7 +196,8 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None, None, None, None, None, None, None
+        """Straight-through estimator: only ``input`` takes a gradient."""
+        return (grad_output,) + (None,) * 8
 
 
 class FusedAmaxObsFakeQuantFunction(torch.autograd.Function):
@@ -249,7 +255,8 @@ class FusedAmaxObsFakeQuantFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None, None, None, None, None, None, None, None, None
+        """Straight-through estimator: only ``input`` takes a gradient."""
+        return (grad_output,) + (None,) * 10
 
 
 class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
@@ -330,7 +337,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             )
 
         self.observer_enabled[0] = self.qscheme is not None
-        self.is_per_channel = self.qscheme == qt.per_channel_symmetric
+        self.is_per_channel = self.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
 
         if outlier_pct is not None:
             self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
@@ -342,7 +349,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
 
     @torch.jit.export
     def calculate_qparams(self):
-        if self.qscheme == qt.group_wise_affine:
+        if self.qscheme == QScheme.GROUP_WISE_AFFINE:
             return self.scale, self.zero_point
         return self.scale
 
@@ -394,7 +401,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             outlier_pct = skip.sum().item() / x.numel()
             self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
 
-        if self.qscheme == qt.microscaling:
+        if self.qscheme == QScheme.MICROSCALING:
             x = MXFakeQuantFunction.apply(
                 x,
                 self.fake_quant_enabled,
@@ -406,7 +413,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 self.force_scale_power_of_two,
                 self.scale_qmap,
             )
-        elif self.qscheme == qt.group_wise_affine:
+        elif self.qscheme == QScheme.GROUP_WISE_AFFINE:
             x = GroupWiseAffineFakeQuantFunction.apply(
                 x,
                 self.fake_quant_enabled,

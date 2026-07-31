@@ -19,20 +19,42 @@ from .node_info import (
     is_nop,
     is_reshape_op,
 )
-from .shape_prop import ShapeProp
-from .iteration_space_normalization import (
+from .iteration_space import (
     IterationSpaceNormalizer,
     NormalizationError,
 )
-from ..pt2e_utils import (
+from ..export_utils import create_getattr_from_value
+from ..shape_prop import (
+    ShapeProp,
     fetch_attr,
     propagate_shape,
     set_node_value,
-    update_submod_user_meta,
 )
-from ..quantize_pt2e import create_getattr_from_value
 
 logger = logging.getLogger(__name__)
+
+
+def update_submod_user_meta(model, node, named_modules=None):
+    """
+    Update the metadata of all user nodes that consume the given node.
+    """
+    if named_modules is None:
+        named_modules = dict(model.named_modules())
+
+    for user in list(node.users):
+        if user.op != "call_module":
+            continue
+
+        index = user.all_input_nodes.index(node)
+
+        submod = named_modules[user.target]
+        placeholders = [n for n in submod.graph.nodes if n.op == 'placeholder']
+
+        assert index < len(placeholders)
+
+        placeholder = placeholders[index]
+        placeholder.name = node.name
+        placeholder.meta['source_node'] = node
 
 
 def copy_graph_module(

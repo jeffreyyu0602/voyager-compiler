@@ -86,14 +86,14 @@ from voyager_compiler.codegen.reporting import (
     write_excel_report,
     write_perfetto,
 )
-from voyager_compiler.codegen.transform.bufferize.tiling import (
+from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
-from voyager_compiler.hardware import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 from voyager_compiler.codegen.aten_classifier import is_compute_op
 from voyager_compiler.codegen.node_info import is_fully_connected
-from voyager_compiler.codegen.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp
 
 try:
     # torchao helper the KIVI 2-bit KV path annotates cache buffers with.

@@ -5,10 +5,10 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import get_arg_value
-from .operator_fusion import duplicate_shared_nodes
 from ..aten_classifier import is_elementwise_op
+from .operator_fusion import duplicate_shared_nodes
 from ..node_info import (
+    get_arg_value,
     is_conv2d,
     is_depthwise_conv,
     is_fully_connected,
@@ -19,14 +19,15 @@ from ..node_info import (
     quant_param_arg_nodes,
     swaps_last_two_dims,
 )
-from ...pt2e_utils import deduplicate_nodes, fetch_attr, propagate_shape
-from ...layout_ops import (
+from .rewrites import deduplicate_nodes
+from ...shape_prop import fetch_attr, propagate_shape
+from ...ops.layout import (
     NCHW_TO_NHWC,
     NHWC_OP_VARIANTS,
     NHWC_TO_NCHW,
     WEIGHT_NCHW_TO_HWIO,
 )
-from ...quantize_pt2e import create_getattr_from_value
+from ...export_utils import create_getattr_from_value
 
 logger = logging.getLogger(__name__)
 

@@ -1,4 +1,4 @@
-from voyager_compiler.hardware import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 
 def get_transform_args(args, vector_stages):

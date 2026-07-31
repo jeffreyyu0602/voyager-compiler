@@ -1,18 +1,90 @@
+"""Execute an FX graph and record each node's shape / dtype.
+
+``ShapeProp`` walks a whole ``GraphModule``; ``propagate_shape`` is its
+single-node twin, used by the passes that build nodes one at a time.  Both
+resolve ``get_attr`` through ``fetch_attr`` and stamp their result with
+``set_node_value``, so all four live together.
+"""
+
 import logging
 from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
+from torch.fx import GraphModule
 from torch.fx.graph import map_arg
 from torch.fx.node import Node
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from ..pt2e_utils import fetch_attr, set_node_value
-
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ShapeProp",
+    "fetch_attr",
+    "propagate_shape",
+    "set_node_value",
+]
 
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
+
+
+def fetch_attr(module, target):
+    """Resolve a dotted ``get_attr`` target against ``module``."""
+    target_atoms = target.split(".")
+    attr_itr = module
+    for i, atom in enumerate(target_atoms):
+        if not hasattr(attr_itr, atom):
+            raise RuntimeError(
+                "Node referenced nonexistant target "
+                f"{'.'.join(target_atoms[:i])}"
+            )
+        attr_itr = getattr(attr_itr, atom)
+    return attr_itr
+
+
+def set_node_value(node: Node, value):
+    """Record ``value`` on ``node`` as ``.value`` (plus ``.shape``)."""
+    if isinstance(value, torch.Tensor):
+        node.shape = value.shape
+        node.value = value.cpu().clone()
+    elif isinstance(value, (tuple, list)):
+        # A tuple may mix tensors with scalars (e.g. the integer loop counters
+        # carried by a while_loop); keep non-tensor elements as-is.
+        node.shape = tuple(
+            x.shape if isinstance(x, torch.Tensor) else None for x in value
+        )
+        node.value = tuple(
+            x.cpu().clone() if isinstance(x, torch.Tensor) else x for x in value
+        )
+    else:
+        node.value = value
+
+
+def propagate_shape(node: Node, model: GraphModule = None):
+    """Run a single ``node`` on its operands' recorded values and stamp it."""
+
+    def load_arg(a):
+        return map_arg(a, lambda n: getattr(n, "value", n.meta.get("val")))
+
+    modules = dict(model.named_modules()) if model is not None else {}
+
+    if node.op == "get_attr":
+        result = fetch_attr(model, node.target)
+    elif node.op == "call_function":
+        result = node.target(*load_arg(node.args), **load_arg(node.kwargs))
+    elif node.op == "call_method":
+        self_obj, *args = load_arg(node.args)
+        kwargs = load_arg(node.kwargs)
+        result = getattr(self_obj, node.target)(*args, **kwargs)
+    elif node.op == "call_module":
+        result = modules[node.target](
+            *load_arg(node.args), **load_arg(node.kwargs)
+        )
+    elif node.op == "output":
+        result = load_arg(node.args[0])
+
+    set_node_value(node, result)
 
 
 def _commit_op():
@@ -100,8 +172,8 @@ class ShapeProp:
                 other = self._subprop(false_g.target, ins)
                 result = taken if load_arg(pred) else other
             elif self._recurse and node.target is _commit_op():
-                # ``commit(subgraph, *operands, ...)``: stamp the region (and run
-                # its kernel, mutating the destination buffer) with the operand
+                # ``commit(subgraph, *operands, ...)``: stamp the region (and
+                # run its kernel, mutating the destination buffer) with operand
                 # values.  The dependency / post semaphores are side effects the
                 # oracle-disabled ShapeProp ignores.
                 sub_g, *operands = node.args

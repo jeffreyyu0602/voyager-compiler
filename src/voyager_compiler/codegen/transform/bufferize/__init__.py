@@ -35,6 +35,8 @@ has_side_effect(torch.ops.voyager.async_wait.default)
 has_side_effect(torch.ops.higher_order.commit)
 from .bufferization import annotate_tensor_spaces, bufferize_graph  # noqa: F401
 from .emit import (  # noqa: F401
+    compute_op_names,
+    flush_tensor_files,
     gen_code_bufferized,
     gen_compute_graph_bufferized,
     print_bufferized_graph,
@@ -45,6 +47,8 @@ __all__ = [
     "ops",
     "bufferize_graph",
     "annotate_tensor_spaces",
+    "compute_op_names",
+    "flush_tensor_files",
     "gen_code_bufferized",
     "gen_compute_graph_bufferized",
     "print_bufferized_graph",

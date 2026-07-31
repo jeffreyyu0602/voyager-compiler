@@ -12,11 +12,11 @@ The op identity therefore carries the layout contract: eager execution
 of a transformed graph is correct with no process-global monkeypatching.
 
 This module is a leaf (it imports only torch): the twins are registered
-the moment ``decomposed`` imports it, before any module that references
+the moment ``quantized`` imports it, before any module that references
 ``torch.ops.quantized_ops.conv2d`` etc. at import time can load.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -24,6 +24,44 @@ NCHW_TO_NHWC = (0, 2, 3, 1)
 NHWC_TO_NCHW = (0, 3, 1, 2)
 WEIGHT_NCHW_TO_HWIO = (2, 3, 1, 0)
 WEIGHT_HWIO_TO_NCHW = (3, 2, 0, 1)
+
+
+def project(per_axis: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
+    """Reorder a per-logical-axis tuple into a tensor's physical order.
+
+    Tile specs are written in logical axis order — feature maps NCHW, weights
+    OIHW — and projected onto an operand's physical order only at the
+    load/store boundary.
+
+    Args:
+        per_axis: Value per logical axis; ``per_axis[a]`` belongs to axis ``a``.
+        dims: NCHW->physical permutation (physical position ``i`` holds logical
+            axis ``dims[i]``), or ``None`` for the logical layout itself.
+
+    Returns:
+        The values in physical order.
+    """
+    if dims is None:
+        return tuple(per_axis)
+    return tuple(per_axis[a] for a in dims)
+
+
+def unproject(physical: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
+    """Read a physical-order sequence back into logical NCHW / OIHW order.
+
+    Inverse of :func:`project`.
+
+    Args:
+        physical: Values in the tensor's physical order (e.g. a ``shape``).
+        dims: The same permutation :func:`project` takes, or ``None``.
+
+    Returns:
+        The values in logical axis order.
+    """
+    if dims is None:
+        return tuple(physical)
+    return tuple(physical[dims.index(a)] for a in range(len(physical)))
+
 
 # Operators consuming NHWC activations (their twin takes and returns
 # hardware-layout tensors; a conv weight is HWIO).
@@ -49,7 +87,7 @@ GEMM_OPS: List[torch._ops.OpOverload] = [
     torch.ops.aten.matmul.default,
 ]
 
-# The twins join the ``quantized_ops`` namespace ``decomposed.py`` owns
+# The twins join the ``quantized_ops`` namespace ``quantized.py`` owns
 # (a FRAGMENT extends it; the handle must stay alive for the
 # registrations to persist).
 _QUANTIZED_OPS_FRAGMENT = torch.library.Library("quantized_ops", "FRAGMENT")

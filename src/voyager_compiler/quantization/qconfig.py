@@ -3,8 +3,8 @@ from collections import namedtuple
 from dataclasses import asdict
 
 from torch import nn
-from voyager_compiler.fake_quantize import FusedAmaxObsFakeQuantize
-from voyager_compiler.quantizer import QuantizationSpec
+from .fake_quantize import FusedAmaxObsFakeQuantize
+from .quantizer import QuantizationSpec
 
 __all__ = [
     "QConfig",

@@ -9,24 +9,26 @@ from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
-from ..node_info import _pair, get_arg_value
-from ..subgraph import replace_node_with_graph_module
-from .operator_fusion import _nodes_sequential
 from ..aten_classifier import is_elementwise_op
-from ..node_info import is_gemm_op, is_nop, is_prunable_op
-from ...pt2e_utils import (
-    WrapperModule,
-    get_aten_graph_module,
-    fetch_attr,
-    propagate_shape,
-    set_node_value,
+from ..node_info import (
+    _pair,
+    get_arg_value,
+    is_gemm_op,
+    is_nop,
+    is_prunable_op,
 )
-from ...quantize_pt2e import create_getattr_from_value
-from ...quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
+from ..subgraph import replace_node_with_graph_module, update_submod_user_meta
+from .operator_fusion import _nodes_sequential
+from ...export_utils import create_getattr_from_value, get_aten_graph_module
+from ...shape_prop import fetch_attr, propagate_shape, set_node_value
+from ...quantization.quantizer.xnnpack_quantizer_utils import (
+    _convert_scalars_to_attrs,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "deduplicate_nodes",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
     "replace_conv2d_with_im2col",
@@ -37,6 +39,63 @@ __all__ = [
     "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
 ]
+
+
+class WrapperModule(torch.nn.Module):
+    """Wrap a callable in a ``Module`` so it can be exported."""
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
+
+
+def deduplicate_nodes(model: GraphModule):
+    """Collapse identical nodes — same op, target, args and kwargs — into one.
+
+    Args:
+        model: Graph module to rewrite in place.
+
+    Returns:
+        A mapping from each erased node to the node that replaced it.
+    """
+    seen = {}
+    mapping = {}
+    graph = model.graph
+
+    for node in list(graph.nodes):
+        if node.op in ("placeholder", "output"):
+            continue
+
+        key = (
+            node.op,
+            node.target,
+            tuple(node.args),
+            frozenset(node.kwargs.items()),
+        )
+
+        if key in seen:
+            orig = seen[key]
+            node.replace_all_uses_with(orig)
+            graph.erase_node(node)
+            mapping[node] = orig
+        else:
+            seen[key] = node
+
+    for old, new in mapping.items():
+        logger.debug(f"Deduplicated {old} to {new}")
+
+    named_modules = dict(model.named_modules())
+
+    nodes_to_update = set(mapping.values())
+    for node in nodes_to_update:
+        update_submod_user_meta(model, node, named_modules)
+
+    graph.lint()
+    model.recompile()
+    return mapping
 
 
 def remove_prunable_ops(model: GraphModule) -> None:

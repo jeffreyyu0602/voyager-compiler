@@ -1,11 +1,11 @@
 import argparse
 
-from voyager_compiler.hardware import (
+from voyager_compiler.hardware_config import (
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
     DEFAULT_DRAM_BANDWIDTH_GBS,
     DEFAULT_DRAM_SIZE_GB,
 )
-from voyager_compiler.quantizer.quantizer import QuantizationSpec
+from voyager_compiler.quantization.quantizer.quantizer import QuantizationSpec
 from voyager_compiler.utils import SLURM_ARGS
 
 __all__ = [

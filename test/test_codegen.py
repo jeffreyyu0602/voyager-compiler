@@ -45,7 +45,7 @@ from voyager_compiler.codegen import (
     remove_softmax_dtype_cast,
 )
 from voyager_compiler.codegen.node_info import is_fully_connected
-from voyager_compiler.llm_utils import fuse_dequantize_quantize
+from voyager_compiler import fuse_dequantize_quantize
 
 from utils.models import bert, mobilebert, torchvision_models, vit
 from utils.models.utils import get_compile_args, get_transform_args

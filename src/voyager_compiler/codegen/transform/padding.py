@@ -8,17 +8,20 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
-from ..node_info import get_arg_value
 from ..aten_classifier import is_elementwise_op
 from ..node_info import (
     _BROADCAST_OPS,
+    get_arg_value,
     is_conv2d,
     is_depthwise_conv,
     is_gemm_op,
     is_matmul,
 )
-from ...pt2e_utils import get_aten_graph_module, fetch_attr, propagate_shape
-from ...quantize_pt2e import create_getattr_from_value
+from ...export_utils import (
+    create_getattr_from_value,
+    get_aten_graph_module,
+)
+from ...shape_prop import fetch_attr, propagate_shape
 
 logger = logging.getLogger(__name__)
 

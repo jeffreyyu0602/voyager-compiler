@@ -17,8 +17,9 @@ from typing import Callable, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from voyager_compiler.codegen.transform.bufferize import ops
-from voyager_compiler.codegen.node_info import is_nop, quant_param_arg_nodes
+# Registers voyager.* before ``torch.ops.voyager`` is bound below.
+from . import ops  # noqa: F401
+from ...node_info import is_nop, quant_param_arg_nodes
 
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -535,37 +536,3 @@ def _tag_loop_extents(gm, extents_per_level, depth=0):
             return
 
 
-# ---------------------------------------------------------------------------
-# Layout projection helpers (NCHW/OIHW logical <-> physical NHWC/HWIO).
-#
-# Specs are written in logical axis order — feature maps NCHW (N=0, C/K=1,
-# H=2, W=3), weights OIHW (K=0, C=1, kH=2, kW=3) — and projected onto each
-# operand's physical order only at the load/store boundary.  ``dims`` is the
-# NCHW->physical permutation (physical position ``i`` holds logical axis
-# ``dims[i]``); ``None`` is the logical NCHW / OIHW layout.
-# ---------------------------------------------------------------------------
-# input / output feature maps under the transposed (NHWC) layout
-_NHWC = (0, 2, 3, 1)
-# weight (kH, kW, C, K) under the transposed (HWIO) layout
-_HWIO = (2, 3, 1, 0)
-
-
-def _project(per_axis: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
-    """Reorder a per-logical-axis tuple into a tensor's physical order.
-
-    ``per_axis[a]`` is the value for logical axis ``a``.  ``dims`` is the
-    NCHW->physical permutation: physical position ``i`` holds logical axis
-    ``dims[i]``.
-    """
-    if dims is None:
-        return tuple(per_axis)
-    return tuple(per_axis[a] for a in dims)
-
-
-def _unproject(physical: Tuple, dims: Optional[Tuple[int, ...]]) -> Tuple:
-    """Inverse of ``_project``: read a physical-order sequence (e.g. a
-    ``shape``) back into logical NCHW / OIHW axis order.
-    """
-    if dims is None:
-        return tuple(physical)
-    return tuple(physical[dims.index(a)] for a in range(len(physical)))

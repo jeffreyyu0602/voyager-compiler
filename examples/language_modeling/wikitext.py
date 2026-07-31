@@ -1,6 +1,5 @@
 import argparse
 import logging
-import os
 
 import torch
 from accelerate.utils import get_max_memory
@@ -15,8 +14,6 @@ from voyager_compiler import (
     get_default_quantizer,
     prepare_pt2e,
     convert_pt2e,
-    plot_histogram,
-    plot_layer_range,
     with_execution_context,
     print_node_scope_tabular,
     get_device_map,
@@ -25,45 +22,46 @@ from voyager_compiler import (
     sink_obs_or_fq,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process model parameters.")
     parser.add_argument(
-        '--model_id', required=True, help='Pretrained model identifier'
+        "--model_id", required=True, help="Pretrained model identifier"
     )
     parser.add_argument(
-        '--max_length', type=int, default=1024, help='Maximum sequence length'
+        "--max_length", type=int, default=1024, help="Maximum sequence length"
     )
     parser.add_argument(
-        '--stride', type=int, default=512, help='Stride for processing the data'
+        "--stride", type=int, default=512, help="Stride for processing the data"
     )
     parser.add_argument(
-        '--output_dir', default=None, help='Output directory for histograms'
+        "--output_dir", default=None, help="Output directory for histograms"
     )
     parser.add_argument(
-        '--torch_dtype',
+        "--torch_dtype",
         default="bfloat16",
         choices=["auto", "bfloat16", "float16", "float32"],
         help=(
             "Override the default `torch.dtype` and load the model under this "
             "dtype. If `auto` is passed, the dtype will be automatically "
             "derived from the model's weights."
-        )
+        ),
     )
     parser.add_argument(
-        '--qconfig', default=None, help='Quantization scheme for the model'
+        "--qconfig", default=None, help="Quantization scheme for the model"
     )
     parser.add_argument(
-        '--reserved_memory',
+        "--reserved_memory",
         type=int,
         default=8,
-        help='GPU memory reserved for storing activations'
+        help="GPU memory reserved for storing activations",
     )
     parser.add_argument(
-        '--print_model', action='store_true', help='Print node scope information'
+        "--print_model",
+        action="store_true",
+        help="Print node scope information",
     )
     add_experiment_args(parser)
     return parser.parse_args()
@@ -76,13 +74,14 @@ def setup_quantized_model(
     device=None,
     dtype=None,
     reserved_memory=8,
-    print_model=False
+    print_model=False,
 ):
     """Load model, prepare the quantized graph module, and dispatch to GPU(s).
 
     When device is not None (single GPU), moves the model to that device.
-    When device is None (multi-GPU), dispatches the graph module across available
-    GPUs after prepare_pt2e, reserving reserved_memory GiB per GPU for activations.
+    When device is None (multi-GPU), dispatches the graph module across
+    available GPUs after prepare_pt2e, reserving reserved_memory GiB per GPU
+    for activations.
 
     Returns (model, tokenizer).
     """
@@ -121,9 +120,10 @@ def setup_quantized_model(
     sink_obs_or_fq(gm)
 
     if device is None:
-        reserved_bytes = reserved_memory * 1024 ** 3
+        reserved_bytes = reserved_memory * 1024**3
         max_memory = {
-            k: v - reserved_bytes for k, v in get_max_memory().items()
+            k: v - reserved_bytes
+            for k, v in get_max_memory().items()
             if isinstance(k, int) and v > reserved_bytes
         }
         device_map = get_device_map(gm, max_memory)
@@ -138,7 +138,9 @@ def setup_quantized_model(
     return gm, tokenizer
 
 
-def evaluate_perplexity(model, encodings, max_length, stride, device, num_steps=None):
+def evaluate_perplexity(
+    model, encodings, max_length, stride, device, num_steps=None
+):
     """Sliding-window perplexity evaluation. Returns a scalar tensor.
 
     If num_steps is set, exits early after that many windows — useful for
@@ -147,7 +149,7 @@ def evaluate_perplexity(model, encodings, max_length, stride, device, num_steps=
     seq_len = encodings.input_ids.size(1)
     nlls = []
     prev_end_loc = 0
-    # Subtract max_length from seq_len to ensure that the last window has length max_length
+    # Subtract max_length from seq_len so the last window is max_length long
     for i, begin_loc in enumerate(tqdm(range(0, seq_len - max_length, stride))):
         end_loc = min(begin_loc + max_length, seq_len)
         trg_len = end_loc - prev_end_loc  # may be different from stride on last loop
@@ -202,8 +204,12 @@ def main(args):
     )
 
     if args.calibration_steps > 0:
-        validation = load_dataset("wikitext", "wikitext-2-raw-v1", split="validation")
-        calib_encodings = tokenizer("\n\n".join(validation["text"]), return_tensors="pt")
+        validation = load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="validation"
+        )
+        calib_encodings = tokenizer(
+            "\n\n".join(validation["text"]), return_tensors="pt"
+        )
 
         evaluate_perplexity(
             model,
@@ -235,12 +241,6 @@ def main(args):
     print(f"stride:     {args.stride}")
     print(f"perplexity: {ppl.item()}")
 
-    if args.record_histogram and args.output_dir is not None:
-        os.makedirs(args.output_dir, exist_ok=True)
-        plot_histogram(model, args.output_dir)
-        plot_layer_range(model, args.output_dir)
-
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main(parse_args())

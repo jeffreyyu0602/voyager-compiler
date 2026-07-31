@@ -1,6 +1,7 @@
 import collections.abc
 import logging
 import math
+import re
 from itertools import repeat
 from typing import Any, Optional
 
@@ -467,24 +468,74 @@ def _ntuple(n, name="parse"):
 _pair = _ntuple(2, "_pair")
 
 
-def get_node_bytes(n: Node):
-    # Local import: ``pt2e_utils`` pulls in ``quantize_pt2e``, which imports
-    # this module -- importing it at module scope closes the cycle.
-    from ..pt2e_utils import dtype_byte_size
+def peel_weight(node: Node):
+    """Resolve a GEMM weight operand through the ops fused onto it — a
+    last-two-dim transpose, a grouped-query broadcast, a dequantize — to the
+    external operand they read.
 
-    if (dtype := n.meta.get("dtype", None)) is None:
-        if isinstance(n.value, (list, tuple)):
-            return (dtype_byte_size(t.dtype) for t in (n.value))
-        else:
-            return dtype_byte_size(n.value.dtype)
+    Returns ``(node, transposed, repeat, dequant)``.  An attention ``Q @ Kᵀ``
+    fuses ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that
+    turns 8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the
+    DMA (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile
+    into the bank), ``repeat`` into the block index (``grid_index // repeat[d]``,
+    so four query heads share one KV tile).
 
-    if isinstance(dtype, (list, tuple)):
-        dtypes = [
-            t if t is not None else v.dtype for t, v in zip(dtype, n.value)
-        ]
-        return (dtype_byte_size(t) for t in dtypes)
+    A ``dequantize`` -- a KIVI KV cache, packed in DRAM -- does *not* fold into
+    the addressing, because it computes: it comes back for the builder to run on
+    the fetched tile, which is what lets the cache stay packed all the way into
+    the bank.
 
-    return dtype_byte_size(dtype if dtype is not None else n.value.dtype)
+    Only ops over an external operand — a placeholder, i.e. something the fused
+    submodule is handed rather than computes — peel; anything else comes back
+    unchanged.
+    """
+    inner = node
+    dequant = None
+    if inner.target is torch.ops.quantized_ops.dequantize.default:
+        dequant = inner
+        inner = inner.args[0]
+
+    # A ``Kᵀ`` sits under the decode, never over it (``_insert_transpose_op``
+    # hoists it there).  The decode is none the wiser: the tile the fetch
+    # transposes into the bank is the one it was written against.
+    transposed = swaps_last_two_dims(inner)
+    if transposed:
+        inner = inner.args[0]
+
+    if inner.op == "placeholder":
+        return inner, transposed, None, dequant
+
+    found = repeat_of(inner)
+    if found is not None and found[0].op == "placeholder":
+        source, _, repeat = found
+        return source, transposed, repeat, dequant
+
+    return node, False, None, None
+
+
+def dtype_byte_size(dtype):
+    """Bytes occupied by one element of ``dtype`` (fractional for sub-byte).
+
+    Reads the width out of the dtype's *name*, so it serves both a
+    ``torch.dtype`` and this project's spec-string dtypes (``int4``,
+    ``fp8_e4m3``, ``posit8_1``).
+
+    Args:
+        dtype: A ``torch.dtype`` or a dtype name.
+
+    Returns:
+        Element size in bytes; below one for sub-byte formats.
+
+    Raises:
+        ValueError: If no bit width can be read from the name.
+    """
+    if dtype == torch.bool:
+        return 1 / 8
+    bit_search = re.search(r"[^\d](\d+)(_.*)?$", str(dtype))
+    if bit_search is None:
+        raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
+    bit_width = int(bit_search.groups()[0])
+    return bit_width / 8.0
 
 
 def get_node_to_key_map(node):

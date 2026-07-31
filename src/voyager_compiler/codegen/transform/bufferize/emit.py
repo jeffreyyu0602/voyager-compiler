@@ -50,12 +50,7 @@ import numpy as np
 
 import interstellar
 
-from ...node_info import (
-    QMAP_PARAMS,
-    get_arg_value,
-    is_nop,
-    quant_param_arg_nodes,
-)
+from ...node_info import QMAP_PARAMS, is_nop, quant_param_arg_nodes
 from ...voyager_ir_pb2 import (
     Argument,
     LevelAccessCount,
@@ -67,7 +62,6 @@ from ...voyager_ir_pb2 import (
     Model,
     Operation,
     PrimOp,
-    Region,
     SCALAR_BOOL,
     SCALAR_F32,
     SCALAR_INDEX,
@@ -76,7 +70,7 @@ from ...voyager_ir_pb2 import (
     TensorBoxRef,
     Tiling,
 )
-from ...shape_prop import ShapeProp
+from ....shape_prop import ShapeProp
 from .bufferization import _is_compute
 from .ops import oracle_disabled
 from .utils import _collect_codebook_nodes, _passed_whole

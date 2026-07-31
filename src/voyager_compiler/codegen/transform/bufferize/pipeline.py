@@ -17,62 +17,57 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 from torch._higher_order_ops.while_loop import while_loop
 
-from voyager_compiler import export_model
-from voyager_compiler.codegen.transform.bufferize.utils import (
-    _InputSpec,
-    _OutputSpec,
-    _ScratchSpec,
-    voyager,
+from voyager_compiler.export_utils import export_model
+from voyager_compiler.ops.layout import (
+    NCHW_TO_NHWC,
+    WEIGHT_NCHW_TO_HWIO,
+    project,
+    unproject,
 )
-from voyager_compiler.codegen.transform.bufferize.utils import (
-    _finalize_exported_gm,
-    _lenient_verifier,
-    _tag_loop_extents,
-)
-from voyager_compiler.codegen.transform.bufferize.utils import (
-    _HWIO,
-    _NHWC,
-    _unproject,
-)
-from voyager_compiler.codegen.transform.bufferize.utils import (
-    _build_fused_gm,
-    _compute_input_spec,
-    _project,
-    effect_cond,
-    fuse_store_cones,
+from voyager_compiler.shape_prop import ShapeProp
+
+# Top-level: these modules do not import this one at module scope
+# (bufferization imports the builders function-locally), so no cycle.
+from voyager_compiler.codegen.node_info import (
+    _pair,
+    ancestors,
+    compute_output_tiled_shapes,
+    get_anchor_node,
+    get_arg_value,
+    is_bmm,
+    is_conv2d,
+    peel_weight,
+    quant_param_arg_nodes,
+    trailing_mha_perm,
+    weight_is_ck,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     commit,
     oracle_disabled,
 )
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _InputSpec,
+    _OutputSpec,
+    _ScratchSpec,
+    _build_fused_gm,
+    _compute_input_spec,
+    _finalize_exported_gm,
+    _lenient_verifier,
+    _tag_loop_extents,
+    effect_cond,
+    fuse_store_cones,
+    voyager,
+)
 from voyager_compiler.codegen.transform.tiling.search import (
     pool_op_tiling,
     vector_op_tiling,
 )
-from voyager_compiler.codegen.transform.bufferize.tiling import (
+from voyager_compiler.codegen.transform.tiling.tiler import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
     get_tiling,
 )
-from voyager_compiler.codegen.shape_prop import ShapeProp
-from voyager_compiler.codegen.node_info import (
-    ancestors,
-    is_bmm,
-    is_conv2d,
-    is_linear,
-    quant_param_arg_nodes,
-    repeat_of,
-    swaps_last_two_dims,
-    trailing_mha_perm,
-    weight_is_ck,
-)
-from voyager_compiler.codegen.node_info import compute_output_tiled_shapes
-from voyager_compiler.codegen.node_info import _pair, get_arg_value
-
-# Top-level: these modules do not import this one at module scope
-# (bufferization imports the builders function-locally), so no cycle.
-from voyager_compiler.codegen.node_info import get_anchor_node
 
 _SRAM = int(MemoryLevel.SRAM)
 
@@ -1220,11 +1215,11 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         out_index_map = None
     elif is_conv:
         ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
-        odims = _NHWC if anchor.meta.get("transposed", False) else None
+        odims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
         order = l3_order or CONV_L3_ORDER
         gK, gY, gX = (1 + order.index(d) for d in CONV_L3_ORDER)
-        out_tiling = _project((1, nk, ny, nx), odims)  # physical output counts
-        out_index_map = _project((0, gK, gY, gX), odims)
+        out_tiling = project((1, nk, ny, nx), odims)  # physical output counts
+        out_index_map = project((0, gK, gY, gX), odims)
     else:
         nb = anchor.value.ndim - 2
         order = l3_order or GEMM_L3_ORDER
@@ -1617,13 +1612,13 @@ def build_conv2d(
         return None  # depthwise conv unsupported
 
     nhwc = anchor.meta.get("transposed", False)
-    in_dims = _NHWC if nhwc else None
-    w_dims = _HWIO if nhwc else None
-    out_dims = _NHWC if nhwc else None
+    in_dims = NCHW_TO_NHWC if nhwc else None
+    w_dims = WEIGHT_NCHW_TO_HWIO if nhwc else None
+    out_dims = NCHW_TO_NHWC if nhwc else None
 
-    N, C, H, W = _unproject(inp.shape, in_dims)
-    K, _, kH, kW = _unproject(w.shape, w_dims)
-    oH, oW = _unproject(out.shape, out_dims)[2:]
+    N, C, H, W = unproject(inp.shape, in_dims)
+    K, _, kH, kW = unproject(w.shape, w_dims)
+    oH, oW = unproject(out.shape, out_dims)[2:]
 
     if tiling is None:
         tiling = (1, 1, 1, 1)
@@ -1647,28 +1642,28 @@ def build_conv2d(
     counts = {"K": nk, "Y": ny, "X": nx}
     grid = (1,) + tuple(counts[d] for d in l3_order) + (nc,)
     in_spec = _InputSpec(
-        _project((tn, tc, ih, iw), in_dims),
-        _project((gN, gC, gY, gX), in_dims),  # logical N, C, H, W
+        project((tn, tc, ih, iw), in_dims),
+        project((gN, gC, gY, gX), in_dims),  # logical N, C, H, W
         (False,) * 4,
-        strides=_project((tn, tc, toh * sh, tow * sw), in_dims),
-        pad=_project((0, 0, ph, pw), in_dims),
+        strides=project((tn, tc, toh * sh, tow * sw), in_dims),
+        pad=project((0, 0, ph, pw), in_dims),
         pad_value=0.0,
     )
     w_spec = _InputSpec(
-        _project((tk, tc, kH, kW), w_dims),
+        project((tk, tc, kH, kW), w_dims),
         # kH/kW->None (loaded whole, mapped to no grid dim)
-        _project((gK, gC, None, None), w_dims),
+        project((gK, gC, None, None), w_dims),
         (False,) * 4,
     )
     bias_spec = _InputSpec((tk,), (gK,), (False,))
     # The output(s) tile onto the (N, K, oH, oW) grid dims (C reduction
     # dropped); a fused op may produce several (``quantize_mx``).
-    out_index_map = _project((gN, gK, gY, gX), out_dims)
+    out_index_map = project((gN, gK, gY, gX), out_dims)
     if info is None:
         out_specs = [
             _OutputSpec(
-                _project((N, K, oH, oW), out_dims),
-                _project((tn, tk, toh, tow), out_dims),
+                project((N, K, oH, oW), out_dims),
+                project((tn, tk, toh, tow), out_dims),
                 out_index_map,
                 inp.dtype,
             )
@@ -1711,16 +1706,16 @@ def build_conv2d(
 
     if target == torch.ops.quantized_ops.conv2d_mx.default:
         in_scale_qspec = _InputSpec(
-            _project((tn, tc // bs, ih, iw), in_dims),
-            _project((gN, gC, gY, gX), in_dims),
+            project((tn, tc // bs, ih, iw), in_dims),
+            project((gN, gC, gY, gX), in_dims),
             (False,) * 4,
-            strides=_project((tn, tc // bs, toh * sh, tow * sw), in_dims),
-            pad=_project((0, 0, ph, pw), in_dims),
+            strides=project((tn, tc // bs, toh * sh, tow * sw), in_dims),
+            pad=project((0, 0, ph, pw), in_dims),
             pad_value=0.0,
         )
         wt_scale_qspec = _InputSpec(
-            _project((tk, tc // bs, kH, kW), w_dims),
-            _project((gK, gC, None, None), w_dims),  # kH/kW whole -> None
+            project((tk, tc // bs, kH, kW), w_dims),
+            project((gK, gC, None, None), w_dims),  # kH/kW whole -> None
             (False,) * 4,
         )
         add_kw_input("input_scale", in_scale_qspec)
@@ -1759,7 +1754,7 @@ def build_conv2d(
         # Re-view with the concrete output tile shape (``tn, tk, toh, tow``) and
         # its dense stride via ``as_strided`` (a metadata-only NOP, in
         # ``is_nop``).  Needed independently of the accumulator cast.
-        d0, d1, d2, d3 = _project((tn, tk, toh, tow), out_dims)
+        d0, d1, d2, d3 = project((tn, tk, toh, tow), out_dims)
         return torch.as_strided(
             t, size=(d0, d1, d2, d3), stride=(d1 * d2 * d3, d2 * d3, d3, 1)
         )
@@ -1800,7 +1795,7 @@ def build_conv2d(
         if single_buffer_tail and not async_pipeline:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
         scratch_specs = [
-            _ScratchSpec(_project((tn, tk, toh, tow), out_dims), acc_dtype)
+            _ScratchSpec(project((tn, tk, toh, tow), out_dims), acc_dtype)
         ]
         kernel = _reduction_fused_kernel(
             conv2d_kernel,
@@ -1826,51 +1821,6 @@ def build_conv2d(
         fuse_store_cones(gm)
     _stamp_anchor_meta(gm, anchor)
     return gm
-
-
-def _peel_weight(node: torch.fx.Node):
-    """Resolve a GEMM weight operand through the ops fused onto it — a
-    last-two-dim transpose, a grouped-query broadcast, a dequantize — to the
-    external operand they read.
-
-    Returns ``(node, transposed, repeat, dequant)``.  An attention ``Q @ Kᵀ``
-    fuses ``K.transpose(-2, -1)`` onto the weight, and GQA fuses the repeat that
-    turns 8 KV heads into 32.  Neither is emitted: ``transposed`` folds into the
-    DMA (the fetch swaps its last two dims and ``async_copy`` ``.mT``s the tile
-    into the bank), ``repeat`` into the block index (``grid_index // repeat[d]``,
-    so four query heads share one KV tile).
-
-    A ``dequantize`` -- a KIVI KV cache, packed in DRAM -- does *not* fold into
-    the addressing, because it computes: it comes back for the builder to run on
-    the fetched tile, which is what lets the cache stay packed all the way into
-    the bank.
-
-    Only ops over an external operand — a placeholder, i.e. something the fused
-    submodule is handed rather than computes — peel; anything else comes back
-    unchanged.
-    """
-    inner = node
-    dequant = None
-    if inner.target is torch.ops.quantized_ops.dequantize.default:
-        dequant = inner
-        inner = inner.args[0]
-
-    # A ``Kᵀ`` sits under the decode, never over it (``_insert_transpose_op``
-    # hoists it there).  The decode is none the wiser: the tile the fetch
-    # transposes into the bank is the one it was written against.
-    transposed = swaps_last_two_dims(inner)
-    if transposed:
-        inner = inner.args[0]
-
-    if inner.op == "placeholder":
-        return inner, transposed, None, dequant
-
-    found = repeat_of(inner)
-    if found is not None and found[0].op == "placeholder":
-        source, _, repeat = found
-        return source, transposed, repeat, dequant
-
-    return node, False, None, None
 
 
 def build_gemm(
@@ -1908,7 +1858,7 @@ def build_gemm(
     # folded into how its tile is addressed rather than emitted; the spec itself
     # stays in the matmul (Kᵀ) layout.  A fused ``dequantize`` (a packed KV
     # cache) is compute, so it runs on the fetched tile instead.
-    weight_node, transposed, weight_repeat, dequant = _peel_weight(
+    weight_node, transposed, weight_repeat, dequant = peel_weight(
         anchor.args[1]
     )
 
@@ -2027,7 +1977,7 @@ def build_gemm(
             return
         # A scale wears the same relayouts as the tensor it scales, so it peels
         # the same way.
-        v, transposed, repeat, _ = _peel_weight(v)
+        v, transposed, repeat, _ = peel_weight(v)
         if spec is not None:
             spec.transposed = transposed
             spec.repeat = repeat
@@ -2074,7 +2024,7 @@ def build_gemm(
                 continue
             spec = None
             if v not in tables:
-                v, t, r, _ = _peel_weight(v)
+                v, t, r, _ = peel_weight(v)
                 spec = _spec(v.value.shape, dq_tile, _proj(gn, gk))
                 spec.transposed = t
                 spec.repeat = r
@@ -2360,15 +2310,15 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     outputs = val if isinstance(val, (list, tuple)) else (val,)
     output_shape = tuple(outputs[-1].shape)
 
-    in_dims = _NHWC if anchor.meta.get("transposed", False) else None
-    N, C, H, W = _unproject(output_shape, in_dims)
+    in_dims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
+    N, C, H, W = unproject(output_shape, in_dims)
     if tiling is None:
         nN, nH, nW, nC = 1, 1, 1, 1
     else:
         nN, nH, nW, nC = tiling
     tn, tc, toh, tow = N // nN, C // nC, H // nH, W // nW
-    output_ts = _project((tn, tc, toh, tow), in_dims)
-    out_tiling = _project((nN, nC, nH, nW), in_dims)
+    output_ts = project((tn, tc, toh, tow), in_dims)
+    out_tiling = project((nN, nC, nH, nW), in_dims)
 
     # Geometry params, to size the halo / output / strides.  Only ``max_pool``
     # has a dilation arg; ``avg_pool``'s is implicitly 1.
@@ -2390,11 +2340,11 @@ def build_pool(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
 
     grid = out_tiling
     in_spec = _InputSpec(
-        tile_sizes=_project((tn, tc, ih, iw), in_dims),
+        tile_sizes=project((tn, tc, ih, iw), in_dims),
         index_map=(0, 1, 2, 3),
         is_broadcast=(False,) * 4,
-        strides=_project((tn, tc, step_h, step_w), in_dims),
-        pad=_project((0, 0, ph, pw), in_dims),
+        strides=project((tn, tc, step_h, step_w), in_dims),
+        pad=project((0, 0, ph, pw), in_dims),
         pad_value=pad_value,
     )
 

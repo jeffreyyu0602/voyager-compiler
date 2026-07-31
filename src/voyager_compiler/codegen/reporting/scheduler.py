@@ -28,7 +28,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .cost import dram_cycles, op_info
 from .model import OpInfo, TimingRecord
-from ...hardware import AcceleratorConfig
+from ...hardware_config import AcceleratorConfig
 
 
 @dataclass

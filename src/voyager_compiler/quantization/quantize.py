@@ -1,5 +1,6 @@
 import copy
 import logging
+from typing import Any, Callable, Dict
 
 import torch
 import torch.nn as nn
@@ -7,17 +8,18 @@ import torch.ao.nn.intrinsic as nni
 from torch.nn import Module
 from torch.nn.utils.parametrize import type_before_parametrizations
 
+import peft.tuners.lora as lora
 from accelerate import dispatch_model
 from transformers import PretrainedConfig
+from transformers.activations import GELUActivation
+from transformers.models import llama, mobilebert
+from transformers.pytorch_utils import Conv1D
 
-from voyager_compiler.modules import Softmax
-from voyager_compiler.qconfig import get_qconfig
-from voyager_compiler.quantization_mappings import (
-    DEFAULT_QAT_MODULE_MAPPINGS,
-    QCONFIG_PROPAGATE_MODULE_CLASS_LIST,
-)
+from .modules import Softmax, qat as nnqat
+from .qconfig import get_qconfig
 
 __all__ = [
+    "get_conv_bn_layers",
     "propagate_config",
     "quantize",
     "prepare",
@@ -36,12 +38,65 @@ RESIDUAL_LAYERS_BWD = [
     "bottleneck.attention.dense",
 ]
 
+DEFAULT_QAT_MODULE_MAPPINGS: Dict[Callable, Any] = {
+    nn.Conv2d: nnqat.Conv2d,
+    nn.Conv3d: nnqat.Conv3d,
+    nn.Linear: nnqat.Linear,
+    lora.Linear: nnqat.LoraLinear,
+    # Intrinsic modules:
+    nni.ConvBn1d: nnqat.ConvBn1d,
+    nni.ConvBn2d: nnqat.ConvBn2d,
+    nni.ConvBn3d: nnqat.ConvBn3d,
+}
+
+QCONFIG_PROPAGATE_MODULE_CLASS_LIST = {
+    'activation': [
+        nn.ReLU,
+        nn.GELU,
+        nn.Softmax,
+        GELUActivation,
+    ],
+    'gemm': [
+        nn.Conv1d,
+        nn.Conv2d,
+        nn.Conv3d,
+        nn.Linear,
+        Conv1D,
+    ],
+    'layernorm': [
+        nn.LayerNorm,
+        llama.modeling_llama.LlamaRMSNorm,
+        mobilebert.modeling_mobilebert.NoNorm,
+    ]
+}
+
+
+def get_conv_bn_layers(model):
+    layers = []
+    module_names = list(model._modules)
+    for k, name in enumerate(module_names):
+        if len(list(model._modules[name]._modules)) > 0:
+            conv_bn_pairs = get_conv_bn_layers(model._modules[name])
+            layers.extend(
+                [
+                    [f"{name}.{conv}", f"{name}.{bn}"]
+                    for conv, bn in conv_bn_pairs
+                ]
+            )
+        elif isinstance(model._modules[name], nn.BatchNorm2d) and isinstance(
+            model._modules[module_names[k - 1]], nn.Conv2d
+        ):
+            layers.append([module_names[k - 1], name])
+    return layers
+
+
 def propagate_config(module, name, qconfig):
     # TODO set qconfig ch_axis according to the module type and qscheme.
     setattr(module, name, qconfig)
 
     for child in module.children():
         propagate_config(child, name, qconfig)
+
 
 def quantize(model, args, inplace=True):
     if not inplace:
@@ -93,6 +148,7 @@ def quantize(model, args, inplace=True):
     prepare(model, True, args.quantize_forward, args.quantize_backprop, args.op_fusion)
     return model
 
+
 def _parse_ops(op_str):
     ops = {op.lower() for op in op_str.split(',')} if op_str is not None else set()
     valid_ops = set(QCONFIG_PROPAGATE_MODULE_CLASS_LIST.keys())
@@ -102,9 +158,11 @@ def _parse_ops(op_str):
     )
     return tuple(mod for op in ops for mod in QCONFIG_PROPAGATE_MODULE_CLASS_LIST[op])
 
+
 def _get_unique_devices_(mod):
     return {p.device for p in mod.parameters()} | \
         {p.device for p in mod.buffers()}
+
 
 def _register_module_hook(module, hook_name, name):
     obs_or_fq_dict = nn.ModuleDict()
@@ -142,6 +200,7 @@ def _register_module_hook(module, hook_name, name):
     elif hook_name == 'error_post_process':
         module.register_full_backward_hook(backward_hook)
 
+
 def _add_observer_(
         module, fwd_pre_hook_module_list, bwd_pre_hook_module_list,
         bwd_residual, op_fusion, prefix):
@@ -171,6 +230,7 @@ def _add_observer_(
                 bwd_residual, op_fusion, module_prefix)
     insert_obs_or_fq(module, prefix)
 
+
 def prepare(
         model, inplace=False, fwd_quantized_ops=None, bwd_quantized_ops=None,
         op_fusion=None):
@@ -185,6 +245,7 @@ def prepare(
         is_bwd_residual, op_fusion, prefix='')
     return model
 
+
 def convert(module, mapping=None, inplace=False, custom_module_class_mapping=None):
     if not inplace:
         module = copy.deepcopy(module)
@@ -192,6 +253,7 @@ def convert(module, mapping=None, inplace=False, custom_module_class_mapping=Non
         module, mapping, inplace=True,
         custom_module_class_mapping=custom_module_class_mapping)
     return module
+
 
 def _convert(module, mapping=None, inplace=False, custom_module_class_mapping=None):
     r"""Converts submodules in input mod to a different mod according to `mapping`
@@ -226,6 +288,7 @@ def _convert(module, mapping=None, inplace=False, custom_module_class_mapping=No
         module._modules[key] = value
 
     return module
+
 
 def swap_module(mod, mapping, custom_module_class_mapping):
     r"""Swaps the mod if it has a quantized counterpart and it has an
@@ -274,6 +337,7 @@ def swap_module(mod, mapping, custom_module_class_mapping):
         if device:
             new_mod.to(device)
     return new_mod
+
 
 def replace_softmax(
     module: Module,

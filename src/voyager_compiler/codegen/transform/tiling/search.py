@@ -22,7 +22,7 @@ from ...node_info import (
 )
 from .banking import GEMV_BANK_GROUPS, require_allocation, scratchpad_bytes
 from .cost import gemv_tile_latency, vector_tile_latency
-from ....layout_ops import NHWC_OP_VARIANTS
+from ....ops.layout import NHWC_OP_VARIANTS
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +293,7 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     whatever fusion left of it -- a ``quantize_mx`` tail makes it a pair, an
     MHA relayout re-cuts ``N`` into heads -- diced by the same blocks.
     """
-    from ..bufferize.tiling import _operand_placeholders
+    from .tiler import _operand_placeholders
 
     anchor = get_anchor_node(node)
     tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
