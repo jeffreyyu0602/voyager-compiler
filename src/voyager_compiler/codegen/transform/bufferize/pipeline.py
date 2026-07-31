@@ -20,7 +20,7 @@ from torch._higher_order_ops.while_loop import while_loop
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.ops.layout import (
     NCHW_TO_NHWC,
-    WEIGHT_NCHW_TO_HWIO,
+    OIHW_TO_HWIO,
     project,
     unproject,
 )
@@ -1613,7 +1613,7 @@ def build_conv2d(
 
     nhwc = anchor.meta.get("transposed", False)
     in_dims = NCHW_TO_NHWC if nhwc else None
-    w_dims = WEIGHT_NCHW_TO_HWIO if nhwc else None
+    w_dims = OIHW_TO_HWIO if nhwc else None
     out_dims = NCHW_TO_NHWC if nhwc else None
 
     N, C, H, W = unproject(inp.shape, in_dims)

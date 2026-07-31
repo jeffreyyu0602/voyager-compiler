@@ -22,10 +22,12 @@ from ..node_info import (
 from .rewrites import deduplicate_nodes
 from ...shape_prop import fetch_attr, propagate_shape
 from ...ops.layout import (
+    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    GEMM_WEIGHT_LAYOUTS,
     NCHW_TO_NHWC,
     NHWC_OP_VARIANTS,
     NHWC_TO_NCHW,
-    WEIGHT_NCHW_TO_HWIO,
+    OIHW_TO_HWIO,
 )
 from ...export_utils import create_getattr_from_value
 
@@ -157,7 +159,7 @@ def _process_conv2d_input_nodes(
         param = fetch_attr(model, node.target)
         param.data = param.data.permute(2, 3, 1, 0)
 
-        node.meta["dims"] = WEIGHT_NCHW_TO_HWIO
+        node.meta["dims"] = OIHW_TO_HWIO
         return
 
     # Case B: Input is an activation flowing into the island from outside
@@ -571,12 +573,6 @@ def _insert_transpose_op(
     fold_transpose_into_constant(model, path, transposed_nodes)
 
 
-# The two GEMM weight layouts: ``"kc"`` = [out, contraction] (aten
-# linear's native weight layout), ``"ck"`` = [contraction, out] (aten
-# matmul's native right-operand layout).
-_GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
-
-
 def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
     """The target layout of ``node``'s class: matrix-vector
     (fully-connected / batch-1) nodes follow ``mv_layout``, matrix-matrix
@@ -635,7 +631,9 @@ def _process_matmul_node(
 
 
 def normalize_gemm_weight_layout(
-    model: GraphModule, mm_layout: str = "kc", mv_layout: str = "kc"
+    model: GraphModule,
+    mm_layout: str = DEFAULT_GEMM_WEIGHT_LAYOUT,
+    mv_layout: str = DEFAULT_GEMM_WEIGHT_LAYOUT,
 ) -> GraphModule:
     """Normalize every GEMM right-operand (weight) to one layout per
     operation class: matrix-matrix nodes to ``mm_layout``, matrix-vector
@@ -649,8 +647,8 @@ def normalize_gemm_weight_layout(
     retargeted iff its storage was flipped, so eager execution stays
     correct in every configuration with no global patching.
     """
-    assert mm_layout in _GEMM_WEIGHT_LAYOUTS, mm_layout
-    assert mv_layout in _GEMM_WEIGHT_LAYOUTS, mv_layout
+    assert mm_layout in GEMM_WEIGHT_LAYOUTS, mm_layout
+    assert mv_layout in GEMM_WEIGHT_LAYOUTS, mv_layout
 
     transposed_nodes = {}
 

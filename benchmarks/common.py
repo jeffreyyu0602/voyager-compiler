@@ -701,7 +701,7 @@ def _frontend(cfg: SweepConfig):
         example_kwargs=example_kwargs,
         patterns=FUSION_PIPELINE,
         config=cfg.acc_config,
-        transform_layout=True,
+        layout_policy="systolic",
         context_len=cfg.kv_len if is_decode else None,
         max_gen=DECODE_MAX_GEN if is_decode else None,
     )

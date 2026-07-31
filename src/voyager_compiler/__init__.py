@@ -77,6 +77,11 @@ from .modeling import (
     get_device_map,
     insert_align_device_nodes,
 )
+from .ops.layout import (
+    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_LAYOUT_POLICY,
+    POLICY_GEMM_WEIGHT_LAYOUT,
+)
 from .quantization import (
     DerivedQuantizationSpec,
     FusedAmaxObsFakeQuantize,
@@ -213,8 +218,8 @@ def transform(
     example_kwargs=None,
     patterns=None,
     config=None,
-    transform_layout=False,
-    transpose_fc=False,
+    layout_policy=DEFAULT_LAYOUT_POLICY,
+    gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
     split_spmm=False,
@@ -252,13 +257,13 @@ def transform(
         pad_matrix_op_dimensions(model, *config.pe_array_size)
 
     # Systolic-array-friendly operand layouts.
-    if transform_layout:
+    if layout_policy == "systolic":
         normalize_conv2d_layout(model)
 
     normalize_gemm_weight_layout(
         model,
-        mm_layout="ck" if transform_layout else "kc",
-        mv_layout="ck" if transpose_fc else "kc",
+        mm_layout=POLICY_GEMM_WEIGHT_LAYOUT[layout_policy],
+        mv_layout=gemv_weight_layout,
     )
 
     ShapeProp(model, mode=fake_mode).propagate(*flatten_args)

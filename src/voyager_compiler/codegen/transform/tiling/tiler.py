@@ -46,11 +46,7 @@ from .cost import (
     get_dtype_width,
 )
 from .search import DEFAULT_RUNTIME_TOLERANCE, gemv_op_tiling
-from ....ops.layout import (
-    NCHW_TO_NHWC,
-    WEIGHT_NCHW_TO_HWIO,
-    unproject,
-)
+from ....ops.layout import  NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -912,7 +908,7 @@ def _extract_layer_from_node(node):
     transposed = node.meta.get("transposed", False)
 
     if is_conv2d(node):
-        w_dims = WEIGHT_NCHW_TO_HWIO if transposed else None
+        w_dims = OIHW_TO_HWIO if transposed else None
         in_dims = NCHW_TO_NHWC if transposed else None
         out_channels, in_channels, kH, kW = unproject(weight_shape, w_dims)
         _, _, height, width = unproject(node.shape, in_dims)

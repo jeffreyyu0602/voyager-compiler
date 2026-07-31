@@ -5,6 +5,12 @@ from voyager_compiler.hardware_config import (
     DEFAULT_DRAM_BANDWIDTH_GBS,
     DEFAULT_DRAM_SIZE_GB,
 )
+from voyager_compiler.ops.layout import (
+    DEFAULT_GEMM_WEIGHT_LAYOUT,
+    DEFAULT_LAYOUT_POLICY,
+    GEMM_WEIGHT_LAYOUTS,
+    LAYOUT_POLICIES,
+)
 from voyager_compiler.quantization.quantizer.quantizer import QuantizationSpec
 from voyager_compiler.utils import SLURM_ARGS
 
@@ -344,14 +350,18 @@ def add_compile_args(parser=None):
 
     # -- data layout + hardware unrolling -----------------------------------
     parser.add_argument(
-        "--transform_layout",
-        action="store_true",
-        help="Transpose conv/linear inputs+weights to a systolic-friendly layout.",
+        "--layout_policy",
+        choices=LAYOUT_POLICIES,
+        default=DEFAULT_LAYOUT_POLICY,
+        help="Operand layouts (activation / conv weight / matmul weight): "
+        "pytorch = NCHW/OIHW/KC, systolic = NHWC/HWIO/CK.",
     )
     parser.add_argument(
-        "--transpose_fc",
-        action="store_true",
-        help="Transpose the weights of fully connected layers.",
+        "--gemv_weight_layout",
+        choices=GEMM_WEIGHT_LAYOUTS,
+        default=DEFAULT_GEMM_WEIGHT_LAYOUT,
+        help="Matrix-vector GEMM weight layout: kc is [out, contraction], "
+        "ck is [contraction, out].",
     )
     parser.add_argument(
         "--pe_array_size",

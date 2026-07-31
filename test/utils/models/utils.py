@@ -5,8 +5,8 @@ def get_transform_args(args, vector_stages):
     return {
         "patterns": vector_stages,
         "config": AcceleratorConfig.from_args(args),
-        "transform_layout": args.transform_layout,
-        "transpose_fc": args.transpose_fc,
+        "layout_policy": args.layout_policy,
+        "gemv_weight_layout": args.gemv_weight_layout,
         "fuse_reshape": not args.disable_reshape_fusion,
         "split_spmm": args.split_spmm,
     }
