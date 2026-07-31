@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Union, Tuple, OrderedDict
+from typing import Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import Quantizer
 
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
-    _convert_scalars_to_attrs,
     OP_TO_ANNOTATOR,
     QuantizationConfig,
+    _convert_scalars_to_attrs,
 )
-
 
 __all__ = [
     "XNNPACKQuantizer",
@@ -48,7 +47,9 @@ def _get_module_name_filter(module_name: str):
             return n[prefix:]
 
         names = [_normalize_path(n) for n, _ in nn_module_stack.values()]
-        return module_name in names or any(re.search(module_name, name) for name in names)
+        return module_name in names or any(
+            re.search(module_name, name) for name in names
+        )
 
     return module_name_filter
 
@@ -124,7 +125,9 @@ def _get_module_name_object_type_order_filter(
     >> print(module_name_object_type_order_filter(node))
     """
     import re
-    from ...export_utils import get_node_name_to_scope
+
+    from voyager_compiler.export_utils import get_node_name_to_scope
+
     node_name_to_scope = get_node_name_to_scope(model)
 
     def module_name_object_type_order_filter(n: Node) -> bool:
@@ -145,10 +148,14 @@ def _get_not_module_type_or_name_filter(
     tp_list: List[Callable], module_name_list: List[str]
 ) -> Callable[[Node], bool]:
     module_type_filters = [_get_module_type_filter(tp) for tp in tp_list]
-    module_name_list_filters = [_get_module_name_filter(m) for m in module_name_list]
+    module_name_list_filters = [
+        _get_module_name_filter(m) for m in module_name_list
+    ]
 
     def not_module_type_or_name_filter(n: Node) -> bool:
-        return not any(f(n) for f in module_type_filters + module_name_list_filters)
+        return not any(
+            f(n) for f in module_type_filters + module_name_list_filters
+        )
 
     return not_module_type_or_name_filter
 
@@ -169,14 +176,20 @@ class XNNPACKQuantizer(Quantizer):
     def __init__(self):
         super().__init__()
         self.global_config: Optional[QuantizationConfig] = None
-        self.object_type_config: Dict[Union[Callable, str], Optional[QuantizationConfig]] = {}
-        self.module_type_config: Dict[Callable, Optional[QuantizationConfig]] = {}
+        self.object_type_config: Dict[
+            Union[Callable, str], Optional[QuantizationConfig]
+        ] = {}
+        self.module_type_config: Dict[
+            Callable, Optional[QuantizationConfig]
+        ] = {}
         self.module_name_config: Dict[str, Optional[QuantizationConfig]] = {}
         self.module_name_object_type_order_config: OrderedDict[
             Tuple[str, Callable, int], Optional[QuantizationConfig]
         ] = {}
 
-    def set_global(self, quantization_config: QuantizationConfig) -> XNNPACKQuantizer:
+    def set_global(
+        self, quantization_config: QuantizationConfig
+    ) -> XNNPACKQuantizer:
         self.global_config = quantization_config
         return self
 
@@ -199,7 +212,9 @@ class XNNPACKQuantizer(Quantizer):
         return self
 
     def set_module_name(
-        self, module_name: str, quantization_config: Optional[QuantizationConfig]
+        self,
+        module_name: str,
+        quantization_config: Optional[QuantizationConfig],
     ):
         """Set quantization_config for a submodule with name: `module_name`, for example:
         quantizer.set_module_name("blocks.sub"), it will quantize all supported operator/operator
@@ -218,7 +233,9 @@ class XNNPACKQuantizer(Quantizer):
         """Set quantization_config for modules matching a combination of the given module name, object type,
         and the index at which the module appears.
         """
-        self.module_name_object_type_order_config[(module_name, object_type, index)] = quantization_config
+        self.module_name_object_type_order_config[
+            (module_name, object_type, index)
+        ] = quantization_config
         return self
 
     def transform_for_annotation(
@@ -228,11 +245,17 @@ class XNNPACKQuantizer(Quantizer):
         return _convert_scalars_to_attrs(model)
 
     def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
-        for (module_name, object_type, index), config in self.module_name_object_type_order_config.items():
+        for (
+            module_name,
+            object_type,
+            index,
+        ), config in self.module_name_object_type_order_config.items():
             self._annotate_all_static_patterns(
                 model,
                 config,
-                _get_module_name_object_type_order_filter(model, module_name, object_type, index),
+                _get_module_name_object_type_order_filter(
+                    model, module_name, object_type, index
+                ),
             )
 
         module_name_list = list(self.module_name_config.keys())

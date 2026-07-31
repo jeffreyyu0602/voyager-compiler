@@ -4,24 +4,24 @@ Every pass ``transform()`` runs is exported from here, in the order the
 pipeline applies them.
 """
 
-from .subgraph import rename_nodes_with_param_names
-from .transform.bufferize.emit import gen_compute_graph
-from .transform.data_layout import (
+from voyager_compiler.codegen.subgraph import rename_nodes_with_param_names
+from voyager_compiler.codegen.transform.bufferize.emit import gen_compute_graph
+from voyager_compiler.codegen.transform.data_layout import (
     eliminate_reshape_with_no_effect,
     normalize_conv2d_layout,
     normalize_gemm_weight_layout,
 )
-from .transform.operator_fusion import fuse_operator
-from .transform.padding import (
+from voyager_compiler.codegen.transform.operator_fusion import fuse_operator
+from voyager_compiler.codegen.transform.padding import (
     pad_matrix_op_dimensions,
     pad_vector_op_dimensions,
     pad_vit_embeddings_output,
 )
-from .transform.quant_folding import (
+from voyager_compiler.codegen.transform.quant_folding import (
     fuse_dequantize_quantize,
     fuse_quantize_dequantize_with_previous_op,
 )
-from .transform.rewrites import (
+from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
     extract_input_preprocessor,
     fold_constant_generators,
@@ -34,10 +34,10 @@ from .transform.rewrites import (
     replace_rmsnorm_with_layer_norm,
     split_dense_spmm_node,
 )
-from .transform.tiling.search import (
+from voyager_compiler.codegen.transform.tiling.search import (
     gemv_op_tiling,
-    vector_op_tiling,
     pool_op_tiling,
+    vector_op_tiling,
 )
 
 __all__ = [

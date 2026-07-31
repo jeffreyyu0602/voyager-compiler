@@ -17,15 +17,6 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import torch
 from torch._higher_order_ops.while_loop import while_loop
 
-from voyager_compiler.export_utils import export_model
-from voyager_compiler.ops.layout import (
-    NCHW_TO_NHWC,
-    OIHW_TO_HWIO,
-    project,
-    unproject,
-)
-from voyager_compiler.shape_prop import ShapeProp
-
 # Top-level: these modules do not import this one at module scope
 # (bufferization imports the builders function-locally), so no cycle.
 from voyager_compiler.codegen.node_info import (
@@ -47,13 +38,13 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     oracle_disabled,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
-    _InputSpec,
-    _OutputSpec,
-    _ScratchSpec,
     _build_fused_gm,
     _compute_input_spec,
     _finalize_exported_gm,
+    _InputSpec,
     _lenient_verifier,
+    _OutputSpec,
+    _ScratchSpec,
     _tag_loop_extents,
     effect_cond,
     fuse_store_cones,
@@ -68,6 +59,14 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     GEMM_L3_ORDER,
     get_tiling,
 )
+from voyager_compiler.export_utils import export_model
+from voyager_compiler.ops.layout import (
+    NCHW_TO_NHWC,
+    OIHW_TO_HWIO,
+    project,
+    unproject,
+)
+from voyager_compiler.shape_prop import ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
 

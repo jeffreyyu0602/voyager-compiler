@@ -37,10 +37,23 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch.fx import GraphModule, Node
 
-from .bufferization import _viewed_buffer
-from .utils import _collect_codebook_nodes, _passed_whole, _subgraph
-from ...node_info import _align_size, dtype_byte_size, get_arg_value
-from .ops import MemoryLevel, UNBANKED
+from voyager_compiler.codegen.node_info import (
+    _align_size,
+    dtype_byte_size,
+    get_arg_value,
+)
+from voyager_compiler.codegen.transform.bufferize.bufferization import (
+    _viewed_buffer,
+)
+from voyager_compiler.codegen.transform.bufferize.ops import (
+    UNBANKED,
+    MemoryLevel,
+)
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _collect_codebook_nodes,
+    _passed_whole,
+    _subgraph,
+)
 
 logger = logging.getLogger(__name__)
 

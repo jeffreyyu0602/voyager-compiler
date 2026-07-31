@@ -11,16 +11,16 @@ Three separate stages:
 
 import os
 
-from .compress import compress_schedule
-from .excel import write_excel_report
-from .interpret import estimate_schedule
-from .model import (
+from voyager_compiler.codegen.reporting.compress import compress_schedule
+from voyager_compiler.codegen.reporting.excel import write_excel_report
+from voyager_compiler.codegen.reporting.interpret import estimate_schedule
+from voyager_compiler.codegen.reporting.model import (
     LoopSummary,
     OpInfo,
     ScheduleResult,
     TimingRecord,
 )
-from .perfetto import write_perfetto
+from voyager_compiler.codegen.reporting.perfetto import write_perfetto
 
 __all__ = [
     "LoopSummary",

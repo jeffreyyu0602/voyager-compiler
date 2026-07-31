@@ -266,7 +266,7 @@ def add_experiment_args(parser=None):
     parser_slurm = subparsers.add_parser("slurm", help="slurm command help")
     for k, v in SLURM_ARGS.items():
         parser_slurm.add_argument("--" + k, **v)
-    parser_bash = subparsers.add_parser("bash", help="bash command help")
+    subparsers.add_parser("bash", help="bash command help")
     return parser
 
 

@@ -3,17 +3,22 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 from torch.ao.quantization.fx.utils import (
-    get_new_attr_name_with_prefix,
     assert_and_get_unique_device,
+    get_new_attr_name_with_prefix,
 )
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
 from torchao.quantization.pt2e.quantizer.utils import (
     annotate_input_qspec_map as _annotate_input_qspec_map,
+)
+from torchao.quantization.pt2e.quantizer.utils import (
     annotate_output_qspec as _annotate_output_qspec,
 )
 
-from .quantizer import QuantizationSpec, DerivedQuantizationSpec
+from voyager_compiler.quantization.quantizer.quantizer import (
+    DerivedQuantizationSpec,
+    QuantizationSpec,
+)
 
 
 # In the absence of better name, just winging it with QuantizationConfig
@@ -83,7 +88,10 @@ def _annotate_linear(
     weight_qspec = quantization_config.weight
     bias_qspec = quantization_config.bias
     for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target != torch.ops.aten.linear.default:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.linear.default
+        ):
             continue
         if filter_fn and not filter_fn(node):
             continue
@@ -191,7 +199,10 @@ def _annotate_matmul(
     output_act_qspec = quantization_config.output_activation
     weight_qspec = quantization_config.weight
     for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target != torch.ops.aten.matmul.default:
+        if (
+            node.op != "call_function"
+            or node.target != torch.ops.aten.matmul.default
+        ):
             continue
         if filter_fn and not filter_fn(node):
             continue
@@ -252,12 +263,13 @@ def _annotate_residual(
             or not isinstance(input_act1, Node)
             or input_act0.op == "get_attr"
             or input_act1.op == "get_attr"
-            or input_act0.meta['val'].shape != input_act1.meta['val'].shape
+            or input_act0.meta["val"].shape != input_act1.meta["val"].shape
         ):
             continue
 
         node_to_quantize = (
-            input_act0 if node_order[input_act0] < node_order[input_act1]
+            input_act0
+            if node_order[input_act0] < node_order[input_act1]
             else input_act1
         )
         input_qspec_map = {node_to_quantize: input_act_qspec}
@@ -492,7 +504,9 @@ def _annotate_activation(
 
 
 # TODO: make the list of ops customizable
-def _convert_scalars_to_attrs(model: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def _convert_scalars_to_attrs(
+    model: torch.fx.GraphModule,
+) -> torch.fx.GraphModule:
     device = assert_and_get_unique_device(model)
     for n in model.graph.nodes:
         if n.op != "call_function" or n.target not in [
@@ -514,7 +528,9 @@ def _convert_scalars_to_attrs(model: torch.fx.GraphModule) -> torch.fx.GraphModu
             dtypes = {arg.meta["val"].dtype for arg in n.all_input_nodes}
             assert len(dtypes) <= 1
             dtype = next(iter(dtypes)) if len(dtypes) > 0 else None
-            float_tensor = torch.tensor(float(args[i]), dtype=dtype, device=device)
+            float_tensor = torch.tensor(
+                float(args[i]), dtype=dtype, device=device
+            )
             model.register_buffer(tensor_constant_name, float_tensor)
             fake_mode = n.meta["val"].fake_mode
             with model.graph.inserting_before(n):

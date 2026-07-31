@@ -4,14 +4,14 @@ writes the tensor once instead of once per op.
 """
 
 import logging
+from collections import defaultdict
 from itertools import permutations
 from typing import Any, Callable, Dict, List, Union
-from collections import defaultdict
 
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import (
+from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_arg_value,
     is_elementwise_op,
@@ -23,8 +23,11 @@ from ..node_info import (
     repeat_of,
     swaps_last_two_dims,
 )
-from ..subgraph import create_and_insert_subgraph, update_submod_user_meta
-from ...shape_prop import propagate_shape
+from voyager_compiler.codegen.subgraph import (
+    create_and_insert_subgraph,
+    update_submod_user_meta,
+)
+from voyager_compiler.shape_prop import propagate_shape
 
 logger = logging.getLogger(__name__)
 

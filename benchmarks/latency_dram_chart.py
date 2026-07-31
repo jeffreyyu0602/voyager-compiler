@@ -20,6 +20,7 @@ import re
 import zipfile
 from collections import namedtuple
 
+import per_module_latency_chart
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference, Series
 from openpyxl.chart.axis import (
@@ -43,8 +44,6 @@ from openpyxl.drawing.text import (
     RegularTextRun,
     RichTextProperties,
 )
-
-import per_module_latency_chart
 
 # ---- what a caller hands us -------------------------------------------------
 # A metric sheet is one sweep; each of its groups becomes a prefill+decode chart

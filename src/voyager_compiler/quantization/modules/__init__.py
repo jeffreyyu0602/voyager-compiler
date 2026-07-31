@@ -1,7 +1,10 @@
 """Modules swapped into a float model before or during quantization."""
 
-from .llama_attention_kivi import LlamaAttentionKIVI, swap_llama_attention
-from .posit_softmax import Softmax
+from voyager_compiler.quantization.modules.llama_attention_kivi import (
+    LlamaAttentionKIVI,
+    swap_llama_attention,
+)
+from voyager_compiler.quantization.modules.posit_softmax import Softmax
 
 __all__ = [
     "LlamaAttentionKIVI",

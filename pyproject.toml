@@ -37,6 +37,9 @@ dependencies = [
     "xlsxwriter"
 ]
 
+[project.optional-dependencies]
+dev = ["black", "ruff"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
@@ -44,3 +47,36 @@ where = ["src"]
 "voyager_compiler" = ["*.txt", "*.json"]
 # Subpackage data (the posit lookup tables under quantization/dtypes/posit_gold).
 "voyager_compiler.*" = ["*.txt", "*.json", "*.proto"]
+
+[tool.black]
+line-length = 80
+target-version = ["py312"]
+# Generated; regenerating would undo any formatting.  force- rather than
+# extend-, so it holds when the file is named explicitly on the CLI.
+force-exclude = '/src/interstellar/|(voyager_ir_pb2|aten_classifier)\.py$'
+
+# Linting only; black owns formatting (line-length matches it so the two agree
+# on what fits).
+[tool.ruff]
+line-length = 80
+target-version = "py312"
+# Honour the excludes below for explicitly-named paths too.
+force-exclude = true
+# Code we do not own: interstellar is an external repo, the examples' run_*.py
+# are HuggingFace scripts kept close to upstream.
+extend-exclude = [
+    "src/interstellar",
+    "examples/**/run_*.py",
+    "**/voyager_ir_pb2.py",
+    "**/aten_classifier.py",
+]
+
+[tool.ruff.lint]
+select = ["F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Leave the examples' import order alone; the F rules still apply to them.
+"examples/**" = ["I001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["voyager_compiler", "interstellar"]

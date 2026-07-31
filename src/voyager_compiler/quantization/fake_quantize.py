@@ -1,23 +1,22 @@
 import logging
 import math
 import re
-from typing import Optional, List, Callable, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
-from ..ops import expand, quantize_mx, vmap
-from .dtypes import (
+from voyager_compiler.ops import expand, quantize_mx, vmap
+from voyager_compiler.quantization.dtypes import (
     _quantize_elemwise_core,
     quantize_to_fp8_e4m3,
     quantize_to_fp8_e5m2,
     quantize_to_nf,
     quantize_to_posit,
 )
-from .mx_utils import _reshape_to_blocks
-from .qspec import QScheme
-
+from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
+from voyager_compiler.quantization.qspec import QScheme
 
 __all__ = [
     "FusedAmaxObsFakeQuantize",

@@ -1,6 +1,6 @@
 import os
 
-from datasets import load_dataset, DownloadConfig
+from datasets import DownloadConfig, load_dataset
 from torchvision import transforms
 from tqdm import tqdm
 
@@ -50,7 +50,7 @@ def retrieve_dataset(num_samples, model_type):
         "timm/imagenet-1k-wds",
         split="validation",
         streaming=True,
-        download_config=config
+        download_config=config,
     )
     dataset = dataset.take(num_samples)
 
@@ -80,6 +80,8 @@ def dump_imagenet(output_dir, dataset, model_type, preprocess_fn, torch_dtype):
             else "pixel_values_preprocess.bin"
         )
 
-        preprocessed_dataset.append({"image": image.to(torch_dtype), "label": label})
+        preprocessed_dataset.append(
+            {"image": image.to(torch_dtype), "label": label}
+        )
         write_tensor_to_file(image, os.path.join(dir_name, filename))
     return preprocessed_dataset

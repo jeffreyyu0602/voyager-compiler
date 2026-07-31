@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from ...node_info import (
+from voyager_compiler.codegen.node_info import (
     _align_size,
     dtype_byte_size,
     get_anchor_node,

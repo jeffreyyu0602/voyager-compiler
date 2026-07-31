@@ -49,6 +49,7 @@ from typing import (
 
 import torch
 from datasets import load_dataset
+from torch._export.utils import _disable_aten_to_metadata_assertions
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -60,8 +61,6 @@ from transformers.integrations.executorch import (
 )
 
 import voyager_compiler  # noqa: F401  registers voyager.*
-from torch._export.utils import _disable_aten_to_metadata_assertions
-
 from voyager_compiler import (
     OpMatcher,
     QuantizationSpec,
@@ -76,23 +75,23 @@ from voyager_compiler import (
     swap_llama_attention,
     transform,
 )
-from voyager_compiler.codegen.transform.bufferize import (
-    bufferize_graph,
-    plan_memory,
-)
+from voyager_compiler.codegen.aten_classifier import is_compute_op
+from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
     compress_schedule,
     estimate_schedule,
     write_excel_report,
     write_perfetto,
 )
+from voyager_compiler.codegen.transform.bufferize import (
+    bufferize_graph,
+    plan_memory,
+)
 from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
-from voyager_compiler.codegen.aten_classifier import is_compute_op
-from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.shape_prop import ShapeProp
 
 try:

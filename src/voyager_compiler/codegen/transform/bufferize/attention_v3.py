@@ -30,7 +30,7 @@ import math
 import torch
 from torch._higher_order_ops.while_loop import while_loop
 
-from voyager_compiler.export_utils import export_model
+from voyager_compiler.codegen.node_info import get_arg_value
 from voyager_compiler.codegen.transform.bufferize.attention import (
     _MASK_FILL,
     _fuse_passes,
@@ -52,8 +52,8 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _tag_loop_extents,
     voyager,
 )
+from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import ShapeProp
-from voyager_compiler.codegen.node_info import get_arg_value
 
 _SRAM = int(MemoryLevel.SRAM)
 

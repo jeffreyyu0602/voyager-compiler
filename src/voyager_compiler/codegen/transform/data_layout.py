@@ -5,9 +5,8 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..aten_classifier import is_elementwise_op
-from .operator_fusion import duplicate_shared_nodes
-from ..node_info import (
+from voyager_compiler.codegen.aten_classifier import is_elementwise_op
+from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_conv2d,
     is_depthwise_conv,
@@ -19,9 +18,12 @@ from ..node_info import (
     quant_param_arg_nodes,
     swaps_last_two_dims,
 )
-from .rewrites import deduplicate_nodes
-from ...shape_prop import fetch_attr, propagate_shape
-from ...ops.layout import (
+from voyager_compiler.codegen.transform.operator_fusion import (
+    duplicate_shared_nodes,
+)
+from voyager_compiler.codegen.transform.rewrites import deduplicate_nodes
+from voyager_compiler.export_utils import create_getattr_from_value
+from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
     GEMM_WEIGHT_LAYOUTS,
     NCHW_TO_NHWC,
@@ -29,7 +31,7 @@ from ...ops.layout import (
     NHWC_TO_NCHW,
     OIHW_TO_HWIO,
 )
-from ...export_utils import create_getattr_from_value
+from voyager_compiler.shape_prop import fetch_attr, propagate_shape
 
 logger = logging.getLogger(__name__)
 

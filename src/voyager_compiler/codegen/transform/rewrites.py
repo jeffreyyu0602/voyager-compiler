@@ -1,28 +1,38 @@
 import logging
 import re
-from typing import Tuple, Union, List
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch.fx import GraphModule, Node, Interpreter
+from torch.fx import GraphModule, Interpreter, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torchao.quantization.pt2e.utils import _get_aten_graph_module_for_pattern
 
-from ..aten_classifier import is_elementwise_op
-from ..node_info import (
+from voyager_compiler.codegen.aten_classifier import is_elementwise_op
+from voyager_compiler.codegen.node_info import (
     _pair,
     get_arg_value,
     is_gemm_op,
     is_nop,
     is_prunable_op,
 )
-from ..subgraph import replace_node_with_graph_module, update_submod_user_meta
-from .operator_fusion import _nodes_sequential
-from ...export_utils import create_getattr_from_value, get_aten_graph_module
-from ...shape_prop import fetch_attr, propagate_shape, set_node_value
-from ...quantization.quantizer.xnnpack_quantizer_utils import (
+from voyager_compiler.codegen.subgraph import (
+    replace_node_with_graph_module,
+    update_submod_user_meta,
+)
+from voyager_compiler.codegen.transform.operator_fusion import _nodes_sequential
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    get_aten_graph_module,
+)
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     _convert_scalars_to_attrs,
+)
+from voyager_compiler.shape_prop import (
+    fetch_attr,
+    propagate_shape,
+    set_node_value,
 )
 
 logger = logging.getLogger(__name__)

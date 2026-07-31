@@ -11,22 +11,21 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from google.protobuf import text_format
-from torch.fx import Node
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx import Node
 from torch.utils._pytree import tree_flatten
 
 # Defines torch.ops.quantized_ops.* (and the hardware-layout twins).  This must
 # come first: the imports below reference those targets, and the op namespace
 # resolves lazily, so an unregistered target fails at call time rather than
 # here.
-from . import ops as _register_ops  # noqa: F401
-
-from .cli_args import (
+from voyager_compiler import ops as _register_ops  # noqa: F401
+from voyager_compiler.cli_args import (
     add_compile_args,
     add_experiment_args,
     add_quantization_args,
 )
-from .codegen import (
+from voyager_compiler.codegen import (
     deduplicate_nodes,
     eliminate_reshape_with_no_effect,
     extract_input_preprocessor,
@@ -50,7 +49,7 @@ from .codegen import (
     replace_rmsnorm_with_layer_norm,
     split_dense_spmm_node,
 )
-from .codegen.transform.bufferize import (
+from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     compute_op_names,
     flush_tensor_files,
@@ -59,11 +58,11 @@ from .codegen.transform.bufferize import (
     plan_memory,
     print_bufferized_graph,
 )
-from .codegen.transform.tiling import (
+from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
-from .export_utils import (
+from voyager_compiler.export_utils import (
     TorchExportableModuleWithStaticCache,
     convert_and_export_with_split_cache,
     export_model,
@@ -71,18 +70,18 @@ from .export_utils import (
     get_node_name_to_scope,
     print_node_scope_tabular,
 )
-from .hardware_config import AcceleratorConfig
-from .modeling import (
+from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.modeling import (
     dispatch_model,
     get_device_map,
     insert_align_device_nodes,
 )
-from .ops.layout import (
+from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
     DEFAULT_LAYOUT_POLICY,
     POLICY_GEMM_WEIGHT_LAYOUT,
 )
-from .quantization import (
+from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
     FusedAmaxObsFakeQuantize,
     QConfig,
@@ -101,15 +100,15 @@ from .quantization import (
     replace_softmax,
     sink_obs_or_fq,
 )
-from .quantization.dtypes import (
+from voyager_compiler.quantization.dtypes import (
     quantize_to_fp8_e4m3,
     quantize_to_fp8_e5m2,
     quantize_to_nf,
     quantize_to_posit,
 )
-from .quantization.modules import swap_llama_attention
-from .shape_prop import ShapeProp, fetch_attr, propagate_shape
-from .utils import with_execution_context
+from voyager_compiler.quantization.modules import swap_llama_attention
+from voyager_compiler.shape_prop import ShapeProp, fetch_attr, propagate_shape
+from voyager_compiler.utils import with_execution_context
 
 __all__ = [
     "AcceleratorConfig",

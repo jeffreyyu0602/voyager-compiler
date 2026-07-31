@@ -11,7 +11,10 @@ from torch.fx.operator_schemas import normalize_function
 
 # Re-exported: both predicates are generated from the Core ATen IR by
 # ``tools/gen_aten_classifier.py`` and are imported from here across codegen.
-from .aten_classifier import is_compute_op, is_elementwise_op  # noqa: F401
+from voyager_compiler.codegen.aten_classifier import (  # noqa: F401
+    is_compute_op,
+    is_elementwise_op,
+)
 
 logger = logging.getLogger(__name__)
 

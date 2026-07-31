@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 from torch import Tensor
 from torch.ao.quantization.qconfig import _ObserverOrFakeQuantizeConstructor

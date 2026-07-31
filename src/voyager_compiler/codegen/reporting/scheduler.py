@@ -26,9 +26,9 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .cost import dram_cycles, op_info
-from .model import OpInfo, TimingRecord
-from ...hardware_config import AcceleratorConfig
+from voyager_compiler.codegen.reporting.cost import dram_cycles, op_info
+from voyager_compiler.codegen.reporting.model import OpInfo, TimingRecord
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 
 @dataclass

@@ -11,10 +11,10 @@ from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import GraphModule
 from torch.fx.graph import map_arg
 from torch.fx.node import Node
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 logger = logging.getLogger(__name__)
 

@@ -6,18 +6,21 @@ import sys
 
 import torch
 import torch.nn as nn
-from torch.utils._pytree import tree_flatten
 from datasets import load_dataset
-from torchvision import models, transforms
+from torch.utils._pytree import tree_flatten
 from torchao.quantization.pt2e.quantizer.utils import (
     annotate_output_qspec as _annotate_output_qspec,
 )
+from torchvision import models, transforms
+from tqdm import tqdm
 from transformers import (
     AutoImageProcessor,
     AutoTokenizer,
     StaticCache,
 )
-from tqdm import tqdm
+from utils.dataset import glue, imagenet
+from utils.models import bert, mobilebert, torchvision_models, vit
+from utils.models.utils import get_compile_args, get_transform_args
 
 from voyager_compiler import (
     OpMatcher,
@@ -32,6 +35,7 @@ from voyager_compiler import (
     convert_pt2e,
     export_model,
     extract_input_preprocessor,
+    fuse_dequantize_quantize,
     fuse_operator,
     get_default_quantizer,
     prepare_pt2e,
@@ -41,15 +45,10 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen import (
-    replace_rmsnorm_with_layer_norm,
     remove_softmax_dtype_cast,
+    replace_rmsnorm_with_layer_norm,
 )
 from voyager_compiler.codegen.node_info import is_fully_connected
-from voyager_compiler import fuse_dequantize_quantize
-
-from utils.models import bert, mobilebert, torchvision_models, vit
-from utils.models.utils import get_compile_args, get_transform_args
-from utils.dataset import glue, imagenet
 
 logger = logging.getLogger()
 

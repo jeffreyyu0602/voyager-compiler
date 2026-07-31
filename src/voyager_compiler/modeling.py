@@ -11,15 +11,15 @@ import logging
 from typing import Dict, List
 
 import torch
+from accelerate.big_modeling import infer_auto_device_map
+from accelerate.utils import get_max_memory
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
 from torch.fx import GraphModule, Node
 from torch.fx.graph import map_arg
-from accelerate.big_modeling import infer_auto_device_map
-from accelerate.utils import get_max_memory
 
-from .codegen.node_info import dtype_byte_size
-from .codegen.transform.rewrites import deduplicate_nodes
-from .shape_prop import fetch_attr
+from voyager_compiler.codegen.node_info import dtype_byte_size
+from voyager_compiler.codegen.transform.rewrites import deduplicate_nodes
+from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
 

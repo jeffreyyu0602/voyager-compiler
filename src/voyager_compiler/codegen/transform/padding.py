@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 
-from ..aten_classifier import is_elementwise_op
-from ..node_info import (
+from voyager_compiler.codegen.aten_classifier import is_elementwise_op
+from voyager_compiler.codegen.node_info import (
     _BROADCAST_OPS,
     get_arg_value,
     is_conv2d,
@@ -17,11 +17,11 @@ from ..node_info import (
     is_gemm_op,
     is_matmul,
 )
-from ...export_utils import (
+from voyager_compiler.export_utils import (
     create_getattr_from_value,
     get_aten_graph_module,
 )
-from ...shape_prop import fetch_attr, propagate_shape
+from voyager_compiler.shape_prop import fetch_attr, propagate_shape
 
 logger = logging.getLogger(__name__)
 

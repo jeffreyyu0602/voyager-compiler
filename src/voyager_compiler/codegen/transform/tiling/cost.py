@@ -16,16 +16,19 @@ copy of that formula (and of ``OP_PASSES``).
 import math
 from typing import Optional
 
-import interstellar
 import torch
 from torch.fx import Node
 
-from .banking import operand_roles, require_allocation
-from ...node_info import (
+import interstellar
+from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_fully_connected,
     peel_weight,
+)
+from voyager_compiler.codegen.transform.tiling.banking import (
+    operand_roles,
+    require_allocation,
 )
 
 le = interstellar.le

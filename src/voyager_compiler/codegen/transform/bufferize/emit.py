@@ -33,47 +33,52 @@ non-bufferized path).  Three ideas carry the whole translation:
     ``ForLoop.start/end/step`` already says it.
 """
 
+import logging
 import operator
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
-from concurrent.futures import ThreadPoolExecutor
-
 import graphviz
+import numpy as np
 import torch
 from torch.fx import GraphModule, Node
 from torch.fx.operator_schemas import normalize_function
 
-import logging
-
-import numpy as np
-
 import interstellar
-
-from ...node_info import QMAP_PARAMS, is_nop, quant_param_arg_nodes
-from ...voyager_ir_pb2 import (
+from voyager_compiler.codegen.node_info import (
+    QMAP_PARAMS,
+    is_nop,
+    quant_param_arg_nodes,
+)
+from voyager_compiler.codegen.transform.bufferize.bufferization import (
+    _is_compute,
+)
+from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _collect_codebook_nodes,
+    _passed_whole,
+)
+from voyager_compiler.codegen.voyager_ir_pb2 import (
+    MEMORY_LEVEL_DRAM,
+    MEMORY_LEVEL_REGISTER,
+    MEMORY_LEVEL_SCRATCHPAD,
+    SCALAR_BOOL,
+    SCALAR_F32,
+    SCALAR_INDEX,
     Argument,
     LevelAccessCount,
     LevelTiling,
     LoopBound,
-    MEMORY_LEVEL_DRAM,
-    MEMORY_LEVEL_REGISTER,
-    MEMORY_LEVEL_SCRATCHPAD,
     Model,
     Operation,
     PrimOp,
-    SCALAR_BOOL,
-    SCALAR_F32,
-    SCALAR_INDEX,
     ScalarValue,
     TensorBox,
     TensorBoxRef,
     Tiling,
 )
-from ....shape_prop import ShapeProp
-from .bufferization import _is_compute
-from .ops import oracle_disabled
-from .utils import _collect_codebook_nodes, _passed_whole
+from voyager_compiler.shape_prop import ShapeProp
 
 logger = logging.getLogger(__name__)
 

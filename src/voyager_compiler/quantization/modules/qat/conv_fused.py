@@ -1,3 +1,7 @@
+# Copied from ``torch.ao.nn.intrinsic.qat``; kept in upstream's formatting.
+# isort: skip_file
+# fmt: off
+
 import math
 import torch
 import torch.nn as nn

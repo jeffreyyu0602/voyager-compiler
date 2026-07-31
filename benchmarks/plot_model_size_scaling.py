@@ -17,10 +17,9 @@ import argparse
 import os
 
 import numpy as np
+import plot_results_mpl as style
 from openpyxl import load_workbook
 from transformers import AutoConfig
-
-import plot_results_mpl as style
 
 SHEET = "model_size"
 # Mirrors benchmarks/runner.py's MODEL_SIZES: the sheet stores only the label.

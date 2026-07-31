@@ -17,7 +17,11 @@ even though async copies issued in one iteration complete in another.
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .model import LoopSummary, ScheduleResult, TimingRecord
+from voyager_compiler.codegen.reporting.model import (
+    LoopSummary,
+    ScheduleResult,
+    TimingRecord,
+)
 
 
 def _signature(recs: List[TimingRecord]):

@@ -17,9 +17,10 @@ from typing import Callable, Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
+from voyager_compiler.codegen.node_info import is_nop, quant_param_arg_nodes
+
 # Registers voyager.* before ``torch.ops.voyager`` is bound below.
-from . import ops  # noqa: F401
-from ...node_info import is_nop, quant_param_arg_nodes
+from voyager_compiler.codegen.transform.bufferize import ops  # noqa: F401
 
 voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
@@ -534,5 +535,3 @@ def _tag_loop_extents(gm, extents_per_level, depth=0):
             if isinstance(body, torch.fx.GraphModule):
                 _tag_loop_extents(body, extents_per_level, depth + 1)
             return
-
-

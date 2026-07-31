@@ -1,6 +1,21 @@
 """The hardware-lowering passes, in the order ``transform()`` runs them."""
 
-from .rewrites import (
+from voyager_compiler.codegen.transform.data_layout import (
+    eliminate_reshape_with_no_effect,
+    normalize_conv2d_layout,
+    normalize_gemm_weight_layout,
+)
+from voyager_compiler.codegen.transform.operator_fusion import fuse_operator
+from voyager_compiler.codegen.transform.padding import (
+    pad_matrix_op_dimensions,
+    pad_vector_op_dimensions,
+    pad_vit_embeddings_output,
+)
+from voyager_compiler.codegen.transform.quant_folding import (
+    fuse_dequantize_quantize,
+    fuse_quantize_dequantize_with_previous_op,
+)
+from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
     extract_input_preprocessor,
     fold_constant_generators,
@@ -13,21 +28,6 @@ from .rewrites import (
     replace_rmsnorm_with_layer_norm,
     split_dense_spmm_node,
 )
-from .quant_folding import (
-    fuse_dequantize_quantize,
-    fuse_quantize_dequantize_with_previous_op,
-)
-from .padding import (
-    pad_matrix_op_dimensions,
-    pad_vector_op_dimensions,
-    pad_vit_embeddings_output,
-)
-from .data_layout import (
-    eliminate_reshape_with_no_effect,
-    normalize_conv2d_layout,
-    normalize_gemm_weight_layout,
-)
-from .operator_fusion import fuse_operator
 
 __all__ = [
     "deduplicate_nodes",

@@ -44,6 +44,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from voyager_compiler.codegen.node_info import get_arg_value
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _DEFAULT_NUM_BANKS,
     build_pipelined_buffers,
@@ -54,7 +55,6 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     voyager,
 )
-from voyager_compiler.codegen.node_info import get_arg_value
 
 # Additive fill for masked-out score positions (drives ``exp`` to ~0 without
 # ``-inf`` NaNs when a whole row is masked); Pallas uses the same trick.

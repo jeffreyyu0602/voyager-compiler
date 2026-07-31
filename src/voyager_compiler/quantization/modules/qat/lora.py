@@ -1,3 +1,7 @@
+# Copied from ``peft``; kept in upstream's formatting.
+# isort: skip_file
+# fmt: off
+
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.parametrize import type_before_parametrizations

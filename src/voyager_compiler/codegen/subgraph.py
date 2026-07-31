@@ -14,17 +14,13 @@ from torch.fx import Graph, GraphModule, Node
 from torch.fx.node import map_arg
 from transformers.utils.import_utils import is_torch_greater_or_equal
 
-from .node_info import (
-    is_gemm_op,
-    is_nop,
-    is_reshape_op,
-)
-from .iteration_space import (
+from voyager_compiler.codegen.iteration_space import (
     IterationSpaceNormalizer,
     NormalizationError,
 )
-from ..export_utils import create_getattr_from_value
-from ..shape_prop import (
+from voyager_compiler.codegen.node_info import is_gemm_op, is_nop, is_reshape_op
+from voyager_compiler.export_utils import create_getattr_from_value
+from voyager_compiler.shape_prop import (
     ShapeProp,
     fetch_attr,
     propagate_shape,
@@ -48,13 +44,13 @@ def update_submod_user_meta(model, node, named_modules=None):
         index = user.all_input_nodes.index(node)
 
         submod = named_modules[user.target]
-        placeholders = [n for n in submod.graph.nodes if n.op == 'placeholder']
+        placeholders = [n for n in submod.graph.nodes if n.op == "placeholder"]
 
         assert index < len(placeholders)
 
         placeholder = placeholders[index]
         placeholder.name = node.name
-        placeholder.meta['source_node'] = node
+        placeholder.meta["source_node"] = node
 
 
 def copy_graph_module(

@@ -20,12 +20,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-import interstellar
 import torch
 
-from voyager_compiler.shape_prop import ShapeProp
-
-from ...node_info import (
+import interstellar
+from voyager_compiler.codegen.node_info import (
     _pair,
     get_anchor_node,
     get_arg_value,
@@ -39,14 +37,18 @@ from ...node_info import (
     trailing_mha_perm,
     weight_is_ck,
 )
-from .cost import (
+from voyager_compiler.codegen.transform.tiling.cost import (
     _node_dtype_bits,
     _step_classes,
     _sweep_cycles,
     get_dtype_width,
 )
-from .search import DEFAULT_RUNTIME_TOLERANCE, gemv_op_tiling
-from ....ops.layout import  NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
+from voyager_compiler.codegen.transform.tiling.search import (
+    DEFAULT_RUNTIME_TOLERANCE,
+    gemv_op_tiling,
+)
+from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
+from voyager_compiler.shape_prop import ShapeProp
 
 logger = logging.getLogger(__name__)
 le = interstellar.le

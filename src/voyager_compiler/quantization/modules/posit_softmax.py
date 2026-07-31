@@ -3,7 +3,6 @@ from pathlib import Path
 import torch
 from torch import nn
 
-
 # Resolved against this file, not the CWD, so an installed package works.
 _POSIT_GOLD = Path(__file__).resolve().parent.parent / "dtypes" / "posit_gold"
 
@@ -11,15 +10,17 @@ POSIT_EXP_FILE = _POSIT_GOLD / "posit16_1_exp.txt"
 POSIT_EXP_SHIFTED_FILE = _POSIT_GOLD / "posit16_1_exp_shifted.txt"
 POSIT_RECIPROCAL_FILE = _POSIT_GOLD / "posit16_1_reciprocal.txt"
 
+
 def _convert(input: torch.Tensor, values: torch.Tensor):
     # Keep 8 exponent bits and 14 fraction bits, which is the maximum number
     # of fraction bits for a 16-bit posit.
     if input.dtype == torch.bfloat16:
-        indices = (input.view(torch.int16).int() << 7) & 0x3fffff
+        indices = (input.view(torch.int16).int() << 7) & 0x3FFFFF
     else:
         raw_bits = input.float().view(torch.int32)
-        indices = ((raw_bits >> 9) & 0x3fffff) | ((raw_bits & 0x1ff) != 0).int()
+        indices = ((raw_bits >> 9) & 0x3FFFFF) | ((raw_bits & 0x1FF) != 0).int()
     return values[indices].to(input.dtype)
+
 
 class PositSoftmax(torch.autograd.Function):
     @staticmethod
@@ -55,10 +56,12 @@ class PositSoftmax(torch.autograd.Function):
 
         return grad_input, None, None, None
 
+
 def _read_tensor(filepath, dtype=None, device=None):
-    with open(filepath, 'r') as file:
+    with open(filepath, "r") as file:
         values = [float.fromhex(line.rstrip()) for line in file]
     return torch.tensor(values, dtype=dtype, device=device)
+
 
 class Softmax(nn.Softmax):
     posit_exp: torch.Tensor
@@ -70,21 +73,27 @@ class Softmax(nn.Softmax):
         posit_exp_shifted=False,
         posit_reciprocal=False,
         dim=None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(dim)
         dtype = kwargs.get("dtype", None)
         device = kwargs.get("device", None)
-        factory_kwargs = {'dtype': dtype, 'device': device}
+        factory_kwargs = {"dtype": dtype, "device": device}
         self.posit_exp = None
         if posit_exp:
             self.posit_exp = _read_tensor(POSIT_EXP_FILE, **factory_kwargs)
         elif posit_exp_shifted:
-            self.posit_exp = _read_tensor(POSIT_EXP_SHIFTED_FILE, **factory_kwargs)
+            self.posit_exp = _read_tensor(
+                POSIT_EXP_SHIFTED_FILE, **factory_kwargs
+            )
         self.posit_reciprocal = None
         if posit_reciprocal:
-            self.posit_reciprocal = _read_tensor(POSIT_RECIPROCAL_FILE, **factory_kwargs)
+            self.posit_reciprocal = _read_tensor(
+                POSIT_RECIPROCAL_FILE, **factory_kwargs
+            )
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         input = input - torch.amax(input, dim=self.dim, keepdim=True)
-        return PositSoftmax.apply(input, self.dim, self.posit_exp, self.posit_reciprocal)
+        return PositSoftmax.apply(
+            input, self.dim, self.posit_exp, self.posit_reciprocal
+        )

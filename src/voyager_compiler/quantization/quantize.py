@@ -2,21 +2,21 @@ import copy
 import logging
 from typing import Any, Callable, Dict
 
+import peft.tuners.lora as lora
 import torch
-import torch.nn as nn
 import torch.ao.nn.intrinsic as nni
+import torch.nn as nn
+from accelerate import dispatch_model
 from torch.nn import Module
 from torch.nn.utils.parametrize import type_before_parametrizations
-
-import peft.tuners.lora as lora
-from accelerate import dispatch_model
 from transformers import PretrainedConfig
 from transformers.activations import GELUActivation
 from transformers.models import llama, mobilebert
 from transformers.pytorch_utils import Conv1D
 
-from .modules import Softmax, qat as nnqat
-from .qconfig import get_qconfig
+from voyager_compiler.quantization.modules import Softmax
+from voyager_compiler.quantization.modules import qat as nnqat
+from voyager_compiler.quantization.qconfig import get_qconfig
 
 __all__ = [
     "get_conv_bn_layers",
@@ -50,24 +50,24 @@ DEFAULT_QAT_MODULE_MAPPINGS: Dict[Callable, Any] = {
 }
 
 QCONFIG_PROPAGATE_MODULE_CLASS_LIST = {
-    'activation': [
+    "activation": [
         nn.ReLU,
         nn.GELU,
         nn.Softmax,
         GELUActivation,
     ],
-    'gemm': [
+    "gemm": [
         nn.Conv1d,
         nn.Conv2d,
         nn.Conv3d,
         nn.Linear,
         Conv1D,
     ],
-    'layernorm': [
+    "layernorm": [
         nn.LayerNorm,
         llama.modeling_llama.LlamaRMSNorm,
         mobilebert.modeling_mobilebert.NoNorm,
-    ]
+    ],
 }
 
 
@@ -109,11 +109,11 @@ def quantize(model, args, inplace=True):
         or args.posit_exp_shifted
         or args.posit_reciprocal
     ) and (
-        hasattr(model, 'config') and isinstance(model.config, PretrainedConfig)
+        hasattr(model, "config") and isinstance(model.config, PretrainedConfig)
     ):
-        propagate_config(model, 'config', model.config)
+        propagate_config(model, "config", model.config)
 
-    if hasattr(model, 'hf_device_map'):
+    if hasattr(model, "hf_device_map"):
         dispatch_model(model, device_map=model.hf_device_map)
 
     if args.posit_exp or args.posit_exp_shifted or args.posit_reciprocal:
@@ -125,7 +125,7 @@ def quantize(model, args, inplace=True):
             dtype=torch.bfloat16 if args.bf16 else None,
         )
 
-    if getattr(args, 'bf16', False):
+    if getattr(args, "bf16", False):
         model.bfloat16()
 
     if args.activation is None:
@@ -143,25 +143,38 @@ def quantize(model, args, inplace=True):
     )
 
     # TODO convert QAT modules to float modules after training
-    propagate_config(model, 'qconfig', qconfig)
+    propagate_config(model, "qconfig", qconfig)
     convert(model, mapping=DEFAULT_QAT_MODULE_MAPPINGS, inplace=True)
-    prepare(model, True, args.quantize_forward, args.quantize_backprop, args.op_fusion)
+    prepare(
+        model,
+        True,
+        args.quantize_forward,
+        args.quantize_backprop,
+        args.op_fusion,
+    )
     return model
 
 
 def _parse_ops(op_str):
-    ops = {op.lower() for op in op_str.split(',')} if op_str is not None else set()
+    ops = (
+        {op.lower() for op in op_str.split(",")}
+        if op_str is not None
+        else set()
+    )
     valid_ops = set(QCONFIG_PROPAGATE_MODULE_CLASS_LIST.keys())
     invalid_ops = ops - valid_ops
-    assert not invalid_ops, (
-        f"Invalid operation(s) {', '.join(invalid_ops)}. Options are {', '.join(valid_ops)}."
+    assert (
+        not invalid_ops
+    ), f"Invalid operation(s) {', '.join(invalid_ops)}. Options are {', '.join(valid_ops)}."
+    return tuple(
+        mod for op in ops for mod in QCONFIG_PROPAGATE_MODULE_CLASS_LIST[op]
     )
-    return tuple(mod for op in ops for mod in QCONFIG_PROPAGATE_MODULE_CLASS_LIST[op])
 
 
 def _get_unique_devices_(mod):
-    return {p.device for p in mod.parameters()} | \
-        {p.device for p in mod.buffers()}
+    return {p.device for p in mod.parameters()} | {
+        p.device for p in mod.buffers()
+    }
 
 
 def _register_module_hook(module, hook_name, name):
@@ -169,7 +182,8 @@ def _register_module_hook(module, hook_name, name):
     module.add_module(hook_name, obs_or_fq_dict)
 
     obs_or_fq_ctr = (
-        module.qconfig.activation if hook_name == 'activation_pre_process'
+        module.qconfig.activation
+        if hook_name == "activation_pre_process"
         else module.qconfig.error
     )
 
@@ -193,47 +207,61 @@ def _register_module_hook(module, hook_name, name):
     def backward_hook(self, grad_inputs, grad_outputs):
         return observer_pre_hook(self, grad_inputs)
 
-    if hook_name == 'activation_pre_process':
+    if hook_name == "activation_pre_process":
         module.register_forward_pre_hook(observer_pre_hook)
-    elif hook_name == 'error_pre_process':
+    elif hook_name == "error_pre_process":
         module.register_full_backward_pre_hook(observer_pre_hook)
-    elif hook_name == 'error_post_process':
+    elif hook_name == "error_post_process":
         module.register_full_backward_hook(backward_hook)
 
 
 def _add_observer_(
-        module, fwd_pre_hook_module_list, bwd_pre_hook_module_list,
-        bwd_residual, op_fusion, prefix):
+    module,
+    fwd_pre_hook_module_list,
+    bwd_pre_hook_module_list,
+    bwd_residual,
+    op_fusion,
+    prefix,
+):
     def insert_obs_or_fq(m, name):
-        if not hasattr(m, 'qconfig') or m.qconfig is None:
+        if not hasattr(m, "qconfig") or m.qconfig is None:
             return
         if op_fusion is not None and any(layer in name for layer in op_fusion):
             return
         if isinstance(m, fwd_pre_hook_module_list):
-            _register_module_hook(m, 'activation_pre_process', name)
+            _register_module_hook(m, "activation_pre_process", name)
         if isinstance(m, bwd_pre_hook_module_list):
-            _register_module_hook(m, 'error_pre_process', name)
+            _register_module_hook(m, "error_pre_process", name)
         if bwd_residual and (
             any(layer in name for layer in RESIDUAL_LAYERS_BWD)
             or isinstance(m, _parse_ops("residual"))
         ):
-            _register_module_hook(m, 'error_post_process', name)
+            _register_module_hook(m, "error_post_process", name)
 
     named_modules = dict(module.named_children())
     for name, child in named_modules.items():
-        module_prefix = prefix + '.' + name if prefix else name
+        module_prefix = prefix + "." + name if prefix else name
         if isinstance(child, nni._FusedModule):
             insert_obs_or_fq(child, module_prefix)
         else:
             _add_observer_(
-                child, fwd_pre_hook_module_list, bwd_pre_hook_module_list,
-                bwd_residual, op_fusion, module_prefix)
+                child,
+                fwd_pre_hook_module_list,
+                bwd_pre_hook_module_list,
+                bwd_residual,
+                op_fusion,
+                module_prefix,
+            )
     insert_obs_or_fq(module, prefix)
 
 
 def prepare(
-        model, inplace=False, fwd_quantized_ops=None, bwd_quantized_ops=None,
-        op_fusion=None):
+    model,
+    inplace=False,
+    fwd_quantized_ops=None,
+    bwd_quantized_ops=None,
+    op_fusion=None,
+):
     if not inplace:
         model = copy.deepcopy(model)
 
@@ -241,21 +269,33 @@ def prepare(
     bwd_pre_hook_module_list = _parse_ops(bwd_quantized_ops)
     is_bwd_residual = bwd_quantized_ops and "residual" in bwd_quantized_ops
     _add_observer_(
-        model, fwd_pre_hook_module_list, bwd_pre_hook_module_list,
-        is_bwd_residual, op_fusion, prefix='')
+        model,
+        fwd_pre_hook_module_list,
+        bwd_pre_hook_module_list,
+        is_bwd_residual,
+        op_fusion,
+        prefix="",
+    )
     return model
 
 
-def convert(module, mapping=None, inplace=False, custom_module_class_mapping=None):
+def convert(
+    module, mapping=None, inplace=False, custom_module_class_mapping=None
+):
     if not inplace:
         module = copy.deepcopy(module)
     _convert(
-        module, mapping, inplace=True,
-        custom_module_class_mapping=custom_module_class_mapping)
+        module,
+        mapping,
+        inplace=True,
+        custom_module_class_mapping=custom_module_class_mapping,
+    )
     return module
 
 
-def _convert(module, mapping=None, inplace=False, custom_module_class_mapping=None):
+def _convert(
+    module, mapping=None, inplace=False, custom_module_class_mapping=None
+):
     r"""Converts submodules in input mod to a different mod according to `mapping`
     by calling `from_float` method on the target mod class
 
@@ -279,8 +319,11 @@ def _convert(module, mapping=None, inplace=False, custom_module_class_mapping=No
     for name, mod in module.named_children():
         # both fused modules and observed custom modules are
         # swapped as one unit
-        if (not isinstance(mod, nni._FusedModule)
-            and type_before_parametrizations(mod) not in custom_module_class_mapping):
+        if (
+            not isinstance(mod, nni._FusedModule)
+            and type_before_parametrizations(mod)
+            not in custom_module_class_mapping
+        ):
             _convert(mod, mapping, True, custom_module_class_mapping)
         reassign[name] = swap_module(mod, mapping, custom_module_class_mapping)
 
@@ -304,10 +347,12 @@ def swap_module(mod, mapping, custom_module_class_mapping):
     new_mod = mod
     swapped = False
     if type_before_parametrizations(mod) in custom_module_class_mapping:
-        new_mod = custom_module_class_mapping[type_before_parametrizations(mod)].from_observed(mod)
+        new_mod = custom_module_class_mapping[
+            type_before_parametrizations(mod)
+        ].from_observed(mod)
         swapped = True
     elif (
-        hasattr(mod, 'qconfig')
+        hasattr(mod, "qconfig")
         and mod.qconfig is not None
         and type_before_parametrizations(mod) in mapping
     ):
@@ -330,9 +375,9 @@ def swap_module(mod, mapping, custom_module_class_mapping):
 
         # respect device affinity when swapping modules
         devices = _get_unique_devices_(mod)
-        assert len(devices) <= 1, (
-            f"swap_module only works with cpu or single-device CUDA modules, but got devices {devices}"
-        )
+        assert (
+            len(devices) <= 1
+        ), f"swap_module only works with cpu or single-device CUDA modules, but got devices {devices}"
         device = next(iter(devices)) if len(devices) > 0 else None
         if device:
             new_mod.to(device)
@@ -345,7 +390,7 @@ def replace_softmax(
     posit_exp_shifted: bool,
     posit_reciprocal: bool,
     dtype=None,
-    device=None
+    device=None,
 ):
     if device is None:
         devices = _get_unique_devices_(module)
@@ -353,8 +398,21 @@ def replace_softmax(
 
     for name, mod in module.named_children():
         if type_before_parametrizations(mod) == nn.Softmax:
-            new_mod = Softmax(posit_exp, posit_exp_shifted, posit_reciprocal,
-                              dim=-1, dtype=dtype, device=device)
+            new_mod = Softmax(
+                posit_exp,
+                posit_exp_shifted,
+                posit_reciprocal,
+                dim=-1,
+                dtype=dtype,
+                device=device,
+            )
             setattr(module, name, new_mod)
         else:
-            replace_softmax(mod, posit_exp, posit_exp_shifted, posit_reciprocal, dtype, device)
+            replace_softmax(
+                mod,
+                posit_exp,
+                posit_exp_shifted,
+                posit_reciprocal,
+                dtype,
+                device,
+            )

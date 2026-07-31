@@ -5,9 +5,13 @@ module-swap flow (``quantize``) is for QAT experiments.  Both are configured
 with the comma-separated spec strings ``QuantizationSpec.from_str`` parses.
 """
 
-from .fake_quantize import FusedAmaxObsFakeQuantize, get_quantization_map
-from .qconfig import QConfig, get_qconfig
-from .quantize import (
+from voyager_compiler.quantization.fake_quantize import (
+    FusedAmaxObsFakeQuantize,
+    get_quantization_map,
+)
+from voyager_compiler.quantization.qconfig import QConfig, get_qconfig
+from voyager_compiler.quantization.qspec import QScheme
+from voyager_compiler.quantization.quantize import (
     convert,
     get_conv_bn_layers,
     prepare,
@@ -15,7 +19,7 @@ from .quantize import (
     quantize,
     replace_softmax,
 )
-from .quantize_pt2e import (
+from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
     get_default_quantizer,
@@ -23,12 +27,13 @@ from .quantize_pt2e import (
     sink_obs_or_fq,
     swap_matmul_inputs,
 )
-from .qspec import QScheme
-from .quantizer.quantizer import (
+from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
     QuantizationSpec,
 )
-from .quantizer.xnnpack_quantizer_utils import QuantizationConfig
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
+    QuantizationConfig,
+)
 
 __all__ = [
     "DerivedQuantizationSpec",

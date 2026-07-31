@@ -15,7 +15,10 @@ timeline), and ``Summary`` (totals + per-loop view + a representative period).
 
 from typing import Dict, List
 
-from .model import ScheduleResult, TimingRecord
+from voyager_compiler.codegen.reporting.model import (
+    ScheduleResult,
+    TimingRecord,
+)
 
 # ``xlsxwriter`` is imported lazily in ``write_excel_report`` so that importing
 # voyager_compiler never hard-requires it; only generating a workbook does.

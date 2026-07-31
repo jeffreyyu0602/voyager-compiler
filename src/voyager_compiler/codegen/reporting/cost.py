@@ -14,16 +14,16 @@ from typing import Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import (
+from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_conv2d,
     is_fully_connected,
     is_gemm_op,
 )
-from ..transform.tiling.cost import vector_op_utilization
-from ...hardware_config import AcceleratorConfig
-from .model import OpInfo
+from voyager_compiler.codegen.reporting.model import OpInfo
+from voyager_compiler.codegen.transform.tiling.cost import vector_op_utilization
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 
 def _val(node):

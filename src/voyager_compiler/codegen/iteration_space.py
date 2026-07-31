@@ -17,9 +17,9 @@ from typing import (
 import torch
 from torch import fx
 
-from .node_info import (
-    get_anchor_node,
+from voyager_compiler.codegen.node_info import (
     ancestors,
+    get_anchor_node,
     is_elementwise_op,
     is_nop,
     is_reshape_op,
@@ -27,7 +27,11 @@ from .node_info import (
     quant_param_arg_nodes,
     reshape_preserves_full_blocks,
 )
-from ..shape_prop import ShapeProp, propagate_shape, set_node_value
+from voyager_compiler.shape_prop import (
+    ShapeProp,
+    propagate_shape,
+    set_node_value,
+)
 
 logger = logging.getLogger(__name__)
 

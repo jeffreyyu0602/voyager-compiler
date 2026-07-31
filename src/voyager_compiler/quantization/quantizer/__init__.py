@@ -1,6 +1,6 @@
-from .quantizer import (
-    QuantizationSpec,
+from voyager_compiler.quantization.quantizer.quantizer import (
     QScheme,
+    QuantizationSpec,
 )
 
 __all__ = [

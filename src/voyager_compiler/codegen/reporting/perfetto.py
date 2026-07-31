@@ -11,7 +11,7 @@ cycles (the trace ``ts``/``dur`` unit is arbitrary).
 import json
 from typing import Dict
 
-from .model import ScheduleResult
+from voyager_compiler.codegen.reporting.model import ScheduleResult
 
 _TID = {"mma": 0, "vector": 1, "dram": 2, "control": 3}
 _TRACK = {0: "Matrix", 1: "Vector", 2: "DRAM", 3: "Control"}

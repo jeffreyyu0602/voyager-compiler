@@ -24,8 +24,8 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import Graph, GraphModule, Node
 
-from ..aten_classifier import is_compute_op
-from ..node_info import (
+from voyager_compiler.codegen.aten_classifier import is_compute_op
+from voyager_compiler.codegen.node_info import (
     _BROADCAST_OPS,
     get_arg_value,
     is_gemm_op,
@@ -34,13 +34,16 @@ from ..node_info import (
     is_reshape_op,
     reshape_preserves_full_blocks,
 )
-from ..subgraph import (
+from voyager_compiler.codegen.subgraph import (
     create_and_insert_subgraph,
     replace_node_with_graph_module,
 )
-from ...export_utils import create_getattr_from_value, get_aten_graph_module
-from ...ops.quantized import expand
-from ...shape_prop import fetch_attr, propagate_shape
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    get_aten_graph_module,
+)
+from voyager_compiler.ops.quantized import expand
+from voyager_compiler.shape_prop import fetch_attr, propagate_shape
 
 logger = logging.getLogger(__name__)
 

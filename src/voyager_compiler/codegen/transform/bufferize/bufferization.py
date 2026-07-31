@@ -21,9 +21,8 @@ import torch
 import torch.fx as fx
 from torch.fx import GraphModule, Node
 
-from ...node_info import (
+from voyager_compiler.codegen.node_info import (
     get_anchor_node,
-    quant_param_arg_nodes,
     is_compute_op,
     is_conv2d,
     is_elementwise_op,
@@ -31,18 +30,22 @@ from ...node_info import (
     is_nop,
     is_pooling,
     is_shape_changing_nop,
+    quant_param_arg_nodes,
 )
-from ...subgraph import (
+from voyager_compiler.codegen.subgraph import (
     replace_node_with_graph_module,
     update_submod_user_meta,
 )
-from .ops import MemoryLevel, oracle_disabled
-from ..tiling.tiler import prefetch_tilings
-from .utils import (
+from voyager_compiler.codegen.transform.bufferize.ops import (
+    MemoryLevel,
+    oracle_disabled,
+)
+from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
     _subgraph,
 )
+from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
 
 logger = logging.getLogger(__name__)
 
@@ -727,9 +730,13 @@ def bufferize_graph(
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
     """
-    from .attention import build_attention
-    from .attention_v3 import build_attention_fa3
-    from .pipeline import (
+    from voyager_compiler.codegen.transform.bufferize.attention import (
+        build_attention,
+    )
+    from voyager_compiler.codegen.transform.bufferize.attention_v3 import (
+        build_attention_fa3,
+    )
+    from voyager_compiler.codegen.transform.bufferize.pipeline import (
         build_conv2d,
         build_gemm,
         build_pointwise,
@@ -975,8 +982,14 @@ def _build_for_untiled(node: Node):
     Returns ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to
     load/store (``getitem``, a non-tensor output).
     """
-    from .pipeline import _map_kernel, build_pipelined_buffers
-    from .utils import _InputSpec, _OutputSpec
+    from voyager_compiler.codegen.transform.bufferize.pipeline import (
+        _map_kernel,
+        build_pipelined_buffers,
+    )
+    from voyager_compiler.codegen.transform.bufferize.utils import (
+        _InputSpec,
+        _OutputSpec,
+    )
 
     if node.target is operator.getitem:
         return None

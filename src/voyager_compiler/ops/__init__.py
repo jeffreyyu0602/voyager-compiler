@@ -8,20 +8,7 @@ the op namespace resolves lazily, so a missing registration surfaces at call
 time, not at import.
 """
 
-from .quantized import (  # noqa: F401  (defines quantized_ops.*)
-    calculate_mx_qparam,
-    dequantize,
-    expand,
-    filter_outlier,
-    quantize,
-    quantize_mx,
-    quantize_mx_outlier,
-    quantized_ops_lib,
-    slice_csr_tensor,
-    spmm_csr,
-    vmap,
-)
-from .layout import (
+from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
     DEFAULT_LAYOUT_POLICY,
     GEMM_OP_VARIANTS,
@@ -35,6 +22,19 @@ from .layout import (
     POLICY_GEMM_WEIGHT_LAYOUT,
     project,
     unproject,
+)
+from voyager_compiler.ops.quantized import (
+    calculate_mx_qparam,
+    dequantize,
+    expand,
+    filter_outlier,
+    quantize,
+    quantize_mx,
+    quantize_mx_outlier,
+    quantized_ops_lib,
+    slice_csr_tensor,
+    spmm_csr,
+    vmap,
 )
 
 __all__ = [

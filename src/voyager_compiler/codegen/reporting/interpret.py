@@ -23,19 +23,26 @@ from typing import Dict, List
 import torch
 from torch.fx import GraphModule, Node
 
-from ..node_info import get_arg_value, is_compute_op, is_nop
-from ..transform.bufferize.bufferization import _produces_tensor, _viewed_buffer
-from ..transform.bufferize.emit import (
+from voyager_compiler.codegen.node_info import (
+    get_arg_value,
+    is_compute_op,
+    is_nop,
+)
+from voyager_compiler.codegen.reporting.cost import _shape, _val, tile_bytes
+from voyager_compiler.codegen.reporting.model import ScheduleResult
+from voyager_compiler.codegen.reporting.scheduler import ResourceState
+from voyager_compiler.codegen.transform.bufferize.bufferization import (
+    _produces_tensor,
+    _viewed_buffer,
+)
+from voyager_compiler.codegen.transform.bufferize.emit import (
     COMMIT,
     COND,
     WHILE_LOOP,
     _loop_extents,
     _norm_extent,
 )
-from .cost import _shape, _val, tile_bytes
-from .model import ScheduleResult
-from .scheduler import ResourceState
-from ...hardware_config import AcceleratorConfig
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default

@@ -5,7 +5,7 @@ import operator
 import re
 from collections import OrderedDict
 from dataclasses import asdict, replace
-from typing import Dict, Tuple, Any, Optional, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -17,23 +17,31 @@ from torchao.quantization.pt2e.quantizer import (
     QuantizationSpecBase,
 )
 
-from .fake_quantize import (
-    _DerivedObserverOrFakeQuantize,
+from voyager_compiler.codegen.node_info import (
+    get_arg_value,
+    is_gemm_op,
+    is_matmul,
+)
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    export_model,
+)
+from voyager_compiler.quantization.fake_quantize import (
     FusedAmaxObsFakeQuantize,
+    _DerivedObserverOrFakeQuantize,
     get_quantization_map,
 )
-from .quantizer.quantizer import (
+from voyager_compiler.quantization.quantizer.quantizer import (
+    DerivedQuantizationSpec,
     QScheme,
     QuantizationSpec,
-    DerivedQuantizationSpec,
 )
-from .quantizer.xnnpack_quantizer import XNNPACKQuantizer
-from .quantizer.xnnpack_quantizer_utils import (
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
+    XNNPACKQuantizer,
+)
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
 )
-
-from ..codegen.node_info import get_arg_value, is_gemm_op, is_matmul
-from ..export_utils import create_getattr_from_value, export_model
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +241,7 @@ def get_default_quantizer(
 
     if weight is not None and weight.qscheme == QScheme.PER_CHANNEL_SYMMETRIC:
         assert weight.ch_axis == 0, (
-            f"Per-channel weight quantization only supports quantizing output "
+            "Per-channel weight quantization only supports quantizing output "
             "channel dimension (dim=0)."
         )
 
@@ -712,7 +720,7 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
     assert modules is not None
     assert isinstance(node.target, str)
     activation_post_process = modules[node.target]
-    device = assert_and_get_unique_device(activation_post_process)
+    assert_and_get_unique_device(activation_post_process)
 
     if isinstance(activation_post_process.ch_axis, int):
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)

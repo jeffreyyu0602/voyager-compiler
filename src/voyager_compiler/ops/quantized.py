@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import Tuple, Union, Optional, List
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +14,7 @@ quantized_ops_lib = Library("quantized_ops", "DEF")
 # Registers the auto-generated hardware-layout twins (conv2d /
 # max_pool2d / adaptive_avg_pool2d / linear / matmul) into the namespace
 # just created, before any importer references them.
-from . import layout as _register_layout  # noqa: E402,F401
+from voyager_compiler.ops import layout as _register_layout  # noqa: E402,F401
 
 quantized_ops_lib.define(
     "layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, "
@@ -220,7 +220,7 @@ def conv2d_mx(
     weight_code: Optional[torch.Tensor] = None,
     layout: str = "nchw",
 ) -> torch.Tensor:
-    from ..codegen.node_info import _pair
+    from voyager_compiler.codegen.node_info import _pair
 
     assert layout in ("nchw", "nhwc"), layout
 
@@ -417,7 +417,10 @@ def calculate_mx_qparam(
 ) -> torch.Tensor:
     # Deferred to break a real cycle: ``quantization`` imports this module for
     # the ops, so it cannot be imported here at module scope.
-    from ..quantization.mx_utils import _reshape_to_blocks, _shared_exponents
+    from voyager_compiler.quantization.mx_utils import (
+        _reshape_to_blocks,
+        _shared_exponents,
+    )
 
     assert block_size > 0
 

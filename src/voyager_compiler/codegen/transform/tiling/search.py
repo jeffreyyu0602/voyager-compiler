@@ -1,11 +1,11 @@
 import logging
 import math
 from functools import partial
-from typing import Tuple, Generator, Optional
+from typing import Generator, Optional, Tuple
 
 import torch
 
-from ...node_info import (
+from voyager_compiler.codegen.node_info import (
     _pair,
     compute_output_tiled_shapes,
     compute_tiled_shape,
@@ -20,9 +20,16 @@ from ...node_info import (
     trailing_mha_perm,
     weight_is_ck,
 )
-from .banking import GEMV_BANK_GROUPS, require_allocation, scratchpad_bytes
-from .cost import gemv_tile_latency, vector_tile_latency
-from ....ops.layout import NHWC_OP_VARIANTS
+from voyager_compiler.codegen.transform.tiling.banking import (
+    GEMV_BANK_GROUPS,
+    require_allocation,
+    scratchpad_bytes,
+)
+from voyager_compiler.codegen.transform.tiling.cost import (
+    gemv_tile_latency,
+    vector_tile_latency,
+)
+from voyager_compiler.ops.layout import NHWC_OP_VARIANTS
 
 logger = logging.getLogger(__name__)
 
@@ -293,7 +300,9 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     whatever fusion left of it -- a ``quantize_mx`` tail makes it a pair, an
     MHA relayout re-cuts ``N`` into heads -- diced by the same blocks.
     """
-    from .tiler import _operand_placeholders
+    from voyager_compiler.codegen.transform.tiling.tiler import (
+        _operand_placeholders,
+    )
 
     anchor = get_anchor_node(node)
     tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
