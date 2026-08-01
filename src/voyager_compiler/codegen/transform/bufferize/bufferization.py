@@ -11,6 +11,7 @@ post-op tail in the kernel.
 Runs after operator fusion and before memory allocation.
 """
 
+import itertools
 import logging
 import math
 import operator
@@ -712,7 +713,10 @@ def rename_nest_nodes(model: GraphModule) -> None:
     for node in list(model.graph.nodes):
         if (scope := node.meta.get("scope")) is None:
             continue  # not from a nest: its name is already unique
-        rename_node(model, node, *scope, keep)
+        name, anchor_target = scope
+        if name.endswith(_FUSED_SUFFIX):
+            name = name[: -len(_FUSED_SUFFIX)]
+        rename_node(model, node, name, anchor_target, keep)
 
     model.recompile()
 
@@ -749,6 +753,7 @@ def bufferize_graph(
     graph = model.graph
     num_banks = 2 if pipelined else 1
     build_cache = {}
+    group_ids = itertools.count()
 
     if tiler is not None:
         prefetch_tilings(
@@ -783,7 +788,7 @@ def bufferize_graph(
             "HIT" if cached is not None else "MISS",
         )
         if cached is not None:
-            sub_gm, n_out = cached
+            sub_gm, n_out, group = cached
         else:
             if is_conv2d(anchor):
                 sub_gm = build_conv2d(
@@ -835,8 +840,11 @@ def bufferize_graph(
                     f"'{node.name}' ({node.target})"
                 )
 
+            # A nest built afresh starts an equivalence group; an uncacheable
+            # key never reaches the cache, so its group stays a singleton.
+            group = next(group_ids)
             if key is not None:
-                build_cache[key] = (sub_gm, n_out)
+                build_cache[key] = (sub_gm, n_out, group)
 
         # Stamp logical (quantized) dtypes on the nest
         phs = [p for p in sub_gm.graph.nodes if p.op == "placeholder"]
@@ -862,13 +870,14 @@ def bufferize_graph(
             )
         logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
 
-        # Scope the nest by the name of the op it replaces
+        # Scope the nest by the name of the op it replaces, and record which
+        # build it came from — the scope says which layer a node belongs to,
+        # the group says which other layers were built the same way.
         scope = node.name
-        if scope.endswith(_FUSED_SUFFIX):
-            scope = scope[: -len(_FUSED_SUFFIX)]
         for src, new in value_remap.items():
             if src.op != "placeholder" and isinstance(new, Node):
                 new.meta["scope"] = (scope, anchor.target)
+                new.meta["build_group"] = group
 
         out_vals = node.value if n_out > 1 else [node.value]
         out_shapes = node.shape if n_out > 1 else [node.shape]

@@ -5,7 +5,7 @@ pipeline applies them.
 """
 
 from voyager_compiler.codegen.subgraph import rename_nodes_with_param_names
-from voyager_compiler.codegen.transform.bufferize.emit import gen_compute_graph
+from voyager_compiler.codegen.transform.bufferize import gen_compute_graph
 from voyager_compiler.codegen.transform.data_layout import (
     eliminate_reshape_with_no_effect,
     normalize_conv2d_layout,
@@ -19,7 +19,7 @@ from voyager_compiler.codegen.transform.padding import (
 )
 from voyager_compiler.codegen.transform.quant_folding import (
     fuse_dequantize_quantize,
-    fuse_quantize_dequantize_with_previous_op,
+    fuse_quantize_dequantize_with_producer,
 )
 from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
@@ -32,7 +32,6 @@ from voyager_compiler.codegen.transform.rewrites import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
-    split_dense_spmm_node,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     gemv_op_tiling,
@@ -47,7 +46,7 @@ __all__ = [
     "fold_constant_generators",
     "fuse_dequantize_quantize",
     "fuse_operator",
-    "fuse_quantize_dequantize_with_previous_op",
+    "fuse_quantize_dequantize_with_producer",
     "gen_compute_graph",
     "inline_autocast_modules",
     "normalize_conv2d_layout",
@@ -62,7 +61,6 @@ __all__ = [
     "replace_conv2d_with_im2col",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
-    "split_dense_spmm_node",
     "gemv_op_tiling",
     "vector_op_tiling",
     "pool_op_tiling",

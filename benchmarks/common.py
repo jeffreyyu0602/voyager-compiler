@@ -702,7 +702,7 @@ def _frontend(cfg: SweepConfig):
         config=cfg.acc_config,
         layout_policy="systolic",
         context_len=cfg.kv_len if is_decode else None,
-        max_gen=DECODE_MAX_GEN if is_decode else None,
+        max_new_tokens=DECODE_MAX_GEN if is_decode else None,
     )
 
     if cfg.dump_dir is not None:

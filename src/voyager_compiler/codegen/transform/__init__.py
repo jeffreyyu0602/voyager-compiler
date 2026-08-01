@@ -13,7 +13,7 @@ from voyager_compiler.codegen.transform.padding import (
 )
 from voyager_compiler.codegen.transform.quant_folding import (
     fuse_dequantize_quantize,
-    fuse_quantize_dequantize_with_previous_op,
+    fuse_quantize_dequantize_with_producer,
 )
 from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
@@ -26,7 +26,6 @@ from voyager_compiler.codegen.transform.rewrites import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
-    split_dense_spmm_node,
 )
 
 __all__ = [
@@ -36,7 +35,7 @@ __all__ = [
     "fold_constant_generators",
     "fuse_dequantize_quantize",
     "fuse_operator",
-    "fuse_quantize_dequantize_with_previous_op",
+    "fuse_quantize_dequantize_with_producer",
     "inline_autocast_modules",
     "normalize_conv2d_layout",
     "normalize_gemm_weight_layout",
@@ -49,5 +48,4 @@ __all__ = [
     "replace_conv2d_with_im2col",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
-    "split_dense_spmm_node",
 ]

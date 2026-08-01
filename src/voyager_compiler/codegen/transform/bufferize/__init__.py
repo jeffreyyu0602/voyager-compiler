@@ -23,11 +23,11 @@ from voyager_compiler.codegen.transform.bufferize.bufferization import (
     bufferize_graph,
 )
 from voyager_compiler.codegen.transform.bufferize.emit import (
-    compute_op_names,
     flush_tensor_files,
     gen_code_bufferized,
-    gen_compute_graph_bufferized,
+    gen_compute_graph,
     print_bufferized_graph,
+    print_layer_table,
 )
 from voyager_compiler.codegen.transform.bufferize.memory_planning import (
     MemoryPlan,
@@ -44,10 +44,10 @@ has_side_effect(torch.ops.higher_order.commit)
 __all__ = [
     "bufferize_graph",
     "annotate_tensor_spaces",
-    "compute_op_names",
+    "print_layer_table",
     "flush_tensor_files",
     "gen_code_bufferized",
-    "gen_compute_graph_bufferized",
+    "gen_compute_graph",
     "print_bufferized_graph",
     "plan_memory",
     "MemoryPlan",

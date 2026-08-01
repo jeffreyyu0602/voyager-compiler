@@ -3,7 +3,7 @@
 Two passes over an already-quantized graph, both of which move a quantize or
 dequantize rather than compute it:
 
-  * ``fuse_quantize_dequantize_with_previous_op`` runs inside ``transform()``.
+  * ``fuse_quantize_dequantize_with_producer`` runs inside ``transform()``.
     It hoists a quantize into its producer (so a value is stored already
     narrow), replays it above a relayout, folds one into a KV cache write, and
     splits a quantized cache feeding a GEMV.
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "fuse_dequantize_quantize",
-    "fuse_quantize_dequantize_with_previous_op",
+    "fuse_quantize_dequantize_with_producer",
 ]
 
 
@@ -358,7 +358,11 @@ def _cone_to_matmul(idx: Node, node: Node):
 
 
 def _split_quantized_cache(
-    model: GraphModule, node: Node, idx: Node, context_len: int, max_gen: int
+    model: GraphModule,
+    node: Node,
+    idx: Node,
+    context_len: int,
+    max_new_tokens: int,
 ) -> bool:
     """Split a cache the quantize blocks along the written axis in two, and
     read each half with its own GEMV.
@@ -382,7 +386,8 @@ def _split_quantized_cache(
         idx: The ``index_copy_`` cache write feeding ``node``.
         context_len: Positions already written in the exported cache -- the
             prefix that can be baked quantized.
-        max_gen: Generation slots that follow, sizing the residual window.
+        max_new_tokens: Generation slots that follow, sizing the residual
+            window.
 
     Returns:
         ``True`` if the cache was split; ``False`` if the cone below ``node``
@@ -391,8 +396,9 @@ def _split_quantized_cache(
 
     Raises:
         RuntimeError: The cache's exported length along the written axis does
-            not match ``context_len + max_gen`` rounded up to ``block_size``
-            -- the compiler was told a shape the graph was not exported with.
+            not match ``context_len + max_new_tokens`` rounded up to
+            ``block_size`` -- the compiler was told a shape the graph was not
+            exported with.
     """
 
     cone, matmul = _cone_to_matmul(idx, node)
@@ -406,11 +412,12 @@ def _split_quantized_cache(
 
     contents = fetch_attr(model, cache.target)
     cache_len = contents.shape[dim]
-    expect = -(-(context_len + max_gen) // block_size) * block_size
+    expect = -(-(context_len + max_new_tokens) // block_size) * block_size
     if cache_len != expect:
         raise RuntimeError(
             f"KV split: {cache.target} holds {cache_len} positions along dim "
-            f"{dim}, but context_len={context_len} + max_gen={max_gen} rounded "
+            f"{dim}, but context_len={context_len} + "
+            f"max_new_tokens={max_new_tokens} rounded "
             f"up to the {block_size} block is {expect} -- the compiler was "
             f"told a different shape than the graph was exported with"
         )
@@ -551,7 +558,7 @@ def _split_quantized_cache(
 
 
 def _fold_quantize_into_cache(
-    model: GraphModule, node: Node, context_len: int, max_gen: int
+    model: GraphModule, node: Node, context_len: int, max_new_tokens: int
 ) -> bool:
     """Fold a ``quantize_mx`` over a KV cache into the cache itself.
 
@@ -584,10 +591,12 @@ def _fold_quantize_into_cache(
     if any(a % rank == dim for a in node.args[2]):
         # A token lands mid-block, so the cache cannot be baked whole -- but
         # the blocks below the write can be.  Split it instead.
-        if prelude or context_len is None or max_gen is None:
+        if prelude or context_len is None or max_new_tokens is None:
             logger.debug(f"Skip folding {node}: blocked along written axis.")
             return False
-        return _split_quantized_cache(model, node, idx, context_len, max_gen)
+        return _split_quantized_cache(
+            model, node, idx, context_len, max_new_tokens
+        )
 
     cache = idx.args[0]
     q_args = node.args[1:]
@@ -734,10 +743,10 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     return True
 
 
-def fuse_quantize_dequantize_with_previous_op(
+def fuse_quantize_dequantize_with_producer(
     model: GraphModule,
     context_len: Optional[int] = None,
-    max_gen: Optional[int] = None,
+    max_new_tokens: Optional[int] = None,
 ):
     """Move each quantize / dequantize up the graph to sit directly after the
     op that computed its input, so the two can fuse into one kernel.
@@ -753,7 +762,7 @@ def fuse_quantize_dequantize_with_previous_op(
         model: The graph module to rewrite in place.
         context_len: Positions already written in the decode cache the graph
             was exported with.  ``None`` outside decode.
-        max_gen: Generation slots that follow those positions.  ``None``
+        max_new_tokens: Generation slots that follow those positions.  ``None``
             outside decode.  With ``context_len`` it lets a quantize that
             blocks along the written axis split the cache rather than sweep it
             (``_split_quantized_cache``).
@@ -779,7 +788,7 @@ def fuse_quantize_dequantize_with_previous_op(
     graph.eliminate_dead_code()
     for node in list(graph.nodes):
         if node.target is _QUANTIZE_MX:
-            _fold_quantize_into_cache(model, node, context_len, max_gen)
+            _fold_quantize_into_cache(model, node, context_len, max_new_tokens)
 
     graph.lint()
     graph.eliminate_dead_code()

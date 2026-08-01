@@ -392,7 +392,7 @@ def main():
 
         if args.model == "llm_decode":
             transform_args["context_len"] = args.context_length
-            transform_args["max_gen"] = 128
+            transform_args["max_new_tokens"] = 128
 
             past_key_values = StaticCache(
                 config=model.config,
@@ -553,20 +553,7 @@ def main():
             h, mask, pos, cache = example_args
             example_args = (h, mask_preprocess_fn(mask), pos, cache)
 
-        has_outlier = (
-            args.enable_mixed_precision
-            and args.outlier_pct is not None
-            and args.outlier_pct > 0.0
-        )
-
-        # if outlier quantization is enabled, we need to use actual data to
-        # determine the tile sizes of csr tensors
-        transform(
-            gm,
-            example_args,
-            use_fake_mode=(not has_outlier),
-            **transform_args,
-        )
+        transform(gm, example_args, **transform_args)
         compile(gm, example_args, **compile_args)
         gm.graph.print_tabular()
         new_output = gm(*example_args) if args.debug else None

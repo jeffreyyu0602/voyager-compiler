@@ -11,7 +11,6 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from google.protobuf import text_format
-from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx import Node
 from torch.utils._pytree import tree_flatten
 
@@ -27,12 +26,11 @@ from voyager_compiler.cli_args import (
 )
 from voyager_compiler.codegen import (
     deduplicate_nodes,
-    eliminate_reshape_with_no_effect,
     extract_input_preprocessor,
     fold_constant_generators,
     fuse_dequantize_quantize,
     fuse_operator,
-    fuse_quantize_dequantize_with_previous_op,
+    fuse_quantize_dequantize_with_producer,
     gen_compute_graph,
     inline_autocast_modules,
     normalize_conv2d_layout,
@@ -47,16 +45,14 @@ from voyager_compiler.codegen import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
-    split_dense_spmm_node,
 )
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
-    compute_op_names,
     flush_tensor_files,
     gen_code_bufferized,
-    gen_compute_graph_bufferized,
     plan_memory,
     print_bufferized_graph,
+    print_layer_table,
 )
 from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
@@ -221,10 +217,8 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
-    split_spmm=False,
-    use_fake_mode=True,
     context_len=None,
-    max_gen=None,
+    max_new_tokens=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -233,29 +227,17 @@ def transform(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    fake_mode = (
-        FakeTensorMode(allow_non_fake_inputs=True) if use_fake_mode else None
-    )
-
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
+    ShapeProp(model).propagate(*flatten_args)
 
-    # Fold input-free ``arange`` / ``zeros`` (RoPE setup) into ``get_attr``.
     fold_constant_generators(model)
-
-    # Flatten the autocast / no_grad wrap HOPs ``torch.export`` leaves behind.
     inline_autocast_modules(model)
-
-    # Delete identity ops: full slices, unit expands, no-op casts, p=0 dropout.
     remove_prunable_ops(model)
+    fuse_quantize_dequantize_with_producer(model, context_len, max_new_tokens)
 
-    fuse_quantize_dequantize_with_previous_op(model, context_len, max_gen)
-
-    # Pad dimensions to the hardware unrolling.
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, *config.pe_array_size)
 
-    # Systolic-array-friendly operand layouts.
     if layout_policy == "systolic":
         normalize_conv2d_layout(model)
 
@@ -265,18 +247,9 @@ def transform(
         mv_layout=gemv_weight_layout,
     )
 
-    ShapeProp(model, mode=fake_mode).propagate(*flatten_args)
-
-    # Drop reshapes that do not change tensor semantics.
-    eliminate_reshape_with_no_effect(model)
-
-    if split_spmm:
-        split_dense_spmm_node(model)
-
     if config.pe_array_size is not None:
         pad_vector_op_dimensions(model, config.vector_lanes)
 
-    # Fuse op sequences (e.g. Conv+ReLU) into one kernel.
     if not skip_op_fusion:
         fuse_operator(model, patterns, fuse_reshape)
 
@@ -304,19 +277,15 @@ def compile(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*flatten_args)
 
+    gen_compute_graph(model, os.path.join(output_dir, output_file))
+
     tolerance = (
         DEFAULT_RUNTIME_TOLERANCE
         if runtime_tolerance is None
         else runtime_tolerance
     )
     tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
-
-    gen_compute_graph(
-        model, os.path.join(output_dir, output_file + "_prelowered")
-    )
-
     bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
-
     plan_memory(model, config)
     print_bufferized_graph(model)
 
@@ -328,13 +297,7 @@ def compile(
     with open(os.path.join(output_dir, "model.txt"), "w") as f:
         f.write(text_format.MessageToString(params))
     with open(os.path.join(output_dir, "layers.txt"), "w") as f:
-        f.write("\n".join(compute_op_names(model)))
-
-    gen_compute_graph_bufferized(
-        model,
-        os.path.join(output_dir, output_file),
-        timeout=5 * 60,
-    )
+        f.write(print_layer_table(model, params, to_string=True))
 
     flush_tensor_files()
     return params

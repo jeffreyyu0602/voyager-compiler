@@ -383,11 +383,6 @@ def add_compile_args(parser=None):
         help="Do not fuse reshape with the following GEMM in Transformers.",
     )
     parser.add_argument(
-        "--split_spmm",
-        action="store_true",
-        help="Split linear_mx with outliers into dense + SpMM operations.",
-    )
-    parser.add_argument(
         "--runtime_tolerance",
         type=float,
         default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()

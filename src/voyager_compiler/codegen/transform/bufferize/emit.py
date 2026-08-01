@@ -4,9 +4,9 @@ Loop-aware output generation for bufferized FX graphs.
 Three consumers of the bufferized FX dialect (``while_loop`` + ``voyager.*``
 nodes), grouped here because they share the same traversal concerns:
 
-  * ``gen_code_bufferized``          FX graph -> ``voyager`` protobuf Model
-  * ``gen_compute_graph_bufferized`` FX graph -> graphviz SVG (loop clusters)
-  * ``print_bufferized_graph``       FX graph -> indented text
+  * ``gen_code_bufferized``    FX graph -> ``voyager`` protobuf Model
+  * ``gen_compute_graph``      FX graph -> graphviz SVG
+  * ``print_bufferized_graph`` FX graph -> indented text
 
 The protobuf is the ``voyager`` schema (``voyager_ir.proto``), which models
 this dialect directly and so *replaces* — rather than reuses — the legacy
@@ -43,6 +43,7 @@ from typing import Dict, List, Optional
 import graphviz
 import numpy as np
 import torch
+from tabulate import tabulate
 from torch.fx import GraphModule, Node
 from torch.fx.operator_schemas import normalize_function
 
@@ -59,6 +60,9 @@ from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
+)
+from voyager_compiler.codegen.transform.tiling.banking import (
+    require_allocation,
 )
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
@@ -183,15 +187,6 @@ def save_tensor(tensor, filename):
 # ===========================================================================
 
 
-def _loop_input_value(n):
-    """Resolve a while_loop carried/additional input to a runtime value.
-
-    Loop inputs may be FX Nodes (use their propagated value) or captured scalar
-    constants (e.g. kernel/spatial sizes), which are passed through literally.
-    """
-    return n.value if isinstance(n, torch.fx.Node) else n
-
-
 def _norm_extent(e):
     """Normalise a ``loop_extents`` entry to ``(start, end, step)``.
 
@@ -216,6 +211,17 @@ def _loop_extents(node) -> List[tuple]:
         return [_norm_extent(e) for e in ext]
     # Legacy / untagged: a single loop with an unknown bound.
     return [(0, 0, 1)]
+
+
+def _loop_trip(node) -> int:
+    """How many times a flattened-grid while_loop runs, at least once — the
+    count the emitted ``ForLoop`` bounds describe.  An FA3 sweep whose grid
+    holds a single step tags ``(1, 1, 1)`` and a legacy loop is untagged; both
+    would otherwise read as zero iterations."""
+    count = 1
+    for start, end, step in _loop_extents(node):
+        count *= max(1, -(-(end - start) // step))
+    return count
 
 
 def _trip_str(node) -> str:
@@ -988,40 +994,92 @@ class _Emitter:
         return model
 
 
-def compute_op_names(model: GraphModule) -> List[str]:
-    """Every compute op of a bufferized graph, in execution order (descending
-    into loop bodies and cond branches) — the bufferized ``layers.txt``, and the
-    enumeration of the ops a hardware run replays one at a time.  A fused group
-    counts once, as the one op it is emitted as."""
-    names: List[str] = []
+def print_layer_table(
+    model: GraphModule, params: Model, to_string: bool = False
+):
+    """Print (or return) the bufferized ``layers.txt``: one
+    ``name start end group trip`` row per layer, in execution order.
 
-    def walk(gm: GraphModule) -> None:
-        named = dict(gm.named_modules(remove_duplicate=False))
+    A layer is one bufferized nest.  Its nodes all carry the same
+    ``meta['scope']`` — the op bufferization replaced — and a splice lands them
+    as one contiguous run, so the scope changing *is* the layer boundary, and
+    naming the run's first and last op delimits the whole layer: the buffers it
+    allocates, the DMA and semaphores around them, and the tile loop holding
+    the compute.  Everything a layer needs is therefore inside its own range,
+    and a nest lowered to several kernels is still one layer.  Ops between two
+    ranges belong to none — they are host-side setup.
 
-        def subgraph(target):
-            sub = named.get(str(target))
-            return sub if isinstance(sub, GraphModule) else None
+    ``group`` is an equivalence class: two layers share one exactly when
+    bufferization built them from the same cached nest
+    (``meta['build_group']``), so a consumer can exercise one representative
+    per class.  Classes are numbered from zero in the order they first appear
+    — deterministic within a file, meaningless across files.  ``trip`` is how
+    many tiles the layer's loop sweeps (the longest, if it has more than one),
+    1 for an untiled layer.
 
-        for n in gm.graph.nodes:
-            if n.op == "call_module":
-                names.append(n.name)
-            elif n.op != "call_function":
-                continue
-            elif n.target is WHILE_LOOP:
-                if (body := subgraph(n.args[1].target)) is not None:
-                    walk(body)
-            elif n.target is COND:
-                for branch in (n.args[1], n.args[2]):
-                    if (br := subgraph(branch.target)) is not None:
-                        walk(br)
-            elif n.target is COMMIT:
-                if (body := subgraph(n.args[0].target)) is not None:
-                    walk(body)
-            elif _is_compute(n):
-                names.append(n.name)
+    Args:
+        model: The bufferized graph, named and memory-planned.
+        params: The emitted Model, whose top-level ``ops`` are the instructions
+            a row may name — an FX node that produced none (a store folded into
+            its producer, a view) is not one, and cannot bound a range.
+        to_string: Return the table instead of printing it.
 
-    walk(model)
-    return names
+    Returns:
+        The table text.
+
+    Raises:
+        ValueError: If a layer's ops are not contiguous, which would leave its
+            range covering another layer's ops.
+    """
+    emitted = {op.name for op in params.ops}
+    spans: Dict[str, List[Node]] = {}
+    current = None
+
+    for n in model.graph.nodes:
+        if n.name not in emitted:
+            continue
+        scope = n.meta.get("scope")
+        if scope is None and not _is_compute(n):
+            continue  # setup that belongs to no layer
+        # A compute op bufferization never built has no scope, and is a layer
+        # of its own under its own name.
+        name = scope[0] if scope else n.name
+        if name != current:
+            if name in spans:
+                raise ValueError(
+                    f"the ops of layer '{name}' are split by '{n.name}': a "
+                    f"layer is spliced as one contiguous run, so its start / "
+                    f"end cannot name a range"
+                )
+            spans[name] = []
+            current = name
+        spans[name].append(n)
+
+    rows, first = [], {}
+    for name, nodes in spans.items():
+        group = nodes[0].meta.get("build_group")
+        trips = [
+            _loop_trip(n)
+            for n in nodes
+            if n.op == "call_function" and n.target is WHILE_LOOP
+        ]
+        rows.append(
+            [
+                name,
+                nodes[0].name,
+                nodes[-1].name,
+                first.setdefault(name if group is None else group, len(first)),
+                max(trips, default=1),
+            ]
+        )
+
+    # ``plain`` aligns the columns without rules or separators, so a row is
+    # still five whitespace-separated fields that ``line.split()`` reads.
+    text = tabulate(rows, tablefmt="plain")
+    if to_string:
+        return text
+    print(text)
+    return text
 
 
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
@@ -1047,112 +1105,110 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
 
 
 # ===========================================================================
-# 2. Graphviz rendering (loops as clusters)
+# 2. Graphviz rendering
 # ===========================================================================
 
+# A line break inside a record label.
+_LABEL_BREAK = "&#92;n"
 
-def _label(node: torch.fx.Node) -> str:
-    name = node.name
+
+def _wrap_long_name(name: str, max_len: int = 20) -> str:
+    """Break a long node name over several label lines, at the last
+    non-alphabetic character before each limit, so a box stays narrow."""
+    if len(name) <= max_len:
+        return name
+    lines = []
+    start = 0
+    while start + max_len < len(name):
+        end = start + max_len
+        break_at = end
+        for i in range(end, start, -1):
+            if not name[i].isalpha():
+                break_at = i + 1
+                break
+        lines.append(name[start:break_at])
+        start = break_at
+    lines.append(name[start:])
+    return _LABEL_BREAK.join(lines)
+
+
+def _node_label(node, named) -> Optional[str]:
+    """``node``'s record label: its name (wrapped), the shape(s) it produces,
+    and the dtype when that is worth saying — the logical (quantized) one the
+    quantizer stamped, else a physical one that is not the default float.  A
+    fused submodule adds the ops it chains as a second field.
+
+    ``None`` for a node that produces no tensor, which gets no box at all.
+    """
     val = getattr(node, "value", None)
+    dtype = node.meta.get("dtype")
+    parts = [_wrap_long_name(node.name)]
+
     if isinstance(val, torch.Tensor):
-        return f"{name}\\n{tuple(val.shape)}"
-    if isinstance(val, (tuple, list)):
-        shapes = ", ".join(
-            str(tuple(t.shape)) for t in val if isinstance(t, torch.Tensor)
+        parts.append(str(tuple(val.shape)))
+        if dtype is not None:
+            parts.append(str(dtype))
+        elif val.dtype not in (torch.float, torch.bfloat16):
+            parts.append(str(val.dtype))
+    elif isinstance(val, (tuple, list)):
+        parts.append(", ".join(str(tuple(t.shape)) for t in val))
+        dtypes = [t.dtype for t in val]
+        if isinstance(dtype, (list, tuple)):
+            dtypes = [d or physical for d, physical in zip(dtype, dtypes)]
+        if any(d not in (torch.float, torch.bfloat16) for d in dtypes):
+            parts.append(", ".join(str(d) for d in dtypes))
+    else:
+        return None
+
+    label = _LABEL_BREAK.join(parts)
+    sub = named.get(str(node.target)) if node.op == "call_module" else None
+    if isinstance(sub, GraphModule):
+        label += "|" + _LABEL_BREAK.join(
+            n.name for n in sub.graph.nodes if n.op == "call_function"
         )
-        return f"{name}\\n{shapes}"
-    return name
+    # ``<`` and ``>`` are record-label port syntax, so a dtype or shape holding
+    # one has to be escaped.
+    return ("{" + label + "}").replace("<", r"\<").replace(">", r"\>")
 
 
-def _render_graph(gm, g, env: Dict, counter: list, scope: str = "") -> None:
-    named = dict(gm.named_modules(remove_duplicate=False))
+def _render(model: GraphModule, output_file: str) -> None:
+    """Draw one box per node and one edge per use, then write the SVG."""
+    g = graphviz.Digraph()
+    named = dict(model.named_modules(remove_duplicate=False))
+    edges = []
 
-    def gid(node):
-        return env.get(node, f"{scope}{node.name}")
-
-    for node in gm.graph.nodes:
-        if node.op == "output":
+    for node in model.graph.nodes:
+        if node.op == "get_attr" and not require_allocation(node):
             continue
-        if node.op == "placeholder":
-            if node not in env:
-                nid = f"{scope}{node.name}"
-                env[node] = nid
-                g.node(nid, _label(node), shape="oval")
+        label = _node_label(node, named)
+        if label is None:
             continue
-        if node.op == "get_attr":
-            continue
-        if node.op == "call_function" and node.target is WHILE_LOOP:
-            _render_loop(node, named, g, env, counter, scope)
-            continue
+        g.node(node.name, label=label, shape="Mrecord")
+        edges += [(node.name, u.name) for u in node.users]
 
-        # Ordinary op node — namespace id by scope so names are unique across
-        # loop bodies (FX node names repeat between subgraphs).
-        nid = f"{scope}{node.name}"
-        label = f"{{{_target_name(node.target, short=True)}\\n{_label(node)}}}"
-        g.node(nid, label, shape="record")
-        env[node] = nid
-        for inp in node.all_input_nodes:
-            g.edge(gid(inp), nid)
+    g.edges(edges)
+    g.render(output_file, format="svg", cleanup=True)
 
 
-def _render_loop(node, parent_named, g, env, counter, scope="") -> None:
-    body_gm = parent_named[str(node.args[1].target)]
-    carried = list(node.args[2])
-    extra = list(node.args[3]) if len(node.args) > 3 else []
-    body_inputs = carried + extra
-
-    body_args = [_loop_input_value(n) for n in body_inputs]
-
-    with oracle_disabled():
-        ShapeProp(body_gm).propagate(*body_args)
-
-    placeholders = [n for n in body_gm.graph.nodes if n.op == "placeholder"]
-    for ph, src in zip(placeholders, body_inputs):
-        if isinstance(src, torch.fx.Node):
-            env[ph] = env.get(src, src.name)
-
-    counter[0] += 1
-    cluster_name = f"cluster_{node.name}_{counter[0]}"
-    body_scope = f"{cluster_name}/"
-    title = f"loop {node.name}{_trip_str(node)}"
-    with g.subgraph(name=cluster_name) as sub:
-        sub.attr(label=title, style="rounded", color="blue")
-        _render_graph(body_gm, sub, env, counter, scope=body_scope)
-
-    out_node = next((n for n in body_gm.graph.nodes if n.op == "output"), None)
-    if out_node is not None and isinstance(out_node.args[0], (list, tuple)):
-        last = out_node.args[0][-1]
-        if isinstance(last, torch.fx.Node):
-            env[node] = env.get(last, last.name)
-
-
-def gen_compute_graph_bufferized(
+def gen_compute_graph(
     model: GraphModule,
-    output_file: str = "bufferized_graph",
-    args: Optional[tuple] = None,
-    timeout: Optional[float] = None,
+    output_file: str = "compute_graph",
+    timeout: Optional[float] = 300,
 ) -> None:
+    """Render an FX graph to ``<output_file>.svg``.
+
+    Args:
+        model: The graph to draw.  Shapes must already be propagated — a node
+            with no value produces no box.
+        output_file: Path without extension; ``.svg`` is appended.
+        timeout: Seconds to allow the build + render, or ``None`` for no limit.
+            Graphviz can take minutes on a large graph, and the picture is a
+            debug aid, so exceeding it prints a warning and skips the render
+            rather than raising.  Implemented with ``SIGALRM``, so it only
+            works on the main thread of a POSIX process.
     """
-    Render a bufferized FX graph to ``<output_file>.svg``; each ``while_loop``
-    is a labelled cluster box containing its (possibly nested) body.
-
-    ``timeout`` (seconds) bounds the build+render work: if it is exceeded the
-    rendering is abandoned and a warning is printed instead of raising.  The
-    graph is a debug visualization, so skipping it is non-fatal.  Implemented
-    with ``SIGALRM`` (main thread, POSIX only); ``None`` disables the guard.
-    """
-    if args is not None:
-        ShapeProp(model).propagate(*args)
-
-    def _render():
-        g = graphviz.Digraph()
-        g.attr(compound="true")
-        env: Dict[torch.fx.Node, str] = {}
-        _render_graph(model, g, env, counter=[0])
-        g.render(output_file, format="svg", cleanup=True)
-
     if timeout is None:
-        _render()
+        _render(model, output_file)
         return
 
     class _RenderTimeout(Exception):
@@ -1164,10 +1220,10 @@ def gen_compute_graph_bufferized(
     old_handler = signal.signal(signal.SIGALRM, _on_timeout)
     signal.setitimer(signal.ITIMER_REAL, timeout)
     try:
-        _render()
+        _render(model, output_file)
     except _RenderTimeout:
         print(
-            f"WARNING: gen_compute_graph_bufferized exceeded {timeout:g}s; "
+            f"WARNING: gen_compute_graph exceeded {timeout:g}s; "
             "skipping compute graph rendering."
         )
     finally:
@@ -1477,110 +1533,3 @@ def print_bufferized_graph(model: GraphModule, to_string: bool = False):
         return text
     print(text)
     return text
-
-
-# ==========================================================================
-# Plain (pre-lowered) FX graph rendering
-# ==========================================================================
-
-
-def _wrap_long_name(name: str, max_len: int = 20) -> str:
-    if len(name) <= max_len:
-        return name
-    lines = []
-    start = 0
-    while start + max_len < len(name):
-        end = start + max_len
-        break_at = end
-        for i in range(end, start, -1):
-            if not name[i].isalpha():
-                break_at = i + 1
-                break
-        lines.append(name[start:break_at])
-        start = break_at
-    lines.append(name[start:])
-    return "&#92;n".join(lines)
-
-
-def gen_compute_graph(model, output_file="compute_graph", max_users=10):
-    nodes = {}
-    edges = []
-    named_modules = dict(model.named_modules(remove_duplicate=False))
-
-    for node in model.graph.nodes:
-        if node.op == "get_attr" and "qmap" in node.name:
-            continue
-
-        header = _wrap_long_name(node.name)
-
-        if isinstance(node.value, torch.Tensor):
-            header += f"&#92;n{str(tuple(node.value.shape))}"
-            if (dtype := node.meta.get("dtype", None)) is not None:
-                header += f"&#92;n{dtype}"
-            elif node.value.dtype not in [torch.float, torch.bfloat16]:
-                header += f"&#92;n{node.value.dtype}"
-        elif isinstance(node.value, (tuple, list)):
-            shape_str = ", ".join([str(tuple(t.shape)) for t in node.value])
-            header += f"&#92;n{shape_str}"
-
-            dtypes = [t.dtype for t in node.value]
-            if (dtype := node.meta.get("dtype", None)) is not None:
-                dtypes = [dt or dtypes[i] for i, dt in enumerate(dtype)]
-
-            if any(
-                dtype not in [torch.float, torch.bfloat16] for dtype in dtypes
-            ):
-                header += f"&#92;n{', '.join([str(d) for d in dtypes])}"
-        else:
-            continue
-
-        body = None
-        if node.op == "call_module":
-            gm = named_modules[node.target]
-            if isinstance(gm, torch.fx.GraphModule):
-                body = "&#92;n".join(
-                    [n.name for n in gm.graph.nodes if n.op == "call_function"]
-                )
-        label = f"{{{header}}}" if body is None else f"{{{header}|{body}}}"
-        label = label.replace("<", r"\<").replace(">", r"\>")
-
-        nodes[node.name] = {
-            "label": label,
-            "shape": "Mrecord",
-        }
-
-        users = list(node.users)
-        num_users = len(users)
-        if num_users > max_users:
-            num_splits = (num_users + max_users - 1) // max_users
-            for i in range(num_splits):
-                sub_node = f"{node.name}_split_{i}"
-                sub_label = f"{{{sub_node}}}"
-                sub_label = sub_label.replace("<", r"\<").replace(">", r"\>")
-
-                # Create a sub-node for this group of users
-                nodes[sub_node] = {
-                    "label": sub_label,
-                    "shape": "Mrecord",
-                }
-
-                edges.append((node.name, sub_node))
-
-                # Add edges from sub-node to its users
-                start_idx = i * max_users
-                end_idx = min(start_idx + max_users, num_users)
-                for u in users[start_idx:end_idx]:
-                    edges.append((sub_node, u.name))
-        else:
-            for u in users:
-                edges.append((node.name, u.name))
-
-    g = graphviz.Digraph()
-    # g.attr(bgcolor="transparent")
-
-    for node, attrs in nodes.items():
-        g.node(node, **attrs)
-
-    g.edges(edges)
-
-    g.render(output_file, format="svg", cleanup=True)

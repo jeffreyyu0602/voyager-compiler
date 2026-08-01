@@ -141,30 +141,32 @@ def remap_pad_after_permute(
     return tuple(new_pad)
 
 
-def _process_conv2d_input_nodes(
-    node: Node, model: GraphModule, island_set: Set[Node]
-):
+def _permute_inputs(
+    node: Node, model: GraphModule, nhwc_nodes: List[Node]
+) -> Optional[Node]:
+    """Bring one input of the NHWC group into that layout, and return the node
+    whose value it left stale for the caller to restamp."""
     graph = model.graph
 
     # Case A: Input is a weight (Parameter) or weight scale.
     if node.op == "get_attr":
         user = next((n for n in node.users if is_conv2d(n)), None)
         if user is None or is_depthwise_conv(user):
-            return
+            return None
 
         w = get_arg_value(user, 1, "weight")
         ws = user.kwargs.get("weight_scale")
         if node not in [w, ws]:
-            return
+            return None
 
         logger.debug(f"Permuting {user} parameter: {node}")
         param = fetch_attr(model, node.target)
         param.data = param.data.permute(2, 3, 1, 0)
 
         node.meta["dims"] = OIHW_TO_HWIO
-        return
+        return node
 
-    # Case B: Input is an activation flowing into the island from outside
+    # Case B: Input is an activation flowing into the group from outside
     if len(node.shape) == 4:
         logger.debug(f"Insert permute after {node} with dims {NCHW_TO_NHWC}")
         with graph.inserting_after(node):
@@ -177,8 +179,11 @@ def _process_conv2d_input_nodes(
         permute_node.meta["dtype"] = node.meta.get("dtype")
 
         for user in list(node.users.keys()):
-            if user in island_set:
+            if user in nhwc_nodes:
                 user.replace_input_with(node, permute_node)
+        return permute_node
+
+    return None
 
 
 def _rewrite_node_args_for_layout(node: Node) -> None:
@@ -222,29 +227,31 @@ def _rewrite_node_args_for_layout(node: Node) -> None:
 
 def normalize_conv2d_layout(model: GraphModule):
     graph = model.graph
-    visited_nodes: Set[Node] = set()
+    visited: Set[Node] = set()
+    touched: Set[Node] = set()
 
     for node in list(graph.nodes):
-        if node in visited_nodes or (
+        if node in visited or (
             node.target not in NHWC_OP_VARIANTS
             and node.target != torch.ops.quantized_ops.conv2d_mx.default
         ):
             continue
 
-        # Extract the cluster of nodes that can share the NHWC layout
-        island_nodes = extract_conv2d_graph(model, node, visited_nodes)
-        island_set = set(island_nodes)
+        # The connected group of nodes that can share the NHWC layout
+        nhwc_nodes = extract_conv2d_graph(model, node, visited)
+        touched.update(nhwc_nodes)
 
-        for node_to_treat in island_nodes:
-            # Inspect inputs to see if they come from outside the island (NCHW)
-            for input_node in list(node_to_treat.all_input_nodes):
-                if input_node in island_set or "dims" in input_node.meta:
+        for n in nhwc_nodes:
+            for input_node in list(n.all_input_nodes):
+                if input_node in nhwc_nodes or "dims" in input_node.meta:
                     continue
 
-                _process_conv2d_input_nodes(input_node, model, island_set)
+                stale = _permute_inputs(input_node, model, nhwc_nodes)
+                if stale is not None:
+                    touched.add(stale)
 
-            for user in list(node_to_treat.users.keys()):
-                if user in island_set or "dims" in user.meta:
+            for user in list(n.users.keys()):
+                if user in nhwc_nodes or "dims" in user.meta:
                     continue
 
                 logger.debug(
@@ -252,16 +259,22 @@ def normalize_conv2d_layout(model: GraphModule):
                 )
                 with graph.inserting_before(user):
                     permute_node = graph.call_function(
-                        torch.ops.aten.permute.default,
-                        (node_to_treat, NHWC_TO_NCHW),
+                        torch.ops.aten.permute.default, (n, NHWC_TO_NCHW)
                     )
-                permute_node.meta["dtype"] = node_to_treat.meta.get("dtype")
-                user.replace_input_with(node_to_treat, permute_node)
+                permute_node.meta["dtype"] = n.meta.get("dtype")
+                user.replace_input_with(n, permute_node)
+                touched.add(permute_node)
 
-            _rewrite_node_args_for_layout(node_to_treat)
+            _rewrite_node_args_for_layout(n)
+
+    # Restamp what moved, in graph (topological) order
+    for node in graph.nodes:
+        if node in touched:
+            propagate_shape(node, model)
 
     graph.lint()
     model.recompile()
+    eliminate_reshape_with_no_effect(model)
     return model
 
 
@@ -382,6 +395,7 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
                 torch.ops.aten.transpose.int, (arg, -2, -1)
             )
     transposed.meta["dtype"] = arg.meta.get("dtype")
+    propagate_shape(transposed, model)
     return transposed
 
 
@@ -455,6 +469,7 @@ def eliminate_canceling_transposes(
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
             n.replace_input_with(arg, transposed_nodes[arg])
         _remap_dim_args_after_transpose(n)
+        propagate_shape(n, model)
 
     down_t.replace_all_uses_with(down_t.args[0])
     graph.erase_node(down_t)
@@ -496,6 +511,7 @@ def fold_transpose_into_constant(
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
             n.replace_input_with(arg, transposed_nodes[arg])
         _remap_dim_args_after_transpose(n)
+        propagate_shape(n, model)
 
     down_t.replace_all_uses_with(down_t.args[0])
     graph.erase_node(down_t)
@@ -556,7 +572,6 @@ def _insert_transpose_op(
                 continue
             if arg not in transposed_nodes:
                 transposed_nodes[arg] = _insert_transposed_input(arg, model)
-                propagate_shape(transposed_nodes[arg], model)
             dq.replace_input_with(arg, transposed_nodes[arg])
         _remap_dim_args_after_transpose(dq)
         # The decode -- and every select over it -- now hands on a transposed
@@ -583,21 +598,22 @@ def _node_layout(node: Node, mm_layout: str, mv_layout: str) -> str:
 
 
 def _process_linear_node(model: GraphModule, node: Node) -> None:
-    """Flip a linear's KC-native weight storage to CK and retarget the
-    node to the layout twin, whose weight arrives swapped.  The caller
+    """Point a linear at a CK-stored copy of its KC-native weight and retarget
+    the node to the layout twin, whose weight arrives swapped.  The caller
     decides which nodes to flip."""
     logger.info(f"Transposing weight for linear node {node.name}")
 
     weight_node = node.args[1]
-    weight = fetch_attr(model, weight_node.target)
-    weight.data = weight.data.T
+    transposed = _insert_transposed_input(weight_node, model)
+    node.replace_input_with(weight_node, transposed)
 
     if (scale_node := node.kwargs.get("weight_scale")) is not None:
-        scale = fetch_attr(model, scale_node.target)
-        scale.data = scale.data.T
+        node.replace_input_with(
+            scale_node, _insert_transposed_input(scale_node, model)
+        )
 
     # Mark mx / spmm_csr users as consuming a CK-stored weight.
-    for user in list(weight_node.users):
+    for user in list(transposed.users):
         if user.target in [
             torch.ops.quantized_ops.linear_mx.default,
             torch.ops.quantized_ops.spmm_csr.default,
