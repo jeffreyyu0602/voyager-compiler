@@ -1629,22 +1629,24 @@ def build_conv2d(
     ih = (toh - 1) * sh + dh * (kH - 1) + 1
     iw = (tow - 1) * sw + dw * (kW - 1) + 1
 
-    # Grid dims: batch outermost (never tiled), then K / oH / oW in the L3 loop
-    # order the tiler chose, then C(reduction) innermost -- it accumulates
-    # across consecutive steps, so it cannot move.  The weight's kH/kW axes are
-    # loaded whole (index_map ``None``), so there is no kernel-window grid dim.
     l3_order = l3_order or CONV_L3_ORDER
     gN, gC = 0, 4
     gK, gY, gX = (1 + l3_order.index(d) for d in CONV_L3_ORDER)
     counts = {"K": nk, "Y": ny, "X": nx}
     grid = (1,) + tuple(counts[d] for d in l3_order) + (nc,)
+    in_code = anchor.kwargs.get("input_code")
+    pad_value = (
+        float(in_code.value.abs().argmin())
+        if isinstance(in_code, torch.fx.Node)
+        else 0.0
+    )
     in_spec = _InputSpec(
         project((tn, tc, ih, iw), in_dims),
         project((gN, gC, gY, gX), in_dims),  # logical N, C, H, W
         (False,) * 4,
         strides=project((tn, tc, toh * sh, tow * sw), in_dims),
         pad=project((0, 0, ph, pw), in_dims),
-        pad_value=0.0,
+        pad_value=pad_value,
     )
     w_spec = _InputSpec(
         project((tk, tc, kH, kW), w_dims),
@@ -1708,7 +1710,7 @@ def build_conv2d(
             (False,) * 4,
             strides=project((tn, tc // bs, toh * sh, tow * sw), in_dims),
             pad=project((0, 0, ph, pw), in_dims),
-            pad_value=0.0,
+            pad_value=1.0,
         )
         wt_scale_qspec = _InputSpec(
             project((tk, tc // bs, kH, kW), w_dims),
@@ -1851,10 +1853,6 @@ def build_gemm(
         return None
     anchor = info.anchor_node if info is not None else node
 
-    # The weight's fused relayouts (attention's ``Kᵀ``, GQA's head repeat) are
-    # folded into how its tile is addressed rather than emitted; the spec itself
-    # stays in the matmul (Kᵀ) layout.  A fused ``dequantize`` (a packed KV
-    # cache) is compute, so it runs on the fetched tile instead.
     weight_node, transposed, weight_repeat, dequant = weight_transforms(
         anchor.args[1]
     )
@@ -1879,10 +1877,6 @@ def build_gemm(
         tk = K // nk
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
 
-    # torch matmul broadcasts the leading batch dims: each output batch dim is
-    # its own grid dim (0..nb-1), then M and N in the L3 loop order the tiler
-    # chose, then K innermost -- the reduction accumulates across consecutive
-    # steps, so it cannot move.
     nb = out.ndim - 2
     l3_order = l3_order or GEMM_L3_ORDER
     gm, gn = (nb + l3_order.index(d) for d in GEMM_L3_ORDER)

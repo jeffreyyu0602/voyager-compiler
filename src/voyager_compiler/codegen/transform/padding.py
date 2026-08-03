@@ -331,12 +331,11 @@ def pad_input_node(model, node, is_weight, pad, scale_pad, fold_cache):
 
     # Padding the pre-quantize float contributes 0 with a plain 0 fill; padding
     # the quantized value pads *codebook indices*, so it must fill with the
-    # index that decodes to 0 (NF4 keeps 0 at index 7, not 0 -- index 0 is
-    # -1.0), or the padded contraction adds a nonzero term.
+    # index closest to 0 (NF4 keeps 0 at index 7, not 0 -- index 0 is -1.0), or
+    # the padded contraction adds a nonzero term.
     pad_value = 0
     if not pad_quantize_mx_input and code is not None:
-        zeros = (fetch_attr(model, code.target) == 0).nonzero().flatten()
-        pad_value = int(zeros[0]) if len(zeros) else 0
+        pad_value = int(fetch_attr(model, code.target).abs().argmin())
 
     new_input = _hoist_pad_above_repeat(
         model, node_to_pad, pad, pad_value, fold_cache
