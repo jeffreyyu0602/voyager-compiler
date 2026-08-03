@@ -859,7 +859,7 @@ def bufferize_graph(
         compute_seed = {
             n.target: n.meta["dtype"]
             for n in src_nodes
-            if n.op == "call_function" and n.meta.get("dtype") is not None
+            if is_compute_op(n) and n.meta.get("dtype") is not None
         }
         propagate_logical_dtypes(sub_gm, ph_seed, compute_seed)
 
