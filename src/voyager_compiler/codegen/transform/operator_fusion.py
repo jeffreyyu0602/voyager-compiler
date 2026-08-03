@@ -366,15 +366,18 @@ def _fuse_reshape_with_input_impl(
     reshape_node = fused_nodes[0]
     fused_nodes.append(current_node)
 
-    can_fuse = False
     is_transpose = swaps_last_two_dims(reshape_node)
     # TODO: support fusing reshape with elementwise operations
-    if is_gemm_op(current_node):
-        can_fuse = is_transpose and fused_nodes[-2] in (
+    can_fuse = (
+        is_transpose
+        and is_gemm_op(current_node)
+        and fused_nodes[-2]
+        in (
             current_node.args[1],
             current_node.kwargs.get("weight_scale"),
             current_node.kwargs.get("other_scale"),
         )
+    )
 
     if can_fuse:
         if simulate:
@@ -716,7 +719,7 @@ def fuse_operator(
             continue
 
         # Attempt to fuse it with its immediate user
-        if fuse_reshape and is_reshape_op(node):
+        if is_reshape_op(node):
             fuse_reshape_with_input(graph, fused_nodes_list, nodes_map, node)
 
     for node in list(graph.nodes):

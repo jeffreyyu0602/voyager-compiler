@@ -57,6 +57,7 @@ from voyager_compiler.codegen.node_info import (
 )
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _is_compute,
+    _produces_tensor,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
 from voyager_compiler.codegen.transform.bufferize.utils import (
@@ -682,10 +683,17 @@ class _Emitter:
         it, not a ``TensorBox``: it never leaves the datapath, so it has no
         storage and no address — the reference exists only so the backend can
         see which operand comes from the previous op of the fusion.
+
+        ``op`` is where it runs: a tensor written into storage the op does not
+        own is a bufferized instruction, so it runs on the datapath.
         """
         call = PrimOp(
             name=node.name,
-            op=self._op_kind(node),
+            op=(
+                "call_function"
+                if _produces_tensor(node) and not _owns_storage(node)
+                else "cpu"
+            ),
             target=_target_name(node.target),
         )
         qmaps = quant_param_arg_nodes(node, QMAP_PARAMS)
@@ -717,13 +725,6 @@ class _Emitter:
             )
             kwargs[name] = arg
         return kwargs
-
-    def _op_kind(self, node) -> str:
-        """Where the op runs.  Only compute runs on the accelerator datapath;
-        everything else is driven by the control processor — index arithmetic,
-        predicates, a host-side pad or slice, the DMA and its semaphores.  (The
-        latter deserve classes of their own; that is future work.)"""
-        return "call_function" if _is_compute(node) else "cpu"
 
     def _set_outputs(self, op: Operation, node, env) -> None:
         """An op's results.  An op that *creates* storage declares it; every

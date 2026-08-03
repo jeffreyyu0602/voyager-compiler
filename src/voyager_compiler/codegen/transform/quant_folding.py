@@ -290,6 +290,9 @@ def _hoist_forked(model: GraphModule, node: Node) -> bool:
 
     if not moved:
         return False
+    order = {n: i for i, n in enumerate(graph.nodes)}
+    for n in sorted(dict.fromkeys(on_path), key=order.__getitem__):
+        propagate_shape(n, model)
     _annotate(on_path, node)
     node.replace_all_uses_with(node.args[0])
     graph.erase_node(node)
@@ -723,6 +726,8 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     with graph.inserting_before(path[-1]):
         value = unpack(_MX_VALUE)
     path[-1].replace_input_with(src, value)
+    for n in reversed(path):
+        propagate_shape(n, model)
     _annotate(path, outs[_MX_VALUE])
     outs[_MX_VALUE].replace_all_uses_with(path[0])
 
