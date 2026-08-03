@@ -95,8 +95,13 @@ message ScalarValueList {
 // References to allocations
 // -----------------------------------------------------------------------------
 
-// A reference to an existing TensorBox, optionally a strided window onto it
-// (voyager::subview). It owns no memory and carries no address.
+// One tensor operand, described in full: an instruction is executable without
+// consulting any other part of the model.
+//
+// box repeats the referenced allocation -- node name, dtype, memory (level,
+// partition, resolved address) and banking -- under the shape of the *operand*,
+// which differs from the declaration's whenever an aliasing op (a reshape, a
+// rank-reducing subview) sits between the allocation and the use.
 //
 // offsets, sizes and strides have one entry per referenced dimension and are
 // omitted together to reference the whole allocation. An offset may be a
@@ -105,8 +110,10 @@ message ScalarValueList {
 // The referenced dimensions of a banked TensorBox are [bank_count, *shape]:
 // dimension 0 selects the bank, pitched by bank_stride_bytes.
 message TensorBoxRef {
-  // References TensorBox.node.
-  string node = 1;
+  // The referenced allocation, with the operand's own shape. A box with no
+  // memory names a value produced by an earlier PrimOp of the same fusion,
+  // which never leaves the datapath and so owns no storage.
+  TensorBox box = 1;
 
   repeated ScalarValue offsets = 2;
   repeated int64 sizes = 3;
@@ -141,7 +148,7 @@ message Argument {
 // An operation result.
 //
 // A tensor-producing operation is destination-passing after serialization.
-// Its output names an existing TensorBoxRef that the operation writes.
+// Its output is a TensorBoxRef describing the destination it writes.
 //
 // A scalar-producing operation defines a scalar SSA value with the given name
 // and type.
@@ -194,8 +201,9 @@ message PrimOp {
 //
 // An operand naming an earlier PrimOp in the same op_list is such an
 // intermediate. It is written as a TensorBoxRef so the operand position stays
-// explicit, but the name resolves to a PrimOp rather than to a TensorBox, and
-// no memory is read or written for it.
+// explicit, but the name resolves to a PrimOp rather than to an allocation, and
+// no memory is read or written for it -- its box carries shape and dtype, and
+// no memory.
 message PrimOpList {
   repeated PrimOp op_list = 1;
 }

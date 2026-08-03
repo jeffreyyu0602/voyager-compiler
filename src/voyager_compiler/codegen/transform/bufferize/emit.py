@@ -13,12 +13,14 @@ this dialect directly and so *replaces* — rather than reuses — the legacy
 ``param.proto`` emitter (``codegen/mapping.py``, still used by the
 non-bufferized path).  Three ideas carry the whole translation:
 
-  * **Storage is declared once.**  A ``TensorBox`` — a model input, a weight, a
-    ``voyager.alloc`` / ``voyager.zeros`` — owns an address.  Every *use* of it
-    is a ``TensorBoxRef``: a name, plus the window it reads — a
-    ``voyager.subview``, which for a software-pipeline bank is the slot a step
-    picks.  So no tile carries an address of its own, the slot stays a *runtime*
-    offset, and the ``subview`` collapses into the reference.
+  * **Every instruction stands alone.**  A ``TensorBox`` — a model input, a
+    weight, a ``voyager.alloc`` / ``voyager.zeros`` — declares an allocation.
+    Every *use* of it is a ``TensorBoxRef`` repeating that declaration in full
+    (name, dtype, memory level and address, banking) under the *operand's*
+    shape, plus the window it reads — a ``voyager.subview``, which for a
+    software-pipeline bank is the slot a step picks.  Aliasing ops and the
+    ``subview`` collapse into the reference, the slot stays a *runtime* offset,
+    and nothing has to be resolved to execute an instruction.
   * **Compute is destination-passing.**  ``voyager.insert(src, dst)`` is how the
     FX dialect emulates a write-to-destination; it is not an instruction.  It is
     dropped, and ``dst`` becomes the *producing* op's ``Output.destination`` —
@@ -383,6 +385,27 @@ class _Emitter:
     # --- references ------------------------------------------------------
 
     def _ref(self, node, env, internal=frozenset()) -> TensorBoxRef:
+        """``node`` as an operand: the allocation it names, described in full.
+
+        The reference repeats the allocation — name, dtype, memory level and
+        address, banking — so an instruction is executable without resolving
+        anything else.  Its shape is ``node``'s own whenever an aliasing op
+        (a reshape, a rank-reducing ``subview``) stands between the two.
+        """
+        ref = self._resolve(node, env, internal)
+        value = _value(node)
+        # ``value.shape`` still leads with the bank dim that ``_tensor_box``
+        # factors into ``bank_count``, so an operand naming the allocation
+        # itself keeps the declared shape rather than restoring that dim.  Every
+        # operand of a banked buffer reaches it through ``select_bank``, whose
+        # ``squeeze_dim`` has already dropped the dim.
+        if not _owns_storage(node) and isinstance(value, torch.Tensor):
+            del ref.box.shape[:]
+            ref.box.shape.extend(int(d) for d in value.shape)
+            ref.box.dtype = _dtype_str(node)
+        return ref
+
+    def _resolve(self, node, env, internal) -> TensorBoxRef:
         """The storage ``node`` names.  Views (bank slots, reshapes, casts) and
         region boundaries are transparent: they resolve to the box that owns the
         bytes, plus the window a ``voyager.subview`` reads of them.
@@ -393,7 +416,7 @@ class _Emitter:
         the fusion the operand comes from.
         """
         if node in internal:
-            return TensorBoxRef(node=node.name)
+            return TensorBoxRef(box=TensorBox(node=node.name))
 
         if node in env:
             ref = TensorBoxRef()
@@ -401,7 +424,7 @@ class _Emitter:
             return ref
 
         if _owns_storage(node):
-            return TensorBoxRef(node=node.name)
+            return TensorBoxRef(box=self._tensor_box(node))
 
         if node.op == "call_function":
             if node.target is _SUBVIEW:
@@ -443,8 +466,8 @@ class _Emitter:
         if ref.offsets:
             raise ValueError(
                 f"'{node.name}' windows '{source.name}', which is already a "
-                f"window of '{ref.node}': a TensorBoxRef carries one window, "
-                f"so the two would have to be composed"
+                f"window of '{ref.box.node}': a TensorBoxRef carries one "
+                f"window, so the two would have to be composed"
             )
         shape = list(_value(source).shape)
         if (
@@ -988,7 +1011,7 @@ class _Emitter:
         env = self.envs[self.model]
         for result in _outputs_of(self.model):
             if _is_tensor(result):
-                owner = self.boxes.get(self._ref(result, env).node)
+                owner = self.boxes.get(self._ref(result, env).box.node)
                 if owner is not None:
                     model.outputs.append(self._tensor_box(owner))
         return model

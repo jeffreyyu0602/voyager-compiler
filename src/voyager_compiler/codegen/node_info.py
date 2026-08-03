@@ -243,14 +243,14 @@ def is_nop(node: Node) -> bool:
     ]
 
 
-def is_shape_changing_nop(node: Node) -> bool:
-    """A ``nop`` (no compute) whose output shape differs from its input shape
+def is_aliasing_op(node: Node) -> bool:
+    """``node`` is a second name for its input's bytes under a different shape
     — a ``view`` / ``reshape`` / ``squeeze`` / ``unsqueeze`` / size-1 ``select``
-    that regroups or drops dims.  Such a node sitting *between* two fused
-    compute stages breaks the single-iteration-space assumption and is relocated
-    to the fused module's boundary by the iteration-space normalizer (see
-    ``normalize.py``).  A shape-*preserving* nop (same in/out shape) can stay
-    inside the fused chain.
+    that regroups or drops dims, computing nothing.  Such a node sitting
+    *between* two fused compute stages breaks the single-iteration-space
+    assumption and is relocated to the fused module's boundary by the
+    iteration-space normalizer (see ``normalize.py``).  A nop that also
+    preserves the shape (same in/out) can stay inside the fused chain.
     """
     if not is_nop(node):
         return False

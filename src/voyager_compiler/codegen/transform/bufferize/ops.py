@@ -262,48 +262,66 @@ def async_copy(
     pad_value: Optional[float] = None,
     post_count: int = 1,
 ) -> None:
+    sizes = tuple(sizes)
+    indices = tuple(indices)
+    rank = len(sizes)
+
+    if src.ndim != rank or dst.ndim != rank:
+        raise ValueError(
+            f"src and dst must both have rank {rank}; "
+            f"got src.ndim={src.ndim}, dst.ndim={dst.ndim}"
+        )
+
+    if semaphore.ndim != 0 or semaphore.dtype != torch.int64:
+        raise TypeError(
+            "semaphore must be a scalar torch.int64 tensor; "
+            f"got shape={tuple(semaphore.shape)}, "
+            f"dtype={semaphore.dtype}"
+        )
+
+    if not isinstance(post_count, (int, torch.SymInt)):
+        raise ValueError(
+            f"post_count must be a positive integer, got {post_count!r}"
+        )
+    if isinstance(post_count, torch.SymInt):
+        torch._check(
+            post_count >= 1,
+            lambda: f"post_count must be a positive integer, got {post_count!r}",
+        )
+    elif post_count < 1:
+        raise ValueError(
+            f"post_count must be a positive integer, got {post_count!r}"
+        )
+
     if strides is None:
         strides = sizes
-    # The buffer (the multi-tile operand) is sliced at the block index; the
-    # other operand is exactly one ``sizes`` tile. Identify it by shape, not
-    # numel as a halo tile can be *larger* than a small whole input. A
-    # transposed copy is always a load, so an untiled weight must not pick the
-    # store branch.
-    buf = src if transposed or tuple(src.shape) != tuple(sizes) else dst
-    rank = buf.dim()
-    # Assemble the per-dim block index: ``indices`` covers the tiled ``dims``
-    # (or every dim when ``dims`` is None); untiled dims default to 0.
+
     if dims is None:
         full = list(indices)
     else:
         full = [0] * rank
         for value, d in zip(indices, dims):
             full[d] = value
-    # A halo with padding starts at ``full[d]*stride - pad[d]`` (default pad 0).
-    off = pad if pad is not None else [0] * rank
-    start = [full[d] * strides[d] - off[d] for d in range(rank)]
-    if buf is src and pad_value is not None:
-        # Padded halo load: ``start`` may run off either edge, so don't slice
-        # directly (a negative Python index would wrap). Fill the tile with
-        # ``pad_value`` and overwrite the in-bounds intersection —
-        # out-of-bounds rows/cols stay padded.
-        dst.fill_(pad_value)
+
+    start = [full[d] * strides[d] for d in range(rank)]
+    if pad is not None:
+        dst.fill_(pad_value if pad_value is not None else 0)
         src_sl, dst_sl = [], []
         for d in range(rank):
-            lo, hi = start[d], start[d] + sizes[d]
-            clo, chi = max(lo, 0), min(hi, src.shape[d])
+            lo = start[d] - pad[d]
+            hi = lo + sizes[d]
+            clo = min(max(lo, 0), src.shape[d])
+            chi = min(max(hi, 0), src.shape[d])
             src_sl.append(slice(clo, chi))
             dst_sl.append(slice(clo - lo, chi - lo))
         dst[tuple(dst_sl)] = src[tuple(src_sl)]
     else:
         sl = tuple(slice(start[d], start[d] + sizes[d]) for d in range(rank))
-        if buf is src:
+        if transposed or tuple(dst.shape) == tuple(sizes):
             region = src[sl]
             dst.copy_(region.mT if transposed else region)
         else:
-            dst[sl] = src.mT if transposed else src
-    # Emulate a counting semaphore: the completed transfer signals its slot,
-    # ``post_count`` times (a reused tile posts once per consumer).
+            dst[sl] = src
     semaphore.add_(post_count)
 
 

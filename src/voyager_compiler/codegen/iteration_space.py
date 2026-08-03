@@ -20,10 +20,10 @@ from torch import fx
 from voyager_compiler.codegen.node_info import (
     ancestors,
     get_anchor_node,
+    is_aliasing_op,
     is_elementwise_op,
     is_nop,
     is_reshape_op,
-    is_shape_changing_nop,
     quant_param_arg_nodes,
     reshape_preserves_full_blocks,
 )
@@ -342,7 +342,7 @@ class IterationSpaceNormalizer:
             elif anchor is not None and node is anchor:
                 env[node] = None
             elif (
-                is_shape_changing_nop(node)
+                is_aliasing_op(node)
                 or is_reshape_op(node)
                 or node.target is torch.ops.aten.expand.default
             ):
@@ -609,7 +609,7 @@ class IterationSpaceNormalizer:
         chain = []
         node = value
         while (
-            (is_reshape_op(node) or is_shape_changing_nop(node))
+            (is_reshape_op(node) or is_aliasing_op(node))
             and len(node.users) == 1
             and node.all_input_nodes
         ):
@@ -771,7 +771,7 @@ class IterationSpaceNormalizer:
         removable = [
             node
             for node in child.graph.nodes
-            if is_shape_changing_nop(node) and node not in keep
+            if is_aliasing_op(node) and node not in keep
         ]
 
         for node in removable:

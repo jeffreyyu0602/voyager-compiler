@@ -24,13 +24,13 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     get_anchor_node,
+    is_aliasing_op,
     is_compute_op,
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
     is_nop,
     is_pooling,
-    is_shape_changing_nop,
     quant_param_arg_nodes,
 )
 from voyager_compiler.codegen.subgraph import (
@@ -767,7 +767,7 @@ def bufferize_graph(
 
         # A shape-preserving nop is a pure pass-through — rewire its users to
         # its input
-        if is_nop(node) and not is_shape_changing_nop(node):
+        if is_nop(node) and not is_aliasing_op(node):
             inp = node.all_input_nodes[0]
             node.replace_all_uses_with(inp)
             update_submod_user_meta(model, inp)
