@@ -68,6 +68,7 @@ from voyager_compiler.codegen.transform.tiling.banking import (
 )
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
+    MEMORY_LEVEL_IMMEDIATE,
     MEMORY_LEVEL_REGISTER,
     MEMORY_LEVEL_SCRATCHPAD,
     SCALAR_BOOL,
@@ -483,12 +484,22 @@ class _Emitter:
         return ref
 
     def _scalar(self, value, env) -> ScalarValue:
+        """``value`` as a scalar operand — a literal, or the SSA name of one
+        computed elsewhere (a loop index, a predicate, an address term).  A
+        reference states its type, so it need not be resolved against its
+        defining op to know what it is; a literal's type is the arm it sets."""
         if isinstance(value, Node):
+            out = ScalarValue()
             if value in env:
-                out = ScalarValue()
                 out.CopyFrom(env[value])
-                return out
-            return ScalarValue(node=value.name)
+            else:
+                out.node = value.name
+            known = _value(value)
+            if known is not None and not isinstance(
+                known, (torch.Tensor, tuple, list)
+            ):
+                out.type = _scalar_type(known)
+            return out
         if isinstance(value, bool):
             return ScalarValue(bool_value=value)
         if isinstance(value, int):
@@ -511,7 +522,8 @@ class _Emitter:
             elif _is_index_vector(value):
                 # The whole index vector as one operand: its components by name.
                 arg.scalar_list.values.extend(
-                    ScalarValue(node=n) for n in _component_names(value)
+                    ScalarValue(node=n, type=_scalar_type(v))
+                    for n, v in zip(_component_names(value), _value(value))
                 )
             else:
                 arg.scalar.CopyFrom(self._scalar(value, env))
@@ -584,7 +596,8 @@ class _Emitter:
         phs = _placeholders(body)
 
         child: Dict[Node, object] = {
-            ph: ScalarValue(node=ph.name) for ph in phs[: len(carried)]
+            ph: ScalarValue(node=ph.name, type=_scalar_type(_value(ph)))
+            for ph in phs[: len(carried)]
         }
         child.update(self._child_env_from(phs[len(carried) :], extra, env))
         self.bind(body, child)
@@ -777,15 +790,21 @@ class _Emitter:
         return box
 
     def _memory_level(self, node):
-        """A semaphore (``voyager.zeros`` / a credit-seeded ``voyager.fill``)
-        names no memory — bufferization gives it no space — because it is a
+        """Where ``node``'s bytes live: the space bufferization annotated.
+
+        A semaphore (``voyager.zeros`` / a credit-seeded ``voyager.fill``) is a
         counter the accelerator maps itself, so it is declared at register level
-        with no address."""
+        with no address.  Anything left unannotated is in no memory at all — a
+        codebook or a folded constant, programmed into the instruction that
+        reads it rather than fetched from an address.
+        """
         if node.op == "call_function" and node.target in (_ZEROS, _FILL):
             return MEMORY_LEVEL_REGISTER
         if node.meta.get("space") == "Scratchpad":
             return MEMORY_LEVEL_SCRATCHPAD
-        return MEMORY_LEVEL_DRAM
+        if node.meta.get("space") == "DRAM":
+            return MEMORY_LEVEL_DRAM
+        return MEMORY_LEVEL_IMMEDIATE
 
     def _dump(self, node) -> None:
         """Write the tensors a hardware run needs to replay this op on its own:

@@ -8,16 +8,14 @@ package voyager;
 // -----------------------------------------------------------------------------
 
 enum MemoryLevel {
-  MEMORY_LEVEL_UNSPECIFIED = 0;
+  MEMORY_LEVEL_IMMEDIATE = 0;
   MEMORY_LEVEL_REGISTER = 1;
   MEMORY_LEVEL_LOCAL_BUFFER = 2;
   MEMORY_LEVEL_SCRATCHPAD = 3;
   MEMORY_LEVEL_DRAM = 4;
 }
 
-// A TensorBox has exactly one physical memory location.
-//
-// address may be absent before physical memory mapping. For a banked TensorBox,
+// A TensorBox has exactly one physical memory location. For a banked TensorBox,
 // address is the base address of bank 0.
 message Memory {
   MemoryLevel level = 1;
@@ -72,11 +70,15 @@ enum ScalarType {
 //   1. A literal value encoded directly in the protobuf.
 //   2. A reference to a dynamically computed scalar SSA value.
 //
-// ref may identify:
+// node may identify:
 //
 //   - an Operation scalar output;
 //   - a loop induction variable;
 //   - a loop-carried scalar argument.
+//
+// type is set on a reference, whose value is computed elsewhere, so that what
+// it is does not have to be looked up there. A literal is typed by the arm it
+// sets and leaves it unspecified.
 message ScalarValue {
   oneof value {
     string node = 1;
@@ -84,6 +86,8 @@ message ScalarValue {
     double float_value = 3;
     bool bool_value = 4;
   }
+
+  ScalarType type = 5;
 }
 
 message ScalarValueList {
