@@ -26,11 +26,13 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_conv2d,
     quant_param_arg_nodes,
+    reduction_op,
     reduction_scratch,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
 )
+from voyager_compiler.codegen.subgraph import copy_graph_module
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     commit,
@@ -1316,9 +1318,9 @@ def _map_kernel(
     kernel, writing each result straight into its output bank.  Every num_k == 1
     op uses this; the reduction case uses ``_reduction_fused_kernel``.
 
-    ``num_scratch`` trailing refs are accepted and ignored: a map computes
-    nothing across tiles, so its scratch is space reserved for the backend's
-    own intermediates, which no FX node reads or writes.
+    ``num_scratch`` trailing refs are handed to ``compute`` after the input
+    tiles: a map computes nothing across tiles, so its scratch is space the
+    backend's own passes write, which the op names but never reads.
 
     ``async_pipeline=False`` returns the synchronous :class:`PipelinedKernel`
     kernel (``kernel(grid_index, *in_banks, *out_banks)``, insert inline).
@@ -1335,7 +1337,7 @@ def _map_kernel(
         end = len(args) - num_scratch
         in_banks = args[: end - num_outputs]
         out_banks = args[end - num_outputs : end]
-        results = compute(*in_banks)
+        results = compute(*in_banks, *args[end:])
         if not isinstance(results, (tuple, list)):
             results = (results,)
         for bank, value in zip(out_banks, results):
@@ -2164,6 +2166,43 @@ def _apply_relayout(node, *seqs, invert=False):
     return tuple(tuple(s[p] for p in perm) for s in seqs)
 
 
+def _naming_scratch(submod, names):
+    """``submod`` with its batched reduction retargeted at the twin that names
+    the scratch, taking one extra placeholder per region appended to the
+    operands.  Returned unchanged when the group holds no such reduction; the
+    original is never mutated (it is the graph's ``meta['submodule']``)."""
+    if not names:
+        return submod
+    gm = copy_graph_module(submod)
+    reduction = next(
+        (n for n in gm.graph.nodes if reduction_op(n) is not None), None
+    )
+    if reduction is None:
+        return submod
+
+    # The scratch placeholders have to come last in the signature (the kernel
+    # passes them after the loaded tiles) *and* before the reduction that reads
+    # them.  Export can leave a lifted constant placeholder after the compute,
+    # so gather the block to the front before appending to it.
+    phs = [p for p in gm.graph.nodes if p.op == "placeholder"]
+    anchor = phs[0]
+    for ph in phs[1:]:
+        anchor.append(ph)
+        anchor = ph
+
+    extra = []
+    for name in names:
+        with gm.graph.inserting_after(anchor):
+            anchor = gm.graph.placeholder(f"scratch_{name}")
+        extra.append(anchor)
+
+    reduction.target = reduction_op(reduction)
+    reduction.kwargs = {**reduction.kwargs, **dict(zip(names, extra))}
+    gm.graph.lint()
+    gm.recompile()
+    return gm
+
+
 def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
@@ -2185,6 +2224,23 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     val = node.value
     outputs = val if isinstance(val, (list, tuple)) else (val,)
 
+    output_shape = tuple(outputs[-1].shape)
+    if tiling is None:
+        tiling = (1,) * len(output_shape)
+    grid = tuple(tiling)
+    # ``compute_output_tiled_shapes`` dices each output by ``tiling``, with the
+    # sparse-output handling a per-output ``compute_tiled_shape`` would miss.
+    tiled_shape = compute_output_tiled_shapes(node, tiling)
+    tiled_shape = (
+        list(tiled_shape)
+        if isinstance(node.value, (list, tuple))
+        else [tiled_shape]
+    )
+    # The regions the backend keeps between its passes.  The kernel hands them
+    # to the op, which names them and never reads them.
+    scratch = reduction_scratch(node, tiled_shape, tiler.config.vector_lanes)
+    scratch_names = [name for name, _, _ in scratch]
+
     if node.op == "call_module":
         submod = node.meta.get("submodule")
         if not isinstance(submod, torch.fx.GraphModule):
@@ -2198,7 +2254,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
             for cb in quant_param_arg_nodes(sn):
                 codebooks.add(cb.meta.get("source_node", cb))
 
-        compute = submod
+        compute = _naming_scratch(submod, scratch_names)
 
     else:
         # Resolve each op arg to a loaded-tile index (tensor operand) or a plain
@@ -2216,10 +2272,14 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
         }
         op_args = [_plain(a) for a in node.args]
         op_kwargs = {k: _plain(v) for k, v in node.kwargs.items()}
-        op = node.target
+        # A batched reduction is traced against the twin that names its
+        # scratch, which takes the same operands plus one keyword per region.
+        op = reduction_op(node) or node.target
         codebooks = quant_param_arg_nodes(node)
+        n_scratch = len(scratch_names)
 
         def compute(*tiles):
+            end = len(tiles) - n_scratch
             args = [
                 tiles[i] if i is not None else a
                 for i, a in zip(arg_slots, op_args)
@@ -2228,20 +2288,8 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
                 k: tiles[i] if i is not None else op_kwargs[k]
                 for k, i in kw_slots.items()
             }
+            kwargs.update(zip(scratch_names, tiles[end:]))
             return op(*args, **kwargs)
-
-    output_shape = tuple(outputs[-1].shape)
-    if tiling is None:
-        tiling = (1,) * len(output_shape)
-    grid = tuple(tiling)
-    # ``compute_output_tiled_shapes`` dices each output by ``tiling``, with the
-    # sparse-output handling a per-output ``compute_tiled_shape`` would miss.
-    tiled_shape = compute_output_tiled_shapes(node, tiling)
-    tiled_shape = (
-        list(tiled_shape)
-        if isinstance(node.value, (list, tuple))
-        else [tiled_shape]
-    )
 
     if node.target in (
         torch.ops.aten.transpose.int,
@@ -2269,10 +2317,7 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    scratch_specs = [
-        _ScratchSpec(shape, dtype)
-        for shape, dtype in reduction_scratch(node, tiled_shape)
-    ]
+    scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
     kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,

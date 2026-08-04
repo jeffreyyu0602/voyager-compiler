@@ -163,15 +163,7 @@ def _tensor_bytes(node, shape, bank_width=None, vector_lanes=None):
     return None
 
 
-def scratchpad_bytes(
-    node,
-    tiled_shapes,
-    bank_width,
-    bank_size,
-    num_banks,
-    extra_sharing=0,
-    vector_lanes=None,
-):
+def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
     """Scratchpad bytes one candidate tile occupies.
 
     Every group takes a whole bank, since a bank cannot be split, and the two
@@ -184,13 +176,11 @@ def scratchpad_bytes(
     Args:
         node: The op being tiled; its own entry is the output.
         tiled_shapes: Operand FX node -> tiled shape.
-        bank_width: Per-tensor alignment, bytes.
-        bank_size: Bytes per bank; ``None`` is unbanked, so just sum.
-        num_banks: Banks available to merge down to.
+        config (AcceleratorConfig): The hardware description -- bank width and
+            size, the bank count to merge down to, and the vector lanes.
         extra_sharing: Merge this many groups further.  ``G`` groups floor the
             footprint at ``G * bank_size``, so at ``G == num_banks`` no tile
             fits however small and the caller has to raise it.
-        vector_lanes: Sparse-output alignment, elements.
 
     Returns:
         Bytes the tile needs with every group rounded to whole banks.
@@ -213,42 +203,48 @@ def scratchpad_bytes(
             shape = tiled_shapes[n]
             if shape is None or not require_allocation(n):
                 continue
-            total += _tensor_bytes(n, shape, bank_width, vector_lanes)
+            total += _tensor_bytes(
+                n, shape, config.bank_width, config.vector_lanes
+            )
         if total:
             sizes.append(total)
 
     # No DMA moves the reserved regions, so they share one bank rather than
     # taking one apiece.
     reserved = sum(
-        _align_size(math.prod(shape) * dtype_byte_size(dtype), bank_width)
-        for shape, dtype in reduction_scratch(node, tiled_shapes[node])
+        _align_size(
+            math.prod(shape) * dtype_byte_size(dtype), config.bank_width
+        )
+        for _, shape, dtype in reduction_scratch(
+            node, tiled_shapes[node], config.vector_lanes
+        )
     )
     if reserved:
         sizes.append(reserved)
 
     if not sizes:
         return 0
-    if not bank_size:
+    if not config.bank_size:
         return sum(sizes)
 
     target = len(sizes)
-    if num_banks:
-        target = num_banks
+    if config.num_banks:
+        target = config.num_banks
     target = max(1, target - extra_sharing)
     while len(sizes) > target:
         sizes.sort()
         sizes = [sizes[0] + sizes[1]] + sizes[2:]
 
-    return sum(math.ceil(s / bank_size) * bank_size for s in sizes)
+    return sum(
+        math.ceil(s / config.bank_size) * config.bank_size for s in sizes
+    )
 
 
 def _search_tiling(
     node,
     full_shape,
     shape_builder_fn,
-    cache_size,
-    num_banks,
-    bank_width,
+    config,
     order=None,
     last_dim=None,
     multiple_of=None,
@@ -261,8 +257,8 @@ def _search_tiling(
     merged while they outnumber the banks).
 
     ``get_valid_tiling`` yields candidates largest -> smallest.  Without
-    ``cost_fn`` the first tiling that fits in ``cache_size`` wins (the largest
-    fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
+    ``cost_fn`` the first tiling that fits ``config.scratchpad_size`` wins (the
+    largest fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
     tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every fitting candidate
     is scored and the one moving the fewest bytes wins among those within
     ``(1 + tolerance)`` of the best latency.  Latency alone is not enough: a
@@ -271,7 +267,6 @@ def _search_tiling(
     rounding error.  This is how the interstellar tiler picks a mapping too
     (``mapping_point_generator``, with energy in place of bytes).
     """
-    bank_size = None if num_banks is None else cache_size // num_banks
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
     # footprint at ``G * bank_size``: with as many groups as banks nothing
@@ -288,15 +283,10 @@ def _search_tiling(
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
             total_size = scratchpad_bytes(
-                node,
-                tiled_shapes,
-                bank_width,
-                bank_size,
-                num_banks,
-                extra_sharing,
+                node, tiled_shapes, config, extra_sharing
             )
 
-            if total_size > cache_size:
+            if total_size > config.scratchpad_size:
                 continue
 
             if cost_fn is None:
@@ -312,7 +302,9 @@ def _search_tiling(
                 key=lambda s: (s[1], s[0]),
             )[2]
 
-    logger.debug(f"Failed to tile {node} with cache size {cache_size}.")
+    logger.debug(
+        f"Failed to tile {node} with cache size {config.scratchpad_size}."
+    )
     return None
 
 
@@ -541,9 +533,7 @@ def gemv_op_tiling(node, config):
         full_shape=(X, C, K),
         multiple_of=(block_size, math.lcm(config.vector_lanes, head_dim or 1)),
         shape_builder_fn=_build_gemv_shape_map,
-        cache_size=config.scratchpad_size,
-        num_banks=config.num_banks,
-        bank_width=config.bank_width,
+        config=config,
         cost_fn=(
             partial(gemv_tile_latency, config=config)
             if config.dram_bandwidth is not None
@@ -691,9 +681,7 @@ def vector_op_tiling(node, config):
         multiple_of=multiple_of,
         last_dim=last_dim,
         shape_builder_fn=_build_vector_op_shape_map,
-        cache_size=config.scratchpad_size,
-        num_banks=config.num_banks,
-        bank_width=config.bank_width,
+        config=config,
         cost_fn=cost_fn,
     )
     if tile_sizes is None:
@@ -849,9 +837,7 @@ def pool_op_tiling(node, config):
         multiple_of=multiple_of,
         order=order,
         shape_builder_fn=shape_builder_fn,
-        cache_size=config.scratchpad_size,
-        num_banks=config.num_banks,
-        bank_width=config.bank_width,
+        config=config,
     )
     if tile_sizes is None:
         raise RuntimeError(

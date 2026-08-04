@@ -484,6 +484,7 @@ _QUANTIZED_COMPUTE_OPS = (
     "quantize",
     "quantize_mx",
     "quantize_mx_outlier",
+    "softmax",
     "spmm_csr",
     "vmap",
 )

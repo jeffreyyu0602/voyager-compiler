@@ -32,6 +32,7 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
+    reduction_op,
     reduction_scratch,
 )
 from voyager_compiler.codegen.subgraph import (
@@ -832,7 +833,7 @@ def bufferize_graph(
             ):
                 # Untiled / interstellar-skipped op (FC batch-1, depthwise conv,
                 # a shape-changing reshape/slice): bufferize whole (trip-1).
-                built = _build_for_untiled(node)
+                built = _build_for_untiled(node, tiler)
                 if built is None:
                     continue  # getitem / non-tensor: nothing to load/store
                 sub_gm, n_out = built
@@ -982,7 +983,7 @@ _RELAYOUT_POINTWISE_OPS = {
 }
 
 
-def _build_for_untiled(node: Node):
+def _build_for_untiled(node: Node, tiler):
     """Bufferize an untiled op through the pipeline scheduler with *whole-tensor*
     tiles: a single-step ``PipelinedKernel`` (grid ``(1,)``) that DMA-loads each
     tiled input whole, runs the op, and stores each output whole — no tiling
@@ -993,8 +994,14 @@ def _build_for_untiled(node: Node):
     op-agnostic — it works for shape-changing ops (``reshape`` / ``slice``)
     where the elementwise-alignment spec of ``build_pointwise`` would not.
 
-    Returns ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to
-    load/store (``getitem``, a non-tensor output).
+    Args:
+        node: The op to bufferize whole.
+        tiler: Interstellar ``TilerContext``; its ``config`` describes the
+            hardware, as it does for the tiled builders.
+
+    Returns:
+        ``(sub_gm, n_outputs)``, or ``None`` for nodes with nothing to
+        load/store (``getitem``, a non-tensor output).
     """
     if node.target is operator.getitem:
         return None
@@ -1024,7 +1031,12 @@ def _build_for_untiled(node: Node):
 
     arg_tmpl = [_resolve(a) for a in node.args]
     kw_tmpl = {k: _resolve(v) for k, v in node.kwargs.items()}
-    op = node.target
+    # A batched reduction is traced against the twin that names its scratch,
+    # which takes the same operands plus one keyword per region.
+    op = reduction_op(node) or node.target
+    scratch = reduction_scratch(node, node.shape, tiler.config.vector_lanes)
+    scratch_names = [name for name, _, _ in scratch]
+    n_scratch = len(scratch_names)
 
     def _fill(t, tiles):
         if isinstance(t, list):
@@ -1033,8 +1045,10 @@ def _build_for_untiled(node: Node):
         return tiles[value] if is_index else value
 
     def compute(*tiles):
+        end = len(tiles) - n_scratch
         args = [_fill(t, tiles) for t in arg_tmpl]
         kwargs = {k: _fill(t, tiles) for k, t in kw_tmpl.items()}
+        kwargs.update(zip(scratch_names, tiles[end:]))
         return op(*args, **kwargs)
 
     grid = (1,)
@@ -1054,10 +1068,7 @@ def _build_for_untiled(node: Node):
         _OutputSpec(tuple(o.shape), tuple(o.shape), (0,) * o.ndim, o.dtype)
         for o in outputs
     ]
-    scratch_specs = [
-        _ScratchSpec(shape, dtype)
-        for shape, dtype in reduction_scratch(node, node.shape)
-    ]
+    scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
     kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,

@@ -687,15 +687,34 @@ def _align_size(size, width):
     return (size + width - 1) // width * width
 
 
-# The batched reductions whose backend kernel keeps intermediates on chip, and
-# how many regions each needs beyond the statistics it reduces to: softmax
-# holds a max and a sum, layer_norm a mean and a variance plus a whole tile for
-# the normalized result.
+# The batched reductions whose backend kernel keeps intermediates on chip:
+# the ``quantized_ops`` twin that names them, the regions reduced to one
+# element per row, and the ones as big as the tile itself.  A softmax holds a
+# max and a sum, a layer_norm a mean and a variance plus the normalized tile.
 _REDUCTION_SCRATCH = {
-    aten.softmax.int: 0,
-    aten.layer_norm.default: 1,
-    torch.ops.quantized_ops.layer_norm.default: 1,
+    aten.softmax.int: (
+        torch.ops.quantized_ops.softmax.default,
+        ("max", "sum"),
+        (),
+    ),
+    aten.layer_norm.default: (
+        torch.ops.quantized_ops.layer_norm.default,
+        ("mean", "variance"),
+        ("normalized",),
+    ),
+    torch.ops.quantized_ops.layer_norm.default: (
+        torch.ops.quantized_ops.layer_norm.default,
+        ("mean", "variance"),
+        ("normalized",),
+    ),
 }
+
+
+def reduction_op(node):
+    """The ``quantized_ops`` op that names ``node``'s scratch, or ``None`` if
+    ``node`` is not a batched reduction that keeps any."""
+    entry = _REDUCTION_SCRATCH.get(node.target)
+    return entry[0] if entry else None
 
 
 def _reduced_dims(node, ndim: int) -> set:
@@ -706,7 +725,7 @@ def _reduced_dims(node, ndim: int) -> set:
     return set(range(ndim - len(normalized_shape), ndim))
 
 
-def reduction_scratch(node, out_tile):
+def reduction_scratch(node, out_tile, vector_lanes):
     """The on-chip regions the backend keeps beside a batched reduction's own
     tile: a softmax's max and sum, a layer_norm's mean and variance plus its
     normalized output.
@@ -724,12 +743,17 @@ def reduction_scratch(node, out_tile):
             multi-output op names its iteration space with the last (the
             shape-preserving one; a microscaling scale or a CSR index is
             derived from it).
+        vector_lanes: Lanes the vector unit reduces into.  A statistic is one
+            value per row, but the unit addresses a whole lane group at a
+            time, so it is held duplicated across the lanes and the reduced
+            dims collapse to ``vector_lanes`` rather than to 1.
 
     Returns:
-        ``[(shape, dtype), ...]``, one per region: the tile with its reduced
-        dims collapsed to 1 for a statistic, the whole tile for layer_norm's
-        normalized output, each in the *physical* dtype of the op's input
-        tensor (never the logical dtype in ``meta``).
+        ``[(name, shape, dtype), ...]``, one per region, named as the op's
+        keyword takes it: the tile with its reduced dims collapsed to a lane
+        group for a statistic, the whole tile for layer_norm's normalized
+        output, each in the *physical* dtype of the op's input tensor (never
+        the logical dtype in ``meta``).
     """
     submod = node.meta.get("submodule") if node.op == "call_module" else None
     ops = submod.graph.nodes if submod is not None else [node]
@@ -741,11 +765,17 @@ def reduction_scratch(node, out_tile):
 
     scratch = []
     for op in ops:
-        extra = _REDUCTION_SCRATCH.get(op.target)
-        if extra is None:
+        entry = _REDUCTION_SCRATCH.get(op.target)
+        if entry is None:
             continue
+        _, rows, tiles = entry
         reduced = _reduced_dims(op, len(tile))
-        row = tuple(1 if i in reduced else s for i, s in enumerate(tile))
+        innermost = max(reduced)
+        row = tuple(
+            (vector_lanes if i == innermost else 1) if i in reduced else s
+            for i, s in enumerate(tile)
+        )
         dtype = get_arg_value(op, 0, "input").value.dtype
-        scratch += [(row, dtype)] * 2 + [(tile, dtype)] * extra
+        scratch += [(name, row, dtype) for name in rows]
+        scratch += [(name, tile, dtype) for name in tiles]
     return scratch

@@ -16,9 +16,16 @@ quantized_ops_lib = Library("quantized_ops", "DEF")
 # just created, before any importer references them.
 from voyager_compiler.ops import layout as _register_layout  # noqa: E402,F401
 
+# ``mean`` / ``variance`` / ``normalized`` are the on-chip regions the
+# accelerator keeps between its passes over the data.  The graph never reads
+# them, so eager ignores them; naming them on the op is what tells the backend
+# which bytes are its to write (see ``reduction_scratch``).
 quantized_ops_lib.define(
     "layer_norm(Tensor input, SymInt[] normalized_shape, Tensor? weight=None, "
-    "Tensor? bias=None, float eps=1e-05, bool cudnn_enable=True) -> Tensor"
+    "Tensor? bias=None, float eps=1e-05, bool cudnn_enable=True, "
+    "Tensor(a!)? mean=None, Tensor(b!)? variance=None, "
+    "Tensor(c!)? normalized=None) "
+    "-> Tensor"
 )
 
 
@@ -30,12 +37,16 @@ def layer_norm(
     bias: Optional[torch.Tensor] = None,
     eps: float = 1e-5,
     cudnn_enable: bool = True,
+    mean: Optional[torch.Tensor] = None,
+    variance: Optional[torch.Tensor] = None,
+    normalized: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    k = normalized_shape[-1]
     output = torch.ops.aten.layer_norm.default(
-        input[..., : normalized_shape[-1]],
+        input[..., :k],
         normalized_shape,
-        weight[..., : normalized_shape[-1]],
-        bias[..., : normalized_shape[-1]],
+        None if weight is None else weight[..., :k],
+        None if bias is None else bias[..., :k],
         eps,
         cudnn_enable,
     )
@@ -44,6 +55,28 @@ def layer_norm(
         output, (0, input.shape[-1] - normalized_shape[-1])
     )
     return output
+
+
+quantized_ops_lib.define(
+    "softmax(Tensor input, int dim, ScalarType? dtype=None, "
+    "Tensor(a!)? max=None, Tensor(b!)? sum=None) -> Tensor"
+)
+
+
+@impl(quantized_ops_lib, "softmax", "CompositeExplicitAutograd")
+def softmax(
+    input: torch.Tensor,
+    dim: int,
+    dtype: Optional[torch.dtype] = None,
+    max: Optional[torch.Tensor] = None,
+    sum: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``aten.softmax`` that also names its on-chip scratch.
+
+    ``max`` and ``sum`` are the row statistics the accelerator holds between
+    its passes; eager computes the softmax in one go and ignores them.
+    """
+    return torch.ops.aten.softmax.int(input, dim, dtype)
 
 
 def expand(input, shape, block_size):
