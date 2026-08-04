@@ -659,3 +659,67 @@ def _align_size(size, width):
     if width is None:
         return size
     return (size + width - 1) // width * width
+
+
+# The batched reductions whose backend kernel keeps intermediates on chip, and
+# how many regions each needs beyond the statistics it reduces to: softmax
+# holds a max and a sum, layer_norm a mean and a variance plus a whole tile for
+# the normalized result.
+_REDUCTION_SCRATCH = {
+    aten.softmax.int: 0,
+    aten.layer_norm.default: 1,
+    torch.ops.quantized_ops.layer_norm.default: 1,
+}
+
+
+def _reduced_dims(node, ndim: int) -> set:
+    """The dims ``node`` reduces over, as non-negative indices."""
+    if node.target is aten.softmax.int:
+        return {get_arg_value(node, 1, "dim", -1) % ndim}
+    normalized_shape = get_arg_value(node, 1, "normalized_shape") or ()
+    return set(range(ndim - len(normalized_shape), ndim))
+
+
+def reduction_scratch(node, out_tile):
+    """The on-chip regions the backend keeps beside a batched reduction's own
+    tile: a softmax's max and sum, a layer_norm's mean and variance plus its
+    normalized output.
+
+    No FX node names them -- the graph goes straight from input tile to output
+    tile -- so they are reserved rather than computed.  ``node`` may be a bare
+    op or a fused ``call_module``, whose whole submodule is scanned: a group's
+    reduction is not always its anchor.  Fusion normalizes a group onto its
+    anchor's shape, and a reduction *is* a strong anchor, so one tile of the
+    output is the tile the reduction reduces.
+
+    Args:
+        node: The op being bufferized or tiled.
+        out_tile: One tile of ``node``'s output, or one per output -- a
+            multi-output op names its iteration space with the last (the
+            shape-preserving one; a microscaling scale or a CSR index is
+            derived from it).
+
+    Returns:
+        ``[(shape, dtype), ...]``, one per region: the tile with its reduced
+        dims collapsed to 1 for a statistic, the whole tile for layer_norm's
+        normalized output, each in the *physical* dtype of the op's input
+        tensor (never the logical dtype in ``meta``).
+    """
+    submod = node.meta.get("submodule") if node.op == "call_module" else None
+    ops = submod.graph.nodes if submod is not None else [node]
+    if not out_tile:  # no tile to reduce: a scalar, or a non-tensor result
+        return []
+    if isinstance(out_tile[0], (tuple, list)):
+        out_tile = out_tile[-1]
+    tile = tuple(out_tile)
+
+    scratch = []
+    for op in ops:
+        extra = _REDUCTION_SCRATCH.get(op.target)
+        if extra is None:
+            continue
+        reduced = _reduced_dims(op, len(tile))
+        row = tuple(1 if i in reduced else s for i, s in enumerate(tile))
+        dtype = get_arg_value(op, 0, "input").value.dtype
+        scratch += [(row, dtype)] * 2 + [(tile, dtype)] * extra
+    return scratch

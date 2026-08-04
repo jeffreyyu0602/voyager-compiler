@@ -32,6 +32,7 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
+    reduction_scratch,
 )
 from voyager_compiler.codegen.subgraph import (
     replace_node_with_graph_module,
@@ -60,6 +61,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _InputSpec,
     _OutputSpec,
     _passed_whole,
+    _ScratchSpec,
     _subgraph,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
@@ -1052,8 +1054,18 @@ def _build_for_untiled(node: Node):
         _OutputSpec(tuple(o.shape), tuple(o.shape), (0,) * o.ndim, o.dtype)
         for o in outputs
     ]
-    kernel = _map_kernel(compute, len(outputs))
+    scratch_specs = [
+        _ScratchSpec(shape, dtype)
+        for shape, dtype in reduction_scratch(node, node.shape)
+    ]
+    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
-        kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=1
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        tuple(inputs),
+        scratch_specs=scratch_specs,
+        num_banks=1,
     )
     return gm, len(outputs)

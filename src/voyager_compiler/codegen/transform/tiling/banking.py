@@ -12,79 +12,32 @@ from voyager_compiler.codegen.node_info import (
     get_node_to_key_map,
     is_gemm_op,
     quant_param_arg_nodes,
+    reduction_scratch,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _find_user_target(node: torch.fx.Node, targets):
-    for user in node.users:
-        if user.target in targets and user.args[0] == node:
-            return user.target
+def compute_tensor_size(node, shape, bank_width=None, vector_lanes=None):
+    """Bytes one tile of ``node`` occupies, aligned to ``bank_width``.
 
-        # Check for users of fused dequantization nodes
-        if (
-            user.target == torch.ops.quantized_ops.dequantize.default
-            and user.meta.get("fused") is True
-        ):
-            found = _find_user_target(user, targets)
-            if found is not None:
-                return found
-
-        if user.op == "call_module":
-            gm = user.meta["submodule"]
-            placeholders = [n for n in gm.graph.nodes if n.op == "placeholder"]
-            idx = next(i for i, arg in enumerate(user.args) if arg is node)
-            found = _find_user_target(placeholders[idx], targets)
-            if found is not None:
-                return found
-
-    return None
-
-
-ALLOC_TARGETS = (
-    torch.ops.aten.conv2d.default,
-    torch.ops.quantized_ops.conv2d.default,
-    torch.ops.aten.softmax.int,
-    torch.ops.aten.layer_norm.default,
-)
-
-
-def compute_tensor_size(
-    node, shape, is_output=False, bank_width=None, vector_lanes=None
-):
+    Args:
+        node: The operand the tile belongs to.
+        shape: Its tiled shape -- one per output for a multi-output op.
+        bank_width: Per-tensor alignment, bytes.
+        vector_lanes: Sparse-output alignment, elements.
+    """
     val = node.value
     if isinstance(val, torch.Tensor):
         dtype = node.meta.get("dtype") or val.dtype
-        numel = math.prod(shape) if shape is not None else val.numel()
-        tensor_size = numel * dtype_byte_size(dtype)
-
-        target = _find_user_target(node, ALLOC_TARGETS)
-
-        # Extra space for a conv2d's replicated input, and for the
-        # intermediates a softmax / layer_norm keeps beside its own input.
-        if target in ALLOC_TARGETS[:2]:
-            dim = 1 if target == ALLOC_TARGETS[0] else -1
-            if val.shape[dim] == 3:
-                logger.debug(f"Increase space for conv2d input {node}")
-                tensor_size *= 3
-        elif not is_output:
-            if target == ALLOC_TARGETS[2]:
-                logger.debug(f"Increase space for softmax input {node}")
-                tensor_size = tensor_size * 2
-            elif target == ALLOC_TARGETS[3]:
-                logger.debug(f"Increase space for layer_norm input {node}")
-                tensor_size = (tensor_size + numel) * 2
-
-        return _align_size(tensor_size, bank_width)
+        return _align_size(
+            math.prod(shape) * dtype_byte_size(dtype), bank_width
+        )
 
     if isinstance(val, (tuple, list)):
-        if shape is not None:
-            numel = [math.prod(s) for s in shape]
-        else:
-            numel = [t.numel() for t in val]
+        numel = [math.prod(s) for s in shape]
 
-        # Sparse outputs need to be aligned with hardware unroll dimension
+        # Sparse outputs need to be aligned with fetch width
         if vector_lanes is not None:
             numel = [_align_size(s, vector_lanes) for s in numel]
 
@@ -174,7 +127,8 @@ def scratchpad_bytes(
     smallest merge while the groups outnumber the banks.
     ``GEMV_BANK_GROUPS`` names one op's roles, so an operand it misses -- a
     ``where`` mask, what a fused tail brings of its own -- takes a bank of its
-    own.
+    own.  A batched reduction also holds intermediates the graph never names
+    (``reduction_scratch``), which the footprint has to carry too.
 
     Args:
         node: The op being tiled; its own entry is the output.
@@ -208,11 +162,18 @@ def scratchpad_bytes(
             shape = tiled_shapes[n]
             if shape is None or not require_allocation(n):
                 continue
-            total += compute_tensor_size(
-                n, shape, n is node, bank_width, vector_lanes
-            )
+            total += compute_tensor_size(n, shape, bank_width, vector_lanes)
         if total:
             sizes.append(total)
+
+    # No DMA moves the reserved regions, so they share one bank rather than
+    # taking one apiece.
+    reserved = sum(
+        _align_size(math.prod(shape) * dtype_byte_size(dtype), bank_width)
+        for shape, dtype in reduction_scratch(node, tiled_shapes[node])
+    )
+    if reserved:
+        sizes.append(reserved)
 
     if not sizes:
         return 0

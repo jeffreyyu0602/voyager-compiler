@@ -26,6 +26,7 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_conv2d,
     quant_param_arg_nodes,
+    reduction_scratch,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
@@ -1305,12 +1306,19 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
 
 
 def _map_kernel(
-    compute: Callable, num_outputs: int, async_pipeline: bool = False
+    compute: Callable,
+    num_outputs: int,
+    num_scratch: int = 0,
+    async_pipeline: bool = False,
 ):
     """Map kernel (no cross-tile reduction): adapt a return-style
     ``compute(*in_banks) -> Tensor | tuple`` into the scheduler's mutate-style
     kernel, writing each result straight into its output bank.  Every num_k == 1
     op uses this; the reduction case uses ``_reduction_fused_kernel``.
+
+    ``num_scratch`` trailing refs are accepted and ignored: a map computes
+    nothing across tiles, so its scratch is space reserved for the backend's
+    own intermediates, which no FX node reads or writes.
 
     ``async_pipeline=False`` returns the synchronous :class:`PipelinedKernel`
     kernel (``kernel(grid_index, *in_banks, *out_banks)``, insert inline).
@@ -1324,8 +1332,9 @@ def _map_kernel(
     """
 
     def inner(grid_index, *args):
-        in_banks = args[: len(args) - num_outputs]
-        out_banks = args[len(args) - num_outputs :]
+        end = len(args) - num_scratch
+        in_banks = args[: end - num_outputs]
+        out_banks = args[end - num_outputs : end]
         results = compute(*in_banks)
         if not isinstance(results, (tuple, list)):
             results = (results,)
@@ -2159,8 +2168,11 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
     standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
-    writes each output tile once (no cross-tile reduction).  Returns the gm, or
-    ``None``.
+    writes each output tile once (no cross-tile reduction).
+
+    A batched reduction also reserves the on-chip regions its backend kernel
+    keeps beside its tiles (``reduction_scratch``); the kernel ignores them, so
+    the reservation *is* the declaration.  Returns the gm, or ``None``.
     """
     anchor = get_anchor_node(node)
     tiling = vector_op_tiling(node, tiler.config)
@@ -2257,9 +2269,19 @@ def build_pointwise(node, *, num_banks: int = _DEFAULT_NUM_BANKS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    kernel = _map_kernel(compute, len(outputs))
+    scratch_specs = [
+        _ScratchSpec(shape, dtype)
+        for shape, dtype in reduction_scratch(node, tiled_shape)
+    ]
+    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
-        kernel, grid, in_specs, out_specs, tuple(inputs), num_banks=num_banks
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        tuple(inputs),
+        scratch_specs=scratch_specs,
+        num_banks=num_banks,
     )
 
     if node.op == "call_module" and anchor is not None:
