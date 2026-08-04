@@ -40,20 +40,10 @@ OP_PASSES = {
     torch.ops.aten.softmax.int: 3,
 }
 
-
-def _val(node):
-    """The node's propagated tensor value; the largest tensor of a multi-output
-    node (e.g. ``quantize_mx`` -> ``(scale, quantized)``)."""
-    if not isinstance(node, Node):
-        return None
-    for v in (getattr(node, "value", None), node.meta.get("val")):
-        if isinstance(v, torch.Tensor):
-            return v
-        if isinstance(v, (tuple, list)):
-            tensors = [t for t in v if isinstance(t, torch.Tensor)]
-            if tensors:
-                return max(tensors, key=lambda t: t.numel())
-    return None
+# Cycles a tile costs the vector unit whatever it holds: instruction issue and
+# pipeline fill/drain.  Fixed per tile, so a tile too small to amortise it is
+# dominated by overhead.
+KERNEL_LAUNCH_OVERHEAD = 64
 
 
 def get_dtype_width(dtype) -> int:
@@ -105,15 +95,21 @@ def _node_dtype_bits(node, default: Optional[int] = None):
     return get_dtype_width(value.dtype)
 
 
-def vector_op_utilization(node, vector_lanes, bytes_per_cycle):
+def vector_op_utilization(
+    node, vector_lanes, bytes_per_cycle, ideal_cycles=None
+):
     """Fraction of peak a vector ``node`` sustains, bound by SRAM bandwidth.
 
     Peak is one ``vector_lanes``-wide lane group per cycle, fetched at the
     widest of the op's input / output element widths, once per pass it makes
-    over its data (softmax 3, layer_norm 4 -- see ``OP_PASSES``).  Tile-size
-    independent: it keys off dtype widths, the lane count, and the pass count
-    only, so the caller computes it once and reuses it across every candidate
-    tile.
+    over its data (softmax 3, layer_norm 4 -- see ``OP_PASSES``).
+
+    Given ``ideal_cycles`` -- what one tile would cost at 100% -- the fixed
+    ``KERNEL_LAUNCH_OVERHEAD`` is folded in, so that ``ideal_cycles / result``
+    is the bandwidth-bound cost *plus* the launch.  Utilization then falls as
+    the tile shrinks, collapsing to ``ideal_cycles / KERNEL_LAUNCH_OVERHEAD``
+    for a tile too small to amortise it; without it the answer depends only on
+    dtype widths, lanes and passes, and holds for every tile size.
 
     Everything not running on the matrix unit is a vector op, and all are
     bandwidth-bound the same way -- only the bytes fetched per lane group
@@ -133,14 +129,17 @@ def vector_op_utilization(node, vector_lanes, bytes_per_cycle):
         widths = [
             _node_dtype_bits(n)
             for n in [node, *node.all_input_nodes]
-            if _val(n) is not None
+            if n is node or require_allocation(n)
         ]
     # A multi-output node contributes one width per output.
     bits = [b for w in widths for b in (w if isinstance(w, list) else [w])]
     total_bytes = vector_lanes * max(bits, default=16) / 8
     num_passes = OP_PASSES.get(anchor.target, 1)
     fetch_cycles = num_passes * math.ceil(total_bytes / bytes_per_cycle)
-    return min(1.0, 1.0 / fetch_cycles)
+    util = min(1.0, 1.0 / fetch_cycles)
+    if not ideal_cycles:
+        return util
+    return ideal_cycles / (ideal_cycles / util + KERNEL_LAUNCH_OVERHEAD)
 
 
 def _operand_bytes(shape, node):
@@ -208,8 +207,9 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     tile_ops = max(_tile_elems(out_shape), in_elems)
     lanes = config.vector_lanes
     bpc = config.bytes_per_cycle
-    util = vector_op_utilization(node, lanes, bpc)
-    compute = math.ceil(math.ceil(tile_ops / lanes) / util)
+    ideal = math.ceil(tile_ops / lanes)
+    util = vector_op_utilization(node, lanes, bpc, ideal)
+    compute = math.ceil(ideal / util)
 
     lat = config.access_latency_cycles
     # ``_sweep_cycles`` reads the store off the front.  An operand's dims
@@ -478,8 +478,9 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
         traffic += transfers * n_bytes
 
     lanes = config.vector_lanes
-    util = vector_op_utilization(node, lanes, bpc)
-    compute = math.ceil(math.ceil(math.prod(tile_sizes) / lanes) / util)
+    ideal = math.ceil(math.prod(tile_sizes) / lanes)
+    util = vector_op_utilization(node, lanes, bpc, ideal)
+    compute = math.ceil(ideal / util)
 
     steps = math.prod(grid)
     if config.double_buffered_l2:

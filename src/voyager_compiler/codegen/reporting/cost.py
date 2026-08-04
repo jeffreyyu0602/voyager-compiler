@@ -104,12 +104,16 @@ def op_utilization(
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
     ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
-    case, which it sizes by the streamed weight.
+    case, which it sizes by the streamed weight.  ``ideal_cycles`` is one
+    tile's, so it also folds in the per-launch overhead the tiling model
+    charges, and the two cannot disagree on what a tile costs.
     """
     per_tile = node.meta.get("per_tile_cycles")
     if "mma" in units and per_tile and ideal_cycles > 0:
         return min(1.0, ideal_cycles / per_tile)
-    return vector_op_utilization(node, cost.vector_lanes, cost.bytes_per_cycle)
+    return vector_op_utilization(
+        node, cost.vector_lanes, cost.bytes_per_cycle, ideal_cycles
+    )
 
 
 # --------------------------------------------------------------------------
