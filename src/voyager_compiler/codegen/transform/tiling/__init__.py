@@ -6,7 +6,6 @@ matrix unit runs.  Nothing here imports ``bufferize`` — the dependency runs
 one way, so the builders can ask for a tiling without a cycle.
 """
 
-from voyager_compiler.codegen.transform.tiling.banking import scratchpad_bytes
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_tile_latency,
     vector_op_utilization,
@@ -38,7 +37,6 @@ __all__ = [
     "get_tiling",
     "pool_op_tiling",
     "prefetch_tilings",
-    "scratchpad_bytes",
     "vector_op_tiling",
     "vector_op_utilization",
     "vector_tile_latency",

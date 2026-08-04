@@ -23,12 +23,11 @@ import interstellar
 from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
+    get_node_to_key_map,
     is_fully_connected,
-    weight_transforms,
-)
-from voyager_compiler.codegen.transform.tiling.banking import (
-    operand_roles,
+    is_gemm_op,
     require_allocation,
+    weight_transforms,
 )
 
 le = interstellar.le
@@ -247,6 +246,27 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
 # reduction holds its tile across it, and one that misses the output block as
 # well holds it for the entire kernel.  Whatever a fused tail brings of its own
 # has no role and is diced by the output block, like the output.
+def operand_roles(node) -> dict:
+    """Each operand FX node -> the role it plays, for the tables below and for
+    grouping into banks.
+
+    A fused ``call_module``'s operands have no roles of their own, so read them
+    off the anchor: ``get_node_to_key_map`` traces each placeholder back through
+    ``meta['source_node']`` to the outer node the shape map is keyed by.  What
+    the tail brought of its own the anchor never reads, so it stays unnamed and
+    takes a bank of its own.  A bare node is its own anchor.
+    """
+    anchor = get_anchor_node(node)
+    if not is_gemm_op(anchor):
+        return {}
+    roles = get_node_to_key_map(anchor)
+    # The output is named on the outer node -- what the shape map keys it by --
+    # in place of the anchor's own entry, which is inside the submodule.
+    del roles[anchor]
+    roles[node] = "output"
+    return roles
+
+
 _GEMV_GRID_DIMS = {
     "input": (le.OX, le.IC),
     "input_scale": (le.OX, le.IC),

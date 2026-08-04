@@ -54,6 +54,7 @@ from voyager_compiler.codegen.node_info import (
     QMAP_PARAMS,
     is_nop,
     quant_param_arg_nodes,
+    require_allocation,
 )
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _is_compute,
@@ -63,9 +64,6 @@ from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
-)
-from voyager_compiler.codegen.transform.tiling.banking import (
-    require_allocation,
 )
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,

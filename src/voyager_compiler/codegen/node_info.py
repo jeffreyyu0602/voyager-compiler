@@ -92,6 +92,32 @@ def quant_param_arg_nodes(node: Node, params: set = QUANT_PARAMS) -> set:
     return result
 
 
+def require_allocation(node: torch.fx.Node) -> bool:
+    """Whether ``node`` needs storage allocated for it.
+
+    Three kinds do not, because they are programmed into the instruction that
+    reads them rather than fetched from an address: a quantization lookup
+    table, a non-tensor value, and a single-element parameter.
+    """
+    for user in node.users:
+        gm = user.meta.get("submodule")
+        for op in gm.graph.nodes if gm is not None else [user]:
+            params = quant_param_arg_nodes(op)
+            if any(p.meta.get("source_node", p) is node for p in params):
+                return False
+
+    if (val := getattr(node, "value", None)) is None:
+        return True
+
+    if not isinstance(val, torch.Tensor):
+        return False
+
+    if node.op in ["placeholder", "get_attr"] and val.numel() == 1:
+        return False
+
+    return True
+
+
 # --------------------------------------------------------------------------
 # Op-kind predicates
 # --------------------------------------------------------------------------
