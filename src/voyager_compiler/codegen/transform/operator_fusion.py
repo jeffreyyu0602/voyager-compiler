@@ -593,6 +593,7 @@ def _fuse_dequantize_recursive(
         in [
             torch.ops.aten.layer_norm.default,
             torch.ops.aten.softmax.int,
+            torch.ops.quantized_ops.layer_norm.default,
         ]
     ):
         fused_nodes = duplicate_shared_nodes(graph, fused_nodes)

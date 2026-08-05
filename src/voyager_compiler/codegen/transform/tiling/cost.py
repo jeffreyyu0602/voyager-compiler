@@ -38,6 +38,8 @@ le = interstellar.le
 OP_PASSES = {
     torch.ops.aten.layer_norm.default: 4,
     torch.ops.aten.softmax.int: 3,
+    torch.ops.quantized_ops.layer_norm.default: 4,
+    torch.ops.quantized_ops.softmax.default: 3,
 }
 
 # Cycles a tile costs the vector unit whatever it holds: instruction issue and
@@ -139,7 +141,9 @@ def vector_op_utilization(
     util = min(1.0, 1.0 / fetch_cycles)
     if not ideal_cycles:
         return util
-    return ideal_cycles / (ideal_cycles / util + KERNEL_LAUNCH_OVERHEAD)
+    return ideal_cycles / (
+        ideal_cycles / util + num_passes * KERNEL_LAUNCH_OVERHEAD
+    )
 
 
 def _operand_bytes(shape, node):

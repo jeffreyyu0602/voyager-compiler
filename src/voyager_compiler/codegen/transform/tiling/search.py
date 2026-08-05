@@ -594,7 +594,10 @@ def _vector_op_tiling_limits(node, vector_unit_width):
     multiple_of = (vector_unit_width,)
     if node.target == torch.ops.aten.softmax.int:
         last_dim = get_arg_value(node, 1, "dim", -1)
-    elif node.target == torch.ops.aten.layer_norm.default:
+    elif node.target in [
+        torch.ops.aten.layer_norm.default,
+        torch.ops.quantized_ops.layer_norm.default,
+    ]:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
