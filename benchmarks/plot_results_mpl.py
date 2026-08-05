@@ -8,7 +8,7 @@ in a hatched black-edged paper style instead of Excel's:
   sweep group and mode;
 * one stacked DRAM Weight / Activation / KV breakdown (GB) beside it;
 * one stacked per-module compute / overlap / memory / stall breakdown
-  (million cycles) per baseline sheet.
+  (million cycles), prefill over decode, out of the two baseline sheets.
 
 Nothing here imports the benchmarks package: the workbook carries the group
 column and the chart titles, so the sweep definitions do not have to be
@@ -20,6 +20,7 @@ repeated.
 """
 
 import argparse
+import difflib
 import os
 import re
 from functools import partial
@@ -46,14 +47,11 @@ CYCLES_PER_MCYCLE = 1e6
 FIGSIZE = (10.0, 3.8)
 BAR_WIDTH = 0.30
 EDGE_WIDTH = 1.0
-LABEL_PT = 24
-TICK_PT = 22
+HEADER_PT = 20
 TEXT_PT = 19
-TITLE_PT = 20
-# A merged prefill-over-decode figure: the per-mode label sits just under the
-# shared suptitle, with a small gap between the stacked panels -- wider when
-# the panels do not share an x-axis, so the upper one's labels clear the lower.
-PAIR_TITLE_PT = 20
+# A merged prefill-over-decode figure keeps a small gap between the stacked
+# panels -- wider when they do not share an x-axis, so the upper one's labels
+# clear the lower.
 PAIR_HSPACE = 0.05
 PAIR_HSPACE_UNSHARED = 0.1
 # Headroom above the top mark, leaving the value labels somewhere to go.  The
@@ -66,6 +64,9 @@ PAIR_HSPACE_UNSHARED = 0.1
 HEADROOM = 1.35
 LATENCY_HEADROOM = 1.45
 DRAM_HEADROOM = 1.12
+# A stack is labeled with its total and nothing above it, so it needs only
+# enough room for that one label -- even tilted upright on a crowded axis.
+STACK_HEADROOM = 1.18
 LOG_HEADROOM = 2.2
 LOG_FLOOR = 0.7
 
@@ -76,7 +77,6 @@ CROWDED_POINTS = 10
 LONG_LABEL = 10
 CROWDED_ROT = 40
 CROWDED_PT = 14
-CROWDED_HEADROOM = 1.6
 WIDTH_PER_POINT = 0.8
 MAX_WIDTH = 20.0
 
@@ -92,6 +92,12 @@ LINE_HEIGHT = 1.25
 # the digits readable where it does.
 HALO = [patheffects.withStroke(linewidth=2.5, foreground="white")]
 
+# A legend beside the axes is charged for its width: a swatch wide enough to
+# read the hatch, and no more, with the text close behind it (both in font
+# widths, matplotlib's unit for these).
+LEGEND_HANDLE = 1.2
+LEGEND_PAD = 0.5
+
 HATCHES = ("\\\\", "//", "xx", "..", "++", "oo")
 # Distinct enough in grayscale print; the hatch carries the series anyway.
 COLORS = ("#4F81BD", "#C0504D", "#9BBB59", "#8064A2", "#4BACC6", "#F79646")
@@ -102,12 +108,16 @@ DRAM_SERIES = (
     ("Activation", "dram_activation"),
     ("KV Cache", "dram_kv"),
 )
-# The stacked per-module breakdown, in stack order.
+# The stacked per-module breakdown, in stack order under the compute series --
+# which is named for the unit that runs it, and so differs by mode.
+MODULE_COMPUTE = {
+    "prefill": "Matrix Unit (64x64)",
+    "decode": "Vector Unit (64 wide)",
+}
 MODULE_SERIES = (
-    ("compute", "compute"),
-    ("compute memory overlap", "compute memory overlap"),
-    ("memory", "memory"),
-    ("stall", "stall"),
+    ("Overlap", "compute memory overlap"),
+    ("Memory (64 GB/s)", "memory"),
+    ("Stall", "stall"),
 )
 
 BASELINE_SHEETS = ("baseline_prefill", "baseline_decode")
@@ -124,7 +134,7 @@ def _layout(labels):
     if not crowded:
         return FIGSIZE, TEXT_PT, VALUE_PT, False
     width = min(MAX_WIDTH, max(FIGSIZE[0], WIDTH_PER_POINT * len(labels) + 4))
-    return (width, FIGSIZE[1] + 1.8), CROWDED_PT, CROWDED_VALUE_PT, True
+    return (width, FIGSIZE[1] + 0.8), CROWDED_PT, CROWDED_VALUE_PT, True
 
 
 def _bold_ticks(ax, labels, x, pt=TEXT_PT, crowded=False):
@@ -140,7 +150,7 @@ def _bold_ticks(ax, labels, x, pt=TEXT_PT, crowded=False):
         fontsize=pt,
         fontweight="bold",
     )
-    ax.tick_params(axis="y", labelsize=TICK_PT)
+    ax.tick_params(axis="y", labelsize=HEADER_PT)
     for lbl in ax.get_yticklabels():
         lbl.set_fontweight("bold")
 
@@ -179,10 +189,11 @@ def _frac(ax, value):
 
 
 def _label_bars(ax, bars, values, pt, color, rot=0):
-    """Value labels above ``bars``, in the bars' own color."""
+    """Value labels above ``bars``, in the bars' own color.  A bar of no height
+    is left unlabeled: there is no bar there to name."""
     ax.bar_label(
         bars,
-        labels=[_fmt(v) for v in values],
+        labels=["" if v == 0 else _fmt(v) for v in values],
         padding=4,
         fontsize=pt,
         fontweight="bold",
@@ -200,7 +211,7 @@ def _legend(fig, handles, labels, ncol):
         labels,
         loc="outside lower center",
         frameon=False,
-        fontsize=TEXT_PT,
+        fontsize=HEADER_PT,
         ncol=ncol,
     )
     for text in legend.get_texts():
@@ -248,11 +259,11 @@ def _axis_latency_dram(fig, ax, labels, latency, dram, title, log, xlabel=None):
         linewidth=EDGE_WIDTH,
         zorder=3,
     )
-    ax.set_ylabel("Latency (s)", fontsize=LABEL_PT, fontweight="bold")
+    ax.set_ylabel("Latency (s)", fontsize=HEADER_PT, fontweight="bold")
     _limits(ax, list(seconds), log, headroom=LATENCY_HEADROOM)
     _bold_ticks(ax, labels, x, pt, crowded)
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=TEXT_PT, fontweight="bold")
+        ax.set_xlabel(xlabel, fontsize=HEADER_PT, fontweight="bold")
     _label_bars(ax, bars, seconds, vpt, COLORS[0])
 
     right = ax.twinx()
@@ -268,9 +279,9 @@ def _axis_latency_dram(fig, ax, labels, latency, dram, title, log, xlabel=None):
         markeredgewidth=0.8,
         zorder=4,
     )[0]
-    right.set_ylabel("DRAM (GB)", fontsize=LABEL_PT, fontweight="bold")
+    right.set_ylabel("DRAM (GB)", fontsize=HEADER_PT, fontweight="bold")
     _limits(right, list(gigabytes), log, headroom=DRAM_HEADROOM)
-    right.tick_params(axis="y", labelsize=TICK_PT)
+    right.tick_params(axis="y", labelsize=HEADER_PT)
     for lbl in right.get_yticklabels():
         lbl.set_fontweight("bold")
     # The DRAM label goes above its marker -- but where the two series are
@@ -293,7 +304,7 @@ def _axis_latency_dram(fig, ax, labels, latency, dram, title, log, xlabel=None):
             color=COLORS[1],
             path_effects=HALO,
         )
-    ax.set_title(title, fontsize=TITLE_PT, fontweight="bold")
+    ax.set_title(title, fontsize=HEADER_PT, fontweight="bold")
     return [bars, line], ["Latency", "DRAM Traffic"]
 
 
@@ -323,37 +334,38 @@ def _axis_stacked(fig, ax, labels, series, ylabel, title, log, xlabel=None):
         bottom = bottom + values
         handles.append(bars)
 
-    ax.set_ylabel(ylabel, fontsize=LABEL_PT, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=HEADER_PT, fontweight="bold")
     # Only the stack total is labeled: a segment's own value would land inside
     # the stack, on top of the hatch, and the thin ones have nowhere to go.
     # ``bars`` is the topmost segment, so a label above it is a label above the
     # stack; on a crowded axis the totals turn upright to stay apart.
-    _limits(ax, list(bottom), log, headroom=CROWDED_HEADROOM)
+    _limits(ax, list(bottom), log, headroom=STACK_HEADROOM)
     _bold_ticks(ax, labels, x, pt, crowded)
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=TEXT_PT, fontweight="bold")
+        ax.set_xlabel(xlabel, fontsize=HEADER_PT, fontweight="bold")
     _label_bars(ax, bars, bottom, vpt, "black", rot=90 if crowded else 0)
-    ax.set_title(title, fontsize=TITLE_PT, fontweight="bold")
+    ax.set_title(title, fontsize=HEADER_PT, fontweight="bold")
     return handles, [n for n, _ in series]
 
 
-def draw_stacked(labels, series, ylabel, title, log, out_dir, stem):
-    """A single stacked-bar figure (the baseline per-module breakdown)."""
-    figsize = _layout(labels)[0]
-    fig, ax = plt.subplots(figsize=figsize, layout="constrained")
-    handles, names = _axis_stacked(fig, ax, labels, series, ylabel, title, log)
-    _legend(fig, handles, names, ncol=len(names))
-    return _save(fig, out_dir, stem)
-
-
-def draw_pair(calls, suptitle, base_figsize, out_dir, stem, sharex=True):
+def draw_pair(
+    calls,
+    suptitle,
+    base_figsize,
+    out_dir,
+    stem,
+    sharex=True,
+    legend_right=False,
+):
     """One figure with a subplot per entry of ``calls`` stacked top to bottom --
     prefill above decode -- under one shared ``suptitle``.  Each ``call(fig,
     ax)`` draws one mode, titles its panel with the mode, and returns
     ``(handles, names)`` for the shared legend.  With ``sharex`` the panels
     plot the same points and share one x-axis, labeled once at the bottom;
     without it each panel carries its own tick + axis labels (the pe sweep,
-    whose modes read different axes)."""
+    whose modes read different axes).  ``legend_right`` gives each panel its
+    own legend, beside it, instead of one shared band under the figure -- for
+    a pair whose series are named differently per mode."""
     w, h = base_figsize
     fig, axes = plt.subplots(
         len(calls),
@@ -369,13 +381,26 @@ def draw_pair(calls, suptitle, base_figsize, out_dir, stem, sharex=True):
     handles = names = None
     for ax, call in zip(axes, calls):
         handles, names = call(fig, ax)
-        # The mode label sits under the shared suptitle, a step smaller.
-        ax.title.set_fontsize(PAIR_TITLE_PT)
+        if legend_right:
+            legend = ax.legend(
+                handles,
+                names,
+                loc="center left",
+                bbox_to_anchor=(1.01, 0.5),
+                frameon=False,
+                fontsize=HEADER_PT,
+                handlelength=LEGEND_HANDLE,
+                handletextpad=LEGEND_PAD,
+                borderaxespad=0,
+            )
+            for text in legend.get_texts():
+                text.set_fontweight("bold")
         # A shared x-axis is labeled once, at the bottom.
         if sharex:
             ax.label_outer()
-    fig.suptitle(suptitle, fontsize=TITLE_PT, fontweight="bold")
-    _legend(fig, handles, names, ncol=len(names))
+    fig.suptitle(suptitle, fontsize=HEADER_PT, fontweight="bold")
+    if not legend_right:
+        _legend(fig, handles, names, ncol=len(names))
     return _save(fig, out_dir, stem)
 
 
@@ -513,21 +538,90 @@ def plot_metric_sheet(ws, log, out_dir):
     return written
 
 
-def plot_baseline_sheet(ws, log, out_dir):
-    """A baseline sheet: the per-module stacked runtime breakdown."""
-    rows = _rows(ws)
-    titles = _chart_titles(ws)
-    return draw_stacked(
-        [r["display"] for r in rows],
-        [
-            (name, [(r[field] or 0) / CYCLES_PER_MCYCLE for r in rows])
-            for name, field in MODULE_SERIES
-        ],
+def _module_key(block):
+    """A block name as it compares across modes: the decode graph nests the
+    model one module deeper, and a fused block carries the suffix."""
+    stem = block.removeprefix("model_").removeprefix("model_")
+    return stem.removesuffix("_fused")
+
+
+def _align_modules(rows_per_mode):
+    """One shared module axis for the modes' block lists.  The two graphs are
+    near-identical but not equal -- decode runs the cache's quantize ops and an
+    extra attention matmul -- so they are merged the way a diff would: blocks
+    that match share a slot, and a block only one mode runs takes a slot of its
+    own, left empty in the other panel.  Returns the slot labels and, per mode,
+    the row filling each slot (``None`` where it has none)."""
+    if len(rows_per_mode) == 1:
+        return [r["display"] for r in rows_per_mode[0]], rows_per_mode
+    left, right = rows_per_mode
+    diff = difflib.SequenceMatcher(
+        None,
+        [_module_key(r["block"]) for r in left],
+        [_module_key(r["block"]) for r in right],
+        autojunk=False,
+    )
+    labels, slots = [], ([], [])
+    for tag, i1, i2, j1, j2 in diff.get_opcodes():
+        if tag == "equal":
+            for i, j in zip(range(i1, i2), range(j1, j2)):
+                labels.append(left[i]["display"])
+                slots[0].append(left[i])
+                slots[1].append(right[j])
+            continue
+        # A block one mode does not run: its own slot, empty in the other.
+        for side, rows, lo, hi in ((0, left, i1, i2), (1, right, j1, j2)):
+            for k in range(lo, hi):
+                labels.append(rows[k]["display"])
+                slots[side].append(rows[k])
+                slots[1 - side].append(None)
+    return labels, list(slots)
+
+
+def _module_axis(fig, ax, labels, rows, mode, log):
+    """Adapt a baseline sheet's rows to the per-module compute / overlap /
+    memory / stall stack -- one ``draw_pair`` panel, titled by its mode.  A
+    ``None`` row is a module the other mode runs and this one does not, and
+    stacks to nothing."""
+    series = [
+        (
+            name,
+            [
+                0.0 if r is None else (r[field] or 0) / CYCLES_PER_MCYCLE
+                for r in rows
+            ],
+        )
+        for name, field in ((MODULE_COMPUTE[mode], "compute"),) + MODULE_SERIES
+    ]
+    return _axis_stacked(
+        fig,
+        ax,
+        labels,
+        series,
         "Million cycles",
-        titles[0] if titles else ws.title,
+        mode.capitalize(),
         log,
+    )
+
+
+def plot_baseline_pair(sheets, log, out_dir):
+    """The baseline sheets' per-module runtime breakdowns as one figure,
+    prefill above decode under a single shared title, over one shared module
+    axis labeled once at the bottom.  Each panel legends itself, since the
+    compute series is named for the unit that ran it."""
+    modes = [ws.title.split("_")[-1] for ws in sheets]
+    labels, aligned = _align_modules([_rows(ws) for ws in sheets])
+    titles = _chart_titles(sheets[0])
+    return draw_pair(
+        [
+            partial(_module_axis, labels=labels, rows=rows, mode=mode, log=log)
+            for mode, rows in zip(modes, aligned)
+        ],
+        _shared_title(titles[0] if titles else sheets[0].title),
+        _layout(labels)[0],
         out_dir,
-        _stem(ws.title, "breakdown"),
+        _stem("baseline", "breakdown"),
+        legend_right=True,
     )
 
 
@@ -560,11 +654,11 @@ def main():
     names = args.only or wb.sheetnames
     written = []
     for name in names:
-        ws = wb[name]
-        if name in BASELINE_SHEETS:
-            written += plot_baseline_sheet(ws, args.log, args.out)
-        else:
-            written += plot_metric_sheet(ws, args.log, args.out)
+        if name not in BASELINE_SHEETS:
+            written += plot_metric_sheet(wb[name], args.log, args.out)
+    baselines = [wb[n] for n in BASELINE_SHEETS if n in names]
+    if baselines:
+        written += plot_baseline_pair(baselines, args.log, args.out)
 
     for path in written:
         print(path)
