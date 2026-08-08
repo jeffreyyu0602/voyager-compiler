@@ -681,10 +681,37 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
     return None
 
 
-def _align_size(size, width):
-    if width is None:
-        return size
-    return (size + width - 1) // width * width
+def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
+    """Bytes one on-chip tensor of ``numel`` ``dtype`` elements occupies.
+
+    The store path writes a beat of ``vector_lanes`` values as whole
+    ``bank_width``-byte words, so a beat whose payload is not a whole number
+    of words (a sub-byte dtype) writes past the tensor's end on its final
+    beat.  That tail slack is reserved after the payload -- otherwise the
+    overshoot lands on the next buffer -- and the total is aligned to
+    ``bank_width``.  The tile search and the memory planner both size
+    through here, so a tile the search accepts is a tile the planner can
+    place.
+
+    Args:
+        numel: Element count of the tensor (or of one bank of a banked one).
+        dtype: Its logical dtype (``meta['dtype']`` when quantized).
+        bank_width: Allocation alignment and store-word width, bytes;
+            ``None`` disables the alignment and the tail slack.
+        vector_lanes: Store-beat width, elements; ``None`` charges the
+            payload alone (a DRAM tensor, written byte-exact by the DMA).
+    """
+
+    def _align_size(size):
+        if bank_width is None:
+            return size
+        return (size + bank_width - 1) // bank_width * bank_width
+
+    size = math.ceil(numel * dtype_byte_size(dtype))
+    if vector_lanes is not None and bank_width is not None:
+        beat = math.ceil(vector_lanes * dtype_byte_size(dtype))
+        size += _align_size(beat) - beat
+    return int(_align_size(size))
 
 
 # The batched reductions whose backend kernel keeps intermediates on chip:

@@ -78,6 +78,19 @@ SCHEME_ARGS = {
 # every other scheme is given these -- the same pair MXNF4 asks for.
 DEFAULT_TILER_ARGS = {"--cache_size": "1048576", "--num_banks": "8"}
 
+# One activation element, bytes, per scheme.  Each command's --bank_width is
+# one input beat -- the PE array's column count times this -- which is the
+# word the store bus writes whole, so the memory planner both aligns to it
+# and reserves the tail slack a sub-word store beat overshoots by.
+SCHEME_INPUT_BYTES = {
+    "E4M3": 1,
+    "P8_1": 1,
+    "INT8": 1,
+    "MXINT8": 1,
+    "MXNF4": 0.5,
+}
+assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
+
 # Reused per-command extra-flag groups.
 _SINGLE = "--compile_single_layer"
 _LLM = "--context_length 1024 --compile_single_layer --quantize_attention_mask"
@@ -186,6 +199,10 @@ def _build(command, run_dir):
     for flag, value in DEFAULT_TILER_ARGS.items():
         if flag not in argv:
             argv += [flag, value]
+    if "--bank_width" not in argv:
+        cols = int(command.unrolling.split(",")[1])
+        width = int(cols * SCHEME_INPUT_BYTES[command.scheme])
+        argv += ["--bank_width", str(width)]
     argv += ["--model_output_dir", str(dest)]
     return label, dest, argv
 

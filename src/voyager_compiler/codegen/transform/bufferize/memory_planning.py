@@ -38,9 +38,8 @@ import torch
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
-    _align_size,
-    dtype_byte_size,
     get_arg_value,
+    tensor_alloc_bytes,
 )
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _viewed_buffer,
@@ -126,28 +125,47 @@ def _banks(node) -> int:
     return int(get_arg_value(node, index, "banks", UNBANKED))
 
 
-def _bank_stride(node, bank_width=None) -> int:
-    """Byte distance between adjacent banks of a banked buffer: the aligned size
-    of *one* bank's payload.  The bank dimension leads the tensor, so the
-    payload is the remaining ``numel // banks`` elements."""
+def _store_lanes(node, config) -> Optional[int]:
+    """The store-beat width to size ``node`` with: the vector lanes for a
+    Scratchpad tensor (the datapath writes it in whole beats, so its tail
+    slack must be reserved), ``None`` for anything else (DRAM is written
+    byte-exact by the DMA)."""
+    if node.meta.get("space") != "Scratchpad":
+        return None
+    return config.vector_lanes
+
+
+def _bank_stride(node, config) -> int:
+    """Byte distance between adjacent banks of a banked buffer: the allocated
+    size of *one* bank's payload -- its bytes plus the store path's tail-beat
+    slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  The
+    bank dimension leads the tensor, so the payload is the remaining
+    ``numel // banks`` elements."""
     t = _val(node)
     dtype = node.meta.get("dtype") or t.dtype
-    per_bank = math.ceil(t.numel() / _banks(node) * dtype_byte_size(dtype))
-    return int(_align_size(per_bank, bank_width))
+    return tensor_alloc_bytes(
+        t.numel() // _banks(node),
+        dtype,
+        config.bank_width,
+        _store_lanes(node, config),
+    )
 
 
-def _nbytes(node, bank_width=None) -> int:
+def _nbytes(node, config) -> int:
     """Byte size of a node's tensor, using the logical (quantized) dtype when
-    set and aligning to ``bank_width``.  A banked buffer is ``banks`` aligned
-    payloads, so each bank starts on an aligned boundary."""
+    set: the payload plus, for a Scratchpad tensor, the store path's tail-beat
+    slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  A
+    banked buffer is ``banks`` such payloads, so each bank starts on an
+    aligned boundary."""
     t = _val(node)
     if t is None:
         raise ValueError(f"{node} has no sized value to allocate memory for")
     if _banks(node):
-        return _banks(node) * _bank_stride(node, bank_width)
+        return _banks(node) * _bank_stride(node, config)
     dtype = node.meta.get("dtype") or t.dtype
-    size = math.ceil(t.numel() * dtype_byte_size(dtype))
-    return int(_align_size(size, bank_width))
+    return tensor_alloc_bytes(
+        t.numel(), dtype, config.bank_width, _store_lanes(node, config)
+    )
 
 
 @dataclass
@@ -227,7 +245,7 @@ def _materializes_dram(node: Node) -> bool:
     )
 
 
-def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
+def _plan_dram(model: GraphModule, buffer_of, config) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
     ``meta['memory']`` on each DRAM buffer root.
@@ -271,17 +289,17 @@ def _plan_dram(model: GraphModule, buffer_of, bank_width: Optional[int]) -> int:
     # Persistent region first (params + inputs), linear, no reuse.
     offset = 0
     for b in persistent:
-        size = _nbytes(b, bank_width)
+        size = _nbytes(b, config)
         b.meta["memory"] = Segment(offset, offset + size, MemoryLevel.DRAM, b)
         offset += size
 
     # Reusable activation buffers: greedy best-fit, laid out after the
     # persistent region.
-    items = [(b, _nbytes(b, bank_width), def_t[b], last_t[b]) for b in reusable]
+    items = [(b, _nbytes(b, config), def_t[b], last_t[b]) for b in reusable]
     placed, reuse_bytes = _greedy_best_fit(items)
     for b in reusable:
         start = offset + placed[b]
-        size = _nbytes(b, bank_width)
+        size = _nbytes(b, config)
         b.meta["memory"] = Segment(start, start + size, MemoryLevel.DRAM, b)
 
     return offset + reuse_bytes
@@ -426,7 +444,7 @@ class _Buf:
     members: List[Node]
 
 
-def _buffer_lifetimes(model, buffer_of, order, bank_width) -> Dict[Node, _Buf]:
+def _buffer_lifetimes(model, buffer_of, order, config) -> Dict[Node, _Buf]:
     """Per scratchpad buffer: byte size, birth, and last use.  Death follows the
     names — a use of *any* of them (the getitem of a carried accumulator, the
     bias-add that reads it) extends the lifetime."""
@@ -453,18 +471,12 @@ def _buffer_lifetimes(model, buffer_of, order, bank_width) -> Dict[Node, _Buf]:
             for u in m.users:
                 if u in order:
                     last_t = max(last_t, order[u])
-        size = max(_nbytes(m, bank_width) for m in tiles)
+        size = max(_nbytes(m, config) for m in tiles)
         bufs[root] = _Buf(size, def_t, last_t, tiles)
     return bufs
 
 
-def _plan_scratchpad(
-    model: GraphModule,
-    bufs: Dict[Node, "_Buf"],
-    cache_size: int,
-    num_banks: Optional[int],
-    bank_width: Optional[int],
-):
+def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
     """Pack every Scratchpad buffer with greedy best-fit, exactly like DRAM.
 
     With the alloc-only model each on-chip buffer is an explicit
@@ -474,7 +486,9 @@ def _plan_scratchpad(
     lifetime is already dead (across region boundaries).  Bank separation is
     *structural*: distinct banks are distinct allocs, so simultaneously-live
     banks land at distinct addresses automatically — no per-op banking strategy
-    or region grouping is needed.
+    or region grouping is needed.  ``config`` (the hardware description) is
+    unread by this baseline packer: the sizes in ``bufs`` already carry its
+    alignment and tail slack.
     """
     items = [
         (root, buf.size, buf.def_t, buf.last_t) for root, buf in bufs.items()
@@ -488,10 +502,10 @@ def _plan_scratchpad(
     return int(total), {"buffers": len(items)}
 
 
-def _buf_desc(buf: "_Buf", bank_width) -> str:
+def _buf_desc(buf: "_Buf", config) -> str:
     """``name<shape x dtype>`` of the largest tile in a scratchpad buffer (the
     one that set its size), for the ``[MEM_ALLOC_FAIL]`` diagnostic."""
-    m = max(buf.members, key=lambda x: _nbytes(x, bank_width))
+    m = max(buf.members, key=lambda x: _nbytes(x, config))
     v = _val(m)
     dtype = m.meta.get("dtype") or (v.dtype if v is not None else "?")
     shape = "x".join(str(d) for d in v.shape) if v is not None else "?"
@@ -516,7 +530,7 @@ def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
 # ---------------------------------------------------------------------------
 
 
-def _stamp_banking(model: GraphModule, bank_width: Optional[int]) -> None:
+def _stamp_banking(model: GraphModule, config) -> None:
     """Record each banked buffer's depth and bank pitch on its ``alloc`` /
     ``zeros`` node, so the code generator can serialize the bank dimension as
     ``bank_count`` / ``bank_stride_bytes`` rather than as a tensor dimension.
@@ -527,7 +541,7 @@ def _stamp_banking(model: GraphModule, bank_width: Optional[int]) -> None:
         if not (banks := _banks(node)):
             continue
         node.meta["bank_count"] = banks
-        node.meta["bank_stride"] = _bank_stride(node, bank_width)
+        node.meta["bank_stride"] = _bank_stride(node, config)
 
 
 # ---------------------------------------------------------------------------
@@ -613,38 +627,32 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
 
     ``config.scratchpad_size`` is the *per-buffer* budget; under
     ``double_buffered_l2`` the planner places two ping-pong buffers, so the
-    physical capacity (and bank count) it plans against is doubled here.
+    physical capacity it plans against is doubled here.
     """
-    bank_width = config.bank_width
     cache_size = config.scratchpad_size
-    num_banks = config.num_banks
     if cache_size is not None and config.double_buffered_l2:
         cache_size *= 2
-    if num_banks is not None and config.double_buffered_l2:
-        num_banks *= 2
 
     # Which buffer every name denotes, and the global schedule: both arenas need
     # them (a buffer dies at the last read of *any* of its names), so compute
     # them once.
     buffer_of = _buffer_identity(model)
-    dram_bytes = _plan_dram(model, buffer_of, bank_width)
-    bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), bank_width)
+    dram_bytes = _plan_dram(model, buffer_of, config)
+    bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), config)
 
     scratchpad_bytes = 0
     peak_region = None
     if cache_size is not None:
-        scratchpad_bytes, peak_region = _plan_scratchpad(
-            model, bufs, cache_size, num_banks, bank_width
-        )
+        scratchpad_bytes, peak_region = _plan_scratchpad(model, bufs, config)
 
-    _stamp_banking(model, bank_width)
+    _stamp_banking(model, config)
     _check_invariants(model, bufs)
 
     if cache_size is not None and scratchpad_bytes > cache_size:
         peak_bytes, live = _peak_live_buffers(bufs)
         shown = live[:12]
         detail = "\n".join(
-            f"    {_buf_desc(b, bank_width)}  {b.size} B  "
+            f"    {_buf_desc(b, config)}  {b.size} B  "
             f"[def={b.def_t} last={b.last_t}]"
             for b in shown
         )

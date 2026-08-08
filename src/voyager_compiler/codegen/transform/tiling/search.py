@@ -6,11 +6,9 @@ from typing import Generator, Optional, Tuple
 import torch
 
 from voyager_compiler.codegen.node_info import (
-    _align_size,
     _pair,
     compute_output_tiled_shapes,
     compute_tiled_shape,
-    dtype_byte_size,
     get_anchor_node,
     get_arg_value,
     is_bmm,
@@ -22,6 +20,7 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
     reduction_scratch,
     require_allocation,
+    tensor_alloc_bytes,
     trailing_mha_perm,
     weight_is_ck,
 )
@@ -128,35 +127,32 @@ GEMV_BANK_GROUPS = (
 )
 
 
-def _tensor_bytes(node, shape, bank_width=None, vector_lanes=None):
-    """Bytes one tile of ``node`` occupies, aligned to ``bank_width``.
+def _tensor_bytes(node, shape, config):
+    """Bytes one tile of ``node`` occupies on chip, each output sized by
+    ``tensor_alloc_bytes`` under ``config``'s bank width and vector lanes --
+    so a tile the search accepts is exactly what ``plan_memory`` will
+    allocate for it.
 
     Args:
         node: The operand the tile belongs to.
         shape: Its tiled shape -- one per output for a multi-output op.
-        bank_width: Per-tensor alignment, bytes.
-        vector_lanes: Sparse-output alignment, elements.
+        config (AcceleratorConfig): The hardware description.
     """
+    lanes = config.vector_lanes
     val = node.value
     if isinstance(val, torch.Tensor):
         dtype = node.meta.get("dtype") or val.dtype
-        return _align_size(
-            math.prod(shape) * dtype_byte_size(dtype), bank_width
+        return tensor_alloc_bytes(
+            math.prod(shape), dtype, config.bank_width, lanes
         )
 
     if isinstance(val, (tuple, list)):
         numel = [math.prod(s) for s in shape]
-
-        # Sparse outputs need to be aligned with fetch width
-        if vector_lanes is not None:
-            numel = [_align_size(s, vector_lanes) for s in numel]
-
         dtypes = node.meta.get("dtype") or [None for _ in val]
         sizes = [
-            _align_size(n * dtype_byte_size(dt or t.dtype), bank_width)
+            tensor_alloc_bytes(n, dt or t.dtype, config.bank_width, lanes)
             for t, n, dt in zip(val, numel, dtypes)
         ]
-
         return sum(sizes)
 
     logger.warning(f"Node {node} has a non-tensor output")
@@ -203,17 +199,15 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
             shape = tiled_shapes[n]
             if shape is None or not require_allocation(n):
                 continue
-            total += _tensor_bytes(
-                n, shape, config.bank_width, config.vector_lanes
-            )
+            total += _tensor_bytes(n, shape, config)
         if total:
             sizes.append(total)
 
     # No DMA moves the reserved regions, so they share one bank rather than
     # taking one apiece.
     reserved = sum(
-        _align_size(
-            math.prod(shape) * dtype_byte_size(dtype), config.bank_width
+        tensor_alloc_bytes(
+            math.prod(shape), dtype, config.bank_width, config.vector_lanes
         )
         for _, shape, dtype in reduction_scratch(
             node, tiled_shapes[node], config.vector_lanes
