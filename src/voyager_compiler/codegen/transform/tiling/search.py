@@ -201,7 +201,7 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
         total = 0
         for n in group:
             shape = tiled_shapes[n]
-            if shape is None or not require_allocation(n):
+            if shape is None or (n is not node and not require_allocation(n)):
                 continue
             total += _tensor_bytes(n, shape, config)
         if total:
