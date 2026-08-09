@@ -272,6 +272,13 @@ def _fused_operand_specs(node, anchor):
 # Positions of interstellar's (input, output, weight) byte triple.
 _IF, _OF, _FL = 0, 1, 2
 
+# The L3 loops each operand's tile spans.  A tile advances only when one of
+# them turns, so an operand whose every entry is a single L3 step reads one
+# tile for the whole sweep.
+_IF_DIMS = (le.OX, le.OY, le.IC, le.ON)
+_FL_DIMS = (le.OC, le.IC, le.FX, le.FY)
+_OF_DIMS = (le.OC, le.OY, le.OX, le.ON)
+
 
 def output_is_psum(point, level):
     """Whether the output stored at ``level`` is still a partial sum: it is,
@@ -368,22 +375,33 @@ def make_size_fn(
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
         bias = extent(le.OC) * bias_bits / 8.0 if bias_bits else 0.0
 
+        def slots(dims):
+            """Banks an operand spanning ``dims`` needs: a second holds the
+            next tile, so a single L3 tile needs one.  The builders'
+            ``PipelinedKernel._num_banks`` is the looser test, so this never
+            charges less than is allocated."""
+            tiles = 1
+            for d in dims:
+                tiles *= point.loop_blocking(d)[3]
+            return num_slots if tiles > 1 else 1
+
         groups = [
-            (if_count * if_bits / 8.0, _IF),
-            (_scale_bytes(if_count, if_scale_bits), _IF),
+            (if_count * if_bits / 8.0, _IF, slots(_IF_DIMS)),
+            (_scale_bytes(if_count, if_scale_bits), _IF, slots(_IF_DIMS)),
             (
                 fl_count * fl_bits / 8.0
                 + _scale_bytes(fl_count, fl_scale_bits)
                 + bias,
                 _FL,
+                slots(_FL_DIMS),
             ),
-            (of_count * out_bits / 8.0 + of_scale, _OF),
+            (of_count * out_bits / 8.0 + of_scale, _OF, slots(_OF_DIMS)),
         ]
         for dims, bits in fused_specs:
             count = 1
             for d in dims:
                 count *= extent(d)
-            groups.append((count * bits / 8.0, _OF))
+            groups.append((count * bits / 8.0, _OF, slots(dims)))
 
         # An absent operand (no scale, no bias) occupies no bank.
         groups = [g for g in groups if g[0] > 0]
@@ -399,8 +417,8 @@ def make_size_fn(
 
         out = [0.0, 0.0, 0.0]
         if not bank_size:
-            for size, kind in groups:
-                out[kind] += num_slots * size
+            for size, kind, n in groups:
+                out[kind] += n * size
             out[_OF] += scratch
             return tuple(out)
 
@@ -410,12 +428,15 @@ def make_size_fn(
         target = max(1, budget // num_slots - extra_sharing)
         for _ in range(max(0, len(groups) - target)):
             groups.sort(key=lambda g: g[0])
-            (s0, k0), (s1, k1) = groups[0], groups[1]
-            # Charge the shared bank to the larger member's operand.
-            groups = [(s0 + s1, k0 if s0 >= s1 else k1)] + groups[2:]
+            (s0, k0, n0), (s1, k1, n1) = groups[0], groups[1]
+            # Charge the shared bank to the larger member's operand, and to the
+            # deeper pipeline: one buffer holding both has to ping-pong if
+            # either of them does.
+            merged = (s0 + s1, k0 if s0 >= s1 else k1, max(n0, n1))
+            groups = [merged] + groups[2:]
 
-        for size, kind in groups:
-            out[kind] += num_slots * math.ceil(size / bank_size) * bank_size
+        for size, kind, n in groups:
+            out[kind] += n * math.ceil(size / bank_size) * bank_size
         out[_OF] += scratch_banks * bank_size
         return tuple(out)
 
@@ -463,11 +484,6 @@ class RuntimeCalculator:
             ``quantize_mx`` tail stores the tile's scales next to its values.
         scale_block_size: Elements per block scale.
     """
-
-    # The L3 loops each DRAM operand's tile spans.  A loop outside them is a
-    # reuse window: the tile does not change while it turns.
-    _IF_DIMS = (le.OX, le.OY, le.IC, le.ON)
-    _FL_DIMS = (le.OC, le.IC, le.FX, le.FY)
 
     def __init__(
         self,
@@ -801,10 +817,8 @@ class RuntimeCalculator:
         matrix_cycles = self.matrix_cycles(mapping)
         vector_cycles = self.vector_cycles(mapping) if self.has_tail else 0
 
-        input_steps = self._batch_loads(mapping, self._IF_DIMS, self.batch)
-        weight_steps = self._batch_loads(
-            mapping, self._FL_DIMS, self.weight_batch
-        )
+        input_steps = self._batch_loads(mapping, _IF_DIMS, self.batch)
+        weight_steps = self._batch_loads(mapping, _FL_DIMS, self.weight_batch)
 
         # The mapping covers one batch element; the builder loops the rest.
         l3_blocks = self._l3_blocks(mapping) * self.batch

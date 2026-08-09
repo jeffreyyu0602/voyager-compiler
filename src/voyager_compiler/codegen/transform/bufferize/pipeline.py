@@ -81,6 +81,24 @@ _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
 _DEFAULT_NUM_BANKS = 2
 
 
+def spec_tiled_dims(spec, grid):
+    """``(d, g, r)`` for each operand dim of ``spec`` that is dynamically
+    indexed: it maps to a tiled grid dim ``g`` (``grid > 1``) and is not
+    broadcast.  Whole / broadcast / ``None``-mapped dims stay at block 0 and
+    are left out.  ``r`` is how many consecutive grid steps read the *same*
+    block — 1 unless the operand repeats over ``g`` (a GQA head, say).
+    """
+    bcast = getattr(spec, "is_broadcast", None)
+    rep = getattr(spec, "repeat", None)
+    for d, g in enumerate(spec.index_map):
+        if (
+            g is not None
+            and grid[g] > 1
+            and not (bcast is not None and bcast[d])
+        ):
+            yield d, g, (rep[d] if rep is not None else 1)
+
+
 @dataclass
 class _Window:
     """The ``num_banks``-dependent slice of a grid step's context: the current
@@ -182,24 +200,6 @@ class _BufferedRef:
 
     # --- addressing (shared by both kinds) ----------------------------------
 
-    def _tiled_dims(self):
-        """``(d, g, r)`` for each operand dim that is dynamically indexed: it
-        maps to a tiled grid dim ``g`` (``grid > 1``) and is not broadcast.
-        Whole / broadcast / ``None``-mapped dims stay at block 0 and are left
-        out.  ``r`` is how many consecutive grid steps read the *same* block —
-        1 unless the operand repeats over ``g`` (a GQA head, say).
-        """
-        spec = self.spec
-        bcast = getattr(spec, "is_broadcast", None)
-        rep = getattr(spec, "repeat", None)
-        for d, g in enumerate(spec.index_map):
-            if (
-                g is not None
-                and self.grid[g] > 1
-                and not (bcast is not None and bcast[d])
-            ):
-                yield d, g, (rep[d] if rep is not None else 1)
-
     def _block(self, coord, r):
         """The block index a grid coord addresses: every ``r``-th step advances
         it, so a repeated operand re-reads one tile ``r`` times."""
@@ -211,7 +211,7 @@ class _BufferedRef:
         dynamic (``async_copy``'s "all dims" shorthand).
         """
         dims, indices = [], []
-        for d, g, r in self._tiled_dims():
+        for d, g, r in spec_tiled_dims(self.spec, self.grid):
             dims.append(d)
             indices.append(self._block(grid_idx[g], r))
         if len(dims) < len(self.spec.index_map):
@@ -228,7 +228,7 @@ class _BufferedRef:
         (not ``False``) to avoid a redundant ``False | ...`` node.
         """
         differ = None
-        for _, g, r in self._tiled_dims():
+        for _, g, r in spec_tiled_dims(self.spec, self.grid):
             term = self._block(cur[g], r) != self._block(next[g], r)
             differ = term if differ is None else (differ | term)
         return False if differ is None else differ
@@ -250,7 +250,10 @@ class _BufferedRef:
         inner = self._innermost_tiled_dim()
         if inner is None:
             return False
-        return any(g == inner and r == 1 for _, g, r in self._tiled_dims())
+        return any(
+            g == inner and r == 1
+            for _, g, r in spec_tiled_dims(self.spec, self.grid)
+        )
 
     def _unravel(self, flat):
         """The row-major grid coords of flat index ``flat`` as plain Python
@@ -328,7 +331,7 @@ class _BufferedRef:
         it (1 when it advances every step).  A reused block's load posts this many
         times so a per-step ``commit`` consume balances a once-per-block load.
         """
-        tiled = list(self._tiled_dims())
+        tiled = list(spec_tiled_dims(self.spec, self.grid))
         if not tiled:
             return self.num_steps
         inner = max(g for _, g, _ in tiled)
@@ -560,12 +563,21 @@ class PipelinedKernel(torch.nn.Module):
 
     def _num_banks(self, spec):
         """Resolve an operand's software-pipeline depth: its per-spec
-        ``num_banks`` override, else the scheduler default.
+        ``num_banks`` override, else the scheduler default -- but one bank for
+        an operand the sweep reads a single tile of.  A pipeline slot exists to
+        hold the *next* tile while this one is in use, so an operand that never
+        advances has nothing to put in a second one; the extra bank would be
+        allocated and never written.  A dim indexed by grid dim ``g`` advances
+        every ``r`` steps, so it takes ``ceil(grid[g] / r)`` block values, and
+        their product is how many tiles the operand has.
         """
         n = self.num_banks if spec.num_banks is None else spec.num_banks
         if n < 1:
             raise ValueError("num_banks must be >= 1")
-        return n
+        blocks = 1
+        for _, g, r in spec_tiled_dims(spec, self.grid):
+            blocks *= -(-self.grid[g] // r)
+        return 1 if blocks == 1 else n
 
     def _step_ctx(self, step, distinct_counts):
         """The per-step index context: delinearized ``cur`` / ``next`` /
