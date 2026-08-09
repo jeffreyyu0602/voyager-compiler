@@ -16,7 +16,7 @@ Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program order:
   [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];  commit, post sem_scores
   [B] pv_buf = s_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
   [D] kv == 0 only (a Q-tile boundary): wait sem_pv; o += pv_buf; drain the
-      previous output store; (o / l) -> o_bank; store o_bank to the PREVIOUS
+      previous output store; (o / l) -> o_slots; store o_slots to the PREVIOUS
       tile's DRAM rows (the finalize belongs to the tile that just ended);
       reset m/o/l.
   [C] wait sem_scores;  softmax chain (rowmax, m, alpha, P, rowsum, l).
@@ -44,7 +44,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _guarded_wait,
-    select_bank,
+    get_slot,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
@@ -146,7 +146,7 @@ class _FA3Pipeline(torch.nn.Module):
             idx.append(coords[grid_dim])
         return dims, idx
 
-    def _load_q(self, q, bank, slot, sem, coords):
+    def _load_q(self, q, slots, slot, sem, coords):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
         # Q is loaded once per sweep but read on every one of the sweep's N
@@ -154,52 +154,52 @@ class _FA3Pipeline(torch.nn.Module):
         # consume balances the single load.
         voyager.async_copy(
             q,
-            select_bank(bank, slot),
+            get_slot(slots, slot),
             idx,
             unit + (self.tq, self.d),
-            select_bank(sem, slot),
+            get_slot(sem, slot),
             dims,
             post_count=self.N,
         )
 
-    def _load_k(self, k, bank, slot, sem, coords):
+    def _load_k(self, k, slots, slot, sem, coords):
         # Transposed load: the DRAM buffer is K's own [.., tkv, d] block,
-        # ``.mT``-ed into the bank's Kᵀ [.., d, tkv] tile by the DMA.
+        # ``.mT``-ed into the slot's Kᵀ [.., d, tkv] tile by the DMA.
         dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
         unit = (1,) * self.nb
         voyager.async_copy(
             k,
-            select_bank(bank, slot),
+            get_slot(slots, slot),
             idx,
             unit + (self.d, self.tkv),
-            select_bank(sem, slot),
+            get_slot(sem, slot),
             dims,
             None,
             True,
         )
 
-    def _load_v(self, v, bank, slot, sem, coords):
+    def _load_v(self, v, slots, slot, sem, coords):
         dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
         unit = (1,) * self.nb
         voyager.async_copy(
             v,
-            select_bank(bank, slot),
+            get_slot(slots, slot),
             idx,
             unit + (self.tkv, self.d),
-            select_bank(sem, slot),
+            get_slot(sem, slot),
             dims,
         )
 
-    def _load_mask(self, mask, bank, slot, sem, coords):
+    def _load_mask(self, mask, slots, slot, sem, coords):
         dims = [d for d, _ in self.mask_dyn]
         idx = [coords[g] for _, g in self.mask_dyn]
         munit = (1,) * (mask.ndim - 2)
         voyager.async_copy(
             mask,
-            select_bank(bank, slot),
+            get_slot(slots, slot),
             idx,
             munit + (self.tq, self.tkv),
-            select_bank(sem, slot),
+            get_slot(sem, slot),
             dims,
         )
 
@@ -207,7 +207,7 @@ class _FA3Pipeline(torch.nn.Module):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         unit = (1,) * self.nb
         voyager.async_copy(
-            tile, out, idx, unit + (self.tq, self.d), select_bank(sem, 0), dims
+            tile, out, idx, unit + (self.tq, self.d), get_slot(sem, 0), dims
         )
 
     # --- compute helpers (shared by prologue / loop / epilogue) ---------
@@ -289,22 +289,22 @@ class _FA3Pipeline(torch.nn.Module):
         unit = (1,) * nb
         out = voyager.alloc(self.out_shape, self.out_dtype)
 
-        # SRAM banks (2 slots each) + per-slot DMA semaphores; the output
-        # bank is single-slotted (written once per Q tile).
-        q_bank = voyager.alloc([*unit, self.tq, self.d], q.dtype, _SRAM, 2)
-        q_sem = voyager.zeros([], torch.int64, banks=2)
-        k_bank = voyager.alloc([*unit, self.d, self.tkv], k.dtype, _SRAM, 2)
-        k_sem = voyager.zeros([], torch.int64, banks=2)
-        v_bank = voyager.alloc([*unit, self.tkv, self.d], v.dtype, _SRAM, 2)
-        v_sem = voyager.zeros([], torch.int64, banks=2)
+        # SRAM slots (2 slots each) + per-slot DMA semaphores; the output
+        # slot is single-slotted (written once per Q tile).
+        q_slots = voyager.alloc([*unit, self.tq, self.d], q.dtype, _SRAM, 2)
+        q_sem = voyager.zeros([], torch.int64, num_slots=2)
+        k_slots = voyager.alloc([*unit, self.d, self.tkv], k.dtype, _SRAM, 2)
+        k_sem = voyager.zeros([], torch.int64, num_slots=2)
+        v_slots = voyager.alloc([*unit, self.tkv, self.d], v.dtype, _SRAM, 2)
+        v_sem = voyager.zeros([], torch.int64, num_slots=2)
         if self.has_mask:
             munit = (1,) * (mask.ndim - 2)
-            m_bank = voyager.alloc(
+            m_slots = voyager.alloc(
                 [*munit, self.tq, self.tkv], mask.dtype, _SRAM, 2
             )
-            m_sem = voyager.zeros([], torch.int64, banks=2)
-        out_bank = voyager.alloc([*unit, self.tq, self.d], out.dtype, _SRAM, 1)
-        out_sem = voyager.zeros([], torch.int64, banks=1)
+            m_sem = voyager.zeros([], torch.int64, num_slots=2)
+        out_slots = voyager.alloc([*unit, self.tq, self.d], out.dtype, _SRAM, 1)
+        out_sem = voyager.zeros([], torch.int64, num_slots=1)
 
         # Running softmax state (single-buffered — see module docstring)
         # and the parity-double-buffered scores/probabilities tile.
@@ -321,37 +321,37 @@ class _FA3Pipeline(torch.nn.Module):
 
         # ---- prologue: prime the DMA and run step 0's [A] + [C] --------
         c0 = _unravel(0, grid)
-        self._load_q(q, q_bank, 0, q_sem, c0)
-        self._load_k(k, k_bank, 0, k_sem, c0)
+        self._load_q(q, q_slots, 0, q_sem, c0)
+        self._load_k(k, k_slots, 0, k_sem, c0)
         if self.has_mask:
-            self._load_mask(mask, m_bank, 0, m_sem, c0)
+            self._load_mask(mask, m_slots, 0, m_sem, c0)
         if num_steps > 1:
             c1 = _unravel(1, grid)
-            self._load_k(k, k_bank, 1, k_sem, c1)
+            self._load_k(k, k_slots, 1, k_sem, c1)
             if self.has_mask:
-                self._load_mask(mask, m_bank, 1, m_sem, c1)
+                self._load_mask(mask, m_slots, 1, m_sem, c1)
             if N == 1:
                 # Step 0 is also its sweep's LAST step, so the uniform
                 # pattern's end-of-sweep Q prefetch belongs here too.
-                self._load_q(q, q_bank, 1, q_sem, c1)
+                self._load_q(q, q_slots, 1, q_sem, c1)
         # V's stream runs one step behind K's: block 0 lands in the slot
         # step 1 reads (slot 1); nothing is fetched for step 0, which
         # consumes no V.
-        self._load_v(v, v_bank, 1 % 2, v_sem, c0)
+        self._load_v(v, v_slots, 1 % 2, v_sem, c0)
 
         self._reset(m, l, o)
-        deps = [select_bank(k_sem, 0), select_bank(q_sem, 0)]
+        deps = [get_slot(k_sem, 0), get_slot(q_sem, 0)]
         if self.has_mask:
-            deps.append(select_bank(m_sem, 0))
+            deps.append(get_slot(m_sem, 0))
         self._matmul_qk(
-            select_bank(q_bank, 0),
-            select_bank(k_bank, 0),
-            select_bank(m_bank, 0) if self.has_mask else None,
-            select_bank(s_buf, 0),
+            get_slot(q_slots, 0),
+            get_slot(k_slots, 0),
+            get_slot(m_slots, 0) if self.has_mask else None,
+            get_slot(s_buf, 0),
             sem_scores,
             deps,
         )
-        self._softmax(select_bank(s_buf, 0), m, l, row_tmp, alpha, sem_scores)
+        self._softmax(get_slot(s_buf, 0), m, l, row_tmp, alpha, sem_scores)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
         def cond_fn(step):
@@ -372,19 +372,19 @@ class _FA3Pipeline(torch.nn.Module):
             # step's block into the slot the next step reads (the lag);
             # Q prefetches the next sweep's tile at each sweep's end.
             def k_fetch():
-                self._load_k(k, k_bank, nxt_slot, k_sem, nxt)
+                self._load_k(k, k_slots, nxt_slot, k_sem, nxt)
                 if self.has_mask:
-                    self._load_mask(mask, m_bank, nxt_slot, m_sem, nxt)
+                    self._load_mask(mask, m_slots, nxt_slot, m_sem, nxt)
                 return 1
 
             torch.cond(step + 1 < num_steps, k_fetch, lambda: 0)
-            self._load_v(v, v_bank, nxt_slot, v_sem, cur)
+            self._load_v(v, v_slots, nxt_slot, v_sem, cur)
 
             q_next_slot = ((step + 1) // N) % 2
             torch._check(q_next_slot < 2)
 
             def q_fetch():
-                self._load_q(q, q_bank, q_next_slot, q_sem, nxt)
+                self._load_q(q, q_slots, q_next_slot, q_sem, nxt)
                 return 1
 
             torch.cond(
@@ -398,14 +398,14 @@ class _FA3Pipeline(torch.nn.Module):
             # here — it feeds [B], so [A] issues while V's DMA is in flight.
             q_slot = (step // N) % 2
             torch._check(q_slot < 2)
-            deps = [select_bank(k_sem, cur_slot), select_bank(q_sem, q_slot)]
+            deps = [get_slot(k_sem, cur_slot), get_slot(q_sem, q_slot)]
             if self.has_mask:
-                deps.append(select_bank(m_sem, cur_slot))
+                deps.append(get_slot(m_sem, cur_slot))
             self._matmul_qk(
-                select_bank(q_bank, q_slot),
-                select_bank(k_bank, cur_slot),
-                select_bank(m_bank, cur_slot) if self.has_mask else None,
-                select_bank(s_buf, cur_slot),
+                get_slot(q_slots, q_slot),
+                get_slot(k_slots, cur_slot),
+                get_slot(m_slots, cur_slot) if self.has_mask else None,
+                get_slot(s_buf, cur_slot),
                 sem_scores,
                 deps,
             )
@@ -416,11 +416,11 @@ class _FA3Pipeline(torch.nn.Module):
             prev_slot = (step - 1) % 2
             torch._check(prev_slot < 2)
             self._matmul_pv(
-                select_bank(s_buf, prev_slot),
-                select_bank(v_bank, cur_slot),
+                get_slot(s_buf, prev_slot),
+                get_slot(v_slots, cur_slot),
                 pv_buf,
                 sem_pv,
-                [select_bank(v_sem, cur_slot)],
+                [get_slot(v_sem, cur_slot)],
             )
 
             # [D] Q-tile boundary: land the previous tile's last P@V into o,
@@ -430,12 +430,12 @@ class _FA3Pipeline(torch.nn.Module):
                 voyager.async_wait(sem_pv)
                 voyager.insert(o + pv_buf, o)
                 # Drain the previous boundary's store before overwriting
-                # the bank (no prior store exists at the first boundary).
-                _guarded_wait(select_bank(out_sem, 0), step >= 2 * N)
+                # the slot (no prior store exists at the first boundary).
+                _guarded_wait(get_slot(out_sem, 0), step >= 2 * N)
                 voyager.insert(
-                    (o / l).to(self.out_dtype), select_bank(out_bank, 0)
+                    (o / l).to(self.out_dtype), get_slot(out_slots, 0)
                 )
-                self._store_out(select_bank(out_bank, 0), out, out_sem, prev)
+                self._store_out(get_slot(out_slots, 0), out, out_sem, prev)
                 self._reset(m, l, o)
                 return 1
 
@@ -444,7 +444,7 @@ class _FA3Pipeline(torch.nn.Module):
             # [C] softmax of the current block on the vector unit — runs
             # (synchronously) while the matrix [B] matmul is still in flight.
             self._softmax(
-                select_bank(s_buf, cur_slot), m, l, row_tmp, alpha, sem_scores
+                get_slot(s_buf, cur_slot), m, l, row_tmp, alpha, sem_scores
             )
 
             # [E] deferred rescale fused with the P@V accumulate: o = alpha·(o
@@ -465,20 +465,20 @@ class _FA3Pipeline(torch.nn.Module):
         v_slot = num_steps % 2
         # [B] the final block's P@V on the matrix unit.
         self._matmul_pv(
-            select_bank(s_buf, (num_steps - 1) % 2),
-            select_bank(v_bank, v_slot),
+            get_slot(s_buf, (num_steps - 1) % 2),
+            get_slot(v_slots, v_slot),
             pv_buf,
             sem_pv,
-            [select_bank(v_sem, v_slot)],
+            [get_slot(v_sem, v_slot)],
         )
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)
         voyager.insert(o + pv_buf, o)
         if num_steps > N:  # a prior boundary store exists (static)
-            voyager.async_wait(select_bank(out_sem, 0))
-        voyager.insert((o / l).to(self.out_dtype), select_bank(out_bank, 0))
-        self._store_out(select_bank(out_bank, 0), out, out_sem, c_last)
-        voyager.async_wait(select_bank(out_sem, 0))  # drain
+            voyager.async_wait(get_slot(out_sem, 0))
+        voyager.insert((o / l).to(self.out_dtype), get_slot(out_slots, 0))
+        self._store_out(get_slot(out_slots, 0), out, out_sem, c_last)
+        voyager.async_wait(get_slot(out_sem, 0))  # drain
         if self.g_head > 1:
             out = out.reshape(self.out_unfold_shape)
         return out

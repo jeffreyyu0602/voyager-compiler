@@ -10,23 +10,24 @@ those space-annotated buffers/tiles into a concrete map:
     greedy best-fit, shared-object allocator that reuses a slot whose lifetime
     is disjoint and whose size is closest (least fragmentation).
   * **Scratchpad** — every on-chip buffer is likewise an explicit
-    ``voyager.alloc(SRAM)`` (the input / output banks — each a ``banks``-deep
-    alloc — and the reduction scratch), so it is packed with the same greedy
-    best-fit allocator as DRAM: a buffer reuses the slot of one whose lifetime
-    is already dead, across region boundaries.  A software-pipeline bank is one
-    buffer of ``banks`` slots, laid out contiguously: slot ``i`` sits at
-    ``base + i * bank_stride``, so the slot a step writes can stay a *runtime*
-    index.
+    ``voyager.alloc(SRAM)`` (the input / output buffers — each a
+    ``num_slots``-deep alloc — and the reduction scratch), so it is packed
+    with the same greedy best-fit allocator as DRAM: a buffer reuses the
+    address of one whose lifetime is already dead, across region
+    boundaries.  A software-pipelined buffer is one alloc of ``num_slots``
+    slots, laid out contiguously: slot ``i`` sits at ``base + i *
+    slot_stride``, so the slot a step writes can stay a *runtime* index.
 
 The planner does not move values between DRAM and Scratchpad (that is fixed by
 bufferization); it only decides addresses, reuse, and pool sizes.  Addresses are
 written as ``Segment``s onto each buffer *root* — ``node.meta['memory']``
-(DRAM) / ``node.meta['scratchpad']`` (Scratchpad), plus ``meta['bank_count']``
-and ``meta['bank_stride']`` on a banked one.  A tile is not given an address of
-its own: it is named by the buffer it lives in, which is what the code generator
-serializes (a ``TensorBoxRef``, windowed at the bank it reads).  See the roadmap in the
-design doc for the optimizing passes that build on this baseline (intra-region
-reuse, store->load elision, double buffering, the interstellar schedule).
+(DRAM) / ``node.meta['scratchpad']`` (Scratchpad), plus ``meta['slot_count']``
+and ``meta['slot_stride']`` on a pipelined one.  A tile is not given an
+address of its own: it is named by the buffer it lives in, which is
+what the code generator serializes (a ``TensorBoxRef``, windowed at the
+slot it reads).  See the roadmap in the design doc for the optimizing
+passes that build on this baseline (intra-region reuse, store->load
+elision, double buffering, the interstellar schedule).
 """
 
 import logging
@@ -45,7 +46,7 @@ from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _viewed_buffer,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
-    UNBANKED,
+    UNPIPELINED,
     MemoryLevel,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
@@ -95,8 +96,8 @@ _WHILE = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
 
-# Position of ``banks`` in each allocation primitive's schema:
-_BANKS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
+# Position of ``num_slots`` in each allocation primitive's schema:
+_SLOTS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
 
 
 # ---------------------------------------------------------------------------
@@ -114,15 +115,15 @@ def _val(node) -> Optional[torch.Tensor]:
     return v if isinstance(v, torch.Tensor) else None
 
 
-def _banks(node) -> int:
-    """The software-pipeline depth of an ``alloc`` / ``zeros`` — how many banks
-    its leading dimension holds.  ``UNBANKED`` (0) for every other node."""
+def _slots(node) -> int:
+    """The software-pipeline depth of an ``alloc`` / ``zeros`` — how many slots
+    its leading dimension holds.  ``UNPIPELINED`` (0) for every other node."""
     if not isinstance(node, Node) or node.op != "call_function":
-        return UNBANKED
-    index = _BANKS_ARG.get(node.target)
+        return UNPIPELINED
+    index = _SLOTS_ARG.get(node.target)
     if index is None:
-        return UNBANKED
-    return int(get_arg_value(node, index, "banks", UNBANKED))
+        return UNPIPELINED
+    return int(get_arg_value(node, index, "num_slots", UNPIPELINED))
 
 
 def _store_lanes(node, config) -> Optional[int]:
@@ -135,16 +136,16 @@ def _store_lanes(node, config) -> Optional[int]:
     return config.vector_lanes
 
 
-def _bank_stride(node, config) -> int:
-    """Byte distance between adjacent banks of a banked buffer: the allocated
-    size of *one* bank's payload -- its bytes plus the store path's tail-beat
+def _slot_stride(node, config) -> int:
+    """Byte distance between adjacent slots of a pipelined buffer: the allocated
+    size of *one* slot's payload -- its bytes plus the store path's tail-beat
     slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  The
-    bank dimension leads the tensor, so the payload is the remaining
-    ``numel // banks`` elements."""
+    slot dimension leads the tensor, so the payload is the remaining
+    ``numel // slots`` elements."""
     t = _val(node)
     dtype = node.meta.get("dtype") or t.dtype
     return tensor_alloc_bytes(
-        t.numel() // _banks(node),
+        t.numel() // _slots(node),
         dtype,
         config.bank_width,
         _store_lanes(node, config),
@@ -155,13 +156,13 @@ def _nbytes(node, config) -> int:
     """Byte size of a node's tensor, using the logical (quantized) dtype when
     set: the payload plus, for a Scratchpad tensor, the store path's tail-beat
     slack, aligned to ``config.bank_width`` (``tensor_alloc_bytes``).  A
-    banked buffer is ``banks`` such payloads, so each bank starts on an
+    pipelined buffer is ``slots`` such payloads, so each slot starts on an
     aligned boundary."""
     t = _val(node)
     if t is None:
         raise ValueError(f"{node} has no sized value to allocate memory for")
-    if _banks(node):
-        return _banks(node) * _bank_stride(node, config)
+    if _slots(node):
+        return _slots(node) * _slot_stride(node, config)
     dtype = node.meta.get("dtype") or t.dtype
     return tensor_alloc_bytes(
         t.numel(), dtype, config.bank_width, _store_lanes(node, config)
@@ -353,7 +354,7 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
     viewed, and each name would otherwise look like a buffer of its own, co-live
     with the rest.  Two rules resolve a name back to its buffer:
 
-      * a **view** names the buffer it views — a bank ``subview``, a reshape, the
+      * a **view** names the buffer it views — a slot ``subview``, a reshape, the
         ``getitem`` handle of a loop result;
       * a **region** binds its operands to its placeholders — a ``while_loop``
         (which also returns each carried buffer, written in place), a ``cond``
@@ -365,8 +366,8 @@ def _buffer_identity(model: GraphModule) -> Dict[Node, Node]:
 
     So a scratch ``alloc`` accumulator threaded through the reduction loop
     (alloc -> body arg -> accumulate-add -> getitem) is one buffer with one
-    lifetime, and the bank a ``cond`` branch writes through a slot ``subview`` is
-    the bank itself, not a tile beside it.
+    lifetime, and the slot a ``cond`` branch writes through a ``subview``
+    is the slot itself, not a tile beside it.
     """
     buffer_of: Dict[Node, Node] = {}
 
@@ -456,7 +457,7 @@ def _buffer_lifetimes(model, buffer_of, order, config) -> Dict[Node, _Buf]:
     for root, mem in members.items():
         # The members that own the bytes.  A view is in the group (it names this
         # buffer) but must not size it or start its life: a slot ``select`` is
-        # one tile of a bank several tiles deep.  It still *ends* its life --
+        # one tile of a slot several tiles deep.  It still *ends* its life --
         # the death scan below reads every member.
         tiles = [
             m
@@ -480,12 +481,13 @@ def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
     """Pack every Scratchpad buffer with greedy best-fit, exactly like DRAM.
 
     With the alloc-only model each on-chip buffer is an explicit
-    ``voyager.alloc(SRAM)`` — the input / output banks (a ``[num_banks,
+    ``voyager.alloc(SRAM)`` — the input / output slots (a ``[num_slots,
     tile...]`` alloc each) and the reduction scratch — so ``bufs`` already lists
     them with sizes and lifetimes.  A buffer reuses the address of one whose
-    lifetime is already dead (across region boundaries).  Bank separation is
-    *structural*: distinct banks are distinct allocs, so simultaneously-live
-    banks land at distinct addresses automatically — no per-op banking strategy
+    lifetime is already dead (across region boundaries).  Slot separation is
+    *structural*: distinct slots are distinct allocs, so simultaneously-live
+    slots land at distinct addresses automatically — no per-op
+    pipelining strategy
     or region grouping is needed.  ``config`` (the hardware description) is
     unread by this baseline packer: the sizes in ``bufs`` already carry its
     alignment and tail slack.
@@ -526,22 +528,22 @@ def _peak_live_buffers(bufs: Dict[Node, "_Buf"]):
 
 
 # ---------------------------------------------------------------------------
-# Banking metadata
+# Slot metadata
 # ---------------------------------------------------------------------------
 
 
-def _stamp_banking(model: GraphModule, config) -> None:
-    """Record each banked buffer's depth and bank pitch on its ``alloc`` /
-    ``zeros`` node, so the code generator can serialize the bank dimension as
+def _stamp_slots(model: GraphModule, config) -> None:
+    """Record each pipelined buffer's depth and slot pitch on its ``alloc`` /
+    ``zeros`` node, so the code generator can serialize the slot dimension as
     ``bank_count`` / ``bank_stride_bytes`` rather than as a tensor dimension.
-    A slot is then addressed ``base + bank * bank_stride_bytes``, which is what
-    lets a runtime slot index (``step % num_banks``) stay a runtime value.
+    A slot is then addressed ``base + slot * meta['slot_stride']``, which is
+    what lets a runtime slot index (``step % num_slots``) stay a runtime value.
     """
     for node in _walk(model):
-        if not (banks := _banks(node)):
+        if not (slots := _slots(node)):
             continue
-        node.meta["bank_count"] = banks
-        node.meta["bank_stride"] = _bank_stride(node, config)
+        node.meta["slot_count"] = slots
+        node.meta["slot_stride"] = _slot_stride(node, config)
 
 
 # ---------------------------------------------------------------------------
@@ -618,10 +620,11 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
 
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —
-    plus ``meta['bank_count']`` / ``meta['bank_stride']`` on a banked one, and
-    returns the pool sizes.  Nothing is threaded onto the tile sites: a tile is
-    named by the buffer it lives in (and, for a bank, a runtime slot index), so
-    the address belongs to the buffer, not to every reference to it.
+    plus ``meta['slot_count']`` / ``meta['slot_stride']`` on a pipelined one,
+    and returns the pool sizes.  Nothing is threaded onto the tile sites: a
+    tile is named by the buffer it lives in (and, for a slot, a runtime
+    slot index), so the address belongs to the buffer, not to every
+    reference to it.
 
     ``config.scratchpad_size`` is the whole physical scratchpad, so the plan is
     compared against it directly: the ping-pong slots this places are already
@@ -647,7 +650,7 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
     if capacity is not None:
         scratchpad_bytes, peak_region = _plan_scratchpad(model, bufs, config)
 
-    _stamp_banking(model, config)
+    _stamp_slots(model, config)
     _check_invariants(model, bufs)
 
     if capacity is not None and scratchpad_bytes > capacity:

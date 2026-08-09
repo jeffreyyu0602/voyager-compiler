@@ -47,7 +47,7 @@ import torch
 from voyager_compiler.codegen.node_info import get_arg_value
 from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
-    _DEFAULT_NUM_BANKS,
+    _DEFAULT_NUM_SLOTS,
     build_pipelined_buffers,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
@@ -183,15 +183,15 @@ def _flash_attention_kernel(
     out_dtype: torch.dtype,
 ):
     """Build the mutate-style per-tile kernel ``kernel(grid_index, *in_tiles,
-    o_bank, m, l, o, s_buf, row_tmp, alpha)`` for flash attention (see module
+    o_slot, m, l, o, s_buf, row_tmp, alpha)`` for flash attention (see module
     docstring for the pass sequence).  ``in_tiles`` are the SDPA operands in arg
     order — ``q, kᵀ, v`` then the optional ``attn_mask``.
     """
 
     def kernel(grid_index, *args):
-        # args = (*in_tiles, o_bank, m, l, o, s_buf, row_tmp, alpha)
+        # args = (*in_tiles, o_slot, m, l, o, s_buf, row_tmp, alpha)
         m, l, o, s_buf, row_tmp, alpha = args[-6:]
-        o_bank = args[-7]
+        o_slot = args[-7]
         in_tiles = args[:-7]
         # kT is already Kᵀ ([.., d, tkv]) via the transposed DMA.
         q, kT, v = in_tiles[0], in_tiles[1], in_tiles[2]
@@ -241,7 +241,7 @@ def _flash_attention_kernel(
 
         # Pass 10 (guard kv==last): normalize and store the output tile.
         def finalize():
-            voyager.insert((o / l).to(out_dtype), o_bank)
+            voyager.insert((o / l).to(out_dtype), o_slot)
             return 1
 
         torch.cond(kv == last_idx, finalize, lambda: 0)
@@ -268,7 +268,7 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
                 _fuse_passes(sub)
 
     # A node absorbable into a pass's compute cone.  ``voyager.subview`` is the
-    # bank read (the slot a step consumes) — the load boundary, not compute;
+    # slot read (the slot a step consumes) — the load boundary, not compute;
     # stopping there keeps its integer slot index out of the group's inputs (it
     # would break the fused submodule's tensor-only ShapeProp).
     _boundary = (
@@ -314,7 +314,7 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
 def build_attention(
     node,
     *,
-    num_banks: int = _DEFAULT_NUM_BANKS,
+    num_slots: int = _DEFAULT_NUM_SLOTS,
     accumulate_fp32: bool = True,
     tiler=None,
 ):
@@ -398,7 +398,7 @@ def build_attention(
     )
     # K: loaded transposed to Kᵀ ([.., d, tkv]).  The spec is in matmul (Kᵀ)
     # order; ``transposed`` tells ``async_copy`` the DRAM buffer is its (tkv, d)
-    # transpose (swap the fetch, ``.mT`` into the bank) — as the GEMM weight.
+    # transpose (swap the fetch, ``.mT`` into the slot) — as the GEMM weight.
     k_spec = _InputSpec(
         unit + (d, tkv),
         batch_map + (None, gkv),
@@ -445,7 +445,7 @@ def build_attention(
     in_specs = [spec_by_node[n] for n in in_nodes]
 
     # Output tile [.., tq, d]; the kv reduction dim is dropped (index_map has no
-    # ``gkv``), so the bank stays live across the sweep, written once at the
+    # ``gkv``), so the slot stays live across the sweep, written once at the
     # last kv step — single-buffered, drained at block-exit.  The shape is the
     # folded (KV-head-batch) output; ``_FoldInputs`` unfolds it back.
     out_spec = _OutputSpec(
@@ -453,7 +453,7 @@ def build_attention(
         unit + (tq, d),
         batch_map + (gq, None),
         out.dtype,
-        num_banks=1,
+        num_slots=1,
         first_use_at_exit=True,
     )
 
@@ -491,7 +491,7 @@ def build_attention(
         out_specs=[out_spec],
         inputs=tuple(inputs),
         scratch_specs=scratch_specs,
-        num_banks=num_banks,
+        num_slots=num_slots,
         wrapper=wrap,
     )
     _fuse_passes(gm)

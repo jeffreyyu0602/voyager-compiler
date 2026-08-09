@@ -67,7 +67,7 @@ def _subgraph(gm: GraphModule, target) -> Optional[GraphModule]:
 
 
 def _passed_whole(node: Node, codebooks: set) -> bool:
-    """An operand handed to the op whole rather than tiled into a bank, and so
+    """An operand handed to the op whole rather than tiled into a slot, and so
     exempt from the Scratchpad rule: a codebook / qmap (a *param*, which carries
     no space at all), or a scalar (read from DRAM).  ``_build_for_untiled``
     loads neither."""
@@ -150,8 +150,8 @@ class _InputSpec:
       ``pad``          per-dim low padding (start -= pad).
       ``pad_value``    out-of-bounds fill for a padded load.
       ``transposed``   load swaps the tile's last two dims (a fused weight ᵀ).
-      ``num_banks``    per-operand software-pipeline depth (SRAM bank slots /
-                       prefetch distance ``num_banks - 1``); ``None`` inherits
+      ``num_slots``    per-operand software-pipeline depth (SRAM slots /
+                       prefetch distance ``num_slots - 1``); ``None`` inherits
                        the scheduler's default.  Lets a reused / low-reuse
                        operand pick a shallower or deeper pipeline than its
                        peers.
@@ -171,7 +171,7 @@ class _InputSpec:
     pad: Optional[Tuple[int, ...]] = None
     pad_value: Optional[float] = None
     transposed: bool = False
-    num_banks: Optional[int] = None
+    num_slots: Optional[int] = None
     first_use_at_exit: bool = False
 
 
@@ -193,8 +193,8 @@ class _OutputSpec:
       ``tile_sizes`` per-dim output tile (the grid step for its dims).
       ``index_map``  grid dim each output dim maps to.
       ``dtype``      output dtype.
-      ``num_banks``  per-output software-pipeline depth (``None`` inherits the
-                     scheduler default); see ``_InputSpec.num_banks``.
+      ``num_slots``  per-output software-pipeline depth (``None`` inherits the
+                     scheduler default); see ``_InputSpec.num_slots``.
       ``first_use_at_exit``
                      guarded output first written at its sweep's **last** step
                      (e.g. a reduction's ``post_process``), so the reuse-drain
@@ -207,14 +207,14 @@ class _OutputSpec:
     tile_sizes: Tuple[int, ...]
     index_map: Tuple[int, ...]
     dtype: torch.dtype
-    num_banks: Optional[int] = None
+    num_slots: Optional[int] = None
     first_use_at_exit: bool = False
 
 
 @dataclass(frozen=True)
 class _ScratchSpec:
     """A persistent on-chip SRAM scratch ref — a third class of SRAM object
-    next to input / output banks.  Unlike them it is *local state*: allocated
+    next to input / output slots.  Unlike them it is *local state*: allocated
     once and reused every grid step, not DMA-managed, not double-buffered, and
     not carried in the loop state.  It has only a ``shape`` + ``dtype`` (no
     ``index_map`` / DRAM shape / token / buffer count); the kernel mutates it
@@ -337,7 +337,7 @@ def _lenient_verifier():
 
 def _is_writeout_wrapper(n: Node) -> bool:
     """A ``clone`` / multi-output ``getitem`` that only feeds output stores --
-    the boundary between the compute cone and the bank write.  It is peeled off
+    the boundary between the compute cone and the slot write.  It is peeled off
     a store's source and left outside the fused module."""
     return (
         n.op == "call_function"

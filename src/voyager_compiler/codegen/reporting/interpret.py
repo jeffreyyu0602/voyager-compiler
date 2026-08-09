@@ -57,7 +57,7 @@ _FILL = torch.ops.voyager.fill.default
 class _Ctx:
     rs: ResourceState
     cost: AcceleratorConfig
-    # placeholder -> the outer source node it is bound to (for semaphore-bank
+    # placeholder -> the outer source node it is bound to (for semaphore-slot
     # rooting across loop / cond boundaries).
     bind: Dict[Node, Node]
 
@@ -291,13 +291,13 @@ def _copy_traffic(node: Node, bind: Dict[Node, Node]):
 
 
 def _sem_key(sem_arg, env, bind):
-    """``(bank_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
+    """``(slots_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
 
-    The arg is a ``subview(bank, [slot], [1], [1])`` behind the NOP that squeezes
-    the bank dim off — possibly reached through a chain of placeholder bindings
+    The arg is a ``subview(slots, [slot], [1], [1])`` behind the NOP that
+    squeezes the slot dim off — possibly reached through a chain of placeholder bindings
     when the pick sits outside a ``cond`` that the DMA lives in.  ``slot`` is
     resolved against the shared ``env`` (the slot index, e.g.
-    ``step % num_banks``, was computed in that outer scope), so an ``async_copy``
+    ``step % num_slots``, was computed in that outer scope), so an ``async_copy``
     into a slot and its matching ``async_wait`` hash equal.
     """
     node = _defining(sem_arg, bind)
@@ -310,8 +310,8 @@ def _sem_key(sem_arg, env, bind):
         and node.op == "call_function"
         and node.target is _SUBVIEW
     ):
-        bank = _defining(node.args[0], bind)
-        return (id(bank), _resolve(node.args[1][0], env))
+        slots = _defining(node.args[0], bind)
+        return (id(slots), _resolve(node.args[1][0], env))
     return (id(node), 0)
 
 
@@ -359,11 +359,11 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
                 post_count=post_count,
             )
         elif t is _FILL:
-            # A credit-seeded output store-sem: seed each bank slot's FIFO so
+            # A credit-seeded output store-sem: seed each slot's FIFO so
             # the first commit that waits the slot free draws the credit.
             value = int(get_arg_value(node, 2, "value", 0) or 0)
-            banks = int(get_arg_value(node, 3, "banks", 1) or 1)
-            for slot in range(banks):
+            slots = int(get_arg_value(node, 3, "num_slots", 1) or 1)
+            for slot in range(slots):
                 ctx.rs.seed_semaphore((id(node), slot), value)
         elif t is _ASYNC_WAIT:
             ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)

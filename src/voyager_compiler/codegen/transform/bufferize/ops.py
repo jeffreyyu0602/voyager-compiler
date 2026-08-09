@@ -9,9 +9,9 @@ lowering pass and consumed by the loop-aware code generator.
 Primitives
 ----------
 ``voyager.alloc(size, dtype)``       logical output / temporary storage (DRAM).
-``voyager.zeros(size, dtype)``       zero-initialised bank (accumulator, semaphore).
-``voyager.fill(size, dtype, v)``     value-initialised bank (seed a semaphore credit).
-``voyager.subview(src, o, s, st)``   strided window onto a buffer (a bank slot).
+``voyager.zeros(size, dtype)``       zero-initialised buffer (accumulator, semaphore).
+``voyager.fill(size, dtype, v)``     value-initialised buffer (seed a semaphore credit).
+``voyager.subview(src, o, s, st)``   strided window onto a buffer (a slot).
 ``voyager.insert(src, dst)``         destination-passing compute-result write.
 ``voyager.async_copy(..., sem)``     guarded async tile DMA; signals semaphore ``sem``.
 ``voyager.async_wait(sem)``          waits on (consumes) a DMA semaphore.
@@ -42,7 +42,7 @@ class MemoryLevel(IntEnum):
     """Memory-hierarchy levels, ordered by distance from the compute units
     (smaller = nearer/faster).  ``voyager.alloc(..., space=)`` records which
     level a bufferized storage object lives in (e.g. an ``SRAM``
-    software-pipeline bank vs the ``DRAM`` output buffer); shared wherever a
+    software-pipeline slot vs the ``DRAM`` output buffer); shared wherever a
     buffer's level is needed."""
 
     REGISTER = 0  # PE register file
@@ -52,7 +52,7 @@ class MemoryLevel(IntEnum):
 
 
 # ---------------------------------------------------------------------------
-# Software-pipeline banking.
+# Software pipelining.
 #
 # ``alloc`` / ``zeros`` take a ``banks`` count.  ``banks == 0`` is an unbanked
 # storage object: the tensor has exactly ``size``.  ``banks >= 1`` prepends a
@@ -64,24 +64,24 @@ class MemoryLevel(IntEnum):
 # (``banks == 1``) still keeps its dimension, so ``buf[0]`` addresses it
 # uniformly.
 # ---------------------------------------------------------------------------
-UNBANKED = 0
+UNPIPELINED = 0
 
 
-def _banked_size(size, banks: int):
-    return list(size) if banks == UNBANKED else [banks] + list(size)
+def _pipelined_size(size, num_slots: int):
+    return list(size) if num_slots == UNPIPELINED else [num_slots] + list(size)
 
 
 # ---------------------------------------------------------------------------
 # voyager.alloc — logical storage object (output / staging buffer or on-chip
 # tile).  ``space`` is a ``MemoryLevel`` (int): which level of the hierarchy
 # it lives in — ``DRAM`` (default: output / staging) or ``SRAM`` (an on-chip
-# scratchpad tile, e.g. a software-pipeline ping-pong bank filled by
+# scratchpad tile, e.g. a software-pipeline ping-pong slot filled by
 # ``voyager.memcpy``).  Eager allocation is space-agnostic (a plain tensor);
 # the level is metadata the planner / codegen read.
 # ---------------------------------------------------------------------------
 # ``space`` default 3 == ``MemoryLevel.DRAM``.
 voyager_lib.define(
-    "alloc(SymInt[] size, ScalarType dtype, int space=3, int banks=0) "
+    "alloc(SymInt[] size, ScalarType dtype, int space=3, int num_slots=0) "
     "-> Tensor"
 )
 
@@ -91,9 +91,9 @@ def alloc(
     size: Tuple[int, ...],
     dtype: torch.dtype,
     space: int = MemoryLevel.DRAM,
-    banks: int = UNBANKED,
+    num_slots: int = UNPIPELINED,
 ) -> torch.Tensor:
-    size = _banked_size(size, banks)
+    size = _pipelined_size(size, num_slots)
     if dtype.is_floating_point:
         return torch.randn(size).to(dtype)
     return torch.zeros(size, dtype=dtype)
@@ -104,34 +104,34 @@ def _alloc_fake(
     size: Tuple[int, ...],
     dtype: torch.dtype,
     space: int = MemoryLevel.DRAM,
-    banks: int = UNBANKED,
+    num_slots: int = UNPIPELINED,
 ) -> torch.Tensor:
-    return torch.empty(_banked_size(size, banks), dtype=dtype)
+    return torch.empty(_pipelined_size(size, num_slots), dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
-# voyager.zeros — zero-initialised on-chip tile / bank (e.g. a reduction
-# accumulator or a per-slot DMA-semaphore bank).  A ``voyager`` op (not
+# voyager.zeros — zero-initialised on-chip tile (e.g. a reduction
+# accumulator or a per-slot DMA semaphore).  A ``voyager`` op (not
 # ``aten.zeros``) so the bufferizer can tell a control/semaphore zero-init from
 # a genuine ``aten.zeros`` compute op.
 # ---------------------------------------------------------------------------
 voyager_lib.define(
-    "zeros(SymInt[] size, ScalarType dtype, int banks=0) -> Tensor"
+    "zeros(SymInt[] size, ScalarType dtype, int num_slots=0) -> Tensor"
 )
 
 
 @impl(voyager_lib, "zeros", "CompositeExplicitAutograd")
 def zeros(
-    size: Tuple[int, ...], dtype: torch.dtype, banks: int = UNBANKED
+    size: Tuple[int, ...], dtype: torch.dtype, num_slots: int = UNPIPELINED
 ) -> torch.Tensor:
-    return torch.zeros(_banked_size(size, banks), dtype=dtype)
+    return torch.zeros(_pipelined_size(size, num_slots), dtype=dtype)
 
 
 @torch.library.register_fake("voyager::zeros")
 def _zeros_fake(
-    size: Tuple[int, ...], dtype: torch.dtype, banks: int = UNBANKED
+    size: Tuple[int, ...], dtype: torch.dtype, num_slots: int = UNPIPELINED
 ) -> torch.Tensor:
-    return torch.zeros(_banked_size(size, banks), dtype=dtype)
+    return torch.zeros(_pipelined_size(size, num_slots), dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def _zeros_fake(
 # a token to consume, sparing a warm-up guard).
 # ---------------------------------------------------------------------------
 voyager_lib.define(
-    "fill(SymInt[] size, ScalarType dtype, Scalar value, int banks=0) "
+    "fill(SymInt[] size, ScalarType dtype, Scalar value, int num_slots=0) "
     "-> Tensor"
 )
 
@@ -151,9 +151,9 @@ def fill(
     size: Tuple[int, ...],
     dtype: torch.dtype,
     value,
-    banks: int = UNBANKED,
+    num_slots: int = UNPIPELINED,
 ) -> torch.Tensor:
-    return torch.full(_banked_size(size, banks), value, dtype=dtype)
+    return torch.full(_pipelined_size(size, num_slots), value, dtype=dtype)
 
 
 @torch.library.register_fake("voyager::fill")
@@ -161,25 +161,25 @@ def _fill_fake(
     size: Tuple[int, ...],
     dtype: torch.dtype,
     value,
-    banks: int = UNBANKED,
+    num_slots: int = UNPIPELINED,
 ) -> torch.Tensor:
-    return torch.full(_banked_size(size, banks), value, dtype=dtype)
+    return torch.full(_pipelined_size(size, num_slots), value, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
 # voyager.subview — a strided window onto a buffer, after MLIR's memref.subview:
 # ``offsets`` / ``sizes`` / ``strides`` all carry one entry per *source* dim.
 # ``squeeze_dim`` names the windowed dims to drop from the result (each of size
-# 1), which is how memref.subview reduces rank — a bank dim is not a tensor dim,
-# so a bank pick drops it.  It names no storage of its own; the code generator
+# 1), which is how memref.subview reduces rank — a slot dim is not a tensor dim,
+# so a slot pick drops it.  It names no storage of its own; the code generator
 # folds it into the operand's ``TensorBoxRef``: the window that reference makes
 # onto the buffer.
 #
-# It must return a genuine *view*: a bank slot is a write destination
-# (``insert(src, bank_slot)``), and the FX graph stays executable, so a copy
+# It must return a genuine *view*: a slot is a write destination
+# (``insert(src, slot)``), and the FX graph stays executable, so a copy
 # would land the write in a throwaway tensor.  ``as_strided`` gives the view and
 # keeps the result's shape static -- only its storage offset is dynamic, which
-# is what lets the slot index (``step % num_banks``) stay a runtime value.
+# is what lets the slot index (``step % num_slots``) stay a runtime value.
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "subview(Tensor(a) source, SymInt[] offsets, SymInt[] sizes, "

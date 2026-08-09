@@ -16,9 +16,9 @@ non-bufferized path).  Three ideas carry the whole translation:
   * **Every instruction stands alone.**  A ``TensorBox`` — a model input, a
     weight, a ``voyager.alloc`` / ``voyager.zeros`` — declares an allocation.
     Every *use* of it is a ``TensorBoxRef`` repeating that declaration in full
-    (name, dtype, memory level and address, banking) under the *operand's*
+    (name, dtype, memory level and address, pipelining) under the *operand's*
     shape, plus the window it reads — a ``voyager.subview``, which for a
-    software-pipeline bank is the slot a step picks.  Aliasing ops and the
+    software-pipeline slot is the slot a step picks.  Aliasing ops and the
     ``subview`` collapse into the reference, the slot stays a *runtime* offset,
     and nothing has to be resolved to execute an instruction.
   * **Compute is destination-passing.**  ``voyager.insert(src, dst)`` is how the
@@ -367,7 +367,7 @@ class _Emitter:
 
     **Emit** then serializes, reading those two maps.  Splitting them is what
     lets a destination reach *backwards* into a ``cond`` branch that was already
-    walked, and a bank ``select`` inside a loop body resolve to an ``alloc``
+    walked, and a slot ``select`` inside a loop body resolve to an ``alloc``
     declared outside it.
     """
 
@@ -388,16 +388,17 @@ class _Emitter:
         """``node`` as an operand: the allocation it names, described in full.
 
         The reference repeats the allocation — name, dtype, memory level and
-        address, banking — so an instruction is executable without resolving
+        address, pipelining — so an instruction is executable without resolving
         anything else.  Its shape is ``node``'s own whenever an aliasing op
         (a reshape, a rank-reducing ``subview``) stands between the two.
         """
         ref = self._resolve(node, env, internal)
         value = _value(node)
-        # ``value.shape`` still leads with the bank dim that ``_tensor_box``
+        # ``value.shape`` still leads with the slot dim that ``_tensor_box``
         # factors into ``bank_count``, so an operand naming the allocation
         # itself keeps the declared shape rather than restoring that dim.  Every
-        # operand of a banked buffer reaches it through ``select_bank``, whose
+        # operand of a pipelined buffer reaches it through
+        # ``get_slot``, whose
         # ``squeeze_dim`` has already dropped the dim.
         if not _owns_storage(node) and isinstance(value, torch.Tensor):
             del ref.box.shape[:]
@@ -406,7 +407,7 @@ class _Emitter:
         return ref
 
     def _resolve(self, node, env, internal) -> TensorBoxRef:
-        """The storage ``node`` names.  Views (bank slots, reshapes, casts) and
+        """The storage ``node`` names.  Views (slots, reshapes, casts) and
         region boundaries are transparent: they resolve to the box that owns the
         bytes, plus the window a ``voyager.subview`` reads of them.
 
@@ -452,11 +453,12 @@ class _Emitter:
     def _window(self, node, env, internal) -> TensorBoxRef:
         """A ``voyager.subview`` is not an instruction: it *is* the reference
         the operand makes to the buffer it windows.  Its arguments pass straight
-        through — an offset may be a runtime scalar (the bank a step writes),
+        through — an offset may be a runtime scalar (the slot a step writes),
         while sizes and strides are static.
 
-        The referenced dims of a banked buffer are ``[bank_count, *shape]``, so
-        dim 0 offsets the bank and the backend pitches it by
+        The referenced dims of a pipelined buffer are
+        ``[slot_count, *shape]``, so
+        dim 0 offsets the slot and the backend pitches it by
         ``bank_stride_bytes``.  A window over the *whole* referenced buffer is
         the buffer, and is left off.  ``squeeze_dim`` is not addressing — it is
         the rank the *tensor* takes, and the bytes it names are the same.
@@ -769,17 +771,18 @@ class _Emitter:
             out.destination.CopyFrom(destination)
 
     def _tensor_box(self, node) -> TensorBox:
-        """Declare ``node``'s storage.  A banked buffer records its depth and
-        pitch instead of a leading bank *dimension*, so ``shape`` stays the
-        payload of one bank and slot ``i`` lives at
-        ``address + i * bank_stride_bytes``."""
+        """Declare ``node``'s storage.  A pipelined buffer records its depth and
+        pitch instead of a leading slot *dimension*, so ``shape`` stays the
+        payload of one slot and slot ``i`` lives at
+        ``address + i * bank_stride_bytes`` (the proto keeps the bank_*
+        field names)."""
         box = TensorBox(node=node.name, dtype=_dtype_str(node))
         shape = list(_value(node).shape)
 
-        if banks := node.meta.get("bank_count", 0):
-            box.bank_count = banks
-            box.bank_stride_bytes = node.meta["bank_stride"]
-            shape = shape[1:]  # the bank dim is not a tensor dim
+        if slots := node.meta.get("slot_count", 0):
+            box.bank_count = slots
+            box.bank_stride_bytes = node.meta["slot_stride"]
+            shape = shape[1:]  # the slot dim is not a tensor dim
         box.shape.extend(shape)
 
         box.memory.level = self._memory_level(node)
@@ -810,7 +813,7 @@ class _Emitter:
         a compute op's operand tiles and its result, and a DRAM buffer (which a
         whole loop is replayed against) — an ``alloc``, or a tensor the host
         materializes and the loop then loads tiles out of (a ``pad``, a slice).
-        The machinery in between — the DMA, the semaphores, the SRAM banks, the
+        The machinery in between — the DMA, the semaphores, the SRAM slots, the
         index vectors — the run drives itself, so it is not dumped."""
         if self.dump_dir is None:
             return

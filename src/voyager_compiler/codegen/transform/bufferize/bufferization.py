@@ -111,9 +111,9 @@ def annotate_tensor_spaces(gm: GraphModule) -> None:
 
       * **Buffers** carry ``node.meta['space']``: a ``voyager.alloc`` is
         Scratchpad (``MemoryLevel.SRAM``) or DRAM (its level arg), a
-        ``voyager.zeros`` accumulator / semaphore bank is Scratchpad, and a
+        ``voyager.zeros`` accumulator / semaphore buffer is Scratchpad, and a
         top-level input placeholder or weight ``get_attr`` is DRAM.  A *view* of
-        a buffer — a bank-slot ``select``, a reshape, a loop result — takes the
+        a buffer — a slot-slot ``select``, a reshape, a loop result — takes the
         space of what it views, threading through the loop / cond boundary.
         Codebooks / qmaps are *params* (passed to the accelerator, not memory) —
         unmarked.  Everything else (DMA, semaphore waits, index arithmetic)
@@ -140,7 +140,7 @@ def _is_compute(node: Node) -> bool:
     memory / control-flow / semaphore primitives around a kernel — the buffer
     producers (``alloc`` / ``zeros``), the ``insert`` store, the async DMA and
     its ``async_wait``, the index arithmetic (``increment_indices`` /
-    ``delinearize_index``), the bank-read ``select`` and the multi-output
+    ``delinearize_index``), the slot-read ``select`` and the multi-output
     ``getitem`` — are all excluded by simply not being in it.
     """
     if not _produces_tensor(node):
@@ -215,7 +215,7 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
     Some nodes allocate nothing: they are a second name for a buffer that
     already exists, and so take its space rather than a space of their own.
 
-      * a ``voyager.subview`` — a window onto a buffer (the bank a step reads);
+      * a ``voyager.subview`` — a window onto a buffer (the slot a step reads);
       * a NOP (``reshape``, ``view``, a same-dtype ``to``) — the same bytes;
       * ``getitem`` of a ``while_loop`` — the loop wrote the carried buffer in
         place, so its result *is* that buffer;
@@ -223,7 +223,7 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
         destination its ``insert`` names and so owns no space either.
 
     Everything else writes a tensor of its own and owns it — including an
-    ``aten.select`` that reads a sub-tensor (a *bank* is a ``subview``, so a
+    ``aten.select`` that reads a sub-tensor (a *slot* is a ``subview``, so a
     select here is a model slicing a tensor) and a ``to.dtype`` that really
     converts.
     """
@@ -301,7 +301,7 @@ def _annotate_and_validate(
                 "Scratchpad" if level == int(MemoryLevel.SRAM) else "DRAM"
             )
         elif node.target in (_VOYAGER_ZEROS, _VOYAGER_FILL):
-            # A semaphore bank (``zeros`` = 0, ``fill`` = a seed credit), not a
+            # A semaphore buffer (``zeros`` = 0, ``fill`` = a seed credit), not a
             # tensor buffer: no space (and so not the DRAM default below either).
             pass
         elif node.target is _WHILE_LOOP:
@@ -360,7 +360,7 @@ def _set_dtype(n, dt) -> bool:
 
 def _buffer_of(node):
     """Walk a copy destination back through ``select`` / NOP views to the
-    underlying ``alloc`` (or placeholder bank) it writes, so a copy tags the
+    underlying ``alloc`` (or placeholder slot) it writes, so a copy tags the
     buffer and not just the tile view."""
     seen = set()
     while isinstance(node, Node) and node not in seen:
@@ -384,7 +384,7 @@ def _thread_hop(
 ) -> None:
     """Recurse the forward pass into each loop body / cond branch: seed its
     placeholders from the bound ``operands``, propagate, then carry the dtypes it
-    derived back out — onto the captured operands (SRAM banks written in place)
+    derived back out — onto the captured operands (SRAM slots written in place)
     and onto the HOP's ``getitem`` result handles (a cond branch's tensor
     output)."""
     handles = [
@@ -406,8 +406,8 @@ def _thread_hop(
         for op, ph in zip(operands, phs):
             d = _dtype_of(ph)
             _set_dtype(op, d)
-            # Bridge a bank slot view (``select``) to its alloc, so an
-            # in-loop-written output bank tags the bank, not just the slice.
+            # Bridge a slot view (``select``) to its alloc, so an
+            # in-loop-written output slot tags the slot, not just the slice.
             _set_dtype(_buffer_of(op), d)
         outs = _outputs_of(sub)
         for u in handles:
@@ -591,6 +591,29 @@ def _gm_to_hashable(gm):
     return tuple(_node_to_hashable(n, index_of) for n in gm.graph.nodes)
 
 
+def _nest_output_values(sub_gm) -> list:
+    """The value each of ``sub_gm``'s outputs really carries, one per output
+    slot (``None`` where it carries none).
+
+    Every builder finishes with ``ShapeProp(gm, recurse=True)``, so the nest's
+    output nodes hold concrete values before the splice runs — which is the
+    only place the *nest's* view of its own buffers survives, since
+    ``node_copy`` does not carry the ``.value`` attribute into the parent
+    graph.
+    """
+    out = next(
+        (n for n in reversed(sub_gm.graph.nodes) if n.op == "output"), None
+    )
+    if out is None:
+        return []
+    outs = out.args[0]
+    if not isinstance(outs, (tuple, list)):
+        outs = [outs]
+    return [
+        getattr(n, "value", None) if isinstance(n, Node) else None for n in outs
+    ]
+
+
 def _bufferize_key(node):
     """A structural + shape/dtype signature for ``node``'s bufferized nest:
     two nodes with the same key build to the same nest (only the operand
@@ -626,7 +649,7 @@ def _base_name(name: str) -> str:
 def _keeps_scope(gm: GraphModule) -> set:
     """The nodes of ``gm`` a layer name is worth spending on: the compute ops,
     and the DRAM buffers a whole loop is replayed against.  A tile a compute op
-    reads is not one — it is a ``subview`` of a bank, and it says which bank it
+    reads is not one — it is a ``subview`` of a slot, and it says which slot it
     reads, so the layer it belongs to is already there to follow.
     """
     keep = set()
@@ -754,7 +777,7 @@ def bufferize_graph(
           baseline flash-attention builder (``build_attention``).
     """
     graph = model.graph
-    num_banks = 2 if pipelined else 1
+    num_slots = 2 if pipelined else 1
     build_cache = {}
     group_ids = itertools.count()
 
@@ -796,31 +819,31 @@ def bufferize_graph(
             if is_conv2d(anchor):
                 sub_gm = build_conv2d(
                     node,
-                    num_banks=num_banks,
+                    num_slots=num_slots,
                     single_buffer_tail=single_buffer_tail,
                     tiler=tiler,
                 )
             elif is_gemm_op(anchor):
                 sub_gm = build_gemm(
                     node,
-                    num_banks=num_banks,
+                    num_slots=num_slots,
                     single_buffer_tail=single_buffer_tail,
                     tiler=tiler,
                 )
             elif is_pooling(anchor):
-                sub_gm = build_pool(node, num_banks=num_banks, tiler=tiler)
+                sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
             elif anchor.target is _SDPA:
                 sub_gm = (
                     build_attention_fa3(node, tiler=tiler)
                     if flash_attention_v3
-                    else build_attention(node, num_banks=num_banks, tiler=tiler)
+                    else build_attention(node, num_slots=num_slots, tiler=tiler)
                 )
             elif (
                 is_elementwise_op(anchor)
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):
-                sub_gm = build_pointwise(node, num_banks=num_banks, tiler=tiler)
+                sub_gm = build_pointwise(node, num_slots=num_slots, tiler=tiler)
             else:
                 sub_gm = None
 
@@ -917,7 +940,7 @@ def bufferize_graph(
 
 
 # Never CSE these: an ``alloc`` / ``zeros`` / ``fill`` is a *distinct*
-# allocation even when byte-identical (a separate buffer / semaphore bank), and
+# allocation even when byte-identical (a separate buffer / semaphore), and
 # the side-effecting ops / HOP regions carry effects a merge would drop.
 _DEDUP_SKIP = frozenset(
     {
@@ -938,7 +961,7 @@ def _dedup_regions(gm: GraphModule) -> None:
     """CSE identical *pure* nodes in ``gm`` and every nested region (while_loop
     / cond / commit bodies, fused submodules), skipping ``_DEDUP_SKIP``.  A
     D==0 prefetch loads into the same slot the read consumes, so the fetch and
-    read ``subview``s (bank + semaphore) are identical -- this folds them, and
+    read ``subview``s (slot + semaphore) are identical -- this folds them, and
     any other repeated index math, to one node per region."""
     seen, merged = {}, set()
     for node in list(gm.graph.nodes):
@@ -984,11 +1007,11 @@ _RELAYOUT_POINTWISE_OPS = {
 
 
 def _build_for_untiled(node: Node, tiler):
-    """Bufferize an untiled op through the pipeline scheduler with *whole-tensor*
-    tiles: a single-step ``PipelinedKernel`` (grid ``(1,)``) that DMA-loads each
-    tiled input whole, runs the op, and stores each output whole — no tiling
-    loop, since the operands and output(s) fit on-chip.  Codebooks and scalars
-    (0-D / single-element) are passed whole, not loaded.
+    """Bufferize an untiled op through the pipeline scheduler with
+    *whole-tensor* tiles: a single-step ``PipelinedKernel`` (grid ``(1,)``)
+    that DMA-loads each tiled input whole, runs the op, and stores each output
+    whole — no tiling loop, since the operands and output(s) fit on-chip.
+    Codebooks and scalars (0-D / single-element) are passed whole, not loaded.
 
     Every tensor dim maps to the lone (extent-1) grid dim, so the spec is
     op-agnostic — it works for shape-changing ops (``reshape`` / ``slice``)
@@ -1077,6 +1100,6 @@ def _build_for_untiled(node: Node, tiler):
         out_specs,
         tuple(inputs),
         scratch_specs=scratch_specs,
-        num_banks=1,
+        num_slots=1,
     )
     return gm, len(outputs)

@@ -300,6 +300,8 @@ def make_size_fn(
     oc_align=None,
     has_tail=False,
     num_slots=1,
+    batch=1,
+    weight_batch=1,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -375,33 +377,42 @@ def make_size_fn(
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
         bias = extent(le.OC) * bias_bits / 8.0 if bias_bits else 0.0
 
-        def slots(dims):
+        def slots(dims, distinct):
             """Banks an operand spanning ``dims`` needs: a second holds the
-            next tile, so a single L3 tile needs one.  The builders'
-            ``PipelinedKernel._num_banks`` is the looser test, so this never
-            charges less than is allocated."""
-            tiles = 1
+            next tile, so an operand with one tile over the whole sweep needs
+            one.  The mapping covers a single batch element -- the builder
+            loops the rest -- so the sweep's tile count is the L3 trips times
+            ``distinct``, the operand's distinct tiles over that batch loop
+            (``_batch_loads`` counts fetches the same way).  The builders'
+            ``PipelinedKernel._num_slots`` resolves the depth from the full
+            grid, so this never charges less than is allocated."""
+            tiles = distinct
             for d in dims:
                 tiles *= point.loop_blocking(d)[3]
             return num_slots if tiles > 1 else 1
 
         groups = [
-            (if_count * if_bits / 8.0, _IF, slots(_IF_DIMS)),
-            (_scale_bytes(if_count, if_scale_bits), _IF, slots(_IF_DIMS)),
+            (if_count * if_bits / 8.0, _IF, slots(_IF_DIMS, batch)),
+            (
+                _scale_bytes(if_count, if_scale_bits),
+                _IF,
+                slots(_IF_DIMS, batch),
+            ),
             (
                 fl_count * fl_bits / 8.0
                 + _scale_bytes(fl_count, fl_scale_bits)
                 + bias,
                 _FL,
-                slots(_FL_DIMS),
+                slots(_FL_DIMS, weight_batch),
             ),
-            (of_count * out_bits / 8.0 + of_scale, _OF, slots(_OF_DIMS)),
+            (of_count * out_bits / 8.0 + of_scale, _OF, slots(_OF_DIMS, batch)),
         ]
         for dims, bits in fused_specs:
             count = 1
             for d in dims:
                 count *= extent(d)
-            groups.append((count * bits / 8.0, _OF, slots(dims)))
+            distinct = batch if le.ON in dims else 1
+            groups.append((count * bits / 8.0, _OF, slots(dims, distinct)))
 
         # An absent operand (no scale, no bias) occupies no bank.
         groups = [g for g in groups if g[0] > 0]
@@ -1081,6 +1092,8 @@ def _prepare_search(node, tiler):
             oc_align,
             has_tail=has_tail,
             num_slots=tiler.config.num_slots,
+            batch=batch,
+            weight_batch=batch // weight_repeat,
         )
         for extra_sharing in range(4 + len(fused_specs))
     ]
