@@ -2,7 +2,7 @@
 
 Replaces the individual ``sweep_context / sweep_model_size / sweep_quant /
 sweep_family / sweep_hardware`` scripts.  All of them radiate from the same
-baseline design point (Llama-3.1-8B, 64x64 PE, 1 MB cache, W8A8, length 1024),
+baseline design point (Llama-3.1-8B, 64x64 PE, 2 MB SRAM, W8A8, length 1024),
 so run separately they recompile that point many times over.  Here every axis's
 points are collected, **deduplicated by config** (a ``SweepConfig`` fully
 determines a compile, so ``astuple(cfg)`` is the key), and run through one
@@ -144,11 +144,10 @@ def build_points(args):
                 )
             )
     for mb in SRAM_EFFECTIVE_MB:
-        # Effective SRAM = 2 * cache_size (double buffering).
-        cache_size = int(mb * 1024 * 1024) // 2
+        scratchpad_size = int(mb * 1024 * 1024)
         for mode in MODES:
             cfg = common.config_from_args(
-                args, mode=mode, cache_size=cache_size
+                args, mode=mode, scratchpad_size=scratchpad_size
             )
             pts.append(
                 Point(
@@ -269,7 +268,7 @@ def parse_args():
             "prompt_len",
             "kv_len",
             "pe",
-            "cache_size",
+            "scratchpad_size",
             "num_banks",
             "dram_bandwidth_gbs",
         },

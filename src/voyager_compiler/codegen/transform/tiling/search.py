@@ -160,7 +160,11 @@ def _tensor_bytes(node, shape, config):
 
 
 def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
-    """Scratchpad bytes one candidate tile occupies.
+    """Scratchpad bytes one candidate tile occupies, in **one slot**.
+
+    A ping-ponged buffer holds this much in each of its ``num_slots`` banks, so
+    the caller compares the result against ``scratchpad_size // num_slots``
+    rather than against the whole scratchpad.
 
     Every group takes a whole bank, since a bank cannot be split, and the two
     smallest merge while the groups outnumber the banks.
@@ -173,13 +177,13 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
         node: The op being tiled; its own entry is the output.
         tiled_shapes: Operand FX node -> tiled shape.
         config (AcceleratorConfig): The hardware description -- bank width and
-            size, the bank count to merge down to, and the vector lanes.
+            size, the banks one slot may spread over, and the vector lanes.
         extra_sharing: Merge this many groups further.  ``G`` groups floor the
-            footprint at ``G * bank_size``, so at ``G == num_banks`` no tile
+            footprint at ``G * bank_size``, so at ``G`` banks per slot no tile
             fits however small and the caller has to raise it.
 
     Returns:
-        Bytes the tile needs with every group rounded to whole banks.
+        Bytes one slot needs, with every group rounded to whole banks.
     """
     # ``groups`` is the bank layout, one entry per bank: the groups that match,
     # then any operand they do not name on its own.  A ``where`` lays out as
@@ -223,7 +227,7 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
 
     target = len(sizes)
     if config.num_banks:
-        target = config.num_banks
+        target = config.num_banks // config.num_slots
     target = max(1, target - extra_sharing)
     while len(sizes) > target:
         sizes.sort()
@@ -251,8 +255,8 @@ def _search_tiling(
     merged while they outnumber the banks).
 
     ``get_valid_tiling`` yields candidates largest -> smallest.  Without
-    ``cost_fn`` the first tiling that fits ``config.scratchpad_size`` wins (the
-    largest fitting tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
+    ``cost_fn`` the first tiling that fits one slot wins (the largest fitting
+    tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
     tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every fitting candidate
     is scored and the one moving the fewest bytes wins among those within
     ``(1 + tolerance)`` of the best latency.  Latency alone is not enough: a
@@ -261,6 +265,8 @@ def _search_tiling(
     rounding error.  This is how the interstellar tiler picks a mapping too
     (``mapping_point_generator``, with energy in place of bytes).
     """
+
+    slot_size = config.scratchpad_size // config.num_slots
 
     # Every operand group costs a whole bank, so ``G`` groups floor the
     # footprint at ``G * bank_size``: with as many groups as banks nothing
@@ -280,7 +286,7 @@ def _search_tiling(
                 node, tiled_shapes, config, extra_sharing
             )
 
-            if total_size > config.scratchpad_size:
+            if total_size > slot_size:
                 continue
 
             if cost_fn is None:
@@ -296,9 +302,7 @@ def _search_tiling(
                 key=lambda s: (s[1], s[0]),
             )[2]
 
-    logger.debug(
-        f"Failed to tile {node} with cache size {config.scratchpad_size}."
-    )
+    logger.debug(f"Failed to tile {node} into a {slot_size}-byte slot.")
     return None
 
 

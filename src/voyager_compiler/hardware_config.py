@@ -24,10 +24,11 @@ DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
 class AcceleratorConfig:
     """Full accelerator hardware architecture.
 
-    ``scratchpad_size`` is the **per-buffer** L2 budget: with
-    ``double_buffered_l2`` the physical SRAM is ``scratchpad_size * 2`` (two
-    ping-pong buffers), and a tile is sized to fill one buffer, so tiling
-    against ``scratchpad_size`` needs no halving.
+    ``scratchpad_size`` is the **whole physical** L2 SRAM and ``num_banks`` the
+    banks it divides into, whatever the buffering -- neither is scaled by
+    ``double_buffered_l2``.  What that flag changes is ``num_slots``: a
+    ping-ponged buffer occupies two banks instead of one, so a tile is sized
+    against ``scratchpad_size // num_slots``.
 
     Concrete defaults live in ``cli_args.py`` (the single source of truth); the
     fields here default to ``None`` and just carry whatever the entry point was
@@ -45,7 +46,7 @@ class AcceleratorConfig:
     accum_buffer_size: Optional[int] = None
     double_buffered_accum_buffer: bool = False
     # L2 scratchpad
-    scratchpad_size: Optional[int] = None  # bytes (per-buffer; --cache_size)
+    scratchpad_size: Optional[int] = None
     num_banks: Optional[int] = None
     bank_width: Optional[int] = None
     double_buffered_l2: bool = False
@@ -70,6 +71,11 @@ class AcceleratorConfig:
         return self.dram_access_latency * self.frequency
 
     @property
+    def num_slots(self) -> int:
+        """Banks one buffer occupies: two when it is ping-ponged, else one."""
+        return 2 if self.double_buffered_l2 else 1
+
+    @property
     def bank_size(self) -> Optional[int]:
         if self.num_banks is None:
             return None
@@ -86,7 +92,7 @@ class AcceleratorConfig:
             weight_buffer_size=args.weight_buffer_size,
             accum_buffer_size=args.accum_buffer_size,
             double_buffered_accum_buffer=args.double_buffered_accum_buffer,
-            scratchpad_size=args.cache_size,
+            scratchpad_size=args.scratchpad_size,
             num_banks=args.num_banks,
             bank_width=args.bank_width,
             double_buffered_l2=args.double_buffered_l2,

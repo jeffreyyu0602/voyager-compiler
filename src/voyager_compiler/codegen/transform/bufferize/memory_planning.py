@@ -621,17 +621,19 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
     plus ``meta['bank_count']`` / ``meta['bank_stride']`` on a banked one, and
     returns the pool sizes.  Nothing is threaded onto the tile sites: a tile is
     named by the buffer it lives in (and, for a bank, a runtime slot index), so
-    the address belongs to the buffer, not to every reference to it.  Warns,
-    listing the buffers live at the peak, if the scratchpad plan exceeds
-    ``cache_size``.
+    the address belongs to the buffer, not to every reference to it.
 
-    ``config.scratchpad_size`` is the *per-buffer* budget; under
-    ``double_buffered_l2`` the planner places two ping-pong buffers, so the
-    physical capacity it plans against is doubled here.
+    ``config.scratchpad_size`` is the whole physical scratchpad, so the plan is
+    compared against it directly: the ping-pong slots this places are already
+    part of what it has to hold.
+
+    Raises:
+        ValueError: If the scratchpad plan exceeds ``scratchpad_size``, listing
+            the buffers live at the peak.  A plan that does not fit describes a
+            machine the accelerator does not have, so it is an error rather
+            than a warning: the tile search has to pick smaller tiles.
     """
-    cache_size = config.scratchpad_size
-    if cache_size is not None and config.double_buffered_l2:
-        cache_size *= 2
+    capacity = config.scratchpad_size
 
     # Which buffer every name denotes, and the global schedule: both arenas need
     # them (a buffer dies at the last read of *any* of its names), so compute
@@ -642,13 +644,13 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
 
     scratchpad_bytes = 0
     peak_region = None
-    if cache_size is not None:
+    if capacity is not None:
         scratchpad_bytes, peak_region = _plan_scratchpad(model, bufs, config)
 
     _stamp_banking(model, config)
     _check_invariants(model, bufs)
 
-    if cache_size is not None and scratchpad_bytes > cache_size:
+    if capacity is not None and scratchpad_bytes > capacity:
         peak_bytes, live = _peak_live_buffers(bufs)
         shown = live[:12]
         detail = "\n".join(
@@ -658,21 +660,17 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
         )
         if len(live) > len(shown):
             detail += f"\n    ... (+{len(live) - len(shown)} more)"
-        logger.warning(
-            "[plan_memory] scratchpad plan needs %d bytes > cache_size %d; "
-            "peak concurrency %d B across %d live scratchpad buffers:\n%s",
-            scratchpad_bytes,
-            cache_size,
-            peak_bytes,
-            len(live),
-            detail,
+        raise ValueError(
+            f"[plan_memory] scratchpad plan needs {scratchpad_bytes} bytes > "
+            f"scratchpad_size {capacity}; peak concurrency {peak_bytes} B "
+            f"across {len(live)} live scratchpad buffers:\n{detail}"
         )
 
     logger.info(
         "Memory plan: DRAM=%d bytes, Scratchpad=%d/%s bytes (peak region %s)",
         dram_bytes,
         scratchpad_bytes,
-        cache_size,
+        capacity,
         peak_region,
     )
     return MemoryPlan(dram_bytes, scratchpad_bytes)

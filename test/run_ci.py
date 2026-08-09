@@ -69,14 +69,14 @@ SCHEME_ARGS = {
         "--activation nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 "
         "--weight nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --layout_policy systolic "
-        "--cache_size 1048576 --num_banks 8 --conv2d_im2col"
+        "--scratchpad_size 2097152 --num_banks 16 --conv2d_im2col"
     ),
 }
 
 # The interstellar tiler sizes its blocking against a scratchpad and a bank
 # count, and has no answer when they are unset.  Only MXNF4 names its own, so
 # every other scheme is given these -- the same pair MXNF4 asks for.
-DEFAULT_TILER_ARGS = {"--cache_size": "1048576", "--num_banks": "8"}
+DEFAULT_TILER_ARGS = {"--scratchpad_size": "2097152", "--num_banks": "16"}
 
 # One activation element, bytes, per scheme.  Each command's --bank_width is
 # one input beat -- the PE array's column count times this -- which is the

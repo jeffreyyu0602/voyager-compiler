@@ -110,10 +110,11 @@ torch.set_grad_enabled(False)
 DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 
 # -- baseline design point (spec §1), matching test_llama_report.py -------
-# ``cache_size`` is the tiler's L2 scratchpad; double buffering makes the
-# effective on-chip SRAM ``2 * cache_size`` (so 1 MiB here == 2 MB effective).
-BASELINE_CACHE_SIZE = 1 * 1024 * 1024
-BASELINE_NUM_BANKS = 8
+# ``scratchpad_size`` is the whole on-chip L2 SRAM and ``num_banks`` the banks
+# it divides into; double buffering spends two of those banks per buffer rather
+# than changing either number.
+BASELINE_SCRATCHPAD_SIZE = 2 * 1024 * 1024
+BASELINE_NUM_BANKS = 16
 BASELINE_BANK_WIDTH = 64
 BASELINE_PE = (64, 64)
 BASELINE_FREQUENCY_GHZ = 1.0
@@ -208,7 +209,7 @@ class SweepConfig:
     kv_bits: int = 16
 
     pe: Tuple[int, int] = BASELINE_PE
-    cache_size: int = BASELINE_CACHE_SIZE
+    scratchpad_size: int = BASELINE_SCRATCHPAD_SIZE
     num_banks: int = BASELINE_NUM_BANKS
     bank_width: int = BASELINE_BANK_WIDTH
     frequency_ghz: float = BASELINE_FREQUENCY_GHZ
@@ -232,16 +233,12 @@ class SweepConfig:
     dump_dir: Optional[str] = None
 
     @property
-    def unroll(self) -> Tuple[int, int]:
-        return tuple(self.pe)
-
-    @property
     def acc_config(self) -> AcceleratorConfig:
         """The accelerator description this sweep point compiles for.  L2 is
-        double-buffered (effective SRAM is ``2 * cache_size``)."""
+        double-buffered, so a buffer occupies two of ``num_banks`` banks."""
         return AcceleratorConfig(
-            pe_array_size=self.unroll,
-            scratchpad_size=self.cache_size,
+            pe_array_size=self.pe,
+            scratchpad_size=self.scratchpad_size,
             num_banks=self.num_banks,
             bank_width=self.bank_width,
             input_buffer_size=1024,

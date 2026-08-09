@@ -102,8 +102,8 @@ def build_interstellar_tiler(
     those stay in bytes.
 
     L2 is planned exactly the way ``plan_memory`` allocates it: the capacity is
-    the *physical* scratchpad and, under ``double_buffered_l2``, each source is
-    charged once per ping-pong copy (``size_fn``) rather than the capacity being
+    ``scratchpad_size``, the whole physical scratchpad, and a ping-ponged source
+    is charged one bank per slot (``size_fn``) rather than the capacity being
     halved.  Halving cannot express a buffer that is allocated only once -- the
     reduction scratch -- and it is that omission that let the tiler hand back
     tilings the allocator could not place.
@@ -114,16 +114,6 @@ def build_interstellar_tiler(
     """
     ic_dim, oc_dim = config.pe_array_size
 
-    # Banking applies only at L2 (the on-chip scratchpad).  ``scratchpad_size``
-    # is the per-copy budget, so the physical pool -- and its bank count -- are
-    # doubled when the planner ping-pongs (``plan_memory`` does the same).
-    copies = 2 if config.double_buffered_l2 else 1
-    bank_size = (
-        config.scratchpad_size // config.num_banks
-        if config.num_banks is not None
-        else None
-    )
-
     architecture = interstellar.Resource(
         buf_capacity_list=[
             [1, 1, 1],
@@ -132,7 +122,7 @@ def build_interstellar_tiler(
                 config.accum_buffer_size * oc_dim,
                 config.weight_buffer_size * oc_dim,
             ],
-            [config.scratchpad_size * copies],
+            [config.scratchpad_size],
             [config.dram_size * 1024**3],  # GB -> bytes
         ],
         buf_access_cost_list=[
@@ -147,7 +137,7 @@ def build_interstellar_tiler(
         mac_capacity=0,
         partition_mode=[0, 0, 0, 0],
         invalid_underutilized=False,
-        bank_size_list=[None, None, bank_size, None],
+        bank_size_list=[None, None, config.bank_size, None],
     )
 
     schedule_constraint = {
@@ -279,7 +269,7 @@ def _fused_operand_specs(node, anchor):
     return specs
 
 
-# Slots of interstellar's (input, output, weight) byte triple.
+# Positions of interstellar's (input, output, weight) byte triple.
 _IF, _OF, _FL = 0, 1, 2
 
 
@@ -302,7 +292,7 @@ def make_size_fn(
     extra_sharing=0,
     oc_align=None,
     has_tail=False,
-    copies=1,
+    num_slots=1,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -318,8 +308,8 @@ def make_size_fn(
         input | input_scale | weight+weight_scale+bias | output+output_scale
               | each fused operand
 
-    Each such source is ping-ponged, so it costs ``copies`` whole banks -- the
-    two halves live in *separate* banks, which is what the planner does and
+    Each such source is ping-ponged, so it costs ``num_slots`` whole banks --
+    the two halves live in *separate* banks, which is what the planner does and
     what lets a load overlap the compute reading the other half.  A split
     reduction with a fused tail also accumulates into a scratch buffer the
     builders allocate exactly once (``_ScratchSpec``); it is charged a single
@@ -327,11 +317,11 @@ def make_size_fn(
     tilings ``plan_memory`` could not place.
 
     A bank cannot be split between groups, so each group rounds up to a whole
-    bank -- which puts a floor of ``copies * len(groups) * bank_size`` on the
+    bank -- which puts a floor of ``num_slots * len(groups) * bank_size`` on the
     tile, however small it is.  With more groups than banks the two *smallest*
     are merged until they fit (a tiny scale tensor would otherwise waste a
-    whole bank).  Only whole sources merge, never a source's own two copies --
-    each copy must keep its own bank.  ``extra_sharing`` forces further merges;
+    whole bank).  Only whole sources merge, never a source's own two slots --
+    each slot must keep its own bank.  ``extra_sharing`` forces further merges;
     ``_run_search`` raises it when nothing maps even at the minimum.
 
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
@@ -400,7 +390,7 @@ def make_size_fn(
 
         # A reduction split across L3 steps accumulates into a scratch buffer
         # the builders allocate once for the whole kernel, not per ping-pong
-        # half -- so it is charged one region, outside ``copies``.
+        # half -- so it is charged one region, outside ``num_slots``.
         scratch = (
             of_count * PSUM_BITS / 8.0
             if has_tail and point.loop_blocking(le.IC)[3] > 1
@@ -409,23 +399,23 @@ def make_size_fn(
 
         out = [0.0, 0.0, 0.0]
         if not bank_size:
-            for size, slot in groups:
-                out[slot] += copies * size
+            for size, kind in groups:
+                out[kind] += num_slots * size
             out[_OF] += scratch
             return tuple(out)
 
         scratch_banks = math.ceil(scratch / bank_size) if scratch else 0
         # Banks left for the ping-ponged sources, in whole sources.
-        budget = (num_banks or copies * len(groups)) - scratch_banks
-        target = max(1, budget // copies - extra_sharing)
+        budget = (num_banks or num_slots * len(groups)) - scratch_banks
+        target = max(1, budget // num_slots - extra_sharing)
         for _ in range(max(0, len(groups) - target)):
             groups.sort(key=lambda g: g[0])
             (s0, k0), (s1, k1) = groups[0], groups[1]
             # Charge the shared bank to the larger member's operand.
             groups = [(s0 + s1, k0 if s0 >= s1 else k1)] + groups[2:]
 
-        for size, slot in groups:
-            out[slot] += copies * math.ceil(size / bank_size) * bank_size
+        for size, kind in groups:
+            out[kind] += num_slots * math.ceil(size / bank_size) * bank_size
         out[_OF] += scratch_banks * bank_size
         return tuple(out)
 
@@ -1076,7 +1066,7 @@ def _prepare_search(node, tiler):
             extra_sharing,
             oc_align,
             has_tail=has_tail,
-            copies=2 if tiler.config.double_buffered_l2 else 1,
+            num_slots=tiler.config.num_slots,
         )
         for extra_sharing in range(4 + len(fused_specs))
     ]

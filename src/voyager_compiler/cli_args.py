@@ -276,7 +276,7 @@ def add_compile_args(parser=None):
 
     # -- memory hierarchy ---------------------------------------------------
     parser.add_argument(
-        "--cache_size",
+        "--scratchpad_size",
         type=int,
         default=None,
         help="Total L2 SRAM size (bytes).",
