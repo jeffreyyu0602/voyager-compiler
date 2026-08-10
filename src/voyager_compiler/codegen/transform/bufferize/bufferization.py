@@ -1028,6 +1028,13 @@ def _build_for_untiled(node: Node, tiler):
     """
     if node.target is operator.getitem:
         return None
+    if node.op == "call_module":
+        # ``node.target`` is the submodule's name, not a callable; a fused
+        # group must be built by its anchor's builder.
+        raise ValueError(
+            f"{node.name}: fused module reached the untiled fallback "
+            f"(anchor {get_anchor_node(node).target})"
+        )
     val = getattr(node, "value", None)
     if not isinstance(val, (torch.Tensor, list, tuple)):
         return None

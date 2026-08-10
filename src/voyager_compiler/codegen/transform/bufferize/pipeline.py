@@ -1647,19 +1647,21 @@ def build_conv2d(
     if inp.ndim != 4 or w.ndim != 4:
         return None
     groups = get_arg_value(anchor, 6, "groups", 1)
-    if groups != 1:
-        return None  # depthwise conv unsupported
 
     nhwc = anchor.meta.get("transposed", False)
     in_dims = NCHW_TO_NHWC if nhwc else None
-    w_dims = OIHW_TO_HWIO if nhwc else None
+    # The layout pass never permutes a grouped conv's weight, so it stays
+    # OIHW even on a transposed node.
+    w_dims = OIHW_TO_HWIO if nhwc and groups == 1 else None
     out_dims = NCHW_TO_NHWC if nhwc else None
 
     N, C, H, W = unproject(inp.shape, in_dims)
-    K, _, kH, kW = unproject(w.shape, w_dims)
+    K, wC, kH, kW = unproject(w.shape, w_dims)
     oH, oW = unproject(out.shape, out_dims)[2:]
 
-    if tiling is None:
+    # A grouped conv's C is not a dense reduction, so it cannot be diced --
+    # build it whole-tensor (a trip-1 nest).
+    if groups != 1 or tiling is None:
         tiling = (1, 1, 1, 1)
     ny, nx, nk, nc = tiling
     tn, toh, tow, tc, tk = N, oH // ny, oW // nx, C // nc, K // nk
@@ -1691,7 +1693,7 @@ def build_conv2d(
         pad_value=pad_value,
     )
     w_spec = _InputSpec(
-        project((tk, tc, kH, kW), w_dims),
+        project((tk, wC // nc, kH, kW), w_dims),
         # kH/kW->None (loaded whole, mapped to no grid dim)
         project((gK, gC, None, None), w_dims),
         (False,) * 4,
@@ -1754,8 +1756,16 @@ def build_conv2d(
             pad=project((0, 0, ph, pw), in_dims),
             pad_value=1.0,
         )
+        # A grouped weight has a single (or partial) in-channel, so its
+        # scale's own shape names the channel / kernel extents the dense
+        # arithmetic would misderive from the input's.
+        ws_tile = (tk, tc // bs, kH, kW)
+        ws = anchor.kwargs.get("weight_scale")
+        if groups != 1 and isinstance(ws, torch.fx.Node):
+            s0, s1, s2, s3 = unproject(ws.value.shape, w_dims)
+            ws_tile = (s0 // nk, s1, s2, s3)
         wt_scale_qspec = _InputSpec(
-            project((tk, tc // bs, kH, kW), w_dims),
+            project(ws_tile, w_dims),
             project((gK, gC, None, None), w_dims),  # kH/kW whole -> None
             (False,) * 4,
         )
