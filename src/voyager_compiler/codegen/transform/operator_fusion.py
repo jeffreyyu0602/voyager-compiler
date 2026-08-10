@@ -358,7 +358,6 @@ def move_transpose_after_select(graph: torch.fx.Graph, nodes: List[Node]):
 def _fuse_reshape_with_input_impl(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
-    nodes_map: Dict[Node, Node],
     current_node: Node,
     fused_nodes: List[Node],
     simulate: bool = False,
@@ -384,7 +383,6 @@ def _fuse_reshape_with_input_impl(
             return True
         fused_nodes = duplicate_shared_nodes(graph, fused_nodes)
         fused_nodes = move_transpose_after_select(graph, fused_nodes)
-        nodes_map[fused_nodes[0]] = fused_nodes[-2]
         if (group := search_group(current_node, candidates)) is not None:
             group.extend(n for n in fused_nodes if n not in group)
         else:
@@ -406,7 +404,6 @@ def _fuse_reshape_with_input_impl(
         result = _fuse_reshape_with_input_impl(
             graph,
             candidates,
-            nodes_map,
             user,
             list(fused_nodes),
             simulate,
@@ -423,7 +420,6 @@ def _fuse_reshape_with_input_impl(
 def fuse_reshape_with_input(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
-    nodes_map: Dict[Node, Node],
     reshape_node: Node,
 ):
     # First pass: simulate fusion to ensure all users can be fused
@@ -431,7 +427,6 @@ def fuse_reshape_with_input(
         result = _fuse_reshape_with_input_impl(
             graph,
             candidates,
-            nodes_map,
             user,
             [reshape_node],
             simulate=True,
@@ -447,7 +442,6 @@ def fuse_reshape_with_input(
         result = _fuse_reshape_with_input_impl(
             graph,
             candidates,
-            nodes_map,
             user,
             [reshape_node],
             simulate=False,
@@ -478,7 +472,6 @@ def _tile_holds_whole_heads(gemm_node: Node, reshape_node: Node) -> bool:
 def fuse_reshape_with_output(
     graph: torch.fx.Graph,
     candidates: List[List[Node]],
-    nodes_map: Dict[Node, Node],
     reshape_node: Node,
 ) -> bool:
     if not is_mha_qkv_permute(reshape_node):
@@ -528,8 +521,6 @@ def fuse_reshape_with_output(
     else:
         candidates.append([curr_node, *fused_nodes])
 
-    nodes_map[reshape_node] = curr_node
-
     return True
 
 
@@ -546,7 +537,7 @@ def fuse_repeat_with_input(graph, candidates, node) -> bool:
     transpose, folds into the fetch and is crossed.
 
     Bufferized only: the legacy path copies an ``expand`` into memory, so it
-    never sees one of these groups (hence no ``nodes_map`` entry).
+    never sees one of these groups.
     """
     if (found := repeat_of(node)) is None:
         return False
@@ -574,16 +565,12 @@ def fuse_repeat_with_input(graph, candidates, node) -> bool:
     return True
 
 
-def fuse_dequantize_with_input(graph, candidates, nodes_map, node_to_fuse):
+def fuse_dequantize_with_input(graph, candidates, node_to_fuse):
     for user in list(node_to_fuse.users):
-        _fuse_dequantize_recursive(
-            graph, candidates, nodes_map, user, [node_to_fuse]
-        )
+        _fuse_dequantize_recursive(graph, candidates, user, [node_to_fuse])
 
 
-def _fuse_dequantize_recursive(
-    graph, candidates, nodes_map, current_node, fused_nodes
-):
+def _fuse_dequantize_recursive(graph, candidates, current_node, fused_nodes):
     fused_nodes.append(current_node)
 
     if (
@@ -598,7 +585,6 @@ def _fuse_dequantize_recursive(
     ):
         fused_nodes = duplicate_shared_nodes(graph, fused_nodes)
         fused_nodes = move_dq_after_select(graph, fused_nodes)
-        nodes_map[fused_nodes[0]] = fused_nodes[-2]
 
         if (group := search_group(current_node, candidates)) is not None:
             group.extend(n for n in fused_nodes if n not in group)
@@ -617,9 +603,7 @@ def _fuse_dequantize_recursive(
         return
 
     for user in list(current_node.users):
-        _fuse_dequantize_recursive(
-            graph, candidates, nodes_map, user, list(fused_nodes)
-        )
+        _fuse_dequantize_recursive(graph, candidates, user, list(fused_nodes))
 
 
 def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
@@ -690,6 +674,45 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     return nodes
 
 
+def _accumulate_fusible(
+    anchor: Node, group: List[Node], patterns: List[List[Any]]
+) -> bool:
+    """Whether the vector pipeline can absorb a cross-tile reduction's
+    accumulator add into ``anchor``'s fused chain.
+
+    A ``num_k > 1`` reduction's last step runs ``anchor -> add(accumulator) ->
+    tail`` as one pass only if the add gets a pipeline stage of its own,
+    between the anchor and the stages the tail occupies.  The check embeds
+    ``[add, *tail]`` into each pattern's post-anchor stages in order, each
+    stage claimed at most once.  The tail is the group's post-anchor ops minus
+    relayout / nop members, which consume no stage; the add is virtual (no FX
+    node) and matches a stage by target alone.
+
+    Args:
+        anchor: The group's GEMM / conv node.
+        group: The fused group's nodes, in graph order.
+        patterns: The pipeline patterns handed to :func:`fuse_operator`.
+
+    Returns:
+        True if some pattern admits the chain with the add inserted.
+    """
+    tail = [
+        n
+        for n in group[group.index(anchor) + 1 :]
+        if not (is_nop(n) or is_reshape_op(n))
+    ]
+    add = torch.ops.aten.add.Tensor
+    for pattern in patterns:
+        if not pattern[0].matches(anchor):
+            continue
+        stages = iter(pattern[1:])
+        if any(add in m.targets for m in stages) and all(
+            any(m.matches(n) for m in stages) for n in tail
+        ):
+            return True
+    return False
+
+
 def fuse_operator(
     model: GraphModule,
     operations: List[List[Callable]] = None,
@@ -708,7 +731,6 @@ def fuse_operator(
     """
     graph = model.graph
 
-    nodes_map = {}
     fused_nodes_list = []
 
     if operations is not None:
@@ -716,12 +738,12 @@ def fuse_operator(
 
     for node in list(graph.nodes):
         # Try to fuse MHA QKV permute with preceeding GEMM
-        if fuse_reshape_with_output(graph, fused_nodes_list, nodes_map, node):
+        if fuse_reshape_with_output(graph, fused_nodes_list, node):
             continue
 
         # Attempt to fuse it with its immediate user
         if is_reshape_op(node):
-            fuse_reshape_with_input(graph, fused_nodes_list, nodes_map, node)
+            fuse_reshape_with_input(graph, fused_nodes_list, node)
 
     for node in list(graph.nodes):
         if node.target != torch.ops.quantized_ops.dequantize.default:
@@ -731,7 +753,7 @@ def fuse_operator(
         if search_group(node, fused_nodes_list) is not None:
             continue
 
-        fuse_dequantize_with_input(graph, fused_nodes_list, nodes_map, node)
+        fuse_dequantize_with_input(graph, fused_nodes_list, node)
 
     for node in list(graph.nodes):
         fuse_repeat_with_input(graph, fused_nodes_list, node)
@@ -742,9 +764,13 @@ def fuse_operator(
         nodes.sort(key=lambda n: nodes_order[n])
     fused_nodes_list.sort(key=lambda g: nodes_order[g[-1]])
 
-    nodes_map = {v.name: k.name for k, v in nodes_map.items()}
-
     for fused_nodes in fused_nodes_list:
+        anchor = next((n for n in fused_nodes if is_gemm_op(n)), None)
+        fusible = (
+            anchor is not None
+            and operations is not None
+            and _accumulate_fusible(anchor, fused_nodes, operations)
+        )
         node = create_and_insert_subgraph(
             fused_nodes, model, normalize_iteration_space=True
         )
@@ -752,23 +778,8 @@ def fuse_operator(
             continue
         update_submod_user_meta(model, node)
         propagate_shape(node, model)
-        gm = node.meta.get("submodule")
-
-        for n in list(gm.graph.nodes):
-            if (name := nodes_map.get(n.name, None)) is None:
-                continue
-
-            fused_node = next(iter(n for n in gm.graph.nodes if n.name == name))
-            fused_node.meta["fused"] = True
-
-            if is_reshape_op(fused_node):
-                if next(iter(fused_node.users)).op == "output":
-                    node.meta["reshape"] = fused_node
-                else:
-                    n.meta["reshape"] = fused_node
-
-            if fused_node.target == torch.ops.quantized_ops.dequantize.default:
-                n.meta["dequantize"] = fused_node
+        if anchor is not None:
+            node.meta["accumulate_fusible"] = fusible
 
     graph.lint()
     graph.eliminate_dead_code()

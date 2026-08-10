@@ -54,15 +54,15 @@ class MemoryLevel(IntEnum):
 # ---------------------------------------------------------------------------
 # Software pipelining.
 #
-# ``alloc`` / ``zeros`` take a ``banks`` count.  ``banks == 0`` is an unbanked
-# storage object: the tensor has exactly ``size``.  ``banks >= 1`` prepends a
-# bank dimension (``[banks, *size]``), so ``size`` stays the payload of *one*
-# bank and ``buf[slot]`` reads/writes a slot.  The distinction matters to the
-# code generator: a bank dimension is not a tensor dimension — it is serialized
-# as ``TensorBox.bank_count`` / ``bank_stride_bytes``, and the slot a step picks
-# is the leading offset of the operand's window.  A single-slot bank
-# (``banks == 1``) still keeps its dimension, so ``buf[0]`` addresses it
-# uniformly.
+# ``alloc`` / ``zeros`` take a ``num_slots`` count.  ``num_slots == 0`` is an
+# unpipelined storage object: the tensor has exactly ``size``.  ``num_slots >=
+# 1`` prepends a slot dimension (``[num_slots, *size]``), so ``size`` stays the
+# payload of *one* slot and ``buf[slot]`` reads/writes a slot.  The distinction
+# matters to the code generator: a slot dimension is not a tensor dimension —
+# it is serialized as ``TensorBox.bank_count`` / ``bank_stride_bytes``, and the
+# slot a step picks is the leading offset of the operand's window.  A
+# single-slot buffer (``num_slots == 1``) still keeps its dimension, so
+# ``buf[0]`` addresses it uniformly.
 # ---------------------------------------------------------------------------
 UNPIPELINED = 0
 

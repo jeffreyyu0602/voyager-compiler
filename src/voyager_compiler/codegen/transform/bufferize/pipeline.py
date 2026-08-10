@@ -25,6 +25,7 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_reshape_op,
     quant_param_arg_nodes,
     reduction_op,
     reduction_scratch,
@@ -1386,6 +1387,55 @@ def _map_kernel(
     return kernel
 
 
+def _split_stream_break(fused_gm):
+    """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
+
+    A ``quantize_mx`` along a non-last axis takes two vector-op passes, so
+    its input must be materialized first; after a relayout it must be
+    materialized too, as a workaround until the hardware quantizes a permuted
+    stream.  Either way the quantize runs as a pass of its own on the staged
+    tile.  Assumes the tail's ``quantize_mx``, when present, is the last op,
+    with the relayout (if any) immediately before it.
+
+    Args:
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``.
+
+    Returns:
+        ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
+        else ``(head_gm, quant_gm)``: the tail up to the quantize's input and
+        the quantize applied to the staged tile, each taking the same operand
+        list as ``fused_gm``.
+    """
+    graph = fused_gm.graph
+    phs = [n for n in graph.nodes if n.op == "placeholder"]
+    ops = [n for n in graph.nodes if n.op == "call_function"]
+    quant = ops[-1] if ops else None
+    if (
+        quant is None
+        or quant.target is not torch.ops.quantized_ops.quantize_mx.default
+    ):
+        return None
+    permuted = len(ops) > 1 and is_reshape_op(ops[-2])
+    if not permuted and all(a == -1 for a in get_arg_value(quant, 2, "axes")):
+        return None
+
+    def build(part_ops, root, name, out):
+        pg = torch.fx.Graph()
+        remap = {root: pg.placeholder(name)}
+        for p in phs[1:]:
+            remap[p] = pg.placeholder(p.name)
+        for n in part_ops:
+            remap[n] = pg.node_copy(n, lambda x: remap[x])
+        pg.output(remap[out])
+        pg.lint()
+        return torch.fx.GraphModule(torch.nn.Module(), pg)
+
+    spine = quant.args[0]
+    head_gm = build(ops[:-1], phs[0], "acc", spine)
+    quant_gm = build([quant], spine, "staged", quant)
+    return head_gm, quant_gm
+
+
 def _reduction_fused_kernel(
     compute: Callable,
     reduction_dim: int,
@@ -1393,26 +1443,41 @@ def _reduction_fused_kernel(
     op_dtype: Optional[torch.dtype],
     out_specs: List[_OutputSpec],
     fused_gm: Optional[Callable],
+    chain_tail: bool,
     fused_operand_indices: List[int] = (),
     async_pipeline: bool = False,
 ):
     """Kernel for an op whose reduction needs > 1 tile (num_k > 1 GEMM / conv;
     the num_k == 1 map case uses ``_map_kernel``).
 
-    ``compute(in_slots, first)`` runs the bare op on the current tiles; on the
-    ``first`` step it folds the bias straight into the op (hardware does ``op +
-    bias`` in one pass).  The bias rides only the first step — the same step
-    that initializes the accumulator — so bias gate and reduction init collapse
-    into the single reduction ``torch.cond`` (no nested bias-gate cond).  The
-    partial accumulates into a scratch ref; on the last step the completed
-    accumulator is cast to ``op_dtype`` (it may accumulate wider, e.g. fp32) and
-    mapped through the fused tail (if any) into the output slot(s).
+    The partial accumulates into a scratch ref; on the last step the completed
+    accumulator is cast to ``op_dtype`` and mapped through the fused tail (if
+    any) into the output slot(s).  The bias rides only the first step — the
+    same step that initializes the accumulator — so bias gate and reduction
+    init collapse into the single reduction ``torch.cond`` (no nested
+    bias-gate cond).
 
-    ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant.
-    The accumulate (``_accumulate``, input-only) and the finalize
-    (``_finalize``, output-writing) split across the round predicate, so the
-    finalizing round's commit waits the output store-sem while the others wait
-    only their inputs -- and neither branch carries a statically-dead sub-cond.
+    Args:
+        compute: ``compute(in_slots, first)`` — the bare op on the current
+            tiles; on the ``first`` reduction step it folds the bias straight
+            into the op (hardware does ``op + bias`` in one pass).
+        reduction_dim: Grid dim of the cross-tile reduction (K / C).
+        last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``).
+        op_dtype: Output dtype the finished accumulator is cast to, or
+            ``None`` when it already accumulates in the output dtype.
+        out_specs: Output tile specs; sets the output count.
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``, or
+            ``None``.
+        chain_tail: Finalize the fused tail on the live accumulated value
+            instead of materializing it into scratch first
+            (``meta['accumulate_fusible']``); ignored by the sync kernel.
+        fused_operand_indices: Positions of the tail's extra operands in the
+            kernel's input-slot list.
+        async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
+            instead of the synchronous body.
+
+    Returns:
+        The kernel callable for ``build_pipelined_buffers``.
     """
     num_outputs = len(out_specs)
 
@@ -1464,19 +1529,37 @@ def _reduction_fused_kernel(
     if not async_pipeline:
         return inner
 
-    # The accumulate never touches the output and the finalize always does, so
-    # commit them per round rather than one body in both branches: every round
-    # commits the accumulate (input deps only); the last round commits
-    # accumulate-then-finalize and also waits the output store-sem.
+    split = (
+        _split_stream_break(fused_gm)
+        if chain_tail and fused_gm is not None
+        else None
+    )
+
     def accumulate_body(grid_index, *args):
         in_slots, _out_slots, scratch = _split(args)
         _accumulate(grid_index, in_slots, scratch)
 
     def finalize_body(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
-        partial = _to_acc(compute(in_slots, False), scratch)
-        voyager.insert(partial + scratch, scratch)
-        _finalize(in_slots, out_slots, scratch)
+        total = _to_acc(compute(in_slots, False), scratch) + scratch
+        if not chain_tail:
+            # Materialize the accumulator; the tail reads it back from scratch
+            # as a store cone of its own.
+            voyager.insert(total, scratch)
+            _finalize(in_slots, out_slots, scratch)
+        elif split is None:
+            _finalize(in_slots, out_slots, total)
+        else:
+            # The chained tail's quantize cannot ride the pass
+            # (``_split_stream_break``): the head runs chained and stages its
+            # tile back into scratch (dead now); the quantize fetches it.
+            head_gm, quant_gm = split
+            fused = [in_slots[i] for i in fused_operand_indices]
+            head = head_gm(total, *fused)
+            voyager.insert(head.reshape(scratch.shape), scratch)
+            outs = quant_gm(scratch.view(head.shape), *fused)
+            for slot, out in zip(out_slots, outs):
+                voyager.insert(out, slot)
 
     def kernel(
         grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
@@ -1855,6 +1938,7 @@ def build_conv2d(
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
             fused_gm=fused_gm,
+            chain_tail=node.meta.get("accumulate_fusible", False),
             fused_operand_indices=fused_idx,
             async_pipeline=async_pipeline,
         )
@@ -2162,6 +2246,7 @@ def build_gemm(
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
             fused_gm=fused_gm,
+            chain_tail=node.meta.get("accumulate_fusible", False),
             fused_operand_indices=fused_idx,
             async_pipeline=async_pipeline,
         )
