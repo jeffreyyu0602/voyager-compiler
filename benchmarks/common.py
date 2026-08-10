@@ -115,7 +115,6 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 # than changing either number.
 BASELINE_SCRATCHPAD_SIZE = 2 * 1024 * 1024
 BASELINE_NUM_BANKS = 16
-BASELINE_BANK_WIDTH = 64
 BASELINE_PE = (64, 64)
 BASELINE_FREQUENCY_GHZ = 1.0
 BASELINE_DRAM_BANDWIDTH_GBS = 64.0
@@ -203,33 +202,21 @@ class SweepConfig:
 
     weight_bits: int = 8
     act_bits: int = 8
-    # KV cache is kept BF16 (unquantized): microscaling a stored KV cache is not
-    # supported (it feeds a repeat_kv slice, not an MXU op), so KV precision is
-    # not swept for now.
     kv_bits: int = 16
 
     pe: Tuple[int, int] = BASELINE_PE
     scratchpad_size: int = BASELINE_SCRATCHPAD_SIZE
     num_banks: int = BASELINE_NUM_BANKS
-    bank_width: int = BASELINE_BANK_WIDTH
+    bank_width: Optional[int] = None
     frequency_ghz: float = BASELINE_FREQUENCY_GHZ
     dram_bandwidth_gbs: float = BASELINE_DRAM_BANDWIDTH_GBS
     dram_access_latency_ns: float = BASELINE_DRAM_ACCESS_LATENCY_NS
 
-    # Attention backend.  "eager" keeps attention as ordinary matmuls (the only
-    # backend wired into the bufferize/report path).
     attn_implementation: str = "eager"
-
-    # Single-buffer a >1-tile reduction's output + fused post-op operands
-    # (last-K-step-only), trading SRAM for the prefetch; off => double-buffered.
     single_buffer_tail: bool = False
-
-    # Build only this many decoder layers; None uses the real count.
     num_layers_override: Optional[int] = None
 
-    # Extra runtime a tiling may take vs the fastest; 0.0 = fastest only.
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
-
     dump_dir: Optional[str] = None
 
     @property
@@ -240,7 +227,11 @@ class SweepConfig:
             pe_array_size=self.pe,
             scratchpad_size=self.scratchpad_size,
             num_banks=self.num_banks,
-            bank_width=self.bank_width,
+            bank_width=(
+                self.bank_width
+                if self.bank_width is not None
+                else self.pe[1] * self.act_bits // 8
+            ),
             input_buffer_size=1024,
             weight_buffer_size=1024,
             accum_buffer_size=1024,

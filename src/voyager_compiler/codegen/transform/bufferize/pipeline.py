@@ -242,6 +242,17 @@ class _BufferedRef:
         tiled = [g for g in range(self.ndim) if self.grid[g] > 1]
         return tiled[-1] if tiled else None
 
+    def _single_block(self):
+        """Whether the whole sweep reads one block of this operand — every
+        tiled dim's block count (``ceil(grid[g] / r)``) collapses to one.
+        The same test ``PipelinedKernel._num_slots`` uses to give the buffer
+        one slot, so the predicate and the allocation cannot disagree.
+        """
+        return all(
+            self.grid[g] <= r
+            for _, g, r in spec_tiled_dims(self.spec, self.grid)
+        )
+
     def _advances_every_step(self):
         """Whether this operand's tile block changes on every grid step (it
         spans the innermost tiled, non-broadcast dim).  Known at build time:
@@ -345,13 +356,16 @@ class _BufferedRef:
     def prime_prologue(self, src, post_count=1):
         """Prime the first ``D`` logical positions from DRAM ``src``,
         deduplicating reused blocks (positions are static concrete coords, so
-        the dedup is a Python ``if``).  Each block's load signals ``post_count``
-        times.  Return the seed producer count for a guarded input, or ``None``
-        for an always-advance input (no cursor).
+        the dedup is a Python ``if``).  A single-block operand primes its one
+        block even at ``D == 0`` — the slot is never overwritten, and priming
+        here keeps the load off the loop body's critical path.  Each block's
+        load signals ``post_count`` times.  Return the seed producer count
+        for a guarded input, or ``None`` for an always-advance input (no
+        cursor).
         """
         num_copies = 0
         prev_idx = None
-        for p in range(min(self.D, self.num_steps)):
+        for p in range(min(self.D, self.num_steps) or self._single_block()):
             idx = self._unravel(p)
             if p == 0 or self._indices_differ(prev_idx, idx):
                 slot = num_copies % self.num_slots
@@ -377,6 +391,9 @@ class _BufferedRef:
         Returns the advanced producer count (guarded) or ``None``
         (always-advance).
         """
+        if self.D == 0 and self._single_block():
+            # The prologue primed the operand's only block.
+            return load_count
         nb = self.num_slots
         w = ctx.windows[nb]
         has_fetch = w.has_fetch if self.D > 0 else True
