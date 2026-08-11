@@ -1457,6 +1457,28 @@ def _reduction_fused_kernel(
     init collapse into the single reduction ``torch.cond`` (no nested
     bias-gate cond).
 
+    The async variant dispatches each round as a ``commit``.  Its finalize
+    has three cases:
+
+    1. Chained tail (``chain_tail``, no stream break): GEMM, accumulator add
+       and tail run inside the finalize commit, on the live value.  Scratch
+       is never read after the pass.
+    2. Unchained tail (``not chain_tail``): the commit stages the completed
+       accumulator into scratch; the whole tail runs bare after the commit,
+       reading it back and writing the out slots.
+    3. Chained tail with a stream-breaking ``quantize_mx``
+       (``_split_stream_break``): the commit runs the chained head and
+       stages its tile into scratch; the quantize runs bare after the
+       commit, reading the staged tile and writing the out slots.  It views
+       scratch back to the head's shape — the out slot whose element count
+       matches scratch's, since ``quantize_mx`` preserves its input's shape.
+
+    The bare op in cases 2 and 3 is what closes the scratch write-after-read
+    race: a non-async op executes in program order and runs to completion,
+    so the next sweep's round-0 commit is not dispatched — and cannot
+    overwrite scratch — until the tail is done.  The out-slot-free wait
+    stays on the finalize commit's dependencies, which the bare op trails.
+
     Args:
         compute: ``compute(in_slots, first)`` — the bare op on the current
             tiles; on the ``first`` reduction step it folds the bias straight
@@ -1542,24 +1564,15 @@ def _reduction_fused_kernel(
     def finalize_body(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
         total = _to_acc(compute(in_slots, False), scratch) + scratch
-        if not chain_tail:
-            # Materialize the accumulator; the tail reads it back from scratch
-            # as a store cone of its own.
-            voyager.insert(total, scratch)
-            _finalize(in_slots, out_slots, scratch)
-        elif split is None:
+        if split is None and chain_tail:
             _finalize(in_slots, out_slots, total)
+        elif not chain_tail:
+            voyager.insert(total, scratch)
         else:
-            # The chained tail's quantize cannot ride the pass
-            # (``_split_stream_break``): the head runs chained and stages its
-            # tile back into scratch (dead now); the quantize fetches it.
-            head_gm, quant_gm = split
+            # Chained head; the split-off quantize fetches the staged tile.
             fused = [in_slots[i] for i in fused_operand_indices]
-            head = head_gm(total, *fused)
+            head = split[0](total, *fused)
             voyager.insert(head.reshape(scratch.shape), scratch)
-            outs = quant_gm(scratch.view(head.shape), *fused)
-            for slot, out in zip(out_slots, outs):
-                voyager.insert(out, slot)
 
     def kernel(
         grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
@@ -1573,6 +1586,19 @@ def _reduction_fused_kernel(
                 dependencies=[*in_sems, *out_sems],
                 post=post,
             )
+            # The scratch-reading tail, bare outside the commit (see header).
+            if not chain_tail:
+                _finalize(in_slots, out_slots, scratch[0])
+            elif split is not None:
+                fused = [in_slots[i] for i in fused_operand_indices]
+                staged = next(
+                    scratch[0].view(s.shape)
+                    for s in out_slots
+                    if s.numel() == scratch[0].numel()
+                )
+                outs = split[1](staged, *fused)
+                for slot, out in zip(out_slots, outs):
+                    voyager.insert(out, slot)
             return 0
 
         def not_last():
