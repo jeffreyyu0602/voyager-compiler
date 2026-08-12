@@ -215,15 +215,23 @@ class _OutputSpec:
 class _ScratchSpec:
     """A persistent on-chip SRAM scratch ref — a third class of SRAM object
     next to input / output slots.  Unlike them it is *local state*: allocated
-    once and reused every grid step, not DMA-managed, not double-buffered, and
-    not carried in the loop state.  It has only a ``shape`` + ``dtype`` (no
-    ``index_map`` / DRAM shape / token / buffer count); the kernel mutates it
-    in place (e.g. a tiled-reduction accumulator).  Mirrors Pallas's
-    ``scratch_shapes`` appended after the normal input/output refs.
+    once and reused every grid step, not DMA-managed, and not carried in the
+    loop state.  The kernel mutates it in place (e.g. a tiled-reduction
+    accumulator).  Mirrors Pallas's ``scratch_shapes`` appended after the
+    normal input/output refs.
+
+    ``num_slots == 2`` double-buffers the scratch in the async pipeline: its
+    lifetime is one output tile, so the scheduler hands the kernel the slot
+    at the output tile's ordinal (``store_count % num_slots``), exactly how
+    the out slots rotate.  No synchronization is added — the lagged retire
+    already orders a slot's reuse (tile ``t + 2``) behind the finalize that
+    last read it (tile ``t``), because a commit is dispatched only after
+    every commit two steps back has been observed complete.
     """
 
     shape: Tuple[int, ...]
     dtype: torch.dtype
+    num_slots: int = 1
 
 
 def _compute_input_spec(

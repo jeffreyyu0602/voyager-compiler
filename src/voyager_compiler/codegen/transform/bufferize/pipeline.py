@@ -687,11 +687,17 @@ class PipelinedKernel(torch.nn.Module):
             )
             for s, c, slots in zip(self.out_specs, out_counts, out_slots)
         ]
-        # Scratch refs: single buffer (not ``num_slots``-deep — reused
-        # immediately for the next tile's reduction while the output slot stays
-        # buffered until its DMA drains), captured like ``out_slots``.
+        # Scratch refs, captured like ``out_slots``.  A double-buffered
+        # scratch (``_ScratchSpec.num_slots``, async only) allocates slotted
+        # like any pipelined buffer; the plain accumulator keeps the
+        # unslotted alloc, reused immediately for the next tile's reduction.
         scratch_bufs = tuple(
-            voyager.alloc(s.shape, s.dtype, _SRAM) for s in self.scratch_specs
+            (
+                voyager.alloc(s.shape, s.dtype, _SRAM, num_slots=s.num_slots)
+                if self._async_pipeline and s.num_slots > 1
+                else voyager.alloc(s.shape, s.dtype, _SRAM)
+            )
+            for s in self.scratch_specs
         )
         return (
             out_bufs,
@@ -940,6 +946,18 @@ class AsyncPipelinedKernel(PipelinedKernel):
                 out_slots.append(get_slot(out_refs[i].slots, slot))
                 out_sems.append(get_slot(out_refs[i].sem, slot))
 
+            # A double-buffered scratch rotates with the output tile's
+            # ordinal, like the out slots; the lagged retire alone orders a
+            # slot's reuse behind its last reader (see ``_ScratchSpec``).
+            scratch_slots = [
+                (
+                    get_slot(buf, store_counts[0] % spec.num_slots)
+                    if spec.num_slots > 1
+                    else buf
+                )
+                for buf, spec in zip(scratch_bufs, self.scratch_specs)
+            ]
+
             post = get_slot(done_sem, step % _DONE_DEPTH)
 
             # 3. Dispatch the tile's compute: the async kernel issues the
@@ -950,7 +968,7 @@ class AsyncPipelinedKernel(PipelinedKernel):
                 ctx.cur,
                 in_slots,
                 out_slots,
-                scratch_bufs,
+                scratch_slots,
                 in_sems,
                 out_sems,
                 post,
@@ -1426,44 +1444,33 @@ def _reduction_fused_kernel(
     fused_gm: Optional[Callable],
     chain_tail: bool,
     fused_operand_indices: List[int] = (),
+    scratch_slots: int = 1,
     async_pipeline: bool = False,
 ):
     """Kernel for an op whose reduction needs > 1 tile (num_k > 1 GEMM / conv;
     the num_k == 1 map case uses ``_map_kernel``).
 
-    The partial accumulates into a scratch ref; on the last step the completed
-    accumulator is cast to ``op_dtype`` and mapped through the fused tail (if
-    any) into the output slot(s).  The bias rides only the first step — the
-    same step that initializes the accumulator — so bias gate and reduction
-    init collapse into the single reduction ``torch.cond`` (no nested
-    bias-gate cond).
+    The partial accumulates into a scratch ref; the last step casts it to
+    ``op_dtype`` and maps it through the fused tail (if any) into the out
+    slot(s).  The bias rides only the first step — the same step that
+    initializes the accumulator — so bias gate and reduction init share the
+    single reduction ``torch.cond``.
 
     The async variant dispatches each round as a ``commit``.  Its finalize
-    has three cases:
-
-    1. Chained tail (``chain_tail``, no stream break): GEMM, accumulator add
-       and tail run inside the finalize commit, on the live value.  Scratch
-       is never read after the pass.
-    2. Unchained tail (``not chain_tail``): the commit stages the completed
-       accumulator into scratch; the whole tail runs bare after the commit,
-       reading it back and writing the out slots.
-    3. Chained tail with a stream-breaking ``quantize_mx``
-       (``_split_stream_break``): the commit runs the chained head and
-       stages its tile into scratch; the quantize runs bare after the
-       commit, reading the staged tile and writing the out slots.  It views
-       scratch back to the head's shape — the out slot whose element count
-       matches scratch's, since ``quantize_mx`` preserves its input's shape.
-
-    The bare op in cases 2 and 3 is what closes the scratch write-after-read
-    race: a non-async op executes in program order and runs to completion,
-    so the next sweep's round-0 commit is not dispatched — and cannot
-    overwrite scratch — until the tail is done.  The out-slot-free wait
-    stays on the finalize commit's dependencies, which the bare op trails.
+    runs the tail chained on the live value (``chain_tail``), or reads the
+    completed accumulator back from scratch: an unchained tail, or a chained
+    one whose stream-breaking ``quantize_mx`` (``_split_stream_break``)
+    consumes the staged head tile, viewed back to the head's shape.  A
+    scratch re-read races the next sweep's first accumulate, and
+    ``scratch_slots`` picks how the race is closed: with 1 the reading tail
+    runs bare after the ``commit`` call, so program order holds the next
+    round-0 commit until it is done — an array bubble per sweep boundary;
+    with 2 consecutive tiles alternate scratch slots and the tail stays
+    inside the commit — no bubble, one extra accumulator tile of SRAM.
 
     Args:
         compute: ``compute(in_slots, first)`` — the bare op on the current
-            tiles; on the ``first`` reduction step it folds the bias straight
-            into the op (hardware does ``op + bias`` in one pass).
+            tiles; ``first`` folds the bias straight into the op.
         reduction_dim: Grid dim of the cross-tile reduction (K / C).
         last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``).
         op_dtype: Output dtype the finished accumulator is cast to, or
@@ -1476,6 +1483,8 @@ def _reduction_fused_kernel(
             (``meta['accumulate_fusible']``); ignored by the sync kernel.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
+        scratch_slots: Slot count of the scratch accumulator (see above);
+            only 1 and 2 are meaningful, and only for the async variant.
         async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
             instead of the synchronous body.
 
@@ -1542,6 +1551,19 @@ def _reduction_fused_kernel(
         in_slots, _out_slots, scratch = _split(args)
         _accumulate(grid_index, in_slots, scratch)
 
+    def _staged_quantize(in_slots, out_slots, scratch):
+        """The split-off quantize: fetch the staged tile back out of scratch
+        and write the out slots."""
+        fused = [in_slots[i] for i in fused_operand_indices]
+        staged = next(
+            scratch.view(s.shape)
+            for s in out_slots
+            if s.numel() == scratch.numel()
+        )
+        outs = split[1](staged, *fused)
+        for slot, out in zip(out_slots, outs):
+            voyager.insert(out, slot)
+
     def finalize_body(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
         total = _to_acc(compute(in_slots, False), scratch) + scratch
@@ -1549,11 +1571,15 @@ def _reduction_fused_kernel(
             _finalize(in_slots, out_slots, total)
         elif not chain_tail:
             voyager.insert(total, scratch)
+            if scratch_slots > 1:
+                _finalize(in_slots, out_slots, scratch)
         else:
             # Chained head; the split-off quantize fetches the staged tile.
             fused = [in_slots[i] for i in fused_operand_indices]
             head = split[0](total, *fused)
             voyager.insert(head.reshape(scratch.shape), scratch)
+            if scratch_slots > 1:
+                _staged_quantize(in_slots, out_slots, scratch)
 
     def kernel(
         grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
@@ -1567,19 +1593,13 @@ def _reduction_fused_kernel(
                 dependencies=[*in_sems, *out_sems],
                 post=post,
             )
-            # The scratch-reading tail, bare outside the commit (see header).
-            if not chain_tail:
-                _finalize(in_slots, out_slots, scratch[0])
-            elif split is not None:
-                fused = [in_slots[i] for i in fused_operand_indices]
-                staged = next(
-                    scratch[0].view(s.shape)
-                    for s in out_slots
-                    if s.numel() == scratch[0].numel()
-                )
-                outs = split[1](staged, *fused)
-                for slot, out in zip(out_slots, outs):
-                    voyager.insert(out, slot)
+            # The scratch-reading tail, bare outside the commit (see header);
+            # a double-buffered scratch keeps it in the commit instead.
+            if scratch_slots == 1:
+                if not chain_tail:
+                    _finalize(in_slots, out_slots, scratch[0])
+                elif split is not None:
+                    _staged_quantize(in_slots, out_slots, scratch[0])
             return 0
 
         def not_last():
@@ -1930,8 +1950,22 @@ def build_conv2d(
     else:
         if single_buffer_tail and not async_pipeline:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
+        chain_tail = node.meta.get("accumulate_fusible", False)
+        # Only a tail that reads scratch after the streamed pass gains a
+        # second slot; a chained-whole tail never races and keeps one.  The
+        # count is the tiler's per-node call (the scratch ladder winner,
+        # stamped with the tiling).
+        sync = not chain_tail or (
+            fused_gm is not None and _split_stream_break(fused_gm) is not None
+        )
+        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
+        slots = scratch_slots if sync else 1
         scratch_specs = [
-            _ScratchSpec(project((tn, tk, toh, tow), out_dims), acc_dtype)
+            _ScratchSpec(
+                project((tn, tk, toh, tow), out_dims),
+                acc_dtype,
+                num_slots=slots,
+            )
         ]
         kernel = _reduction_fused_kernel(
             conv2d_kernel,
@@ -1940,8 +1974,9 @@ def build_conv2d(
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
             fused_gm=fused_gm,
-            chain_tail=node.meta.get("accumulate_fusible", False),
+            chain_tail=chain_tail,
             fused_operand_indices=fused_idx,
+            scratch_slots=slots,
             async_pipeline=async_pipeline,
         )
     gm = build_pipelined_buffers(
@@ -2235,7 +2270,19 @@ def build_gemm(
     else:
         if single_buffer_tail and not async_pipeline:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
-        scratch_specs = [_ScratchSpec(tuple(tb) + (tm, tn), acc_dtype)]
+        chain_tail = node.meta.get("accumulate_fusible", False)
+        # Only a tail that reads scratch after the streamed pass gains a
+        # second slot; a chained-whole tail never races and keeps one.  The
+        # count is the tiler's per-node call (the scratch ladder winner,
+        # stamped with the tiling).
+        sync = not chain_tail or (
+            fused_gm is not None and _split_stream_break(fused_gm) is not None
+        )
+        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
+        slots = scratch_slots if sync else 1
+        scratch_specs = [
+            _ScratchSpec(tuple(tb) + (tm, tn), acc_dtype, num_slots=slots)
+        ]
         kernel = _reduction_fused_kernel(
             gemm_kernel,
             reduction_dim=gk,
@@ -2243,8 +2290,9 @@ def build_gemm(
             out_specs=out_specs,
             op_dtype=(out.dtype if acc_dtype != out.dtype else None),
             fused_gm=fused_gm,
-            chain_tail=node.meta.get("accumulate_fusible", False),
+            chain_tail=chain_tail,
             fused_operand_indices=fused_idx,
+            scratch_slots=slots,
             async_pipeline=async_pipeline,
         )
     gm = build_pipelined_buffers(
