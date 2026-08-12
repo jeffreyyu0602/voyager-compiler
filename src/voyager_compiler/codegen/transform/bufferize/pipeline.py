@@ -49,7 +49,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _tag_loop_extents,
     effect_cond,
-    fuse_store_cones,
+    outline_dps_ops,
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
@@ -1236,8 +1236,6 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     tiling, l3_order = get_tiling(node, tiler)
     # ``out_tiling`` is per output *dim* and so is order-independent; only
     # ``out_index_map``, which names a grid dim per output dim, moves with it.
-    # The map resolves even untiled (canonical order), so every ``_OutputSpec``
-    # built here is complete -- the plans reuse it as is.
     if is_conv:
         odims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
         order = l3_order or CONV_L3_ORDER
@@ -1318,13 +1316,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
             ]
 
     return _FusedInfo(
-        anchor,
-        fused_gm,
-        tiling,
-        l3_order,
-        in_nodes,
-        in_specs,
-        out_specs,
+        anchor, fused_gm, tiling, l3_order, in_nodes, in_specs, out_specs
     )
 
 
@@ -1963,7 +1955,7 @@ def build_conv2d(
         async_pipeline=async_pipeline,
     )
     if num_k > 1 or info is not None:
-        fuse_store_cones(gm)
+        outline_dps_ops(gm)
     _stamp_anchor_meta(gm, anchor)
     return gm
 
@@ -2266,7 +2258,7 @@ def build_gemm(
         async_pipeline=async_pipeline,
     )
     if num_k > 1 or info is not None or dequant is not None:
-        fuse_store_cones(gm)
+        outline_dps_ops(gm)
     _stamp_anchor_meta(gm, anchor)
     return gm
 
@@ -2461,7 +2453,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     )
 
     if node.op == "call_module" and anchor is not None:
-        fuse_store_cones(gm)
+        outline_dps_ops(gm)
     return gm
 
 
@@ -2598,5 +2590,5 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     gm = build_pipelined_buffers(
         kernel, grid, in_specs, out_specs, tuple(inputs), num_slots=num_slots
     )
-    fuse_store_cones(gm)
+    outline_dps_ops(gm)
     return gm

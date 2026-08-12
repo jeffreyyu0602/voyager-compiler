@@ -254,12 +254,13 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
     GEMM + its elementwise epilogue) into one ``call_module``, recursing into
     the ``while_loop`` body and ``cond`` branches.
 
-    A pass is the backward compute cone feeding a single ``insert`` — and by
-    construction each cone is exactly one hardware pass (the kernel writes every
-    intermediate to a buffer, so a cone never spans two matmuls or crosses a
-    reduction).  A node joins the cone only when **all** its users are already
-    in it, so a value read by a later pass stays a boundary input, not absorbed.
-    Single-op cones (reductions, a lone ``maximum`` / ``mul``) are left as-is.
+    A pass is the compute feeding a single ``insert``, grown backward — and by
+    construction each such cluster is exactly one hardware pass (the kernel
+    writes every intermediate to a buffer, so a cluster never spans two matmuls
+    or crosses a reduction).  A node joins the cluster only when **all** its
+    users are already in it, so a value read by a later pass stays a boundary
+    input, not absorbed.  Single-op clusters (reductions, a lone ``maximum`` /
+    ``mul``) are left as-is.
     """
     for n in list(gm.graph.nodes):
         if n.op == "get_attr":
@@ -267,7 +268,7 @@ def _fuse_passes(gm: torch.fx.GraphModule) -> None:
             if isinstance(sub, torch.fx.GraphModule):
                 _fuse_passes(sub)
 
-    # A node absorbable into a pass's compute cone.  ``voyager.subview`` is the
+    # A node absorbable into a pass's compute cluster.  ``voyager.subview`` is the
     # slot read (the slot a step consumes) — the load boundary, not compute;
     # stopping there keeps its integer slot index out of the group's inputs (it
     # would break the fused submodule's tensor-only ShapeProp).

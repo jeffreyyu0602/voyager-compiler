@@ -337,8 +337,8 @@ def _lenient_verifier():
 
 def _is_writeout_wrapper(n: Node) -> bool:
     """A ``clone`` / multi-output ``getitem`` that only feeds output stores --
-    the boundary between the compute cone and the slot write.  It is peeled off
-    a store's source and left outside the fused module."""
+    the boundary between an op's compute and the slot write.  It is peeled off
+    a store's source and left outside the outlined module."""
     return (
         n.op == "call_function"
         and n.target in (torch.ops.aten.clone.default, operator.getitem)
@@ -356,59 +356,72 @@ def _on_datapath(n: Node) -> bool:
     loop-counter arithmetic), as does everything that is not a
     ``call_function`` (placeholders, ``get_attr``).  Target-based, not
     value-based -- the freshly exported body carries no shapes yet.
+
+    ``_local_scalar_dense`` is the datapath -> control-processor boundary and
+    stops the walk with them.  What it reads out of a buffer is an index, a
+    count or a running offset, and everything computed from it is control logic
+    the emitter tags ``op: "cpu"`` -- not work the array does.  Excluding it
+    keeps a counter's arithmetic out of the outlined op whether the counter
+    is a Python int (whose ``operator.*`` ops are already outside both
+    namespaces) or a 0-D tensor (whose ``aten`` ops would otherwise be walked
+    straight through).
     """
     if n.op != "call_function":
+        return False
+    if n.target is torch.ops.aten._local_scalar_dense.default:
         return False
     return getattr(n.target, "namespace", None) in ("aten", "quantized_ops")
 
 
-def _store_cone(seed: Node) -> set:
-    """The compute cone feeding one store: ``seed`` (the op whose result is
-    ``insert``ed) plus its datapath ancestors, up to the load boundary.
+def _dps_op_nodes(seed: Node) -> set:
+    """The nodes forming one destination-passing op: ``seed`` (the node whose
+    result is ``insert``ed) plus its datapath ancestors, up to the load
+    boundary.
 
-    Grown *upward only* -- a cone is the ancestors of its stored tile.  The tile
-    loads (placeholders, ``subview``s) end each branch, and a different cone's
-    store, which this one reads back through a buffer rather than an SSA edge,
-    is never crossed -- so the cones a reduction splits across bodies come out
-    disjoint without the walk knowing they exist.
+    Grown *upward only*: an op owns exactly the compute its stored tile
+    depends on.  The tile loads (placeholders, ``subview``s) end each branch,
+    and another op's store, which this one reads back through a buffer rather
+    than an SSA edge, is never crossed -- so the ops a reduction splits across
+    bodies come out disjoint without the walk knowing they exist.
     """
-    cone, stack = set(), [seed]
+    nodes, stack = set(), [seed]
     while stack:
         n = stack.pop()
-        if n in cone or not _on_datapath(n):
+        if n in nodes or not _on_datapath(n):
             continue
-        cone.add(n)
+        nodes.add(n)
         stack.extend(n.all_input_nodes)
-    return cone
+    return nodes
 
 
-def fuse_store_cones(gm: GraphModule) -> None:
-    """Fuse every cluster of compute that ends at a store into its own nested
-    ``call_module``, recursing through the loop / cond / commit bodies.
+def outline_dps_ops(gm: GraphModule) -> None:
+    """Outline each cluster of compute ending at a store into its own nested
+    ``call_module`` -- one destination-passing op apiece -- recursing through
+    the loop / cond / commit bodies.
 
-    A bufferized kernel is a set of such clusters -- a GEMM tile, a fused tail,
-    a reduction's per-round accumulate -- each ending in one ``voyager.insert``.
+    A bufferized kernel is a set of such ops -- a GEMM tile, a fused tail, a
+    reduction's per-round accumulate -- each ending in one ``voyager.insert``.
     The store is the anchor: seed from every ``insert`` and grow the datapath
-    cone above it (:func:`_store_cone`).  Nothing here decides whether a cone is
-    a GEMM, a tail, or an accumulate, nor whether the reduction is single-tile,
+    above it (:func:`_dps_op_nodes`).  Nothing here decides whether an op is a
+    GEMM, a tail, or an accumulate, nor whether the reduction is single-tile,
     software-pipelined, or async-flattened -- the buffer stores that separate
-    those cases are exactly the cone boundaries, so one rule spans them all.
+    those cases are exactly the op boundaries, so one rule spans them all.
     """
     for node in list(gm.graph.nodes):
         if node.op == "get_attr":
             sub = getattr(gm, str(node.target), None)
             if isinstance(sub, GraphModule):
-                fuse_store_cones(sub)
+                outline_dps_ops(sub)
 
-    # A cone's result leaves the body one of two ways: an in-kernel ``insert``
+    # An op's result leaves the body one of two ways: an in-kernel ``insert``
     # (a tile store) or the body's ``output`` -- a cond branch / loop body whose
     # returned value the parent stores.  Seed from both: a reduction's
     # ``accumulate`` branch only *returns* ``gemm + scratch`` with no insert of
     # its own, yet its ``gemm``->``add`` must still fuse into one op.  A returned
     # buffer (a carried alloc, a sub-loop getitem) is not on the datapath and is
-    # skipped.  A multi-output op (quantize_mx) is stored by several inserts that
-    # all peel to the same seed, so it stays a single cone, its getitem users
-    # left outside.
+    # skipped.  A multi-output node (quantize_mx) is stored by several inserts
+    # that all peel to the same seed, so it stays a single outlined op, its
+    # getitem users left outside.
     seeds = []
 
     def _add_seed(src):
@@ -428,16 +441,16 @@ def fuse_store_cones(gm: GraphModule) -> None:
     for seed in seeds:
         if seed in consumed:
             continue
-        cone = _store_cone(seed)
+        nodes = _dps_op_nodes(seed)
         # A view / same-dtype cast is no work -- the code generator drops it --
-        # so a lone real op stores through its own insert and needs no wrapping.
-        # Skip a cone overlapping one already fused (a shared operand's compute),
-        # which would double-extract it.
-        real = [n for n in cone if not is_nop(n)]
-        if len(real) < 2 or cone & consumed:
+        # so an op with a single real node stores through its own insert and
+        # needs no wrapping.  Skip an op overlapping one already outlined (a
+        # shared operand's compute), which would double-extract it.
+        real = [n for n in nodes if not is_nop(n)]
+        if len(real) < 2 or nodes & consumed:
             continue
-        create_and_insert_subgraph(list(cone), gm)
-        consumed |= cone
+        create_and_insert_subgraph(list(nodes), gm)
+        consumed |= nodes
 
     gm.graph.lint()
     gm.recompile()
