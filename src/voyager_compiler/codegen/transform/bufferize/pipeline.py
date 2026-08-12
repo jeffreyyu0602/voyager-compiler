@@ -1099,44 +1099,38 @@ def build_pipelined_buffers(
 # ---------------------------------------------------------------------------
 
 
-# One fused output, as the builders take it before it becomes an
-# ``_OutputSpec``: its DRAM shape, its SRAM tile, its dtype, and the output dim
-# -> grid dim map -- ``None`` for the builder's default, and ``None`` on a dim
-# that no grid index addresses (it is stored whole).
-_FusedOutput = Tuple[
-    Tuple[int, ...],
-    Tuple[int, ...],
-    torch.dtype,
-    Optional[Tuple[Optional[int], ...]],
-]
-
-
 @dataclass
 class _FusedInfo:
     """Parsed pieces of a fused ``call_module`` (GEMM/conv + post-op pointwise
     ops), for the GEMM / conv pipeline builders.
 
-    ``anchor_node`` is the GEMM/conv reference op (inside the submodule, so its
-    ``args`` are submodule placeholders whose ``meta['source_node']`` point back
-    to the outer graph).  ``fused_gm`` runs the post-op ops as ``[acc, *fused]
-    -> output(s)`` on the anchor's result tile, and is ``None`` when there is no
-    tail to run -- a submodule can hold the anchor and nothing but its prelude
-    (a GQA ``expand``), and it is still a ``_fused`` node.  ``input_values`` are
-    the tensors those ops consume; ``in_specs[i]`` is that input's tile
-    ``_InputSpec`` (or ``None`` for a whole input); ``in_sources[i]`` is its
-    outer graph node, used to order operands canonically.  ``output_specs``
-    holds one ``_FusedOutput`` per fused output -- several when the fused op
-    returns a tuple (``quantize_mx``).
+    Attributes:
+        anchor: The GEMM/conv reference op -- inside the submodule, so its
+            ``args`` are submodule placeholders whose ``meta['source_node']``
+            points back to the outer graph.
+        fused_gm: Runs the post-op ops as ``[acc, *fused] -> output(s)`` on
+            the anchor's result tile; ``None`` when there is no tail to run
+            (a submodule can hold the anchor and nothing but its prelude, a
+            GQA ``expand``, and still be a ``_fused`` node).
+        tiling: The anchor's per-dim tile factors, or ``None`` when untiled.
+        l3_order: The L3 loop order the tiler chose, or ``None`` for the
+            canonical one.
+        in_nodes: Each fused input's outer graph node -- the tail's operands
+            only, which the plan merges with the anchor's own and orders
+            canonically.
+        in_specs: Each input's tile ``_InputSpec``, or ``None`` for a whole
+            input.
+        out_specs: One fully resolved ``_OutputSpec`` per fused output --
+            several when the fused op returns a tuple (``quantize_mx``).
     """
 
-    anchor_node: torch.fx.Node
+    anchor: torch.fx.Node
     fused_gm: Optional[torch.fx.GraphModule]
     tiling: Optional[Tuple[int, ...]]
     l3_order: Optional[Tuple[str, ...]]
-    input_values: List[torch.Tensor]
+    in_nodes: List[torch.fx.Node]
     in_specs: List[Optional[_InputSpec]]
-    in_sources: List[torch.fx.Node]
-    output_specs: List[_FusedOutput]
+    out_specs: List[_OutputSpec]
 
 
 def _retile_mha_view(fused_gm, nb, tm) -> None:
@@ -1242,40 +1236,38 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     tiling, l3_order = get_tiling(node, tiler)
     # ``out_tiling`` is per output *dim* and so is order-independent; only
     # ``out_index_map``, which names a grid dim per output dim, moves with it.
-    if tiling is None:
-        out_tiling = None
-        out_index_map = None
-    elif is_conv:
-        ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
+    # The map resolves even untiled (canonical order), so every ``_OutputSpec``
+    # built here is complete -- the plans reuse it as is.
+    if is_conv:
         odims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
         order = l3_order or CONV_L3_ORDER
         gK, gY, gX = (1 + order.index(d) for d in CONV_L3_ORDER)
-        out_tiling = project((1, nk, ny, nx), odims)  # physical output counts
         out_index_map = project((0, gK, gY, gX), odims)
+        if tiling is None:
+            out_tiling = None
+        else:
+            ny, nx, nk, _ = tiling  # logical (Y, X, K, C) counts
+            out_tiling = project((1, nk, ny, nx), odims)  # physical counts
     else:
         nb = anchor.value.ndim - 2
         order = l3_order or GEMM_L3_ORDER
         grid_m, grid_n = (nb + order.index(d) for d in GEMM_L3_ORDER)
-        out_tiling = tiling[:-1]  # gemm (batch.., n_m, n_n, n_k) -> drop K
         out_index_map = tuple(range(nb)) + (grid_m, grid_n)
+        # gemm (batch.., n_m, n_n, n_k) -> drop K
+        out_tiling = tiling[:-1] if tiling is not None else None
 
     anchor_prelude = ancestors(anchor)
     fused_ops = []
-    input_nodes, input_values, in_specs = [], [], []
+    phs, in_specs = [], []
     for sn in submod.graph.nodes:
         if sn is anchor or sn.op != "call_function" or sn in anchor_prelude:
             continue
         fused_ops.append(sn)
         codebooks = quant_param_arg_nodes(sn)
         for inp in sn.all_input_nodes:
-            if (
-                inp.op != "placeholder"
-                or inp in input_nodes
-                or inp in anchor_prelude
-            ):
+            if inp.op != "placeholder" or inp in phs or inp in anchor_prelude:
                 continue
-            input_nodes.append(inp)
-            input_values.append(inp.value.clone())
+            phs.append(inp)
             if inp in codebooks or inp.value.numel() == 1 or out_tiling is None:
                 in_specs.append(None)  # whole operand
             else:
@@ -1286,11 +1278,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
                 )
 
     fused_gm = (
-        _build_fused_gm(submod, anchor, fused_ops, input_nodes)
-        if fused_ops
-        else None
+        _build_fused_gm(submod, anchor, fused_ops, phs) if fused_ops else None
     )
-    in_sources = [n.meta.get("source_node", n) for n in input_nodes]
+    in_nodes = [n.meta.get("source_node", n) for n in phs]
 
     multi_outputs = isinstance(node.value, (list, tuple))
     vals = list(node.value) if multi_outputs else [node.value]
@@ -1302,10 +1292,10 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     else:
         tiled_shape = compute_output_tiled_shapes(node, out_tiling)
         tiled_shape = list(tiled_shape) if multi_outputs else [tiled_shape]
-    # ``index_map`` is ``None`` (builder's default M/N mapping) except for the
-    # MHA relayout handled below.
-    output_specs = [
-        (s, t, v.dtype, None) for s, t, v in zip(full_shapes, tiled_shape, vals)
+    # The default M/N mapping, except for the MHA relayout handled below.
+    out_specs = [
+        _OutputSpec(s, tuple(t), out_index_map, v.dtype)
+        for s, t, v in zip(full_shapes, tiled_shape, vals)
     ]
 
     if not is_conv and fused_ops and tiling is not None:
@@ -1314,15 +1304,15 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         )
         if relayout is not None:
             out_tile, out_imap, data_shape = relayout
-            output_specs = [
-                (
+            out_specs = [
+                _OutputSpec(
                     s,
                     tuple(
                         t * d // full
                         for t, d, full in zip(out_tile, s, data_shape)
                     ),
-                    v.dtype,
                     out_imap,
+                    v.dtype,
                 )
                 for s, v in zip(full_shapes, vals)
             ]
@@ -1332,10 +1322,9 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
         fused_gm,
         tiling,
         l3_order,
-        input_values,
+        in_nodes,
         in_specs,
-        in_sources,
-        output_specs,
+        out_specs,
     )
 
 
@@ -1748,7 +1737,7 @@ def build_conv2d(
         tiling, l3_order = get_tiling(node, tiler)
     if info is None and tiling is None:
         return None
-    anchor = info.anchor_node if info is not None else node
+    anchor = info.anchor if info is not None else node
 
     inp = anchor.args[0].value.clone()
     w = anchor.args[1].value.clone()
@@ -1821,10 +1810,7 @@ def build_conv2d(
             )
         ]
     else:
-        out_specs = [
-            _OutputSpec(tuple(shape), tuple(tile), imap or out_index_map, dtype)
-            for shape, tile, dtype, imap in info.output_specs
-        ]
+        out_specs = list(info.out_specs)
 
     src = lambda n: n.meta.get("source_node", n)
     node_to_spec = {
@@ -1885,10 +1871,8 @@ def build_conv2d(
 
     # Fused post-op operands (a residual, …), keyed by their outer node.
     if info is not None:
-        for s, val, spec in zip(
-            info.in_sources, info.input_values, info.in_specs
-        ):
-            node_to_spec[s] = (val, spec)
+        for s, spec in zip(info.in_nodes, info.in_specs):
+            node_to_spec[s] = (s.value.clone(), spec)
 
     order = {n: i for i, n in enumerate(node.all_input_nodes)}
     assert len(node_to_spec) == len(order), "conv operand shared across roles"
@@ -1899,7 +1883,7 @@ def build_conv2d(
     w_idx = order[src(anchor.args[1])]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
-    fused_idx = [order[s] for s in info.in_sources] if info is not None else []
+    fused_idx = [order[s] for s in info.in_nodes] if info is not None else []
     fused_gm = info.fused_gm if info is not None else None
 
     def _conv(in_tile, w_tile, bias, kw):
@@ -2013,7 +1997,7 @@ def build_gemm(
         tiling, l3_order = get_tiling(node, tiler)
     if info is None and tiling is None and not is_bmm(node):
         return None
-    anchor = info.anchor_node if info is not None else node
+    anchor = info.anchor if info is not None else node
 
     weight_node, transposed, weight_repeat, dequant = weight_transforms(
         anchor.args[1]
@@ -2098,10 +2082,7 @@ def build_gemm(
             )
         ]
     else:
-        out_specs = [
-            _OutputSpec(tuple(shape), tuple(tile), imap or out_index_map, dtype)
-            for shape, tile, dtype, imap in info.output_specs
-        ]
+        out_specs = list(info.out_specs)
 
     src = lambda n: n.meta.get("source_node", n)
     node_to_spec = {
@@ -2186,10 +2167,8 @@ def build_gemm(
 
     # Fused post-op operands (residual, scale, …), keyed by their outer node.
     if info is not None:
-        for s, val, spec in zip(
-            info.in_sources, info.input_values, info.in_specs
-        ):
-            node_to_spec[s] = (val, spec)
+        for s, spec in zip(info.in_nodes, info.in_specs):
+            node_to_spec[s] = (s.value.clone(), spec)
 
     order = {n: i for i, n in enumerate(node.all_input_nodes)}
     assert len(node_to_spec) == len(order), "gemm operand shared across roles"
@@ -2200,7 +2179,7 @@ def build_gemm(
     weight_idx = order[src(weight_node)]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
-    fused_idx = [order[s] for s in info.in_sources] if info is not None else []
+    fused_idx = [order[s] for s in info.in_nodes] if info is not None else []
     fused_gm = info.fused_gm if info is not None else None
 
     # The kernel body is traced, and dynamo refuses to look inside an FX node
