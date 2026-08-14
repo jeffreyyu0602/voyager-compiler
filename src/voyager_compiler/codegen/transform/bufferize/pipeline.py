@@ -1440,7 +1440,7 @@ def _reduction_fused_kernel(
     reduction_dim: int,
     last_idx: int,
     op_dtype: Optional[torch.dtype],
-    out_specs: List[_OutputSpec],
+    num_outputs: int,
     fused_gm: Optional[Callable],
     chain_tail: bool,
     fused_operand_indices: List[int] = (),
@@ -1475,7 +1475,7 @@ def _reduction_fused_kernel(
         last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``).
         op_dtype: Output dtype the finished accumulator is cast to, or
             ``None`` when it already accumulates in the output dtype.
-        out_specs: Output tile specs; sets the output count.
+        num_outputs: Number of output tiles the kernel writes.
         fused_gm: The fused tail ``[acc, *operands] -> output(s)``, or
             ``None``.
         chain_tail: Finalize the fused tail on the live accumulated value
@@ -1491,7 +1491,6 @@ def _reduction_fused_kernel(
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
     """
-    num_outputs = len(out_specs)
 
     def _split(args):
         # args = [*in_slots, *out_slots, scratch]; one scratch accumulator.
@@ -1681,6 +1680,95 @@ def _reduction_inplace_kernel(
         torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
 
     return kernel
+
+
+def _gemm_scratch_and_kernel(
+    gemm_kernel,
+    fused_gm,
+    *,
+    reduction_dim,
+    num_k,
+    acc_shape,
+    in_specs,
+    out_specs,
+    fused_idx,
+    anchor,
+    accumulate_fp32,
+    chain_tail,
+    async_pipeline,
+    single_buffer_tail=False,
+):
+    """The scheduler kernel and scratch specs a tiled reduction op needs —
+    shared by the GEMM and conv builders.
+
+    Args:
+        gemm_kernel: The per-step op call, ``(in_tiles, first) -> tile``.
+        fused_gm: The tail to apply, or ``None``.
+        reduction_dim: Grid dim the cross-tile reduction runs along.
+        num_k: Reduction steps per output tile.
+        acc_shape: The accumulator tile's shape.
+        in_specs: One block spec per operand; ``single_buffer_tail``
+            mutates these in place.
+        out_specs: The group's outputs.
+        fused_idx: Operand indices the fused tail consumes after the op.
+        anchor: The op node, carrying the tiler's ``scratch_slots`` meta.
+        accumulate_fp32: Accumulate the reduction in fp32 rather than the
+            output dtype.
+        chain_tail: Whether the tail chains into the async finalize pass.
+        async_pipeline: The async kernel variants, or the sync ones.
+        single_buffer_tail: Collapse a sync reduction's operand banks to one.
+
+    Returns:
+        ``(scratch_specs, kernel)``.
+    """
+
+    def compute(*in_tiles):
+        # num_k == 1 map: the op in one step, then the fused tail (if any).
+        result = gemm_kernel(in_tiles, True)
+        if fused_gm is not None:
+            return fused_gm(result, *[in_tiles[i] for i in fused_idx])
+        return result
+
+    out_dtype = anchor.value.dtype
+    acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
+    if num_k == 1:
+        scratch_specs = []
+        kernel = _map_kernel(
+            compute, len(out_specs), async_pipeline=async_pipeline
+        )
+    elif fused_gm is None and acc_dtype == out_dtype:
+        scratch_specs = []
+        kernel = _reduction_inplace_kernel(
+            gemm_kernel,
+            reduction_dim=reduction_dim,
+            async_pipeline=async_pipeline,
+        )
+    else:
+        if single_buffer_tail and not async_pipeline:
+            _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
+        # Only a tail that reads scratch after the streamed pass gains a
+        # second slot; a chained-whole tail never races and keeps one.  The
+        # count is the tiler's per-node call (the scratch ladder winner,
+        # stamped with the tiling).
+        sync = not chain_tail or (
+            fused_gm is not None and _split_stream_break(fused_gm) is not None
+        )
+        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
+        slots = scratch_slots if sync else 1
+        scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
+        kernel = _reduction_fused_kernel(
+            gemm_kernel,
+            reduction_dim=reduction_dim,
+            last_idx=num_k - 1,
+            num_outputs=len(out_specs),
+            op_dtype=(out_dtype if acc_dtype != out_dtype else None),
+            fused_gm=fused_gm,
+            chain_tail=chain_tail,
+            fused_operand_indices=fused_idx,
+            scratch_slots=slots,
+            async_pipeline=async_pipeline,
+        )
+    return scratch_specs, kernel
 
 
 def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
@@ -1929,56 +2017,21 @@ def build_conv2d(
         bias = in_tiles[bias_idx] if (bias_idx is not None and first) else None
         return _fix_stride(_conv(in_tile, w_tile, bias, kw))
 
-    def compute(*in_tiles):
-        # num_k == 1 map: conv in one step, then the fused tail (if any).
-        result = conv2d_kernel(in_tiles, True)
-        if fused_gm is not None:
-            return fused_gm(result, *[in_tiles[i] for i in fused_idx])
-        return result
-
-    acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
-    if num_k == 1:
-        scratch_specs = []
-        kernel = _map_kernel(
-            compute, len(out_specs), async_pipeline=async_pipeline
-        )
-    elif fused_gm is None and acc_dtype == out.dtype:
-        scratch_specs = []
-        kernel = _reduction_inplace_kernel(
-            conv2d_kernel, reduction_dim=gC, async_pipeline=async_pipeline
-        )
-    else:
-        if single_buffer_tail and not async_pipeline:
-            _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
-        chain_tail = node.meta.get("accumulate_fusible", False)
-        # Only a tail that reads scratch after the streamed pass gains a
-        # second slot; a chained-whole tail never races and keeps one.  The
-        # count is the tiler's per-node call (the scratch ladder winner,
-        # stamped with the tiling).
-        sync = not chain_tail or (
-            fused_gm is not None and _split_stream_break(fused_gm) is not None
-        )
-        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
-        slots = scratch_slots if sync else 1
-        scratch_specs = [
-            _ScratchSpec(
-                project((tn, tk, toh, tow), out_dims),
-                acc_dtype,
-                num_slots=slots,
-            )
-        ]
-        kernel = _reduction_fused_kernel(
-            conv2d_kernel,
-            reduction_dim=gC,
-            last_idx=num_k - 1,
-            out_specs=out_specs,
-            op_dtype=(out.dtype if acc_dtype != out.dtype else None),
-            fused_gm=fused_gm,
-            chain_tail=chain_tail,
-            fused_operand_indices=fused_idx,
-            scratch_slots=slots,
-            async_pipeline=async_pipeline,
-        )
+    scratch_specs, kernel = _gemm_scratch_and_kernel(
+        conv2d_kernel,
+        fused_gm,
+        reduction_dim=gC,
+        num_k=num_k,
+        acc_shape=project((tn, tk, toh, tow), out_dims),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        fused_idx=fused_idx,
+        anchor=anchor,
+        accumulate_fp32=accumulate_fp32,
+        chain_tail=node.meta.get("accumulate_fusible", False),
+        async_pipeline=async_pipeline,
+        single_buffer_tail=single_buffer_tail,
+    )
     gm = build_pipelined_buffers(
         kernel,
         grid,
@@ -2249,52 +2302,21 @@ def build_gemm(
         bias = in_tiles[bias_idx] if first else None
         return op(act_tile, weight_tile, bias, **kw)
 
-    def compute(*in_tiles):
-        # num_k == 1 map: GEMM in one step, then the fused tail (if any).
-        result = gemm_kernel(in_tiles, True)
-        if fused_gm is not None:
-            return fused_gm(result, *[in_tiles[i] for i in fused_idx])
-        return result
-
-    acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
-    if num_k == 1:
-        scratch_specs = []
-        kernel = _map_kernel(
-            compute, len(out_specs), async_pipeline=async_pipeline
-        )
-    elif fused_gm is None and acc_dtype == out.dtype:
-        scratch_specs = []
-        kernel = _reduction_inplace_kernel(
-            gemm_kernel, reduction_dim=gk, async_pipeline=async_pipeline
-        )
-    else:
-        if single_buffer_tail and not async_pipeline:
-            _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
-        chain_tail = node.meta.get("accumulate_fusible", False)
-        # Only a tail that reads scratch after the streamed pass gains a
-        # second slot; a chained-whole tail never races and keeps one.  The
-        # count is the tiler's per-node call (the scratch ladder winner,
-        # stamped with the tiling).
-        sync = not chain_tail or (
-            fused_gm is not None and _split_stream_break(fused_gm) is not None
-        )
-        scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
-        slots = scratch_slots if sync else 1
-        scratch_specs = [
-            _ScratchSpec(tuple(tb) + (tm, tn), acc_dtype, num_slots=slots)
-        ]
-        kernel = _reduction_fused_kernel(
-            gemm_kernel,
-            reduction_dim=gk,
-            last_idx=num_k - 1,
-            out_specs=out_specs,
-            op_dtype=(out.dtype if acc_dtype != out.dtype else None),
-            fused_gm=fused_gm,
-            chain_tail=chain_tail,
-            fused_operand_indices=fused_idx,
-            scratch_slots=slots,
-            async_pipeline=async_pipeline,
-        )
+    scratch_specs, kernel = _gemm_scratch_and_kernel(
+        gemm_kernel,
+        fused_gm,
+        reduction_dim=gk,
+        num_k=num_k,
+        acc_shape=tuple(tb) + (tm, tn),
+        in_specs=in_specs,
+        out_specs=out_specs,
+        fused_idx=fused_idx,
+        anchor=anchor,
+        accumulate_fp32=accumulate_fp32,
+        chain_tail=node.meta.get("accumulate_fusible", False),
+        async_pipeline=async_pipeline,
+        single_buffer_tail=single_buffer_tail,
+    )
     gm = build_pipelined_buffers(
         kernel,
         grid,
