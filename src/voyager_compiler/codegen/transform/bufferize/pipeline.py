@@ -1386,6 +1386,76 @@ def _map_kernel(
     return kernel
 
 
+def _reduction_inplace_kernel(
+    compute: Callable, reduction_dim: int, async_pipeline: bool = False
+):
+    """Kernel for a reduction with nothing left to do once it completes — no
+    cast (the accumulator's dtype is the output's) and no fused tail.  It
+    accumulates straight into the output slot, so there is no scratch ref and no
+    finalize step: the completed tile is already in the slot the store reads.
+
+    ``_reduction_fused_kernel`` is the general case, where a cast or a tail must
+    map the accumulator into the slot and so needs one of its own.
+
+    ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant:
+    the accumulator *is* the output slot, first written on the ``0`` reduction
+    coord, so the commit dispatch waits the slot free there.
+    """
+
+    def inner(grid_index, *args):
+        *in_slots, out_slot = args
+
+        def init():
+            return compute(in_slots, True)
+
+        def accumulate(prev=out_slot):
+            return compute(in_slots, False) + prev
+
+        voyager.insert(
+            torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
+            out_slot,
+        )
+
+    if not async_pipeline:
+        return inner
+
+    # ``init`` writes the output-slot accumulator fresh (waits the slot free),
+    # ``accumulate`` RMWs it in place (no output dep).  Split them across the
+    # round-0 predicate so neither commit body carries the now-redundant
+    # ``K == 0`` inner cond.
+    def init_body(grid_index, *args):
+        *in_slots, out_slot = args
+        voyager.insert(compute(in_slots, True), out_slot)
+
+    def accumulate_body(grid_index, *args):
+        *in_slots, out_slot = args
+        voyager.insert(compute(in_slots, False) + out_slot, out_slot)
+
+    def kernel(
+        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+    ):
+        operands = [grid_index, *in_slots, *out_slots, *scratch]
+
+        def on_first():
+            commit(
+                init_body,
+                operands,
+                dependencies=[*in_sems, *out_sems],
+                post=post,
+            )
+            return 0
+
+        def not_first():
+            commit(
+                accumulate_body, operands, dependencies=[*in_sems], post=post
+            )
+            return 0
+
+        torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
+
+    return kernel
+
+
 def _split_stream_break(fused_gm):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
@@ -1612,76 +1682,6 @@ def _reduction_fused_kernel(
     return kernel
 
 
-def _reduction_inplace_kernel(
-    compute: Callable, reduction_dim: int, async_pipeline: bool = False
-):
-    """Kernel for a reduction with nothing left to do once it completes — no
-    cast (the accumulator's dtype is the output's) and no fused tail.  It
-    accumulates straight into the output slot, so there is no scratch ref and no
-    finalize step: the completed tile is already in the slot the store reads.
-
-    ``_reduction_fused_kernel`` is the general case, where a cast or a tail must
-    map the accumulator into the slot and so needs one of its own.
-
-    ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant:
-    the accumulator *is* the output slot, first written on the ``0`` reduction
-    coord, so the commit dispatch waits the slot free there.
-    """
-
-    def inner(grid_index, *args):
-        *in_slots, out_slot = args
-
-        def init():
-            return compute(in_slots, True)
-
-        def accumulate(prev=out_slot):
-            return compute(in_slots, False) + prev
-
-        voyager.insert(
-            torch.cond(grid_index[reduction_dim] == 0, init, accumulate),
-            out_slot,
-        )
-
-    if not async_pipeline:
-        return inner
-
-    # ``init`` writes the output-slot accumulator fresh (waits the slot free),
-    # ``accumulate`` RMWs it in place (no output dep).  Split them across the
-    # round-0 predicate so neither commit body carries the now-redundant
-    # ``K == 0`` inner cond.
-    def init_body(grid_index, *args):
-        *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, True), out_slot)
-
-    def accumulate_body(grid_index, *args):
-        *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, False) + out_slot, out_slot)
-
-    def kernel(
-        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
-    ):
-        operands = [grid_index, *in_slots, *out_slots, *scratch]
-
-        def on_first():
-            commit(
-                init_body,
-                operands,
-                dependencies=[*in_sems, *out_sems],
-                post=post,
-            )
-            return 0
-
-        def not_first():
-            commit(
-                accumulate_body, operands, dependencies=[*in_sems], post=post
-            )
-            return 0
-
-        torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
-
-    return kernel
-
-
 def _gemm_scratch_and_kernel(
     gemm_kernel,
     fused_gm,
@@ -1699,7 +1699,7 @@ def _gemm_scratch_and_kernel(
     single_buffer_tail=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
-    shared by the GEMM and conv builders.
+    shared by the dense / sparse GEMM and conv builders.
 
     Args:
         gemm_kernel: The per-step op call, ``(in_tiles, first) -> tile``.
@@ -2048,27 +2048,81 @@ def build_conv2d(
     return gm
 
 
-def build_gemm(
-    node,
-    *,
-    num_slots: int = _DEFAULT_NUM_SLOTS,
-    accumulate_fp32: bool = False,
-    single_buffer_tail: bool = False,
-    async_pipeline: bool = True,
-    tiler=None,
-):
-    """Pipeline builder for a linear / matmul / batched-matmul node — incl. the
-    microscaling / codebook (``*_mx``) variants and a fused bias — over the
-    cross-tile K reduction.  Grid ``(M, N, K)`` (or ``(B, M, N, K)``) tiles with
-    K innermost; the kernel accumulates ``act_tile @ weight_tile`` into the
-    output bank.  Returns the gm, or ``None``.
+@dataclass
+class _GemmPlan:
+    """What a GEMM node determines before any kernel exists: the grid it sweeps,
+    its operands and their block specs in splice order, and the bare GEMM call
+    on one step's tiles.
+
+    Attributes:
+        anchor: The GEMM node itself, or the anchor of the fused group.
+        grid: Tile counts, batch dims then M/N in ``l3_order`` then K.
+        grid_dims: Grid dims the row / column / reduction tiles run along.
+        tile_k: Columns one reduction step spans.
+        acc_shape: The accumulator tile, batch dims then ``(tile_m, tile_n)``.
+        inputs: Operand values in ``node.all_input_nodes`` order.
+        in_specs: One block spec per operand, ``None`` for a whole-tensor one.
+        out_specs: The group's outputs.
+        kw_idx: Operand index of each tensor kwarg the op takes.
+        gemm_kernel: ``(in_tiles, first) -> tile``, the GEMM (plus any weight
+            decode) on one step; ``first`` says whether the bias folds in.
+        fused_gm: The fused tail, or ``None``.
+        fused_idx: Operand indices the fused tail consumes after the GEMM.
+        outline_dps: Whether the built gm needs ``outline_dps_ops``.
+    """
+
+    anchor: torch.fx.Node
+    grid: Tuple[int, ...]
+    grid_dims: Tuple[int, int, int]
+    tile_k: int
+    acc_shape: Tuple[int, ...]
+    inputs: Tuple[torch.Tensor, ...]
+    in_specs: List[Optional[_InputSpec]]
+    out_specs: List[_OutputSpec]
+    kw_idx: dict
+    gemm_kernel: Callable
+    fused_gm: Optional[torch.nn.Module]
+    fused_idx: List[int]
+    outline_dps: bool
+
+    @property
+    def tile_m(self) -> int:
+        """Rows one output tile spans."""
+        return self.acc_shape[-2]
+
+    @property
+    def tile_n(self) -> int:
+        """Columns one output tile spans."""
+        return self.acc_shape[-1]
+
+    @property
+    def num_k(self) -> int:
+        """Reduction steps per output tile."""
+        return self.grid[self.grid_dims[2]]
+
+    @property
+    def out_dtype(self) -> torch.dtype:
+        """Element type of the GEMM's own output -- the accumulator's."""
+        return self.anchor.value.dtype
+
+
+def _gemm_plan(node, tiler=None) -> Optional[_GemmPlan]:
+    """Derive a GEMM node's grid, operands and per-step call — everything a
+    builder needs before it picks a kernel.  Returns ``None`` for a node that
+    has no tiling and is not a BMM.
 
     Operands are assembled in the fused node's ``all_input_nodes`` order so the
     positional splice in ``replace_node_with_graph_module`` binds each
     placeholder correctly even when a fused-tail operand is graph-ordered before
-    the anchor; ``compute`` / ``gemm_kernel`` then dispatch by canonical index
-    (``act_idx`` / ``kw_idx`` / ``fused_idx``), not a positional ``*extra``
-    split.
+    the anchor; ``gemm_kernel`` then dispatches by canonical index (``act_idx``
+    / ``kw_idx`` / ``fused_idx``), not a positional ``*extra`` split.
+
+    Args:
+        node: The linear / matmul / batched-matmul node, or the fused group.
+        tiler: Tile-search backend, forwarded to ``get_tiling``.
+
+    Returns:
+        A ``_GemmPlan``, or ``None``.
     """
     info = parse_fused_submodule(node, tiler)
     if info is not None:
@@ -2096,11 +2150,11 @@ def build_gemm(
             out_ts = (1,) * (out.ndim - 2) + tuple(out.shape[-2:])
         else:
             out_ts = tuple(out.shape)
-        tk = K
+        nk = 1
     else:
         out_tiling, nk = tiling[:-1], tiling[-1]  # batch.. + (n_m, n_n) , n_k
         out_ts = tuple(s // t for s, t in zip(out.shape, out_tiling))
-        tk = K // nk
+    tk = K // nk
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
 
     nb = out.ndim - 2
@@ -2251,7 +2305,11 @@ def build_gemm(
             node_to_spec[s] = (s.value.clone(), spec)
 
     order = {n: i for i, n in enumerate(node.all_input_nodes)}
-    assert len(node_to_spec) == len(order), "gemm operand shared across roles"
+    assert len(node_to_spec) == len(order), (
+        f"{node.name}: {len(order) - len(node_to_spec)} operand(s) reached the "
+        f"GEMM with no role — every input needs a block spec "
+        f"({sorted(n.name for n in order if n not in node_to_spec)})"
+    )
     inputs = [node_to_spec[n][0] for n in node.all_input_nodes]
     in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
 
@@ -2302,16 +2360,52 @@ def build_gemm(
         bias = in_tiles[bias_idx] if first else None
         return op(act_tile, weight_tile, bias, **kw)
 
-    scratch_specs, kernel = _gemm_scratch_and_kernel(
-        gemm_kernel,
-        fused_gm,
-        reduction_dim=gk,
-        num_k=num_k,
+    return _GemmPlan(
+        anchor=anchor,
+        grid=grid,
+        grid_dims=(gm, gn, gk),
+        tile_k=tk,
         acc_shape=tuple(tb) + (tm, tn),
+        inputs=tuple(inputs),
         in_specs=in_specs,
         out_specs=out_specs,
+        kw_idx=kw_idx,
+        gemm_kernel=gemm_kernel,
+        fused_gm=fused_gm,
         fused_idx=fused_idx,
-        anchor=anchor,
+        outline_dps=num_k > 1 or info is not None or dequant is not None,
+    )
+
+
+def build_gemm(
+    node,
+    *,
+    num_slots: int = _DEFAULT_NUM_SLOTS,
+    accumulate_fp32: bool = False,
+    single_buffer_tail: bool = False,
+    async_pipeline: bool = True,
+    tiler=None,
+):
+    """Pipeline builder for a linear / matmul / batched-matmul node — incl. the
+    microscaling / codebook (``*_mx``) variants and a fused bias — over the
+    cross-tile K reduction.  Grid ``(M, N, K)`` (or ``(B, M, N, K)``) tiles with
+    K innermost; the kernel accumulates ``act_tile @ weight_tile`` into the
+    output slot.  Returns the gm, or ``None``.
+    """
+    plan = _gemm_plan(node, tiler)
+    if plan is None:
+        return None
+
+    scratch_specs, kernel = _gemm_scratch_and_kernel(
+        plan.gemm_kernel,
+        plan.fused_gm,
+        reduction_dim=plan.grid_dims[2],
+        num_k=plan.num_k,
+        acc_shape=plan.acc_shape,
+        in_specs=plan.in_specs,
+        out_specs=plan.out_specs,
+        fused_idx=plan.fused_idx,
+        anchor=plan.anchor,
         accumulate_fp32=accumulate_fp32,
         chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
@@ -2319,17 +2413,17 @@ def build_gemm(
     )
     gm = build_pipelined_buffers(
         kernel,
-        grid,
-        in_specs,
-        out_specs,
-        tuple(inputs),
+        plan.grid,
+        plan.in_specs,
+        plan.out_specs,
+        plan.inputs,
         scratch_specs=scratch_specs,
         num_slots=num_slots,
         async_pipeline=async_pipeline,
     )
-    if num_k > 1 or info is not None or dequant is not None:
+    if plan.outline_dps:
         outline_dps_ops(gm)
-    _stamp_anchor_meta(gm, anchor)
+    _stamp_anchor_meta(gm, plan.anchor)
     return gm
 
 
