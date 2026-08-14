@@ -182,8 +182,8 @@ def build_interstellar_tiler(
 def _layer_cache_key(node):
     """A hashable key for what the *node alone* says about its interstellar
     mapping: op, operand / output shapes, the conv stride/padding/dilation, the
-    operand + scale element widths and the microscaling block size.  Identical
-    layers thus share one optimizer run.
+    operand + scale + outlier-CSR element widths and the microscaling block
+    size.  Identical layers thus share one optimizer run.
 
     The architecture is fixed for a run, so it is left out; so is anything the
     caller knows and the node does not -- the output dtype, the fused post-op
@@ -199,6 +199,9 @@ def _layer_cache_key(node):
         _node_dtype_bits(node.args[1]),
         _node_dtype_bits(node.kwargs.get("input_scale"), 0),
         _node_dtype_bits(node.kwargs.get("weight_scale"), 0),
+        _node_dtype_bits(node.kwargs.get("A_indptr"), 0),
+        _node_dtype_bits(node.kwargs.get("A_data"), 0),
+        _node_dtype_bits(node.kwargs.get("A_indices"), 0),
         node.kwargs.get("block_size"),
     ]
     if is_conv2d(node):
@@ -302,6 +305,7 @@ def make_size_fn(
     num_slots=1,
     batch=1,
     weight_batch=1,
+    outlier_pct=0.0,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -348,6 +352,10 @@ def make_size_fn(
     fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
     of_scale_bits = get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
     block_size = node.kwargs.get("block_size") or 1
+    # One gathered-CSR entry: the outlier value plus its column index.
+    csr_data_bits = _node_dtype_bits(node.kwargs.get("A_data"), 0)
+    csr_index_bits = _node_dtype_bits(node.kwargs.get("A_indices"), 0)
+    csr_bits = csr_data_bits + csr_index_bits
 
     def _scale_bytes(count, bits):
         return count / block_size * bits / 8.0 if bits else 0.0
@@ -395,6 +403,11 @@ def make_size_fn(
             (if_count * if_bits / 8.0, _IF, slots(_IF_DIMS, batch)),
             (
                 _scale_bytes(if_count, if_scale_bits),
+                _IF,
+                slots(_IF_DIMS, batch),
+            ),
+            (
+                if_count * outlier_pct * csr_bits / 8.0,
                 _IF,
                 slots(_IF_DIMS, batch),
             ),
@@ -1015,11 +1028,21 @@ def _prepare_search(node, tiler):
         if perm is not None and perm.value.ndim > anchor.value.ndim:
             oc_align = perm.value.shape[-1]
 
+    # An outlier GEMM's CSR: what fraction of the activation the packed stream
+    # is sized to hold.  Read off the operand rather than the producer's
+    # geometry, so tiling stays independent of the bufferize builders.
+    outlier_pct = 0.0
+    a_data = anchor.kwargs.get("A_data")
+    if a_data is not None and getattr(a_data, "value", None) is not None:
+        rows, cols = anchor.args[0].value.shape[-2:]
+        outlier_pct = a_data.value.shape[-1] / (rows * cols)
+
     key = _layer_cache_key(anchor) + (
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
         has_tail,
         oc_align,
+        outlier_pct,
     )
 
     if key in tiler.cache:
@@ -1078,6 +1101,7 @@ def _prepare_search(node, tiler):
         weight_scale_width=fl_scale_bits,
         output_scale_width=of_scale_bits,
         scale_block_size=anchor.kwargs.get("block_size") or 1,
+        has_sparse_op=outlier_pct > 0,
     )
 
     # Built up front rather than per attempt: each one reads the node, which
@@ -1094,6 +1118,7 @@ def _prepare_search(node, tiler):
             num_slots=tiler.config.num_slots,
             batch=batch,
             weight_batch=batch // weight_repeat,
+            outlier_pct=outlier_pct,
         )
         for extra_sharing in range(4 + len(fused_specs))
     ]

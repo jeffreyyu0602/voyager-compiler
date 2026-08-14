@@ -545,16 +545,24 @@ def _pad_csr(
 
     pad_len = max_nnz - nse
 
-    if pad_len > 0:
+    if pad_len >= 0:
         data = F.pad(values, (0, pad_len), mode="constant", value=0)
         indices = F.pad(col_indices, (0, pad_len), mode="constant", value=-1)
-    else:
-        logger.warning(f"Number of outliers {nse} exceeds capacity {max_nnz}.")
-        data = values[:max_nnz]
-        indices = col_indices[:max_nnz]
-        crow_indices.clamp_(max=max_nnz)
+        return data, indices
 
-    return data, indices
+    # Overflow cannot raise here: ``ShapeProp(recurse=True)`` stamps a nest by
+    # running both ``cond`` branches and one ``while_loop`` iteration from the
+    # carried *initial* values, so a tiled quantize is propagated over an
+    # accumulator no step has written yet and reads uninitialized memory as
+    # nearly all-outlier.  The capacity a tile really needs is checked against
+    # the live activation where the builder derives its geometry.
+    logger.warning(
+        f"Number of outliers {nse} exceeds capacity {max_nnz}; "
+        f"{nse - max_nnz} dropped."
+    )
+    crow_indices.clamp_(max=max_nnz)
+
+    return values[:max_nnz], col_indices[:max_nnz]
 
 
 @impl(quantized_ops_lib, "filter_outlier", "CompositeExplicitAutograd")
@@ -635,7 +643,8 @@ quantized_ops_lib.define(
     "quantize_mx_outlier(Tensor self, Tensor qmap, SymInt[] axes, "
     "int block_size, float quant_max, bool force_scale_power_of_two=False, "
     "Tensor scale_qmap=None, Tensor output_code=None, float? threshold=None, "
-    "float max_pct=0.01) -> (Tensor, Tensor, Tensor, Tensor, Tensor)"
+    "float max_pct=0.01, SymInt indptr_offset=0) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
 )
 
 
@@ -651,8 +660,33 @@ def quantize_mx_outlier(
     output_code: Optional[torch.Tensor] = None,
     threshold: Optional[float] = None,
     max_pct: float = 0.01,
+    indptr_offset: int = 0,
 ) -> Tuple[torch.Tensor]:
+    """Split an input into quantized inliers and a CSR of outliers.
+
+    Args:
+        input: Tensor to quantize.
+        qmap: Codebook the inliers are quantized into.
+        axes: Axes the microscaling blocks run along.
+        block_size: Elements per microscaling block.
+        quant_max: Largest representable magnitude of ``qmap``.
+        force_scale_power_of_two: Round each block scale down to a power
+            of two.
+        scale_qmap: Codebook the scales are quantized into.
+        output_code: Unused; present to match the sibling quantize ops.
+        threshold: Magnitude above which an element is an outlier.
+        max_pct: Fraction of the matrix the CSR is sized to hold.
+        indptr_offset: Value the returned row pointers start from, so a
+            tile's CSR can extend one that is already partly built. The
+            consumer subtracts ``indptr[0]`` to recover data positions.
+
+    Returns:
+        ``(data, indices, indptr, scale, inliers)``.
+    """
     data, indices, indptr, inliers = filter_outlier(input, threshold, max_pct)
+
+    if indptr_offset:
+        indptr = indptr + indptr_offset
 
     scale = calculate_mx_qparam(
         inliers,
@@ -679,6 +713,7 @@ def _(
     output_code: Optional[torch.Tensor] = None,
     threshold: Optional[float] = None,
     max_pct: float = 0.01,
+    indptr_offset: int = 0,
 ):
     batch_shape = input.shape[:-2]
     mat_shape = input.shape[-2:]
@@ -818,10 +853,15 @@ def spmm_csr(
         B_batch = B[i] if B.ndim == 3 else B
 
         input_size = (indptr[i].numel() - 1, B_batch.shape[0])
-        end_index = indptr[i][-1].item()
+
+        # The row pointers may name a range lifted out of a longer array,
+        # in which case they do not start at 0 and data/indices hold only
+        # the span they cover.  Rebase both onto that span's start.
+        base = indptr[i][0].item()
+        end_index = indptr[i][-1].item() - base
 
         csr = torch.sparse_csr_tensor(
-            indptr[i],
+            indptr[i] - base,
             indices[i, :end_index],
             data[i, :end_index],
             dtype=torch.float32,

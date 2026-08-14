@@ -1,0 +1,692 @@
+"""A GEMM whose activation carries an outlier CSR.
+
+``linear_mx`` / ``matmul_mx`` fuse a dense low-precision matmul with a sparse
+high-precision correction, and the engine takes **one** CSR per call covering
+exactly the dense tile's rows. The producer, though, emits its CSR per
+``(row block, K slice)`` and packs the blocks end to end (see
+``quantize_mx_outlier``), so a row tile spanning ``R`` row blocks finds its
+correction in ``R`` runs scattered through that stream. The consumer therefore
+concatenates them on chip before the call.
+
+That concatenation is a valid CSR without re-indexing anything. Column indices
+are already local to ``tk``, so a block's columns lie in ``[0, tk)`` whichever
+rows they came from, and stacking blocks that share a ``k`` just extends the
+row list. The row pointers need no work either: the producer wrote them in
+slice coordinates, so the tile's pointer range is a contiguous window of one
+array, and the engine subtracts ``indptr[0]`` itself. Placing block ``j``'s
+data at ``p[j*rows] - p[0]`` is exactly what makes those pointers address it.
+
+Everything else is the dense GEMM: ``_gemm_plan`` derives the grid, the operand
+specs and the per-step call, and this module only adds the fetches and swaps
+the CSR kwargs for its own scratch.
+"""
+
+import contextlib
+from dataclasses import replace
+from typing import Optional
+
+import torch
+
+from voyager_compiler.codegen.node_info import (
+    get_anchor_node,
+    is_gemm_op,
+    is_nop,
+)
+from voyager_compiler.codegen.transform.bufferize.ops import (
+    MemoryLevel,
+    oracle_disabled,
+)
+from voyager_compiler.codegen.transform.bufferize.pipeline import (
+    _DEFAULT_NUM_SLOTS,
+    _gemm_plan,
+    _gemm_scratch_and_kernel,
+    _stamp_anchor_meta,
+    PipelinedKernel,
+)
+from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
+    _Bufs,
+    _check_block_budget,
+    _entry,
+    _Geometry,
+    _QUANTIZE_MX_OUTLIER,
+    _scalar,
+    base_table_shape,
+    GEOMETRY_META,
+    PRODUCER_META,
+    tag_base_table,
+)
+from voyager_compiler.codegen.transform.bufferize.utils import (
+    _finalize_exported_gm,
+    _lenient_verifier,
+    _tag_loop_extents,
+    outline_dps_ops,
+    voyager,
+)
+from voyager_compiler.export_utils import export_model
+from voyager_compiler.shape_prop import set_node_value, ShapeProp
+
+_SRAM = int(MemoryLevel.SRAM)
+
+
+class _EpilogueTail(torch.nn.Module):
+    """The fused tail of a CSR-producing GEMM, plus its CSR stores.
+
+    Wrapping rather than threading extra arguments keeps the tail's arity: the
+    reduction kernel applies it inside a ``torch.cond`` on the last reduction
+    step and calls it with the group's own operands. The offset and the grid
+    index it needs are captured here instead, which is also what puts the
+    stores on the step that actually completes an output tile.
+    """
+
+    def __init__(self, owner, idx):
+        super().__init__()
+        self.owner = owner
+        self.gm = owner.plan.fused_gm
+        self.idx = idx
+
+    def forward(self, acc, *operands):
+        outs = self.gm(acc, *operands, self.owner._offset_at(self.idx))
+        self.owner._store_csr(self.idx, outs[0], outs[1], outs[2])
+        return outs[3], outs[4]
+
+
+class _SparseGemm(torch.nn.Module):
+    """The dense GEMM nest plus a per-step CSR gather.
+
+    The gather cannot live inside the plan's ``gemm_kernel``, which is
+    index-blind by design: a block's source address comes from the shared base
+    table, indexed by ``(K slice, row block)``. So it runs here, where the grid
+    index is in hand, and the kernel below only substitutes the filled scratch
+    for the raw operands.
+    """
+
+    def __init__(
+        self,
+        plan,
+        geom,
+        data_dtype,
+        *,
+        out_geom=None,
+        num_slots: int = _DEFAULT_NUM_SLOTS,
+        accumulate_fp32: bool = False,
+    ):
+        super().__init__()
+        self.plan = plan
+        self.accumulate_fp32 = accumulate_fp32
+        self.data_dtype = data_dtype
+        self.geom = geom
+        self.out_geom = out_geom
+        self.R = plan.tile_m // geom.rows if geom is not None else 1
+        self.span = self.R * geom.budget if geom is not None else 0
+        self.grid_m, self.grid_n, self.grid_k = plan.grid_dims
+        if out_geom is not None:
+            # The CSR outputs are stored by hand; only the dense pair is diced
+            # by the output grid.
+            plan.out_specs = list(plan.out_specs)[3:]
+            plan.fused_gm = _thread_indptr_offset(plan.fused_gm)
+        # The K accumulator, when the reduction needs one.  The kernel built
+        # alongside it is rebuilt per step (with the grid index captured) and
+        # discarded here; only the specs are needed before the loop exists.
+        self.scratch_specs = self._scratch_and_kernel(plan.fused_gm)[0]
+        # Synchronous: the per-step CSR gather issues its DMAs outside any
+        # commit region, which the async scheduler cannot capture.
+        self.inner = PipelinedKernel(
+            self._kernel,
+            grid=plan.grid,
+            in_specs=plan.in_specs,
+            out_specs=plan.out_specs,
+            scratch_specs=self.scratch_specs,
+            num_slots=num_slots,
+        )
+
+    # --- kernel assembly ----------------------------------------------------
+
+    def _scratch_and_kernel(self, tail):
+        """The dense path's scratch and kernel, over a ``gemm_kernel`` that
+        reads the gathered CSR instead of the raw operands.
+
+        Args:
+            tail: The fused tail to apply — the plan's own, or its
+                ``_EpilogueTail`` wrapper when a step's tail also stores a
+                CSR. Rebuilt per step because a HOP body may not mutate an
+                outer Python object, so the stores have to run where the
+                results exist.
+
+        Returns:
+            ``(scratch_specs, kernel)``, the kernel matching the arity of
+            the dense path's.
+        """
+        plan = self.plan
+        csr = plan.kw_idx
+
+        def gemm_kernel(in_tiles, first):
+            tiles = list(in_tiles)
+            tiles[csr["A_data"]] = self._bufs.gather_data
+            tiles[csr["A_indices"]] = self._bufs.gather_indices
+            # One call consumes one K slice, so the slice axis is addressing,
+            # not data: the op wants a plain [*batch, tm+1] pointer array.
+            ptr = in_tiles[csr["A_indptr"]]
+            tiles[csr["A_indptr"]] = ptr.reshape(
+                tuple(ptr.shape[:-2]) + (ptr.shape[-1],)
+            )
+            return plan.gemm_kernel(tuple(tiles), first)
+
+        return _gemm_scratch_and_kernel(
+            gemm_kernel,
+            tail,
+            reduction_dim=self.grid_k,
+            num_k=plan.num_k,
+            acc_shape=plan.acc_shape,
+            in_specs=plan.in_specs,
+            out_specs=plan.out_specs,
+            fused_idx=plan.fused_idx,
+            anchor=plan.anchor,
+            accumulate_fp32=self.accumulate_fp32,
+            # Sync, matching ``self.inner`` (see ``__init__``).
+            chain_tail=False,
+            async_pipeline=False,
+        )
+
+    # --- the gather ---------------------------------------------------------
+
+    def _gather(self, idx, slots):
+        """Concatenate this row tile's ``R`` blocks into one CSR.
+
+        Source addresses come from the resident base table (a plain read, not a
+        fetch); destinations and lengths come from the pointer tile that was
+        loaded with the dense operands, so no arithmetic beyond reading scalars.
+        """
+        plan, g, bufs = self.plan, self.geom, self._bufs
+        nb, ones = g.nb, g.ones
+        bidx = [idx[i] for i in range(nb)]
+        m_c, k = idx[self.grid_m], idx[self.grid_k]
+
+        # The loaded pointer tile is a slot window, so an entry read off it
+        # would window a window (see ``_scalar``); stage it first.
+        ptr = slots[plan.kw_idx["A_indptr"]]
+        voyager.insert(
+            ptr.reshape(ones + (plan.tile_m + 1,)).clone(), bufs.gather_ptr_tile
+        )
+        p = bufs.gather_ptr_tile
+        lo = _scalar(_entry(p, 0, nb, ones))
+
+        for j in range(self.R):
+            slot = voyager.subview(
+                bufs.base_table,
+                [0] * g.dropped + bidx + [k, m_c * self.R + j],
+                (1,) * g.dropped + ones + (1, 1),
+                (1,) * (g.dropped + nb + 2),
+                [],
+            )
+            at = _scalar(slot)
+            torch._check(at >= 0)
+            at_j = _scalar(_entry(p, j * g.rows, nb, ones))
+            start = at_j - lo
+            torch._check(start >= 0)
+            count = _scalar(_entry(p, (j + 1) * g.rows, nb, ones)) - at_j
+            torch._check(count >= 0)
+
+            for src, dst in (
+                (slots[plan.kw_idx["A_data"]], bufs.gather_data),
+                (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
+            ):
+                voyager.async_copy(
+                    src,
+                    voyager.subview(
+                        dst,
+                        [0] * nb + [start],
+                        ones + (g.budget,),
+                        (1,) * (nb + 1),
+                        [],
+                    ),
+                    bidx + [at],
+                    ones + (g.budget,),
+                    bufs.gather_sem,
+                    None,
+                    [1] * (nb + 1),
+                    count=[1] * nb + [count],
+                )
+                voyager.async_wait(bufs.gather_sem)
+
+    def _offset_at(self, idx):
+        """This K slice's running nonzero count, the op's ``indptr_offset``."""
+        g, bufs = self.out_geom, self._bufs
+        nb = g.nb
+        off = _scalar(
+            voyager.subview(
+                bufs.slice_nnz,
+                [idx[x] for x in range(nb)] + [idx[self.grid_n]],
+                g.ones + (1,),
+                (1,) * (nb + 1),
+                [],
+            )
+        )
+        torch._check(off >= 0)
+        return off
+
+    def _store_csr(self, idx, d, i, p):
+        """Append this output tile's CSR to the packed stream.
+
+        The same layout the row-swept producer writes, one tile at a time: the
+        row pointers land in their slice's continuous array, the data and
+        indices at the stream position ``base`` names, and the block's position
+        goes into the shared table for its consumer.
+        """
+        g, bufs = self.out_geom, self._bufs
+        nb, ones = g.nb, g.ones
+        bidx = [idx[x] for x in range(nb)]
+        m = idx[self.grid_m]
+        # The CSR's K slice is this GEMM's column tile.
+        k = idx[self.grid_n]
+
+        # A compute result reaches DRAM through a scratchpad tile (see
+        # ``_OutlierProducer._slice_loop``); stage the op's results first.
+        voyager.insert(d, bufs.store_data_tile)
+        voyager.insert(i, bufs.store_index_tile)
+        voyager.insert(p, bufs.store_indptr_tile)
+        d, i, p = (
+            bufs.store_data_tile,
+            bufs.store_index_tile,
+            bufs.store_indptr_tile,
+        )
+
+        voyager.async_copy(
+            p.reshape(ones + (1, g.rows + 1)),
+            bufs.csr_indptr,
+            bidx + [k, m],
+            ones + (1, g.rows + 1),
+            bufs.store_sem,
+            None,
+            [1] * nb + [1, g.rows],
+        )
+        voyager.async_wait(bufs.store_sem)
+
+        last = _entry(p, g.rows, nb, ones)
+        nnz = _scalar(last) - _scalar(_entry(p, 0, nb, ones))
+        torch._check(nnz >= 0)
+        base_ref = voyager.subview(
+            bufs.stream_pos, bidx + [0], ones + (1,), (1,) * (nb + 1), []
+        )
+        at = _scalar(base_ref)
+        torch._check(at >= 0)
+
+        for src, dst in ((d, bufs.csr_data), (i, bufs.csr_indices)):
+            voyager.async_copy(
+                src,
+                dst,
+                bidx + [at],
+                ones + (g.budget,),
+                bufs.store_sem,
+                None,
+                [1] * (nb + 1),
+                count=[1] * nb + [nnz],
+            )
+            voyager.async_wait(bufs.store_sem)
+
+        voyager.insert(
+            base_ref.reshape(ones + (1, 1)).clone(),
+            voyager.subview(
+                bufs.out_base_table,
+                bidx + [k, m],
+                ones + (1, 1),
+                (1,) * (nb + 2),
+                [],
+            ),
+        )
+        voyager.insert(base_ref + nnz, base_ref)
+        voyager.insert(
+            last.clone(),
+            voyager.subview(
+                bufs.slice_nnz, bidx + [k], ones + (1,), (1,) * (nb + 1), []
+            ),
+        )
+
+    def _kernel(self, idx, *slots):
+        if self.geom is not None:
+            self._gather(idx, slots)
+        tail = self.plan.fused_gm
+        if self.out_geom is not None:
+            tail = _EpilogueTail(self, idx)
+        self._scratch_and_kernel(tail)[1](idx, *slots)
+
+    # --- entry --------------------------------------------------------------
+
+    def forward(self, *inputs):
+        bufs = _Bufs()
+        g = self.geom
+        if g is not None:
+            # R blocks of at most ``budget`` each: a row tile can never exceed
+            # it, since it is exactly R blocks.
+            bufs.gather_data = voyager.alloc(
+                list(g.ones) + [self.span], self.data_dtype, _SRAM
+            )
+            bufs.gather_indices = voyager.alloc(
+                list(g.ones) + [self.span], torch.int32, _SRAM
+            )
+            bufs.base_table = voyager.alloc(
+                base_table_shape(g), torch.int32, _SRAM
+            )
+            bufs.gather_ptr_tile = voyager.alloc(
+                list(g.ones) + [self.plan.tile_m + 1], torch.int32, _SRAM
+            )
+            bufs.gather_sem = voyager.zeros([], torch.int64)
+
+        og = self.out_geom
+        if og is not None:
+            vals = self.out_values
+            bufs.csr_data = voyager.alloc(
+                list(og.batch) + [og.stream], vals[0].dtype
+            )
+            bufs.csr_indices = voyager.alloc(
+                list(og.batch) + [og.stream], torch.int32
+            )
+            bufs.csr_indptr = voyager.alloc(
+                list(og.batch) + [og.n_k, og.M + 1], torch.int32
+            )
+            bufs.slice_nnz = voyager.alloc(
+                list(og.batch) + [og.n_k], torch.int32, _SRAM
+            )
+            bufs.stream_pos = voyager.alloc(
+                list(og.batch) + [1], torch.int32, _SRAM
+            )
+            bufs.out_base_table = voyager.alloc(
+                base_table_shape(og), torch.int32, _SRAM
+            )
+            bufs.store_sem = voyager.zeros([], torch.int64)
+            # Per-tile staging for ``_store_csr``'s stores.
+            bufs.store_data_tile = voyager.alloc(
+                list(og.ones) + [og.budget], vals[0].dtype, _SRAM
+            )
+            bufs.store_index_tile = voyager.alloc(
+                list(og.ones) + [og.budget], torch.int32, _SRAM
+            )
+            bufs.store_indptr_tile = voyager.alloc(
+                list(og.ones) + [og.rows + 1], torch.int32, _SRAM
+            )
+        self._bufs = bufs
+        dense = self.inner(*inputs)
+        if og is None:
+            return dense
+        scale, inliers = (dense if isinstance(dense, tuple) else (dense,))[:2]
+        return (
+            bufs.csr_data,
+            bufs.csr_indices,
+            bufs.csr_indptr,
+            scale,
+            inliers,
+        )
+
+
+def gemm_produces_csr(node) -> bool:
+    """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
+
+    Such a group is a producer as well as (possibly) a consumer: the quantize
+    runs on the accumulator tile, so its CSR is emitted per output tile and has
+    to be stored by hand rather than diced by the output grid. A group whose
+    *anchor* is the quantize is not one -- that is the row-swept case.
+    """
+    submod = node.meta.get("submodule")
+    if not isinstance(submod, torch.fx.GraphModule):
+        return False
+    anchor = get_anchor_node(node)
+    if anchor is None or not is_gemm_op(anchor):
+        return False
+    if not any(
+        n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
+        for n in submod.graph.nodes
+    ):
+        return False
+    return isinstance(node.value, (list, tuple)) and len(node.value) == 5
+
+
+def _epilogue_geometry(node, plan) -> _Geometry:
+    """The CSR geometry a GEMM epilogue produces.
+
+    The quantize sees the GEMM's output tile, so the row block *is* the row
+    tile and the K slice *is* the column tile -- the producing GEMM's tiling
+    defines the layout rather than following one.
+    """
+    vals = node.value
+    inliers = vals[4]
+    batch = tuple(inliers.shape[:-2])
+    M, K = inliers.shape[-2], inliers.shape[-1]
+    submod = node.meta["submodule"]
+    qnode = next(
+        n
+        for n in submod.graph.nodes
+        if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
+    )
+    bs = qnode.args[3]
+    max_pct = qnode.args[9] if len(qnode.args) > 9 else 0.01
+    geom = _Geometry(
+        batch=batch,
+        M=M,
+        K=K,
+        rows=plan.tile_m,
+        tk=plan.tile_n,
+        block_size=bs,
+        budget=int(plan.tile_m * plan.tile_n * max_pct),
+        max_pct=max_pct,
+    )
+    # The tile search has already run, so the submodule carries the GEMM's real
+    # output -- what the quantize will see, and the only chance to catch a
+    # block that does not fit before ``_pad_csr`` silently drops its tail.
+    _check_block_budget(
+        getattr(qnode.args[0], "value", None),
+        qnode.args[8] if len(qnode.args) > 8 else None,
+        geom,
+    )
+    return geom
+
+
+def _thread_indptr_offset(fused_gm):
+    """Give the fused quantize a runtime ``indptr_offset``.
+
+    The op emits pointers from that offset, which is what keeps one continuous
+    pointer array per K slice; in a fused tail the call is a graph node, so the
+    offset has to be threaded in as an extra operand.
+    """
+    g = fused_gm.graph
+    qnode = next(
+        n
+        for n in g.nodes
+        if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
+    )
+    last_ph = [n for n in g.nodes if n.op == "placeholder"][-1]
+    with g.inserting_after(last_ph):
+        ph = g.placeholder("indptr_offset")
+    qnode.kwargs = {**qnode.kwargs, "indptr_offset": ph}
+    g.lint()
+    fused_gm.recompile()
+    return fused_gm
+
+
+def _retarget_csr_views(node) -> None:
+    """Let a CSR reach a lower-rank consumer without losing its slicing.
+
+    A reshape can sit between producer and consumer — the boundary between a
+    decoder layer and ``lm_head`` drops the leading batch dim — and it carries
+    no meta of its own. Dropping the batch dim is what the consumer wants;
+    flattening the K-slice axis away with it is not, since the pointer array
+    holds one array per slice. So the pointer view is retargeted to keep that
+    axis, and every CSR view inherits the producer's geometry.
+    """
+    for arg in list(node.args) + list(node.kwargs.values()):
+        if not isinstance(arg, torch.fx.Node) or not is_nop(arg):
+            continue
+        src = arg
+        while is_nop(src) and src.all_input_nodes:
+            src = src.all_input_nodes[0]
+        geom = src.meta.get(GEOMETRY_META)
+        if geom is None:
+            continue
+        arg.meta[GEOMETRY_META] = geom
+        arg.meta[PRODUCER_META] = src.meta.get(PRODUCER_META)
+        value = getattr(arg, "value", None)
+        if (
+            value is None
+            or value.dtype != torch.int32
+            or value.shape[-1] != geom.M + 1
+            or value.ndim >= src.value.ndim
+        ):
+            continue
+        shape = list(value.shape[:-1]) + [geom.n_k, value.shape[-1]]
+        arg.args = (arg.args[0], shape)
+        set_node_value(arg, src.value.reshape(shape))
+
+
+def _csr_geometry(node):
+    """This GEMM's ``A_indptr`` operand and the geometry its producer stamped.
+
+    Identified by shape rather than by the anchor's kwargs, which on a fused
+    group name submodule placeholders that carry no meta.
+
+    Returns:
+        ``(operand, geometry)``, or ``(None, None)``.
+    """
+    for operand in node.all_input_nodes:
+        geom = operand.meta.get(GEOMETRY_META)
+        value = getattr(operand, "value", None)
+        if geom is None or not isinstance(value, torch.Tensor):
+            continue
+        if value.dtype == torch.int32 and value.shape[-1] == geom.M + 1:
+            # A reshape on the way in may have dropped batch dims the producer
+            # had; the consumer indexes only the ones it still sees.
+            batch = tuple(value.shape[:-2])
+            if batch != geom.batch:
+                geom = replace(
+                    geom,
+                    batch=batch,
+                    dropped=len(geom.batch) - len(batch),
+                )
+            return operand, geom
+    return None, None
+
+
+@contextlib.contextmanager
+def _slice_axis_hidden(node):
+    """Hide the K-slice axis of this GEMM's ``A_indptr`` operand.
+
+    The producer's buffer is ``[*batch, n_k, M+1]`` -- one cumulative pointer
+    array per K slice -- but a single ``linear_mx`` consumes exactly one slice,
+    so what the op is handed is ``[*batch, M+1]``. Shape derivation runs the
+    submodule on the operand *values*, and ``spmm_csr`` reads every leading dim
+    as batch, so an extra one there gives the GEMM's output a rank it does not
+    have.
+
+    Only derivation sees the shorter value: the fetch still addresses the whole
+    buffer, picking its slice off the reduction grid dim, so the axis is put
+    back on the way out.
+
+    Yields:
+        The ``(node, full_value)`` pair that was hidden, or ``None``.
+    """
+    hidden = None
+    for operand in node.all_input_nodes:
+        geom = operand.meta.get(GEOMETRY_META)
+        value = getattr(operand, "value", None)
+        if geom is None or not isinstance(value, torch.Tensor):
+            continue
+        if (
+            value.dtype == torch.int32
+            and value.ndim == geom.nb + 2
+            and value.shape[-1] == geom.M + 1
+        ):
+            hidden = (operand, value)
+            operand.value = value[..., 0, :]
+            operand.shape = tuple(operand.value.shape)
+            break
+    try:
+        yield hidden
+    finally:
+        if hidden is not None:
+            operand, value = hidden
+            operand.value = value
+            operand.shape = tuple(value.shape)
+
+
+def build_sparse_gemm(
+    node,
+    *,
+    num_slots: int = _DEFAULT_NUM_SLOTS,
+    accumulate_fp32: bool = False,
+    tiler=None,
+) -> Optional[torch.fx.GraphModule]:
+    """Bufferize a GEMM whose activation carries an outlier CSR.
+
+    Args:
+        node: The sparse ``linear_mx`` / ``matmul_mx``, bare or fused.
+        num_slots: Software-pipeline depth for the dense operands.
+        accumulate_fp32: Accumulate the K reduction in fp32.
+        tiler: The interstellar ``TilerContext``.
+
+    Returns:
+        The bufferized gm, or ``None`` when the node has no CSR or the
+        producer's geometry never reached it.
+    """
+    produces = gemm_produces_csr(node)
+    # The CSR's geometry is fixed by its producer, and the GEMM has to split K
+    # the same way, so read it before deriving anything and hand the derivation
+    # that slice count instead of the tile search's.
+    _retarget_csr_views(node)
+    ptr, geom = _csr_geometry(node)
+    if geom is None and not produces:
+        return None
+
+    with _slice_axis_hidden(node) as hidden:
+        plan = _gemm_plan(
+            node,
+            tiler,
+            k_tiles=geom.n_k if geom is not None else None,
+        )
+    if plan is None:
+        return None
+    operands = list(node.all_input_nodes)
+    if hidden is not None:
+        # Derivation ran against one slice; the nest fetches from the whole
+        # buffer, so hand the loop the operand it will actually address.
+        inputs = list(plan.inputs)
+        inputs[plan.kw_idx["A_indptr"]] = hidden[1].clone()
+        plan.inputs = tuple(inputs)
+
+    data_dtype = None
+    if geom is not None:
+        if plan.tile_k != geom.tk:
+            raise ValueError(
+                f"{node.name}: k tile {plan.tile_k} does not match the CSR's "
+                f"slice width {geom.tk}; column indices are local to a slice "
+                f"and the engine cannot rebase them"
+            )
+        if plan.tile_m % geom.rows:
+            raise ValueError(
+                f"{node.name}: row tile {plan.tile_m} is not a whole number "
+                f"of the producer's {geom.rows}-row blocks"
+            )
+        data_dtype = operands[plan.kw_idx["A_data"]].value.dtype
+
+    out_geom = _epilogue_geometry(node, plan) if produces else None
+    pattern = _SparseGemm(
+        plan,
+        geom,
+        data_dtype,
+        out_geom=out_geom,
+        num_slots=num_slots,
+        accumulate_fp32=accumulate_fp32,
+    )
+    if out_geom is not None:
+        pattern.out_values = list(node.value)
+    with _lenient_verifier():
+        gm = export_model(pattern, plan.inputs)
+    gm = _finalize_exported_gm(gm)
+    _tag_loop_extents(gm, [[(0, pattern.inner.num_steps, 1)]])
+    if geom is not None:
+        tag_base_table(gm, ptr.meta[PRODUCER_META], base_table_shape(geom))
+    if out_geom is not None:
+        tag_base_table(gm, node.name, base_table_shape(out_geom))
+        gm.meta[GEOMETRY_META] = out_geom
+    with oracle_disabled():
+        ShapeProp(gm, recurse=True).propagate(*plan.inputs)
+    if plan.outline_dps:
+        outline_dps_ops(gm)
+    _stamp_anchor_meta(gm, plan.anchor)
+    return gm

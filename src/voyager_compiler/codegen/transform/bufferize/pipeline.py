@@ -2106,7 +2106,7 @@ class _GemmPlan:
         return self.anchor.value.dtype
 
 
-def _gemm_plan(node, tiler=None) -> Optional[_GemmPlan]:
+def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     """Derive a GEMM node's grid, operands and per-step call — everything a
     builder needs before it picks a kernel.  Returns ``None`` for a node that
     has no tiling and is not a BMM.
@@ -2120,6 +2120,8 @@ def _gemm_plan(node, tiler=None) -> Optional[_GemmPlan]:
     Args:
         node: The linear / matmul / batched-matmul node, or the fused group.
         tiler: Tile-search backend, forwarded to ``get_tiling``.
+        k_tiles: Reduction-tile count to use instead of the one the tile
+            search picked. A sparse GEMM sets this to its CSR's slice count.
 
     Returns:
         A ``_GemmPlan``, or ``None``.
@@ -2154,6 +2156,11 @@ def _gemm_plan(node, tiler=None) -> Optional[_GemmPlan]:
     else:
         out_tiling, nk = tiling[:-1], tiling[-1]  # batch.. + (n_m, n_n) , n_k
         out_ts = tuple(s // t for s, t in zip(out.shape, out_tiling))
+    # A sparse GEMM must split K exactly as its CSR was produced -- column
+    # indices are local to a slice and the engine cannot rebase them -- so it
+    # overrides the tile search along that one dim.
+    if k_tiles is not None:
+        nk = k_tiles
     tk = K // nk
     tm, tn = int(out_ts[-2]), int(out_ts[-1])
 
@@ -2267,6 +2274,23 @@ def _gemm_plan(node, tiler=None) -> Optional[_GemmPlan]:
         )
         add_kw_input("input_code", None)
         add_kw_input("weight_code", None)
+
+    # An outlier CSR rides the GEMM as three kwargs. The row pointers are one
+    # continuous array per K slice, so this tile is a row *range* of it: tm+1
+    # entries at stride tm, overlapping its neighbour by the boundary entry
+    # both share. ``data`` / ``indices`` are a packed stream addressed by
+    # values only known at run time, so they stay raw DRAM (``None``) and the
+    # sparse builder fetches them by hand.
+    if anchor.kwargs.get("A_indptr") is not None:
+        ptr_spec = _InputSpec(
+            tuple(tb) + (1, tm + 1),
+            tuple(range(nb)) + (gk, gm),
+            (False,) * (nb + 2),
+            strides=tuple(tb) + (1, tm),
+        )
+        add_kw_input("A_indptr", ptr_spec)
+        add_kw_input("A_data", None)
+        add_kw_input("A_indices", None)
 
     # A packed KV cache reaches the GEMM through a ``dequantize``, which decodes
     # the weight *tile* in the kernel -- so the cache is fetched, and paid for,

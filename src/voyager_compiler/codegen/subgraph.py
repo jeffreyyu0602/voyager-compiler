@@ -308,7 +308,15 @@ def create_and_insert_subgraph(
         new_node.meta["dtype"] = dtype
     nodes[-1].replace_all_uses_with(new_node)
 
-    args = map_arg(new_node.args, lambda n: n.value.clone())
+    # An operand is cloned so propagation cannot write through it, but a group
+    # may also take a scalar -- an index or a running offset read out of a
+    # buffer, which the datapath walk stops at -- and those are passed as is.
+    args = map_arg(
+        new_node.args,
+        lambda n: (
+            n.value.clone() if isinstance(n.value, torch.Tensor) else n.value
+        ),
+    )
     result = ShapeProp(submodule).propagate(*args)
     set_node_value(new_node, result)
 

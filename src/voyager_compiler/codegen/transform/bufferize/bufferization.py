@@ -57,6 +57,17 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     build_pointwise,
     build_pool,
 )
+from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
+    build_sparse_gemm,
+    gemm_produces_csr,
+)
+from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
+    _quantize_node,
+    GEOMETRY_META,
+    PRODUCER_META,
+    build_quantize_mx_outlier,
+    merge_base_tables,
+)
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _InputSpec,
@@ -823,6 +834,14 @@ def bufferize_graph(
                     single_buffer_tail=single_buffer_tail,
                     tiler=tiler,
                 )
+            elif anchor.kwargs.get("A_indptr") is not None or gemm_produces_csr(
+                node
+            ):
+                # A GEMM whose activation carries an outlier CSR: same dense
+                # nest, plus the per-step gather of the row tile's blocks.
+                sub_gm = build_sparse_gemm(
+                    node, num_slots=num_slots, tiler=tiler
+                )
             elif is_gemm_op(anchor):
                 sub_gm = build_gemm(
                     node,
@@ -838,6 +857,23 @@ def bufferize_graph(
                     if flash_attention_v3
                     else build_attention(node, num_slots=num_slots, tiler=tiler)
                 )
+            elif _quantize_node(node) is not None:
+                # A row-swept producer: the quantize needs a per-K-slice tiling
+                # its anchor cannot give it, so it gets its own two-loop nest
+                # rather than build_pointwise's single grid.  A GEMM-anchored
+                # epilogue never reaches this arm — the sparse arm above
+                # takes it.
+                sub_gm = build_quantize_mx_outlier(
+                    node, tiler=tiler, num_slots=num_slots
+                )
+                if sub_gm is None:
+                    # No fallback: build_pointwise would hand the quantize a
+                    # full-K tile, whose column indices span all of K and which
+                    # the SpMM engine cannot consume.
+                    raise ValueError(
+                        f"{node.name}: produces an outlier CSR but no "
+                        f"row-swept nest could be built for it"
+                    )
             elif (
                 is_elementwise_op(anchor)
                 or anchor.target in _REDUCTION_POINTWISE_OPS
@@ -907,8 +943,22 @@ def bufferize_graph(
 
         out_vals = node.value if n_out > 1 else [node.value]
         out_shapes = node.shape if n_out > 1 else [node.shape]
-        for r, v, s in zip(results, out_vals, out_shapes):
-            r.value, r.shape = v, s
+        # An outlier producer's tile geometry travels with its results: its
+        # sparse consumers read it off the A_indptr kwarg to size their CSR
+        # fetches, and the CSR's shapes alone do not say how it was diced.
+        geometry = sub_gm.meta.get(GEOMETRY_META)
+        if geometry is not None:
+            for r in results:
+                r.meta[GEOMETRY_META] = geometry
+                r.meta[PRODUCER_META] = node.name
+
+        for r, nest, v, s in zip(
+            results, _nest_output_values(sub_gm), out_vals, out_shapes
+        ):
+            if nest is not None and tuple(nest.shape) != tuple(s or ()):
+                r.value, r.shape = nest, nest.shape
+            else:
+                r.value, r.shape = v, s
 
         if n_out == 1:
             if "dtype" in node.meta:
@@ -931,6 +981,7 @@ def bufferize_graph(
                 graph.erase_node(user)
         graph.erase_node(node)
 
+    merge_base_tables(model)
     graph.lint()
     model.recompile()
     _dedup_regions(model)

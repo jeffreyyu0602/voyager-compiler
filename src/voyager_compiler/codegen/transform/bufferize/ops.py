@@ -239,12 +239,18 @@ def _insert_fake(src: torch.Tensor, dst: torch.Tensor) -> None:
 # once but consumed by ``R`` per-step ``commit``s posts ``+R``, so a reused
 # input balances a per-step consume against a once-per-block load without being
 # re-fetched (see ``AsyncPipelinedKernel``).
+#
+# ``count`` (default: the whole tile) is how much of the block actually moves,
+# and may be a runtime scalar. It never moves the transfer: ``sizes`` still
+# names the block and still discriminates load from store, so a variable-length
+# payload keeps a fixed, statically-sized home. A shorter ``sizes`` would flip
+# the direction test instead.
 # ---------------------------------------------------------------------------
 voyager_lib.define(
     "async_copy(Tensor src, Tensor(a!) dst, SymInt[] indices, SymInt[] sizes, "
     "Tensor(b!) semaphore, SymInt[]? dims=None, SymInt[]? strides=None, "
     "bool transposed=False, SymInt[]? pad=None, float? pad_value=None, "
-    "SymInt post_count=1) -> ()"
+    "SymInt post_count=1, SymInt[]? count=None) -> ()"
 )
 
 
@@ -261,67 +267,50 @@ def async_copy(
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
     post_count: int = 1,
+    count: Optional[Tuple[int, ...]] = None,
 ) -> None:
-    sizes = tuple(sizes)
-    indices = tuple(indices)
-    rank = len(sizes)
-
-    if src.ndim != rank or dst.ndim != rank:
-        raise ValueError(
-            f"src and dst must both have rank {rank}; "
-            f"got src.ndim={src.ndim}, dst.ndim={dst.ndim}"
-        )
-
-    if semaphore.ndim != 0 or semaphore.dtype != torch.int64:
-        raise TypeError(
-            "semaphore must be a scalar torch.int64 tensor; "
-            f"got shape={tuple(semaphore.shape)}, "
-            f"dtype={semaphore.dtype}"
-        )
-
-    if not isinstance(post_count, (int, torch.SymInt)):
-        raise ValueError(
-            f"post_count must be a positive integer, got {post_count!r}"
-        )
-    if isinstance(post_count, torch.SymInt):
-        torch._check(
-            post_count >= 1,
-            lambda: f"post_count must be a positive integer, got {post_count!r}",
-        )
-    elif post_count < 1:
-        raise ValueError(
-            f"post_count must be a positive integer, got {post_count!r}"
-        )
-
     if strides is None:
         strides = sizes
 
     if dims is None:
-        full = list(indices)
+        offsets = tuple(i * s for i, s in zip(indices, strides))
     else:
-        full = [0] * rank
-        for value, d in zip(indices, dims):
-            full[d] = value
+        offsets = [0] * len(sizes)
+        for index, dim in zip(indices, dims):
+            offsets[dim] = index * strides[dim]
+        offsets = tuple(offsets)
 
-    start = [full[d] * strides[d] for d in range(rank)]
     if pad is not None:
-        dst.fill_(pad_value if pad_value is not None else 0)
-        src_sl, dst_sl = [], []
-        for d in range(rank):
-            lo = start[d] - pad[d]
-            hi = lo + sizes[d]
-            clo = min(max(lo, 0), src.shape[d])
-            chi = min(max(hi, 0), src.shape[d])
-            src_sl.append(slice(clo, chi))
-            dst_sl.append(slice(clo - lo, chi - lo))
-        dst[tuple(dst_sl)] = src[tuple(src_sl)]
+        dst.fill_(0 if pad_value is None else pad_value)
+        src_slices, dst_slices = [], []
+        for offset, size, padding, extent in zip(
+            offsets, sizes, pad, src.shape
+        ):
+            start = offset - padding
+            stop = start + size
+            clipped_start = max(0, min(start, extent))
+            clipped_stop = max(0, min(stop, extent))
+            src_slices.append(slice(clipped_start, clipped_stop))
+            dst_slices.append(
+                slice(clipped_start - start, clipped_stop - start)
+            )
+        dst[tuple(dst_slices)].copy_(src[tuple(src_slices)])
     else:
-        sl = tuple(slice(start[d], start[d] + sizes[d]) for d in range(rank))
-        if transposed or tuple(dst.shape) == tuple(sizes):
-            region = src[sl]
-            dst.copy_(region.mT if transposed else region)
+        block = tuple(
+            slice(offset, offset + size) for offset, size in zip(offsets, sizes)
+        )
+        payload = (
+            tuple(slice(0, extent) for extent in count)
+            if count is not None
+            else slice(None)
+        )
+        if transposed:
+            dst.copy_(src[block].mT)
+        elif tuple(dst.shape) == tuple(sizes):
+            dst[payload].copy_(src[block][payload])
         else:
-            dst[sl] = src
+            dst[block][payload] = src[payload]
+
     semaphore.add_(post_count)
 
 
@@ -338,6 +327,7 @@ def _async_copy_fake(
     pad: Optional[Tuple[int, ...]] = None,
     pad_value: Optional[float] = None,
     post_count: int = 1,
+    count: Optional[Tuple[int, ...]] = None,
 ) -> None:
     return None
 
