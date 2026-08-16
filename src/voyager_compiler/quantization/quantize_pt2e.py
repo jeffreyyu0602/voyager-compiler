@@ -42,6 +42,7 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
 )
+from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
 
@@ -313,7 +314,7 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
     input_node = node.args[0]
     if input_node.op == "get_attr":
         # Quantize weight and remove the fq module
-        param = model.get_parameter(input_node.target)
+        param = fetch_attr(model, input_node.target)
         param.data = torch.ops.quantized_ops.quantize(
             param.data, scale, qmap=activation_post_process.qmap
         )
@@ -478,10 +479,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     if input_node.op == "get_attr":
         # quantize model parameter and remove the fq module
-        try:
-            param = model.get_parameter(input_node.target)
-        except AttributeError:
-            param = model.get_buffer(input_node.target)
+        param = fetch_attr(model, input_node.target)
 
         scale = torch.ops.quantized_ops.calculate_mx_qparam(
             param.data,
@@ -728,11 +726,7 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
     input_node = node.args[0]
 
     if input_node.op == "get_attr":
-        try:
-            param = model.get_parameter(input_node.target)
-        except AttributeError:
-            param = model.get_buffer(input_node.target)
-
+        param = fetch_attr(model, input_node.target)
         activation_post_process(param.data)
         scale, zero_point = activation_post_process.calculate_qparams()
         scale = scale.to(param.data.dtype)
