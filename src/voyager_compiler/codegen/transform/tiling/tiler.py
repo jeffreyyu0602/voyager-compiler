@@ -140,6 +140,14 @@ def build_interstellar_tiler(
         bank_size_list=[None, None, config.bank_size, None],
     )
 
+    # The L1 order is pinned to ... > FY > FX > OY > OX (IC/OC free above).
+    # OX/OY innermost is never slower -- the L1 sweep costs
+    # ``max(loading, reused_tile) * remaining``, monotone in the reused
+    # tile -- and the arrangement of the loops above them ties on both
+    # runtime and energy, so FX/FY are fixed to the representative the
+    # search's first-seen tie-break picked anyway.  FX=2/FY=3 assumes a
+    # square kernel (equal FX/FY blocking); a non-square model may prefer
+    # them swapped.
     schedule_constraint = {
         "schedule_hint": {
             "IC": {
@@ -151,13 +159,21 @@ def build_interstellar_tiler(
             "OC": {
                 "level0": {"order": 0, "partitioning_size": oc_dim},
             },
+            "OX": {
+                "level1": {"order": 0},
+            },
+            "OY": {
+                "level1": {"order": 1},
+            },
             "FX": {
                 "level0": {"blocking_size": 1, "partitioning_size": 1},
+                "level1": {"order": 2},
                 "level2": {"blocking_size": 1, "partitioning_size": 1},
                 "level3": {"blocking_size": 1, "partitioning_size": 1},
             },
             "FY": {
                 "level0": {"blocking_size": 1, "partitioning_size": 1},
+                "level1": {"order": 3},
                 "level2": {"blocking_size": 1, "partitioning_size": 1},
                 "level3": {"blocking_size": 1, "partitioning_size": 1},
             },
@@ -1247,8 +1263,9 @@ def prefetch_tilings(nodes, tiler):
     inherited instead of marshalling them, which matters because a closure
     cannot be pickled.  A key that does not match the one ``get_tiling``
     recomputes during the build simply misses and is redone serially — a stale
-    key costs time, never correctness, and the same holds for a pool abandoned
-    on timeout.
+    key costs time, never correctness, and the same holds for a search the
+    deadline passes over.  The deadline is on the pool, not on any one search:
+    whatever has finished when it expires is kept, and only the rest go serial.
     """
     global _PREFETCH_JOBS
 
@@ -1282,18 +1299,29 @@ def prefetch_tilings(nodes, tiler):
     # Keep the parent heap out of the workers' GC so fork stays copy-on-write.
     gc.freeze()
     pool = None
-    results = None
+    # One slot per search; a slot still empty when the deadline expires is
+    # left for the serial path.
+    results = [None] * len(searches)
     try:
         context = multiprocessing.get_context("fork")
         pool = context.Pool(workers)
-        results = pool.map_async(_run_prefetch_job, range(len(searches))).get(
-            PREFETCH_TIMEOUT_S
-        )
-    except multiprocessing.TimeoutError:
-        logger.warning(
-            "[tiling] parallel prefetch did not finish in %.0fs; going serial",
-            PREFETCH_TIMEOUT_S,
-        )
+        pending = [
+            pool.apply_async(_run_prefetch_job, (index,))
+            for index in range(len(searches))
+        ]
+        deadline = start + PREFETCH_TIMEOUT_S
+        for index, job in enumerate(pending):
+            # Collected one at a time rather than as one map: past the
+            # deadline a zero timeout still hands back every job already
+            # finished, so a search that overruns costs only itself.
+            try:
+                results[index] = job.get(
+                    max(0.0, deadline - time.perf_counter())
+                )
+            except multiprocessing.TimeoutError:
+                continue
+            except Exception as e:  # a worker died outright
+                logger.warning("[tiling] prefetched search failed (%s)", e)
     except Exception as e:
         logger.warning(
             "[tiling] parallel prefetch failed (%s); going serial", e
@@ -1307,24 +1335,27 @@ def prefetch_tilings(nodes, tiler):
         gc.unfreeze()
         _PREFETCH_JOBS = []
 
-    if results is None:
-        return
-
     cached = 0
-    for key, search, (ok, found) in zip(keys, searches, results):
-        if not ok:
+    for key, search, result in zip(keys, searches, results):
+        if result is None or not result[0]:
             continue
         try:
-            tiler.cache[key] = _finish_search(search, found)
+            tiler.cache[key] = _finish_search(search, result[1])
         except Exception:  # redone, and re-raised, by the serial path
             continue
         cached += 1
     logger.info(
         "[tiling] prefetched %d/%d mappings in %.2fs",
         cached,
-        len(results),
+        len(searches),
         time.perf_counter() - start,
     )
+    if cached < len(searches):
+        logger.warning(
+            "[tiling] %d mapping(s) did not finish in %.0fs; going serial",
+            len(searches) - cached,
+            PREFETCH_TIMEOUT_S,
+        )
 
 
 def _l3_order_from_mapping(mapping, canonical, loop_of):

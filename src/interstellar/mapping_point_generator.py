@@ -26,7 +26,9 @@ def get_hinted_para(layer, level, hint):
 
     hinted_para = 1
     for loop in range(le.NUM):
-        if loop in hint:
+        # A loop may be hinted at other levels only (e.g. an order-only
+        # constraint); it contributes no parallelism here.
+        if loop in hint and hint[loop][level] is not None:
             hinted_loop_para = hint[loop][level][2]
             hinted_para *= hinted_loop_para
 
@@ -37,7 +39,7 @@ def get_hinted_partitioning(level, hint):
     hinted_partitioning = []
     hinted_para_dim = []
     for loop in range(le.NUM):
-        if loop in hint:
+        if loop in hint and hint[loop][level] is not None:
             hinted_partitioning.append(hint[loop][level][2])
             hinted_para_dim.append([loop])
         else:
@@ -189,8 +191,13 @@ def loop_tile_with_para_hint(tile_permutations, loop_extent, num_level, loop_hin
 
 def loop_tile_with_hint(tile_permutations, loop_extent, num_level, loop_hint):
     # TODO support more than 1 level of para hint
+    # Find the first level with a tiling constraint; an order-only level
+    # does not constrain the tile sizes.
     for level in range(num_level):
-        if loop_hint[level] != None:
+        if loop_hint[level] is not None and (
+            loop_hint[level][1] is not None
+            or loop_hint[level][2] is not None
+        ):
             loop_hint_level = level
             break
 
@@ -243,11 +250,16 @@ def loop_tile_with_hint(tile_permutations, loop_extent, num_level, loop_hint):
 def loop_tile(loop_extent, num_level, loop_hint=None):
     tile_permutations = []
 
-    # check if the hint specifies the blocking at any level
+    # Check if the hint constrains the tiling at any level.  Only a blocking
+    # or partitioning size does; an order-only hint says how loops nest, not
+    # how they tile, so it must leave the enumeration untouched.
     is_valid_hint = False
     if loop_hint is not None:
         for level in range(num_level):
-            if loop_hint[level] is not None:
+            if loop_hint[level] is not None and (
+                loop_hint[level][1] is not None
+                or loop_hint[level][2] is not None
+            ):
                 is_valid_hint = True
                 break
 
@@ -906,11 +918,54 @@ def opt_get_best_loop_order(resource, layer, point, schedule=None, verbose=False
     return best_cost, list(zip(*best_loop_order))
 
 
+def _order_fits_hint(order, blocking, partitioning, schedule, level):
+    """Whether one level's ``order`` satisfies the schedule hint.
+
+    The hint's order constraints are per level: each names the rank a loop
+    must hold at one level, and reads nothing from any other level.  A loop
+    absent from the level -- neither temporally blocked nor spatially
+    partitioned there -- is exempt: it has no position to constrain.  A
+    spatially unrolled loop does hold a rank (level 0's array dims), so its
+    constraint applies.  A negative constraint counts from the outermost
+    rank (``-1`` = outermost), resolved against this order's own loop count.
+    """
+    if schedule is None or schedule.schedule_hint is None:
+        return True
+
+    for loop_index in range(le.NUM):
+        if (
+            blocking[loop_index][level] == 1
+            and partitioning[loop_index][level] == 1
+        ):
+            continue
+        if loop_index not in schedule.schedule_hint:
+            continue
+        hint = schedule.schedule_hint[loop_index][level]
+        if hint is None or hint[0] is None:
+            continue
+
+        loop_index_constraint = hint[0]
+        if loop_index_constraint < 0:
+            max_loop_index = max(i if i != 6 else -1 for i in order)
+            loop_index_constraint = (
+                max_loop_index + 1 + loop_index_constraint
+            )
+
+        if order[loop_index] != loop_index_constraint:
+            return False
+    return True
+
+
 def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=False):
     """
     Generator version of opt_get_best_loop_order.
 
     Yields each valid mapping point instead of calculating the cost and returning the best loop order.
+
+    The schedule hint factors per level (see ``_order_fits_hint``), so each
+    level's orders are filtered before the cross-product -- the product then
+    builds only the mapping points the hint accepts, which are exactly the
+    ones the post-hoc check used to let through, in the same sequence.
     """
     num_levels = resource.buffer_levels()
     blocking = point.loop_blockings
@@ -918,57 +973,24 @@ def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=
     para_dim = point.para_loop_dim
     non_empty_loops = get_non_empty_loops(point, num_levels)
 
-    # Iterate through all possible combinations of loop orders for all levels.
     level_orders = [
-        list(level_order_generator_function(point, le.NUM, non_empty_loops, level))
+        [
+            order
+            for order in level_order_generator_function(
+                point, le.NUM, non_empty_loops, level
+            )
+            if _order_fits_hint(order, blocking, partitioning, schedule, level)
+        ]
         for level in range(num_levels)
     ]
 
     for level_order_combination in itertools.product(*level_orders):
-        dummy_loop_order = list(level_order_combination)
-        mapping_point = MappingPoint(
-            list(zip(*dummy_loop_order)), blocking, partitioning, para_dim
+        yield MappingPoint(
+            list(zip(*level_order_combination)),
+            blocking,
+            partitioning,
+            para_dim,
         )
-
-        # check mapping point fits the schedule hint constraint
-        valid_mapping_point = True
-        if schedule is not None and schedule.schedule_hint is not None:
-            for level in range(num_levels):
-                for loop_index in range(le.NUM):
-                    if blocking[loop_index][level] == 1:
-                        continue
-
-                    if loop_index in schedule.schedule_hint:
-                        if (
-                            schedule.schedule_hint[loop_index][level] is not None
-                            and schedule.schedule_hint[loop_index][level][0] is not None
-                        ):
-                            loop_index_constraint = schedule.schedule_hint[loop_index][
-                                level
-                            ][0]
-
-                            if loop_index_constraint < 0:
-                                max_loop_index = max(
-                                    [
-                                        i if i != 6 else -1
-                                        for i in level_order_combination[level]
-                                    ]
-                                )
-                                loop_index_constraint = (
-                                    max_loop_index + 1 + loop_index_constraint
-                                )
-
-                            if (
-                                level_order_combination[level][loop_index]
-                                != loop_index_constraint
-                            ):
-                                valid_mapping_point = False
-                                break
-                if not valid_mapping_point:
-                    break
-        if not valid_mapping_point:
-            continue
-        yield mapping_point
 
 
 def opt_mapping_point_generator_function(

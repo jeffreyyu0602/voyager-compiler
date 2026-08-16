@@ -69,7 +69,9 @@ def get_hinted_para(level, hint):
 
     hinted_para = 1
     for loop in range(le.NUM):
-        if loop in hint:
+        # A loop may be hinted at other levels only (e.g. an order-only
+        # constraint); it contributes no parallelism here.
+        if loop in hint and hint[loop][level] is not None:
             hinted_loop_para = hint[loop][level][2]
             hinted_para *= hinted_loop_para
 
