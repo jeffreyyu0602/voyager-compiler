@@ -53,6 +53,7 @@ from voyager_compiler.codegen.node_info import (
     get_anchor_node,
     get_arg_value,
     is_gemm_op,
+    is_nop,
     quant_param_arg_nodes,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
@@ -661,7 +662,14 @@ def consumer_k_tile(node, tiler) -> Tuple[Optional[int], Optional[int]]:
     for use in node.users:
         if use.target is not operator.getitem:
             continue
-        for user in use.users:
+        # A nop view can sit between the CSR and its consumer (the reshape
+        # between a decoder layer and ``lm_head``); walk through it.
+        stack = list(use.users)
+        while stack:
+            user = stack.pop()
+            if is_nop(user):
+                stack.extend(user.users)
+                continue
             anchor = get_anchor_node(user)
             if anchor is None or not is_gemm_op(anchor):
                 continue

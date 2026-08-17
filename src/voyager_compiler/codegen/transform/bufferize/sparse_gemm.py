@@ -22,6 +22,7 @@ the CSR kwargs for its own scratch.
 """
 
 import contextlib
+import math
 from dataclasses import replace
 from typing import Optional
 
@@ -50,7 +51,9 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _Geometry,
     _QUANTIZE_MX_OUTLIER,
     _scalar,
+    _split_prefix,
     base_table_shape,
+    consumer_k_tile,
     GEOMETRY_META,
     PRODUCER_META,
     tag_base_table,
@@ -71,23 +74,91 @@ _SRAM = int(MemoryLevel.SRAM)
 class _EpilogueTail(torch.nn.Module):
     """The fused tail of a CSR-producing GEMM, plus its CSR stores.
 
-    Wrapping rather than threading extra arguments keeps the tail's arity: the
-    reduction kernel applies it inside a ``torch.cond`` on the last reduction
-    step and calls it with the group's own operands. The offset and the grid
-    index it needs are captured here instead, which is also what puts the
-    stores on the step that actually completes an output tile.
+    Runs the tail's prefix once on the whole accumulator tile, then the
+    quantize once per ``tk``-wide sub-slice of it, so the CSR comes out at
+    the *consumers'* slice width while this GEMM's own tiling stays whatever
+    its search picked.  Wrapping rather than threading extra arguments keeps
+    the tail's arity: the reduction kernel applies it inside a ``torch.cond``
+    on the last reduction step and calls it with the group's own operands.
+    The offset and the grid index it needs are captured here instead, which
+    is also what puts the stores on the step that actually completes an
+    output tile.
     """
 
     def __init__(self, owner, idx):
         super().__init__()
         self.owner = owner
-        self.gm = owner.plan.fused_gm
         self.idx = idx
 
     def forward(self, acc, *operands):
-        outs = self.gm(acc, *operands, self.owner._offset_at(self.idx))
-        self.owner._store_csr(self.idx, outs[0], outs[1], outs[2])
-        return outs[3], outs[4]
+        o = self.owner
+        og = o.out_geom
+        bufs = o._bufs
+        nb, ones = og.nb, og.ones
+        bound = (acc,) + operands
+
+        def val(t):
+            kind, v = t
+            return bound[v] if kind == "arg" else v
+
+        # A value shared by several sub-slices must cross a *buffer*: DPS
+        # outlining grows one op per store, and ops sharing an SSA edge
+        # cannot come out disjoint.  So with several sub-slices the prefix
+        # result lands in a staging buffer the slices window, and each
+        # slice's scale / inlier tiles land in a full-tile staging buffer
+        # the kernel then moves into the output slot.
+        if o.epi_prefix is None:
+            x = acc
+        elif o.n_sub == 1:
+            x = o.epi_prefix(*bound)
+        else:
+            voyager.insert(o.epi_prefix(*bound), bufs.epi_mid)
+            x = None
+
+        for j in range(o.n_sub):
+            if x is None:
+                tile = voyager.subview(
+                    bufs.epi_mid,
+                    [0] * nb + [0, j * og.tk],
+                    ones + (og.rows, og.tk),
+                    (1,) * (nb + 2),
+                    [],
+                )
+            elif o.n_sub > 1:
+                tile = x[..., j * og.tk : (j + 1) * og.tk]
+            else:
+                tile = x
+            d, i, p, s, q = _QUANTIZE_MX_OUTLIER(
+                tile,
+                *[val(t) for t in o.epi_q_args],
+                **{k: val(t) for k, t in o.epi_q_kwargs.items()},
+                indptr_offset=o._offset_at(self.idx, j),
+            )
+            o._store_csr(self.idx, j, d, i, p)
+            if o.n_sub == 1:
+                return s, q
+            sb = og.tk // og.block_size
+            voyager.insert(
+                s,
+                voyager.subview(
+                    bufs.epi_scale_tile,
+                    [0] * nb + [0, j * sb],
+                    ones + (og.rows, sb),
+                    (1,) * (nb + 2),
+                    [],
+                ),
+            )
+            voyager.insert(
+                q,
+                voyager.subview(
+                    bufs.epi_out_tile,
+                    [0] * nb + [0, j * og.tk],
+                    ones + (og.rows, og.tk),
+                    (1,) * (nb + 2),
+                    [],
+                ),
+            )
+        return bufs.epi_scale_tile, bufs.epi_out_tile
 
 
 class _SparseGemm(torch.nn.Module):
@@ -123,7 +194,31 @@ class _SparseGemm(torch.nn.Module):
             # The CSR outputs are stored by hand; only the dense pair is diced
             # by the output grid.
             plan.out_specs = list(plan.out_specs)[3:]
-            plan.fused_gm = _thread_indptr_offset(plan.fused_gm)
+            # The quantize runs per ``tk``-wide sub-slice of the accumulator
+            # tile (see ``_EpilogueTail``): split the tail at the quantize and
+            # bind the op's own arguments to their positions in the tail's
+            # operand list, so the per-slice calls can be issued directly.
+            self.n_sub = plan.tile_n // out_geom.tk
+            qnode = next(
+                n
+                for n in plan.fused_gm.graph.nodes
+                if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
+            )
+            self.epi_prefix = _split_prefix(plan.fused_gm, qnode)
+            phs = [
+                n for n in plan.fused_gm.graph.nodes if n.op == "placeholder"
+            ]
+            slot = {p: i for i, p in enumerate(phs)}
+
+            def resolve(a):
+                if isinstance(a, torch.fx.Node):
+                    return ("arg", slot[a])
+                if isinstance(a, (list, tuple)):
+                    return ("lit", list(a))
+                return ("lit", a)
+
+            self.epi_q_args = [resolve(a) for a in qnode.args[1:]]
+            self.epi_q_kwargs = {k: resolve(v) for k, v in qnode.kwargs.items()}
         # The K accumulator, when the reduction needs one.  The kernel built
         # alongside it is rebuilt per step (with the grid index captured) and
         # discarded here; only the specs are needed before the loop exists.
@@ -248,14 +343,16 @@ class _SparseGemm(torch.nn.Module):
                 )
                 voyager.async_wait(bufs.gather_sem)
 
-    def _offset_at(self, idx):
-        """This K slice's running nonzero count, the op's ``indptr_offset``."""
+    def _offset_at(self, idx, j):
+        """Sub-slice ``j``'s running nonzero count, the op's
+        ``indptr_offset``."""
         g, bufs = self.out_geom, self._bufs
         nb = g.nb
         off = _scalar(
             voyager.subview(
                 bufs.slice_nnz,
-                [idx[x] for x in range(nb)] + [idx[self.grid_n]],
+                [idx[x] for x in range(nb)]
+                + [idx[self.grid_n] * self.n_sub + j],
                 g.ones + (1,),
                 (1,) * (nb + 1),
                 [],
@@ -264,11 +361,11 @@ class _SparseGemm(torch.nn.Module):
         torch._check(off >= 0)
         return off
 
-    def _store_csr(self, idx, d, i, p):
-        """Append this output tile's CSR to the packed stream.
+    def _store_csr(self, idx, j, d, i, p):
+        """Append one sub-slice's CSR block to the packed stream.
 
-        The same layout the row-swept producer writes, one tile at a time: the
-        row pointers land in their slice's continuous array, the data and
+        The same layout the row-swept producer writes, one block at a time:
+        the row pointers land in their slice's continuous array, the data and
         indices at the stream position ``base`` names, and the block's position
         goes into the shared table for its consumer.
         """
@@ -276,8 +373,8 @@ class _SparseGemm(torch.nn.Module):
         nb, ones = g.nb, g.ones
         bidx = [idx[x] for x in range(nb)]
         m = idx[self.grid_m]
-        # The CSR's K slice is this GEMM's column tile.
-        k = idx[self.grid_n]
+        # The CSR's K slice is sub-slice ``j`` of this GEMM's column tile.
+        k = idx[self.grid_n] * self.n_sub + j
 
         # A compute result reaches DRAM through a scratchpad tile (see
         # ``_OutlierProducer._slice_loop``); stage the op's results first.
@@ -403,6 +500,26 @@ class _SparseGemm(torch.nn.Module):
             bufs.store_indptr_tile = voyager.alloc(
                 list(og.ones) + [og.rows + 1], torch.int32, _SRAM
             )
+            # Sub-slice staging (see ``_EpilogueTail``): the shared prefix
+            # result, and the reassembled scale / inlier column tiles.
+            if self.epi_prefix is not None and self.n_sub > 1:
+                bufs.epi_mid = voyager.alloc(
+                    list(og.ones) + [og.rows, self.plan.tile_n],
+                    self.plan.out_dtype,
+                    _SRAM,
+                )
+            if self.n_sub > 1:
+                bufs.epi_scale_tile = voyager.alloc(
+                    list(og.ones)
+                    + [og.rows, self.plan.tile_n // og.block_size],
+                    vals[3].dtype,
+                    _SRAM,
+                )
+                bufs.epi_out_tile = voyager.alloc(
+                    list(og.ones) + [og.rows, self.plan.tile_n],
+                    vals[4].dtype,
+                    _SRAM,
+                )
         self._bufs = bufs
         dense = self.inner(*inputs)
         if og is None:
@@ -439,12 +556,16 @@ def gemm_produces_csr(node) -> bool:
     return isinstance(node.value, (list, tuple)) and len(node.value) == 5
 
 
-def _epilogue_geometry(node, plan) -> _Geometry:
+def _epilogue_geometry(node, plan, tiler) -> _Geometry:
     """The CSR geometry a GEMM epilogue produces.
 
     The quantize sees the GEMM's output tile, so the row block *is* the row
-    tile and the K slice *is* the column tile -- the producing GEMM's tiling
-    defines the layout rather than following one.
+    tile.  The K slice, though, is the *consumers'* k tile: the tail dices
+    each column tile into ``tk``-wide sub-slices (``_EpilogueTail``), so the
+    slice width follows the consumers — never coarser than a consumer's own
+    search validated — while this GEMM's tiling stays its own.  The gcd with
+    ``tile_n`` keeps a slice inside one column tile; forcing *finer* than a
+    consumer asked only shrinks its tiles, which is always safe.
     """
     vals = node.value
     inliers = vals[4]
@@ -458,14 +579,20 @@ def _epilogue_geometry(node, plan) -> _Geometry:
     )
     bs = qnode.args[3]
     max_pct = qnode.args[9] if len(qnode.args) > 9 else 0.01
+    tk_pref, _ = consumer_k_tile(node, tiler)
+    tk = plan.tile_n if tk_pref is None else math.gcd(tk_pref, plan.tile_n)
+    if tk % bs:
+        # A slice must hold whole microscaling blocks; fall back to the
+        # column tile (the consumer's own guard reports the mismatch).
+        tk = plan.tile_n
     geom = _Geometry(
         batch=batch,
         M=M,
         K=K,
         rows=plan.tile_m,
-        tk=plan.tile_n,
+        tk=tk,
         block_size=bs,
-        budget=int(plan.tile_m * plan.tile_n * max_pct),
+        budget=int(plan.tile_m * tk * max_pct),
         max_pct=max_pct,
     )
     # The tile search has already run, so the submodule carries the GEMM's real
@@ -477,28 +604,6 @@ def _epilogue_geometry(node, plan) -> _Geometry:
         geom,
     )
     return geom
-
-
-def _thread_indptr_offset(fused_gm):
-    """Give the fused quantize a runtime ``indptr_offset``.
-
-    The op emits pointers from that offset, which is what keeps one continuous
-    pointer array per K slice; in a fused tail the call is a graph node, so the
-    offset has to be threaded in as an extra operand.
-    """
-    g = fused_gm.graph
-    qnode = next(
-        n
-        for n in g.nodes
-        if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
-    )
-    last_ph = [n for n in g.nodes if n.op == "placeholder"][-1]
-    with g.inserting_after(last_ph):
-        ph = g.placeholder("indptr_offset")
-    qnode.kwargs = {**qnode.kwargs, "indptr_offset": ph}
-    g.lint()
-    fused_gm.recompile()
-    return fused_gm
 
 
 def _retarget_csr_views(node) -> None:
@@ -664,7 +769,7 @@ def build_sparse_gemm(
             )
         data_dtype = operands[plan.kw_idx["A_data"]].value.dtype
 
-    out_geom = _epilogue_geometry(node, plan) if produces else None
+    out_geom = _epilogue_geometry(node, plan, tiler) if produces else None
     pattern = _SparseGemm(
         plan,
         geom,
