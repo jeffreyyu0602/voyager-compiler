@@ -832,6 +832,7 @@ def bufferize_graph(
                     node,
                     num_slots=num_slots,
                     single_buffer_tail=single_buffer_tail,
+                    async_pipeline=pipelined,
                     tiler=tiler,
                 )
             elif anchor.kwargs.get("A_indptr") is not None or gemm_produces_csr(
@@ -847,6 +848,7 @@ def bufferize_graph(
                     node,
                     num_slots=num_slots,
                     single_buffer_tail=single_buffer_tail,
+                    async_pipeline=pipelined,
                     tiler=tiler,
                 )
             elif is_pooling(anchor):

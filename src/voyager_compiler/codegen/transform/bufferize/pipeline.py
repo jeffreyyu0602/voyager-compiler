@@ -25,6 +25,7 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_nop,
     is_reshape_op,
     quant_param_arg_nodes,
     reduction_op,
@@ -1460,20 +1461,25 @@ def _split_stream_break(fused_gm):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
     A ``quantize_mx`` along a non-last axis takes two vector-op passes, so
-    its input must be materialized first; after a relayout it must be
-    materialized too, as a workaround until the hardware quantizes a permuted
-    stream.  Either way the quantize runs as a pass of its own on the staged
-    tile.  Assumes the tail's ``quantize_mx``, when present, is the last op,
-    with the relayout (if any) immediately before it.
+    its input must be materialized first; behind a relayout it cannot ride
+    either — the hardware does not quantize a permuted stream.  Either way
+    the quantize runs as a pass of its own on the staged tile.  The cut
+    lands *before* the relayout chain feeding the quantize: the staged tile
+    keeps the accumulator's layout and the relayout rides the quantize pass
+    as addressing.  (Staging the permuted head in place would be a data
+    hazard — a store order that no longer matches the accumulator-read
+    order overwrites elements the pass has not read yet.)  Assumes the
+    tail's ``quantize_mx``, when present, is the last op, with the relayout
+    (if any) immediately before it.
 
     Args:
         fused_gm: The fused tail ``[acc, *operands] -> output(s)``.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
-        else ``(head_gm, quant_gm)``: the tail up to the quantize's input and
-        the quantize applied to the staged tile, each taking the same operand
-        list as ``fused_gm``.
+        else ``(head_gm, quant_gm)``: the tail up to the relayout chain, and
+        the relayout + quantize applied to the staged tile, each taking the
+        same operand list as ``fused_gm``.
     """
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
@@ -1484,7 +1490,19 @@ def _split_stream_break(fused_gm):
         or quant.target is not torch.ops.quantized_ops.quantize_mx.default
     ):
         return None
-    permuted = len(ops) > 1 and is_reshape_op(ops[-2])
+
+    # The relayout chain feeding the quantize: contiguous transpose /
+    # permute / view members on the spine, walked input-ward.
+    relayout = []
+    spine = quant.args[0]
+    while (
+        spine.op == "call_function"
+        and (is_reshape_op(spine) or is_nop(spine))
+        and len(spine.users) == 1
+    ):
+        relayout.append(spine)
+        spine = spine.args[0]
+    permuted = any(is_reshape_op(n) for n in relayout)
     if not permuted and all(a == -1 for a in get_arg_value(quant, 2, "axes")):
         return None
 
@@ -1499,9 +1517,10 @@ def _split_stream_break(fused_gm):
         pg.lint()
         return torch.fx.GraphModule(torch.nn.Module(), pg)
 
-    spine = quant.args[0]
-    head_gm = build(ops[:-1], phs[0], "acc", spine)
-    quant_gm = build([quant], spine, "staged", quant)
+    relayout.reverse()
+    head_ops = [n for n in ops[:-1] if n not in relayout]
+    head_gm = build(head_ops, phs[0], "acc", spine)
+    quant_gm = build(relayout + [quant], spine, "staged", quant)
     return head_gm, quant_gm
 
 
@@ -1530,7 +1549,8 @@ def _reduction_fused_kernel(
     runs the tail chained on the live value (``chain_tail``), or reads the
     completed accumulator back from scratch: an unchained tail, or a chained
     one whose stream-breaking ``quantize_mx`` (``_split_stream_break``)
-    consumes the staged head tile, viewed back to the head's shape.  A
+    reads the staged tile in the accumulator's own layout, the relayout (if
+    any) folded into that pass.  A
     scratch re-read races the next sweep's first accumulate, and
     ``scratch_slots`` picks how the race is closed: with 1 the reading tail
     runs bare after the ``commit`` call, so program order holds the next
@@ -1621,15 +1641,11 @@ def _reduction_fused_kernel(
         _accumulate(grid_index, in_slots, scratch)
 
     def _staged_quantize(in_slots, out_slots, scratch):
-        """The split-off quantize: fetch the staged tile back out of scratch
-        and write the out slots."""
+        """The split-off pass: relayout + quantize the staged tile straight
+        out of scratch and write the out slots.  The staged tile keeps the
+        accumulator's own shape (the head is layout-preserving)."""
         fused = [in_slots[i] for i in fused_operand_indices]
-        staged = next(
-            scratch.view(s.shape)
-            for s in out_slots
-            if s.numel() == scratch.numel()
-        )
-        outs = split[1](staged, *fused)
+        outs = split[1](scratch, *fused)
         for slot, out in zip(out_slots, outs):
             voyager.insert(out, slot)
 
@@ -1643,7 +1659,8 @@ def _reduction_fused_kernel(
             if scratch_slots > 1:
                 _finalize(in_slots, out_slots, scratch)
         else:
-            # Chained head; the split-off quantize fetches the staged tile.
+            # Layout-preserving chained head; the split-off relayout +
+            # quantize pass reads the staged tile.
             fused = [in_slots[i] for i in fused_operand_indices]
             head = split[0](total, *fused)
             voyager.insert(head.reshape(scratch.shape), scratch)
@@ -1680,6 +1697,24 @@ def _reduction_fused_kernel(
         torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
 
     return kernel
+
+
+def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
+    """A >1-tile reduction writes / consumes these operands only on the last K
+    step — the output (``post_process``) and the fused post-op operands — so
+    they gain nothing from double buffering.  Single-buffer them (halving their
+    SRAM) and defer their wait to block-exit (``first_use_at_exit``) so the
+    load / store still overlaps the reduction.  Bias is excluded — it is folded
+    on the *first* K step, so it stays double-buffered (prefetched, no stall).
+    Mutates the passed specs in place; call only when ``num_k > 1``.
+    """
+    for s in out_specs:
+        s.num_slots = 1
+        s.first_use_at_exit = True
+    for i in fused_idx:
+        if in_specs[i] is not None:
+            in_specs[i].num_slots = 1
+            in_specs[i].first_use_at_exit = True
 
 
 def _gemm_scratch_and_kernel(
@@ -1769,24 +1804,6 @@ def _gemm_scratch_and_kernel(
             async_pipeline=async_pipeline,
         )
     return scratch_specs, kernel
-
-
-def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
-    """A >1-tile reduction writes / consumes these operands only on the last K
-    step — the output (``post_process``) and the fused post-op operands — so
-    they gain nothing from double buffering.  Single-buffer them (halving their
-    SRAM) and defer their wait to block-exit (``first_use_at_exit``) so the
-    load / store still overlaps the reduction.  Bias is excluded — it is folded
-    on the *first* K step, so it stays double-buffered (prefetched, no stall).
-    Mutates the passed specs in place; call only when ``num_k > 1``.
-    """
-    for s in out_specs:
-        s.num_slots = 1
-        s.first_use_at_exit = True
-    for i in fused_idx:
-        if in_specs[i] is not None:
-            in_specs[i].num_slots = 1
-            in_specs[i].first_use_at_exit = True
 
 
 def _stamp_anchor_meta(gm, anchor) -> None:
