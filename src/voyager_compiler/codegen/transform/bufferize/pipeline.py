@@ -1347,8 +1347,9 @@ def _map_kernel(
 ):
     """Map kernel (no cross-tile reduction): adapt a return-style
     ``compute(*in_slots) -> Tensor | tuple`` into the scheduler's mutate-style
-    kernel, writing each result straight into its output slot.  Every num_k == 1
-    op uses this; the reduction case uses ``_reduction_fused_kernel``.
+    kernel, writing each result straight into its output slot.  A num_k == 1
+    op whose fused tail (if any) can ride its output drain uses this; the
+    reduction and staged-tail cases use ``_reduction_fused_kernel``.
 
     ``num_scratch`` trailing refs are handed to ``compute`` after the input
     tiles: a map computes nothing across tiles, so its scratch is space the
@@ -1461,23 +1462,27 @@ def _reduction_inplace_kernel(
     return kernel
 
 
-def _split_stream_break(fused_gm):
+def _split_stream_break(fused_gm, in_place=True):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
-    A ``quantize_mx`` along a non-last axis takes two vector-op passes, so
-    its input must be materialized first; behind a relayout it cannot ride
-    either — the hardware does not quantize a permuted stream.  Either way
-    the quantize runs as a pass of its own on the staged tile.  The cut
-    lands *before* the relayout chain feeding the quantize: the staged tile
-    keeps the accumulator's layout and the relayout rides the quantize pass
-    as addressing.  (Staging the permuted head in place would be a data
-    hazard — a store order that no longer matches the accumulator-read
-    order overwrites elements the pass has not read yet.)  Assumes the
-    tail's ``quantize_mx``, when present, is the last op, with the relayout
-    (if any) immediately before it.
+    A non-last scale axis always breaks the ride: the scale unit groups
+    along the stream, so the tile must be materialized first.  A relayout
+    breaks only an in-place pass — its permuted store order no longer
+    matches the read order and overwrites unread elements; a drain to a
+    fresh slot folds the permute into store addressing instead.
+
+    The cut lands *before* the relayout chain feeding the quantize: the
+    staged tile keeps the accumulator's layout and the relayout rides the
+    split-off quantize pass as addressing.  Assumes the tail's
+    ``quantize_mx``, when present, is the last op, with the relayout (if
+    any) immediately before it.
 
     Args:
-        fused_gm: The fused tail ``[acc, *operands] -> output(s)``.
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``; a
+            non-``GraphModule`` tail (``None``, a sparse ``_EpilogueTail``)
+            is never split.
+        in_place: Whether the chained pass re-reads the tile it streams —
+            a K-split finalize cone rather than a ``num_k == 1`` drain.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
@@ -1485,6 +1490,8 @@ def _split_stream_break(fused_gm):
         the relayout + quantize applied to the staged tile, each taking the
         same operand list as ``fused_gm``.
     """
+    if not isinstance(fused_gm, torch.fx.GraphModule):
+        return None
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
     ops = [n for n in graph.nodes if n.op == "call_function"]
@@ -1507,7 +1514,9 @@ def _split_stream_break(fused_gm):
         relayout.append(spine)
         spine = spine.args[0]
     permuted = any(is_reshape_op(n) for n in relayout)
-    if not permuted and all(a == -1 for a in get_arg_value(quant, 2, "axes")):
+    if (not permuted or not in_place) and all(
+        a == -1 for a in get_arg_value(quant, 2, "axes")
+    ):
         return None
 
     def build(part_ops, root, name, out):
@@ -1540,8 +1549,10 @@ def _reduction_fused_kernel(
     scratch_slots: int = 1,
     async_pipeline: bool = False,
 ):
-    """Kernel for an op whose reduction needs > 1 tile (num_k > 1 GEMM / conv;
-    the num_k == 1 map case uses ``_map_kernel``).
+    """Kernel for an op that stages its result in scratch: a reduction that
+    needs > 1 tile (num_k > 1 GEMM / conv), or a single-tile one whose fused
+    tail must read a materialized tile (the num_k == 1 case whose tail rides
+    the compute pass uses ``_map_kernel``).
 
     The partial accumulates into a scratch ref; the last step casts it to
     ``op_dtype`` and maps it through the fused tail (if any) into the out
@@ -1554,19 +1565,14 @@ def _reduction_fused_kernel(
     completed accumulator back from scratch: an unchained tail, or a chained
     one whose stream-breaking ``quantize_mx`` (``_split_stream_break``)
     reads the staged tile in the accumulator's own layout, the relayout (if
-    any) folded into that pass.  A
-    scratch re-read races the next sweep's first accumulate, and
-    ``scratch_slots`` picks how the race is closed: with 1 the reading tail
-    runs bare after the ``commit`` call, so program order holds the next
-    round-0 commit until it is done — an array bubble per sweep boundary;
-    with 2 consecutive tiles alternate scratch slots and the tail stays
-    inside the commit — no bubble, one extra accumulator tile of SRAM.
+    any) folded into that pass.
 
     Args:
         compute: ``compute(in_slots, first)`` — the bare op on the current
             tiles; ``first`` folds the bias straight into the op.
         reduction_dim: Grid dim of the cross-tile reduction (K / C).
-        last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``).
+        last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``);
+            0 selects the single-round staging variant.
         op_dtype: Output dtype the finished accumulator is cast to, or
             ``None`` when it already accumulates in the output dtype.
         num_outputs: Number of output tiles the kernel writes.
@@ -1577,14 +1583,16 @@ def _reduction_fused_kernel(
             (``meta['accumulate_fusible']``); ignored by the sync kernel.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
-        scratch_slots: Slot count of the scratch accumulator (see above);
-            only 1 and 2 are meaningful, and only for the async variant.
+        scratch_slots: Slot count of the scratch accumulator — how the
+            scratch re-read race is closed (see ``on_last``); only 1 and 2
+            are meaningful, and only for the async variant.
         async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
             instead of the synchronous body.
 
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
     """
+    single_round = last_idx == 0
 
     def _split(args):
         # args = [*in_slots, *out_slots, scratch]; one scratch accumulator.
@@ -1628,6 +1636,12 @@ def _reduction_fused_kernel(
 
     def inner(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
+        if single_round:
+            # The only round both initializes (bias folded) and completes
+            # the tile: stage it and run the tail from scratch.
+            voyager.insert(_to_acc(compute(in_slots, True), scratch), scratch)
+            _finalize(in_slots, out_slots, scratch)
+            return
         _accumulate(grid_index, in_slots, scratch)
         effect_cond(
             grid_index[reduction_dim] == last_idx,
@@ -1637,11 +1651,7 @@ def _reduction_fused_kernel(
     if not async_pipeline:
         return inner
 
-    split = (
-        _split_stream_break(fused_gm)
-        if chain_tail and fused_gm is not None
-        else None
-    )
+    split = _split_stream_break(fused_gm) if chain_tail else None
 
     def accumulate_body(grid_index, *args):
         in_slots, _out_slots, scratch = _split(args)
@@ -1658,7 +1668,11 @@ def _reduction_fused_kernel(
 
     def finalize_body(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
-        total = _to_acc(compute(in_slots, False), scratch) + scratch
+        if single_round:
+            # The only round: bias folds in, no prior partial to add.
+            total = _to_acc(compute(in_slots, True), scratch)
+        else:
+            total = _to_acc(compute(in_slots, False), scratch) + scratch
         if split is None and chain_tail:
             _finalize(in_slots, out_slots, total)
         elif not chain_tail:
@@ -1686,8 +1700,10 @@ def _reduction_fused_kernel(
                 dependencies=[*in_sems, *out_sems],
                 post=post,
             )
-            # The scratch-reading tail, bare outside the commit (see header);
-            # a double-buffered scratch keeps it in the commit instead.
+            # With one scratch slot the next sweep's round-0 accumulate
+            # would overwrite the tile this tail still reads, so the tail
+            # runs bare here — program order delays that commit (an array
+            # bubble).  With two slots the tail stays in ``finalize_body``.
             if scratch_slots == 1:
                 if not chain_tail:
                     _finalize(in_slots, out_slots, scratch[0])
@@ -1701,6 +1717,10 @@ def _reduction_fused_kernel(
             )
             return 0
 
+        if single_round:
+            # Every step completes its tile: skip the constant-predicate cond.
+            on_last()
+            return
         torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
 
     return kernel
@@ -1773,7 +1793,8 @@ def _gemm_scratch_and_kernel(
 
     out_dtype = anchor.value.dtype
     acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
-    if num_k == 1:
+    split = _split_stream_break(fused_gm, in_place=num_k > 1)
+    if num_k == 1 and split is None:
         scratch_specs = []
         kernel = _map_kernel(
             compute, len(out_specs), async_pipeline=async_pipeline
@@ -1786,15 +1807,17 @@ def _gemm_scratch_and_kernel(
             async_pipeline=async_pipeline,
         )
     else:
-        if single_buffer_tail and not async_pipeline:
+        if single_buffer_tail and not async_pipeline and num_k > 1:
             _single_buffer_reduction_operands(in_specs, out_specs, fused_idx)
+        if num_k == 1:
+            # A single round stages its finished tile, not a running
+            # partial: the scratch holds the output's own dtype.
+            acc_dtype = out_dtype
         # Only a tail that reads scratch after the streamed pass gains a
         # second slot; a chained-whole tail never races and keeps one.  The
         # count is the tiler's per-node call (the scratch ladder winner,
         # stamped with the tiling).
-        sync = not chain_tail or (
-            fused_gm is not None and _split_stream_break(fused_gm) is not None
-        )
+        sync = not chain_tail or split is not None
         scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
         slots = scratch_slots if sync else 1
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
