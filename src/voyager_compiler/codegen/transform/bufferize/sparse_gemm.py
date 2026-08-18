@@ -67,6 +67,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
+    effect_cond,
     outline_dps_ops,
     voyager,
 )
@@ -88,6 +89,13 @@ class _EpilogueTail(torch.nn.Module):
     The offset, the grid index and the output slots it needs are captured
     here instead, which is also what puts the stores on the step that
     actually completes an output tile.
+
+    With ``chain_epilogue`` the tail is pure compute, chained on the live
+    total inside the anchor's own pass: d/i/p land in the staging tiles as
+    destinations and the stores run bare afterwards — on the same round in
+    the sync nest (``_SparseGemm._kernel``), two steps later in the async
+    one (``_SparseGemm._async_kernel``).  Otherwise the stores run here,
+    interleaved.
     """
 
     def __init__(self, owner, idx, out_slots):
@@ -101,6 +109,19 @@ class _EpilogueTail(torch.nn.Module):
         og = o.out_geom
         bufs = o._bufs
         nb, ones = og.nb, og.ones
+        # The async chained tail runs inside a commit, whose traced body
+        # must not capture free values: its staging tiles and precomputed
+        # ``indptr_offset`` ride the commit's operand list and arrive as
+        # trailing operands here.  The sync chained tail runs inline and
+        # reaches both directly.
+        offset = None
+        if o.chain_epilogue and o.async_pipeline:
+            d_tile, i_tile, p_tile, offset = operands[-4:]
+            operands = operands[:-4]
+        elif o.chain_epilogue:
+            d_tile = bufs.store_data_tile
+            i_tile = bufs.store_index_tile
+            p_tile = bufs.store_indptr_tile
         bound = (acc,) + operands
 
         def val(t):
@@ -139,9 +160,18 @@ class _EpilogueTail(torch.nn.Module):
                 tile,
                 *[val(t) for t in o.epi_q_args],
                 **{k: val(t) for k, t in o.epi_q_kwargs.items()},
-                indptr_offset=o._offset_at(self.idx, j),
+                indptr_offset=(
+                    offset if offset is not None else o._offset_at(self.idx, j)
+                ),
             )
-            o._store_csr(self.idx, j, d, i, p)
+            if o.chain_epilogue:
+                # Chained: d/i/p land in the staging tiles as this pass's
+                # destinations; the stores run outside the pass.
+                voyager.insert(d, d_tile)
+                voyager.insert(i, i_tile)
+                voyager.insert(p, p_tile)
+            else:
+                o._store_csr(self.idx, j, d, i, p)
             if o.n_sub == 1:
                 return s, q
             sb = og.tk // og.block_size
@@ -246,6 +276,15 @@ class _SparseGemm(torch.nn.Module):
             else:
                 plan.anchor.meta.setdefault("tiling", {})["scratch_slots"] = 1
         self.async_pipeline = async_pipeline
+        # A single-sub-slice epilogue is pure compute once its stores are
+        # peeled off (``_store_staged_csr``), so it chains on the live
+        # total inside the anchor's own pass.  The sync nest stores the
+        # staged CSR on the same round; the async nest stores it two steps
+        # later — after the scheduler's lagged retire has waited the
+        # commit that wrote it — and the loop's final tile in ``forward``.
+        self.chain_epilogue = (
+            out_geom is not None and self.n_sub == 1 and plan.num_k > 1
+        )
         if geom is not None:
             # ``in_sems`` carries one semaphore per *tiled* operand — a
             # ``None``-spec operand is passed through without one — so the
@@ -325,6 +364,13 @@ class _SparseGemm(torch.nn.Module):
                 )
             return plan.gemm_kernel(tuple(tiles), first)
 
+        fused_idx = list(plan.fused_idx)
+        if self.chain_epilogue and self.async_pipeline:
+            # The staging tiles and the offset ride as trailing kernel
+            # operands (after the gather views); ``_finalize`` hands them
+            # to the tail with the group's own operands.
+            base = num_operands + (2 if self.geom is not None else 0)
+            fused_idx += [base, base + 1, base + 2, base + 3]
         return _gemm_scratch_and_kernel(
             gemm_kernel,
             tail,
@@ -333,12 +379,14 @@ class _SparseGemm(torch.nn.Module):
             acc_shape=plan.acc_shape,
             in_specs=plan.in_specs,
             out_specs=plan.out_specs,
-            fused_idx=plan.fused_idx,
+            fused_idx=fused_idx,
             anchor=plan.anchor,
             accumulate_fp32=self.accumulate_fp32,
-            # The CSR epilogue always re-reads the staged accumulator; a
-            # chained tail would trace its stores into the commit.
-            chain_tail=False,
+            # A multi-slice epilogue re-reads the staged accumulator — its
+            # interleaved stores cannot ride the pass; a single-slice tail
+            # is pure compute and chains, its stores running bare in
+            # ``_kernel`` / ``_async_kernel``.
+            chain_tail=self.chain_epilogue,
             async_pipeline=self.async_pipeline,
             # An ``_EpilogueTail`` stages its own stores and is never split.
             split=self.tail_split if tail is plan.fused_gm else None,
@@ -454,7 +502,21 @@ class _SparseGemm(torch.nn.Module):
         return off
 
     def _store_csr(self, idx, j, d, i, p):
-        """Append one sub-slice's CSR block to the packed stream.
+        """Stage one sub-slice's CSR results and store them.
+
+        A compute result reaches DRAM through a scratchpad tile (see
+        ``_OutlierProducer._slice_loop``); the chained epilogue stages
+        d/i/p itself, as its pass's destinations, and calls
+        ``_store_staged_csr`` from the loop body instead.
+        """
+        bufs = self._bufs
+        voyager.insert(d, bufs.store_data_tile)
+        voyager.insert(i, bufs.store_index_tile)
+        voyager.insert(p, bufs.store_indptr_tile)
+        self._store_staged_csr(idx, j)
+
+    def _store_staged_csr(self, idx, j):
+        """Append one staged CSR block to the packed stream.
 
         The same layout the row-swept producer writes, one block at a time:
         the row pointers land in their slice's continuous array, the data and
@@ -468,11 +530,6 @@ class _SparseGemm(torch.nn.Module):
         # The CSR's K slice is sub-slice ``j`` of this GEMM's column tile.
         k = idx[self.grid_n] * self.n_sub + j
 
-        # A compute result reaches DRAM through a scratchpad tile (see
-        # ``_OutlierProducer._slice_loop``); stage the op's results first.
-        voyager.insert(d, bufs.store_data_tile)
-        voyager.insert(i, bufs.store_index_tile)
-        voyager.insert(p, bufs.store_indptr_tile)
         d, i, p = (
             bufs.store_data_tile,
             bufs.store_index_tile,
@@ -540,6 +597,14 @@ class _SparseGemm(torch.nn.Module):
             out_slots = slots[n_in : n_in + len(self.plan.out_specs)]
             tail = _EpilogueTail(self, idx, out_slots)
         self._scratch_and_kernel(tail)[1](idx, *slots)
+        if self.chain_epilogue:
+            # The chained pass staged this tile's CSR; its DMAs and
+            # stream bookkeeping run bare, on the round that completed
+            # the tile.
+            effect_cond(
+                idx[self.grid_k] == self.plan.num_k - 1,
+                lambda: self._store_staged_csr(idx, 0),
+            )
 
     def _async_kernel(
         self, idx, in_slots, out_slots, scratch, in_sems, out_sems, post
@@ -559,6 +624,18 @@ class _SparseGemm(torch.nn.Module):
         for extent, coord in zip(self.plan.grid[1:], idx[1:]):
             step = step * extent + coord
         parity = step % _DONE_DEPTH
+        if self.chain_epilogue:
+            # Store the CSR a finalize commit staged two steps back: the
+            # scheduler's lagged retire waited that commit's post last
+            # step, so its results are readable without a wait of our
+            # own.  Runs before this step's ``_offset_at`` read, which
+            # depends on the bookkeeping.  The loop's final tile has no
+            # step-two-later and is stored in ``forward``.
+            prev2 = voyager.delinearize_index(step - 2, list(self.plan.grid))
+            effect_cond(
+                (step >= 2) & (prev2[self.grid_k] == self.plan.num_k - 1),
+                lambda: self._store_staged_csr(prev2, 0),
+            )
         deps, tiles = list(in_sems), list(in_slots)
         if self.geom is not None:
             voyager.async_wait(deps.pop(self.ptr_sem_index))
@@ -568,6 +645,14 @@ class _SparseGemm(torch.nn.Module):
         tail = self.plan.fused_gm
         if self.out_geom is not None:
             tail = _EpilogueTail(self, idx, out_slots)
+        if self.chain_epilogue:
+            bufs = self._bufs
+            tiles += [
+                bufs.store_data_tile,
+                bufs.store_index_tile,
+                bufs.store_indptr_tile,
+                self._offset_at(idx, 0),
+            ]
         self._scratch_and_kernel(tail)[1](
             idx, tiles, out_slots, scratch, deps, out_sems, post
         )
@@ -640,6 +725,12 @@ class _SparseGemm(torch.nn.Module):
         dense = self.inner(*inputs)
         if og is None:
             return dense
+        if self.chain_epilogue and self.async_pipeline:
+            # The loop's final step always completes a tile, with no
+            # step-two-later to store it; the scheduler's epilogue has
+            # already waited that commit's post, so it stores here.  The
+            # final coordinate is every grid dim at its maximum.
+            self._store_staged_csr([g - 1 for g in self.plan.grid], 0)
         scale, inliers = (dense if isinstance(dense, tuple) else (dense,))[:2]
         return (
             bufs.csr_data,

@@ -78,6 +78,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _subgraph,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
+from voyager_compiler.shape_prop import set_node_value
 
 logger = logging.getLogger(__name__)
 
@@ -972,6 +973,11 @@ def bufferize_graph(
                 tag = new.meta.get(BASE_TABLE_TAG)
                 if tag in retag:
                     new.meta[BASE_TABLE_TAG] = retag[tag]
+                # ``node_copy`` carries meta but not the propagated example
+                # value; top-level consumers (the reporting interpreter's
+                # scalar evaluation) read it off the spliced node.
+                if hasattr(src, "value"):
+                    set_node_value(new, src.value)
 
         out_vals = node.value if n_out > 1 else [node.value]
         out_shapes = node.shape if n_out > 1 else [node.shape]

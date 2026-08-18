@@ -1545,6 +1545,7 @@ def _reduction_fused_kernel(
     num_outputs: int,
     fused_gm: Optional[Callable],
     chain_tail: bool,
+    split,
     fused_operand_indices: List[int] = (),
     scratch_slots: int = 1,
     async_pipeline: bool = False,
@@ -1560,12 +1561,13 @@ def _reduction_fused_kernel(
     initializes the accumulator — so bias gate and reduction init share the
     single reduction ``torch.cond``.
 
-    The async variant dispatches each round as a ``commit``.  Its finalize
-    runs the tail chained on the live value (``chain_tail``), or reads the
-    completed accumulator back from scratch: an unchained tail, or a chained
-    one whose stream-breaking ``quantize_mx`` (``_split_stream_break``)
-    reads the staged tile in the accumulator's own layout, the relayout (if
-    any) folded into that pass.
+    A ``chain_tail`` finalize runs the tail chained on the live value —
+    whole (``split is None``), or its layout-preserving head only, with the
+    split-off ``quantize_mx`` reading the staged tile in the accumulator's
+    own layout, the relayout (if any) folded into that pass.  An unchained
+    tail reads the completed accumulator back from scratch.  Both nests
+    share this logic; the async variant dispatches each round as a
+    ``commit``.
 
     Args:
         compute: ``compute(in_slots, first)`` — the bare op on the current
@@ -1580,7 +1582,11 @@ def _reduction_fused_kernel(
             ``None``.
         chain_tail: Finalize the fused tail on the live accumulated value
             instead of materializing it into scratch first
-            (``meta['accumulate_fusible']``); ignored by the sync kernel.
+            (``meta['accumulate_fusible']``).  Honored by both nests for a
+            multi-round reduction; the sync single-round case keeps the
+            staged shape.
+        split: The tail's ``_split_stream_break`` classification, from the
+            caller — ``None`` chains the tail whole.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
         scratch_slots: Slot count of the scratch accumulator — how the
@@ -1634,6 +1640,15 @@ def _reduction_fused_kernel(
         for slot, out in zip(out_slots, outs):
             voyager.insert(out, slot)
 
+    def _staged_quantize(in_slots, out_slots, scratch):
+        """The split-off pass: relayout + quantize the staged tile straight
+        out of scratch and write the out slots.  The staged tile keeps the
+        accumulator's own shape (the head is layout-preserving)."""
+        fused = [in_slots[i] for i in fused_operand_indices]
+        outs = split[1](scratch, *fused)
+        for slot, out in zip(out_slots, outs):
+            voyager.insert(out, slot)
+
     def inner(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
         if single_round:
@@ -1642,6 +1657,26 @@ def _reduction_fused_kernel(
             voyager.insert(_to_acc(compute(in_slots, True), scratch), scratch)
             _finalize(in_slots, out_slots, scratch)
             return
+
+        if chain_tail:
+            def on_last():
+                total = _to_acc(compute(in_slots, False), scratch) + scratch
+                if split is None:
+                    _finalize(in_slots, out_slots, total)
+                else:
+                    fused = [in_slots[i] for i in fused_operand_indices]
+                    head = split[0](total, *fused)
+                    voyager.insert(head.reshape(scratch.shape), scratch)
+                    _staged_quantize(in_slots, out_slots, scratch)
+                return 0
+
+            def not_last():
+                _accumulate(grid_index, in_slots, scratch)
+                return 0
+
+            torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
+            return
+
         _accumulate(grid_index, in_slots, scratch)
         effect_cond(
             grid_index[reduction_dim] == last_idx,
@@ -1651,20 +1686,9 @@ def _reduction_fused_kernel(
     if not async_pipeline:
         return inner
 
-    split = _split_stream_break(fused_gm) if chain_tail else None
-
     def accumulate_body(grid_index, *args):
         in_slots, _out_slots, scratch = _split(args)
         _accumulate(grid_index, in_slots, scratch)
-
-    def _staged_quantize(in_slots, out_slots, scratch):
-        """The split-off pass: relayout + quantize the staged tile straight
-        out of scratch and write the out slots.  The staged tile keeps the
-        accumulator's own shape (the head is layout-preserving)."""
-        fused = [in_slots[i] for i in fused_operand_indices]
-        outs = split[1](scratch, *fused)
-        for slot, out in zip(out_slots, outs):
-            voyager.insert(out, slot)
 
     def finalize_body(grid_index, *args):
         in_slots, out_slots, scratch = _split(args)
@@ -1840,6 +1864,7 @@ def _gemm_scratch_and_kernel(
             op_dtype=(out_dtype if acc_dtype != out_dtype else None),
             fused_gm=fused_gm,
             chain_tail=chain_tail,
+            split=split,
             fused_operand_indices=fused_idx,
             scratch_slots=slots,
             async_pipeline=async_pipeline,
