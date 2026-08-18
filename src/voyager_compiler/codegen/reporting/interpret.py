@@ -230,9 +230,13 @@ def _is_scratchpad_op(node: Node, bind: Dict[Node, Node]) -> bool:
     ``zeros_like`` that reset an accumulator).  Both sweep the tile through the
     vector unit, so both are costed like any vector op rather than as free
     control.  Only its *inputs* say where it lives: a value stored via
-    ``insert`` carries no space of its own.
+    ``insert`` carries no space of its own.  A scalar read off a tile (the
+    sparse nests' ``_local_scalar_dense`` pointer bookkeeping) has no tile to
+    sweep: it is control math for the scalar evaluator, not datapath work.
     """
     if node.target is _ALLOC or _viewed_buffer(node) is not None:
+        return False
+    if not _produces_tensor(node):
         return False
     ins = [i for i in node.all_input_nodes if _is_tensor(i)]
     return bool(ins) and all(
