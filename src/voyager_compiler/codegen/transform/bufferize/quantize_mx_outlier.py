@@ -69,6 +69,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
     _tag_loop_extents,
+    effect_cond,
     outline_dps_ops,
     voyager,
 )
@@ -81,6 +82,11 @@ logger = logging.getLogger(__name__)
 
 _SRAM = int(MemoryLevel.SRAM)
 _QUANTIZE_MX_OUTLIER = torch.ops.quantized_ops.quantize_mx_outlier.default
+
+# Stores ``_OutlierProducer._slice_loop`` issues per K slice (inliers, scale,
+# indptr, packed data, packed indices), all posting ``store_sem`` — the posts
+# one drain must consume.
+_SLICE_STORES = 5
 
 # Meta key naming the producer whose base table an alloc belongs to. The
 # producer and each of its consumers allocate the table independently; a pass
@@ -350,6 +356,21 @@ class _OutlierProducer(torch.nn.Module):
 
             d, i, p, s, q = self._quantize(tile, slots, offset)
 
+            # The previous slice's stores are drained only here: their DMAs
+            # ran under this slice's quantize, so the waits cost nothing, and
+            # the staging tiles are not reused before this point. The sweep's
+            # first slice has nothing in flight; ``forward`` drains the last
+            # slice's stores after the loop.
+            pending = (m != 0) | (k != 0)
+            for b in bidx:
+                pending |= b != 0
+
+            def drain():
+                for _ in range(_SLICE_STORES):
+                    voyager.async_wait(bufs.store_sem)
+
+            effect_cond(pending, drain)
+
             # A compute result reaches DRAM through a scratchpad tile: the
             # memory model has the datapath write on chip (``insert``) and the
             # DMA move it out, never straight from the op.
@@ -374,7 +395,6 @@ class _OutlierProducer(torch.nn.Module):
                 ones + (g.rows, g.tk),
                 bufs.store_sem,
             )
-            voyager.async_wait(bufs.store_sem)
             voyager.async_copy(
                 s,
                 bufs.scale,
@@ -382,7 +402,6 @@ class _OutlierProducer(torch.nn.Module):
                 ones + (g.rows, g.tk // g.block_size),
                 bufs.store_sem,
             )
-            voyager.async_wait(bufs.store_sem)
             # Slice k, rows [m*rows, m*rows+rows] inclusive: rows+1 entries at
             # stride rows, so consecutive blocks share a boundary element. Both
             # writes carry the same value there, so the overlap is idempotent
@@ -396,7 +415,6 @@ class _OutlierProducer(torch.nn.Module):
                 None,
                 [1] * nb + [1, g.rows],
             )
-            voyager.async_wait(bufs.store_sem)
 
             # The block's real length is the span its pointers cover, not the
             # last one: they are offset by ``run``.
@@ -421,7 +439,6 @@ class _OutlierProducer(torch.nn.Module):
                 [1] * (nb + 1),
                 count=[1] * nb + [nnz],
             )
-            voyager.async_wait(bufs.store_sem)
             voyager.async_copy(
                 i,
                 bufs.csr_indices,
@@ -432,7 +449,6 @@ class _OutlierProducer(torch.nn.Module):
                 [1] * (nb + 1),
                 count=[1] * nb + [nnz],
             )
-            voyager.async_wait(bufs.store_sem)
 
             # Bookkeeping, both scratchpad writes: where this block sits in the
             # stream (for the consumer), and where the slice now stands.
@@ -515,6 +531,10 @@ class _OutlierProducer(torch.nn.Module):
 
         self._bufs = bufs
         self.inner(*inputs)
+        # The last slice's stores are still in flight, and the consumer's
+        # nest reads the CSR next.
+        for _ in range(_SLICE_STORES):
+            voyager.async_wait(bufs.store_sem)
         return (
             bufs.csr_data,
             bufs.csr_indices,
