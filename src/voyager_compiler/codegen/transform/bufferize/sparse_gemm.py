@@ -36,12 +36,16 @@ from voyager_compiler.codegen.node_info import (
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
     oracle_disabled,
+    UNPIPELINED,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _DEFAULT_NUM_SLOTS,
+    _DONE_DEPTH,
     _gemm_plan,
     _gemm_scratch_and_kernel,
     _stamp_anchor_meta,
+    AsyncPipelinedKernel,
+    get_slot,
     PipelinedKernel,
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
@@ -169,6 +173,13 @@ class _SparseGemm(torch.nn.Module):
     table, indexed by ``(K slice, row block)``. So it runs here, where the grid
     index is in hand, and the kernel below only substitutes the filled scratch
     for the raw operands.
+
+    Two scheduling modes.  The synchronous nest waits every operand inline.
+    The async nest (``async_pipeline``) dispatches each step's compute as a
+    ``voyager.commit`` whose dependencies are the dense load semaphores plus
+    this step's gather copies, so the whole fetch chain overlaps the previous
+    tile's compute; the one wait the control stream keeps is the pointer
+    tile's, whose values drive the gather DMAs' addresses at issue time.
     """
 
     def __init__(
@@ -180,6 +191,7 @@ class _SparseGemm(torch.nn.Module):
         out_geom=None,
         num_slots: int = _DEFAULT_NUM_SLOTS,
         accumulate_fp32: bool = False,
+        async_pipeline: bool = False,
     ):
         super().__init__()
         self.plan = plan
@@ -219,14 +231,37 @@ class _SparseGemm(torch.nn.Module):
 
             self.epi_q_args = [resolve(a) for a in qnode.args[1:]]
             self.epi_q_kwargs = {k: resolve(v) for k, v in qnode.kwargs.items()}
+        # The CSR-store epilogue runs bare in the loop body after the
+        # commit — its DMAs, waits and stream bookkeeping cannot live in a
+        # commit subgraph — which requires a single-slot scratch
+        # (``_reduction_fused_kernel``'s bare-tail path) and a reduction to
+        # attach it to: a ``num_k == 1`` producer keeps the synchronous
+        # nest.
+        if out_geom is not None and async_pipeline:
+            if plan.num_k == 1:
+                async_pipeline = False
+            else:
+                plan.anchor.meta.setdefault("tiling", {})["scratch_slots"] = 1
+        self.async_pipeline = async_pipeline
+        if geom is not None:
+            # ``in_sems`` carries one semaphore per *tiled* operand — a
+            # ``None``-spec operand is passed through without one — so the
+            # pointer semaphore is indexed by rank among the real specs.
+            self.ptr_sem_index = sum(
+                1
+                for s in plan.in_specs[: plan.kw_idx["A_indptr"]]
+                if s is not None
+            )
         # The K accumulator, when the reduction needs one.  The kernel built
         # alongside it is rebuilt per step (with the grid index captured) and
         # discarded here; only the specs are needed before the loop exists.
         self.scratch_specs = self._scratch_and_kernel(plan.fused_gm)[0]
-        # Synchronous: the per-step CSR gather issues its DMAs outside any
-        # commit region, which the async scheduler cannot capture.
-        self.inner = PipelinedKernel(
-            self._kernel,
+        if async_pipeline:
+            kernel, kernel_cls = self._async_kernel, AsyncPipelinedKernel
+        else:
+            kernel, kernel_cls = self._kernel, PipelinedKernel
+        self.inner = kernel_cls(
+            kernel,
             grid=plan.grid,
             in_specs=plan.in_specs,
             out_specs=plan.out_specs,
@@ -240,6 +275,12 @@ class _SparseGemm(torch.nn.Module):
         """The dense path's scratch and kernel, over a ``gemm_kernel`` that
         reads the gathered CSR instead of the raw operands.
 
+        The gathered blocks reach the op differently per mode: the async
+        kernel appends this step's gather-slot views to the commit's operands
+        (a traced commit subgraph must not capture free tensors), so they
+        arrive as extra trailing entries of ``in_tiles``; the sync kernel
+        reads the single-slot staging buffers directly.
+
         Args:
             tail: The fused tail to apply — the plan's own, or its
                 ``_EpilogueTail`` wrapper when a step's tail also stores a
@@ -252,18 +293,28 @@ class _SparseGemm(torch.nn.Module):
             the dense path's.
         """
         plan = self.plan
-        csr = plan.kw_idx
+        num_operands = len(plan.in_specs)
+
+        indptr_idx = plan.kw_idx["A_indptr"]
+        indices_idx = plan.kw_idx["A_indices"]
+        data_idx = plan.kw_idx["A_data"]
 
         def gemm_kernel(in_tiles, first):
-            tiles = list(in_tiles)
-            tiles[csr["A_data"]] = self._bufs.gather_data
-            tiles[csr["A_indices"]] = self._bufs.gather_indices
-            # One call consumes one K slice, so the slice axis is addressing,
-            # not data: the op wants a plain [*batch, tm+1] pointer array.
-            ptr = in_tiles[csr["A_indptr"]]
-            tiles[csr["A_indptr"]] = ptr.reshape(
-                tuple(ptr.shape[:-2]) + (ptr.shape[-1],)
-            )
+            tiles = list(in_tiles[:num_operands])
+            if self.geom is not None:
+                if self.async_pipeline:
+                    tiles[data_idx] = in_tiles[num_operands]
+                    tiles[indices_idx] = in_tiles[num_operands + 1]
+                else:
+                    tiles[data_idx] = self._bufs.gather_data
+                    tiles[indices_idx] = self._bufs.gather_indices
+                # One call consumes one K slice, so the slice axis is
+                # addressing, not data: the op wants a plain [*batch, tm+1]
+                # pointer array.
+                ptr = in_tiles[indptr_idx]
+                tiles[indptr_idx] = ptr.reshape(
+                    tuple(ptr.shape[:-2]) + (ptr.shape[-1],)
+                )
             return plan.gemm_kernel(tuple(tiles), first)
 
         return _gemm_scratch_and_kernel(
@@ -277,19 +328,32 @@ class _SparseGemm(torch.nn.Module):
             fused_idx=plan.fused_idx,
             anchor=plan.anchor,
             accumulate_fp32=self.accumulate_fp32,
-            # Sync, matching ``self.inner`` (see ``__init__``).
+            # The CSR epilogue always re-reads the staged accumulator; a
+            # chained tail would trace its stores into the commit.
             chain_tail=False,
-            async_pipeline=False,
+            async_pipeline=self.async_pipeline,
         )
 
     # --- the gather ---------------------------------------------------------
 
-    def _gather(self, idx, slots):
+    def _gather(self, idx, slots, parity=None):
         """Concatenate this row tile's ``R`` blocks into one CSR.
 
         Source addresses come from the resident base table (a plain read, not a
         fetch); destinations and lengths come from the pointer tile that was
         loaded with the dense operands, so no arithmetic beyond reading scalars.
+
+        Args:
+            idx: The grid coordinate.
+            slots: The operand tiles, positionally.
+            parity: The gather slot this step writes (async mode): the copies
+                land in slot ``parity`` of the two-slot staging buffers and
+                each signals its own semaphore slot, returned for the compute
+                commit's dependency list.  ``None`` is the synchronous mode —
+                single-slot buffers, every copy waited inline.
+
+        Returns:
+            The semaphore-slot views the copies signal (async), else ``[]``.
         """
         plan, g, bufs = self.plan, self.geom, self._bufs
         nb, ones = g.nb, g.ones
@@ -305,6 +369,7 @@ class _SparseGemm(torch.nn.Module):
         p = bufs.gather_ptr_tile
         lo = _scalar(_entry(p, 0, nb, ones))
 
+        sems = []
         for j in range(self.R):
             slot = voyager.subview(
                 bufs.base_table,
@@ -321,27 +386,49 @@ class _SparseGemm(torch.nn.Module):
             count = _scalar(_entry(p, (j + 1) * g.rows, nb, ones)) - at_j
             torch._check(count >= 0)
 
-            for src, dst in (
-                (slots[plan.kw_idx["A_data"]], bufs.gather_data),
-                (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
+            for b, (src, dst) in enumerate(
+                (
+                    (slots[plan.kw_idx["A_data"]], bufs.gather_data),
+                    (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
+                )
             ):
-                voyager.async_copy(
-                    src,
-                    voyager.subview(
+                if parity is None:
+                    window = voyager.subview(
                         dst,
                         [0] * nb + [start],
                         ones + (g.budget,),
                         (1,) * (nb + 1),
                         [],
-                    ),
+                    )
+                    sem = bufs.gather_sem
+                else:
+                    # The slot offset composes into one subview: a window of
+                    # a ``get_slot`` window could not fold into a single
+                    # ``TensorBoxRef``.
+                    window = voyager.subview(
+                        dst,
+                        [parity] + [0] * nb + [start],
+                        [1] + list(ones) + [g.budget],
+                        (1,) * (nb + 2),
+                        [0],
+                    )
+                    sem = get_slot(
+                        bufs.gather_sem, parity * 2 * self.R + 2 * j + b
+                    )
+                    sems.append(sem)
+                voyager.async_copy(
+                    src,
+                    window,
                     bidx + [at],
                     ones + (g.budget,),
-                    bufs.gather_sem,
+                    sem,
                     None,
                     [1] * (nb + 1),
                     count=[1] * nb + [count],
                 )
-                voyager.async_wait(bufs.gather_sem)
+                if parity is None:
+                    voyager.async_wait(sem)
+        return sems
 
     def _offset_at(self, idx, j):
         """Sub-slice ``j``'s running nonzero count, the op's
@@ -446,19 +533,55 @@ class _SparseGemm(torch.nn.Module):
             tail = _EpilogueTail(self, idx)
         self._scratch_and_kernel(tail)[1](idx, *slots)
 
+    def _async_kernel(
+        self, idx, in_slots, out_slots, scratch, in_sems, out_sems, post
+    ):
+        """The async step: gather, then dispatch the dense kernel's commit.
+
+        The pointer tile is consumed on the control stream — its values drive
+        the gather DMAs' addresses at issue time — so its load semaphore is
+        waited here and withheld from the commit, which instead depends on
+        the dense loads plus this step's gather copies.  The gather-slot
+        views ride the dependency-carrying operand list into the commit (see
+        ``_scratch_and_kernel``).
+        """
+        # The scheduler hands the delinearized grid coordinate; the gather
+        # slot ping-pongs with the flat step, like the compute-done slot.
+        step = idx[0]
+        for extent, coord in zip(self.plan.grid[1:], idx[1:]):
+            step = step * extent + coord
+        parity = step % _DONE_DEPTH
+        deps, tiles = list(in_sems), list(in_slots)
+        if self.geom is not None:
+            voyager.async_wait(deps.pop(self.ptr_sem_index))
+            deps += self._gather(idx, in_slots, parity)
+            tiles.append(get_slot(self._bufs.gather_data, parity))
+            tiles.append(get_slot(self._bufs.gather_indices, parity))
+        tail = self.plan.fused_gm
+        if self.out_geom is not None:
+            tail = _EpilogueTail(self, idx)
+        self._scratch_and_kernel(tail)[1](
+            idx, tiles, out_slots, scratch, deps, out_sems, post
+        )
+
     # --- entry --------------------------------------------------------------
 
     def forward(self, *inputs):
         bufs = _Bufs()
         g = self.geom
         if g is not None:
-            # R blocks of at most ``budget`` each: a row tile can never exceed
-            # it, since it is exactly R blocks.
+            num_slots = _DONE_DEPTH if self.async_pipeline else UNPIPELINED
+            sem_slots = (
+                _DONE_DEPTH * 2 * self.R if self.async_pipeline else UNPIPELINED
+            )
             bufs.gather_data = voyager.alloc(
-                list(g.ones) + [self.span], self.data_dtype, _SRAM
+                list(g.ones) + [self.span],
+                self.data_dtype,
+                _SRAM,
+                num_slots,
             )
             bufs.gather_indices = voyager.alloc(
-                list(g.ones) + [self.span], torch.int32, _SRAM
+                list(g.ones) + [self.span], torch.int32, _SRAM, num_slots
             )
             bufs.base_table = voyager.alloc(
                 base_table_shape(g), torch.int32, _SRAM
@@ -466,7 +589,7 @@ class _SparseGemm(torch.nn.Module):
             bufs.gather_ptr_tile = voyager.alloc(
                 list(g.ones) + [self.plan.tile_m + 1], torch.int32, _SRAM
             )
-            bufs.gather_sem = voyager.zeros([], torch.int64)
+            bufs.gather_sem = voyager.zeros([], torch.int64, sem_slots)
 
         og = self.out_geom
         if og is not None:
@@ -716,6 +839,7 @@ def build_sparse_gemm(
     num_slots: int = _DEFAULT_NUM_SLOTS,
     accumulate_fp32: bool = False,
     tiler=None,
+    async_pipeline: bool = False,
 ) -> Optional[torch.fx.GraphModule]:
     """Bufferize a GEMM whose activation carries an outlier CSR.
 
@@ -724,6 +848,10 @@ def build_sparse_gemm(
         num_slots: Software-pipeline depth for the dense operands.
         accumulate_fp32: Accumulate the K reduction in fp32.
         tiler: The interstellar ``TilerContext``.
+        async_pipeline: Dispatch each step's compute as a ``voyager.commit``
+            (the :class:`AsyncPipelinedKernel` nest), overlapping the CSR
+            gather and the dense loads with the previous tile's compute;
+            the synchronous nest otherwise.
 
     Returns:
         The bufferized gm, or ``None`` when the node has no CSR or the
@@ -777,6 +905,7 @@ def build_sparse_gemm(
         out_geom=out_geom,
         num_slots=num_slots,
         accumulate_fp32=accumulate_fp32,
+        async_pipeline=async_pipeline,
     )
     if out_geom is not None:
         pattern.out_values = list(node.value)

@@ -856,7 +856,10 @@ def bufferize_graph(
                 # A GEMM whose activation carries an outlier CSR: same dense
                 # nest, plus the per-step gather of the row tile's blocks.
                 sub_gm = build_sparse_gemm(
-                    node, num_slots=num_slots, tiler=tiler
+                    node,
+                    num_slots=num_slots,
+                    async_pipeline=pipelined,
+                    tiler=tiler,
                 )
             elif is_gemm_op(anchor):
                 sub_gm = build_gemm(
