@@ -752,6 +752,63 @@ def _reduced_dims(node, ndim: int) -> set:
     return set(range(ndim - len(normalized_shape), ndim))
 
 
+def stream_breaking_quantize(gm, in_place=True):
+    """The terminal ``quantize_mx`` of a fused tail that cannot ride the
+    compute pass, or ``None``.
+
+    A non-last scale axis always breaks the ride: the scale unit groups
+    along the stream, so the tile must be materialized first.  The last
+    axis may be spelled ``-1`` or ``ndim - 1`` — the data-layout pass
+    writes the projected physical axis as a positive index.  A relayout
+    ahead of the quantize breaks only an in-place pass; a drain to a fresh
+    slot folds the permute into store addressing instead.  Shared by the
+    bufferize splitter (which cuts the tail here) and the tile search's
+    footprint model (which must charge the staged tile this forces).
+
+    Args:
+        gm: The fused tail or submodule ending in the quantize; a
+            non-``GraphModule`` never breaks.
+        in_place: Whether the pass re-reads the tile it streams — a
+            K-split finalize cone rather than a ``num_k == 1`` drain.
+
+    Returns:
+        ``None`` when the tail has no such quantize, else ``(quant,
+        relayout, spine)``: the quantize node, the relayout chain feeding
+        it (walked input-ward), and the node that chain reads.
+    """
+    if not isinstance(gm, GraphModule):
+        return None
+    ops = [n for n in gm.graph.nodes if n.op == "call_function"]
+    quant = ops[-1] if ops else None
+    if (
+        quant is None
+        or quant.target is not torch.ops.quantized_ops.quantize_mx.default
+    ):
+        return None
+
+    relayout = []
+    spine = quant.args[0]
+    while (
+        spine.op == "call_function"
+        and (is_reshape_op(spine) or is_nop(spine))
+        and len(spine.users) == 1
+    ):
+        relayout.append(spine)
+        spine = spine.args[0]
+    permuted = any(is_reshape_op(n) for n in relayout)
+
+    val = getattr(quant.args[0], "value", None)
+    if val is None:
+        val = quant.args[0].meta.get("val")
+    ndim = getattr(val, "ndim", 0)
+    if (not permuted or not in_place) and all(
+        a == -1 or (ndim and a == ndim - 1)
+        for a in get_arg_value(quant, 2, "axes")
+    ):
+        return None
+    return quant, relayout, spine
+
+
 def reduction_scratch(node, out_tile, vector_lanes):
     """The on-chip regions the backend keeps beside a batched reduction's own
     tile: a softmax's max and sum, a layer_norm's mean and variance plus its

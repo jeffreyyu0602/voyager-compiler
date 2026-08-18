@@ -33,6 +33,7 @@ from voyager_compiler.codegen.node_info import (
     is_fully_connected,
     is_gemm_op,
     quant_param_arg_nodes,
+    stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
@@ -318,6 +319,7 @@ def make_size_fn(
     extra_sharing=0,
     oc_align=None,
     has_tail=False,
+    staged_tail=False,
     num_slots=1,
     batch=1,
     weight_batch=1,
@@ -342,8 +344,10 @@ def make_size_fn(
     what lets a load overlap the compute reading the other half.  A split
     reduction with a fused tail also accumulates into a scratch buffer the
     builders allocate exactly once (``_ScratchSpec``); it is charged a single
-    bank-aligned region on top.  Leaving it out is what let the tiler return
-    tilings ``plan_memory`` could not place.
+    bank-aligned region on top.  So is the finished tile a stream-breaking
+    tail (``staged_tail``) stages even for a single round.  Leaving either
+    out is what let the tiler return tilings ``plan_memory`` could not
+    place.
 
     A bank cannot be split between groups, so each group rounds up to a whole
     bank -- which puts a floor of ``num_slots * len(groups) * bank_size`` on the
@@ -367,6 +371,9 @@ def make_size_fn(
     if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
     fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
     of_scale_bits = get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
+    # A staged single round holds the anchor's finished tile in its own
+    # physical dtype (``_gemm_scratch_and_kernel``'s num_k == 1 staging).
+    stage_bits = get_dtype_width(node.value.dtype)
     block_size = node.kwargs.get("block_size") or 1
     # One gathered-CSR entry: the outlier value plus its column index.
     csr_data_bits = _node_dtype_bits(node.kwargs.get("A_data"), 0)
@@ -448,12 +455,15 @@ def make_size_fn(
 
         # A reduction split across L3 steps accumulates into a scratch buffer
         # the builders allocate once for the whole kernel, not per ping-pong
-        # half -- so it is charged one region, outside ``num_slots``.
-        scratch = (
-            of_count * PSUM_BITS / 8.0
-            if has_tail and point.loop_blocking(le.IC)[3] > 1
-            else 0.0
-        )
+        # half -- so it is charged one region, outside ``num_slots``.  A
+        # stream-breaking tail (``staged_tail``) stages even a single
+        # round's finished tile, in the anchor's own dtype.
+        if has_tail and point.loop_blocking(le.IC)[3] > 1:
+            scratch = of_count * PSUM_BITS / 8.0
+        elif has_tail and staged_tail:
+            scratch = of_count * stage_bits / 8.0
+        else:
+            scratch = 0.0
 
         out = [0.0, 0.0, 0.0]
         if not bank_size:
@@ -1034,6 +1044,10 @@ def _prepare_search(node, tiler):
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
+    # A tail whose quantize breaks the compute stream stages the finished
+    # tile even for a single-round reduction (``_gemm_scratch_and_kernel``);
+    # the footprint model must charge that region for unsplit mappings too.
+    staged_tail = stream_breaking_quantize(sub_gm, in_place=False) is not None
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
     # else _detect_mha_relayout can't store the tile.
@@ -1057,6 +1071,7 @@ def _prepare_search(node, tiler):
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
         has_tail,
+        staged_tail,
         oc_align,
         outlier_pct,
     )
@@ -1131,6 +1146,7 @@ def _prepare_search(node, tiler):
             extra_sharing,
             oc_align,
             has_tail=has_tail,
+            staged_tail=staged_tail,
             num_slots=tiler.config.num_slots,
             batch=batch,
             weight_batch=batch // weight_repeat,

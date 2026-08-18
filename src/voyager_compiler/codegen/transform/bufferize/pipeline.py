@@ -30,6 +30,7 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
     reduction_op,
     reduction_scratch,
+    stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
     weight_transforms,
@@ -1465,11 +1466,12 @@ def _reduction_inplace_kernel(
 def _split_stream_break(fused_gm, in_place=True):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
-    A non-last scale axis always breaks the ride: the scale unit groups
-    along the stream, so the tile must be materialized first.  A relayout
-    breaks only an in-place pass — its permuted store order no longer
-    matches the read order and overwrites unread elements; a drain to a
-    fresh slot folds the permute into store addressing instead.
+    ``stream_breaking_quantize`` decides: a non-last scale axis always
+    breaks (the scale unit groups along the stream, so the tile must be
+    materialized first); a permuted relayout breaks only an in-place pass —
+    its store order no longer matches the read order and overwrites unread
+    elements, while a drain to a fresh slot folds the permute into store
+    addressing instead.
 
     The cut lands *before* the relayout chain feeding the quantize: the
     staged tile keeps the accumulator's layout and the relayout rides the
@@ -1490,34 +1492,13 @@ def _split_stream_break(fused_gm, in_place=True):
         the relayout + quantize applied to the staged tile, each taking the
         same operand list as ``fused_gm``.
     """
-    if not isinstance(fused_gm, torch.fx.GraphModule):
+    broken = stream_breaking_quantize(fused_gm, in_place)
+    if broken is None:
         return None
+    quant, relayout, spine = broken
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
     ops = [n for n in graph.nodes if n.op == "call_function"]
-    quant = ops[-1] if ops else None
-    if (
-        quant is None
-        or quant.target is not torch.ops.quantized_ops.quantize_mx.default
-    ):
-        return None
-
-    # The relayout chain feeding the quantize: contiguous transpose /
-    # permute / view members on the spine, walked input-ward.
-    relayout = []
-    spine = quant.args[0]
-    while (
-        spine.op == "call_function"
-        and (is_reshape_op(spine) or is_nop(spine))
-        and len(spine.users) == 1
-    ):
-        relayout.append(spine)
-        spine = spine.args[0]
-    permuted = any(is_reshape_op(n) for n in relayout)
-    if (not permuted or not in_place) and all(
-        a == -1 for a in get_arg_value(quant, 2, "axes")
-    ):
-        return None
 
     def build(part_ops, root, name, out):
         pg = torch.fx.Graph()
@@ -1659,6 +1640,7 @@ def _reduction_fused_kernel(
             return
 
         if chain_tail:
+
             def on_last():
                 total = _to_acc(compute(in_slots, False), scratch) + scratch
                 if split is None:
