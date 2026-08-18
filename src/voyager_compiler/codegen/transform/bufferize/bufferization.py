@@ -63,6 +63,7 @@ from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _quantize_node,
+    BASE_TABLE_TAG,
     GEOMETRY_META,
     PRODUCER_META,
     build_quantize_mx_outlier,
@@ -644,6 +645,20 @@ def _bufferize_key(node):
         return None
 
 
+def _producer_names(node):
+    """The outlier-producer names a nest built at ``node`` bakes into its
+    base-table tags: the node's own name (its produced table) and each
+    operand's ``PRODUCER_META`` (a consumed table), read through the nop
+    views a CSR may arrive behind (see ``_retarget_csr_views``)."""
+    names = [node.name]
+    for operand in node.all_input_nodes:
+        src = operand
+        while is_nop(src) and src.all_input_nodes:
+            src = src.all_input_nodes[0]
+        names.append(src.meta.get(PRODUCER_META))
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Naming
 # ---------------------------------------------------------------------------
@@ -825,7 +840,7 @@ def bufferize_graph(
             "HIT" if cached is not None else "MISS",
         )
         if cached is not None:
-            sub_gm, n_out, group = cached
+            sub_gm, n_out, group, tag_sources = cached
         else:
             if is_conv2d(anchor):
                 sub_gm = build_conv2d(
@@ -907,8 +922,9 @@ def bufferize_graph(
             # A nest built afresh starts an equivalence group; an uncacheable
             # key never reaches the cache, so its group stays a singleton.
             group = next(group_ids)
+            tag_sources = _producer_names(node)
             if key is not None:
-                build_cache[key] = (sub_gm, n_out, group)
+                build_cache[key] = (sub_gm, n_out, group, tag_sources)
 
         # Stamp logical (quantized) dtypes on the nest
         phs = [p for p in sub_gm.graph.nodes if p.op == "placeholder"]
@@ -938,10 +954,21 @@ def bufferize_graph(
         # build it came from — the scope says which layer a node belongs to,
         # the group says which other layers were built the same way.
         scope = node.name
+        # ``node_copy`` carries the cached build's base-table tags; retag
+        # them to this splice's own producers so ``merge_base_tables``
+        # groups every nest with its own layer's tables.
+        retag = {
+            old: new
+            for old, new in zip(tag_sources, _producer_names(node))
+            if old is not None and new is not None and old != new
+        }
         for src, new in value_remap.items():
             if src.op != "placeholder" and isinstance(new, Node):
                 new.meta["scope"] = (scope, anchor.target)
                 new.meta["build_group"] = group
+                tag = new.meta.get(BASE_TABLE_TAG)
+                if tag in retag:
+                    new.meta[BASE_TABLE_TAG] = retag[tag]
 
         out_vals = node.value if n_out > 1 else [node.value]
         out_shapes = node.shape if n_out > 1 else [node.shape]
@@ -1010,20 +1037,65 @@ _DEDUP_SKIP = frozenset(
 )
 
 
+def _buffer_root(node: Node) -> Node:
+    """The buffer whose bytes ``node`` ultimately names, through any chain of
+    views (see ``_viewed_buffer``); ``node`` itself when it owns its bytes.
+    Stops at the last Node — a view of a carried *literal* (a loop counter's
+    initial value) roots at the view."""
+    while True:
+        buffer = _viewed_buffer(node)
+        if not isinstance(buffer, Node):
+            return node
+        node = buffer
+
+
 def _dedup_regions(gm: GraphModule) -> None:
     """CSE identical *pure* nodes in ``gm`` and every nested region (while_loop
     / cond / commit bodies, fused submodules), skipping ``_DEDUP_SKIP``.  A
     D==0 prefetch loads into the same slot the read consumes, so the fetch and
     read ``subview``s (slot + semaphore) are identical -- this folds them, and
-    any other repeated index math, to one node per region."""
+    any other repeated index math, to one node per region.
+
+    Merging is valid only within a write-free interval of the bytes read: a
+    non-view node (a scalar read, a ``clone``, arithmetic on a tile)
+    registers under each tensor operand's root buffer, and a write to that
+    buffer — ``insert`` / ``async_copy``, or a region taking it as an
+    operand — evicts those entries.  Views and loop-counter arithmetic read
+    no bytes and merge across writes.
+    """
     seen, merged = {}, set()
+    # root buffer -> keys in ``seen`` whose value came from its bytes
+    readers = {}
+
+    def evict(buffer):
+        for key in readers.pop(buffer, ()):
+            seen.pop(key, None)
+
     for node in list(gm.graph.nodes):
+        if node.op == "call_function" and node.target in (
+            _VOYAGER_INSERT,
+            _VOYAGER_ASYNC,
+        ):
+            evict(_buffer_root(node.args[1]))
+        elif node.op == "call_module" or (
+            node.op == "call_function"
+            and node.target in (_WHILE_LOOP, _COND, _COMMIT)
+        ):
+            for arg in node.all_input_nodes:
+                root = _buffer_root(arg)
+                if _produces_tensor(root):
+                    evict(root)
         if node.op != "call_function" or node.target in _DEDUP_SKIP:
             continue
         key = (node.target, tuple(node.args), frozenset(node.kwargs.items()))
         orig = seen.get(key)
         if orig is None:
             seen[key] = node
+            if _viewed_buffer(node) is None:
+                for arg in node.all_input_nodes:
+                    root = _buffer_root(arg)
+                    if _produces_tensor(root):
+                        readers.setdefault(root, set()).add(key)
             continue
         node.replace_all_uses_with(orig)
         gm.graph.erase_node(node)
