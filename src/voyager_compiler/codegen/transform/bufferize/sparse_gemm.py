@@ -43,6 +43,7 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _DONE_DEPTH,
     _gemm_plan,
     _gemm_scratch_and_kernel,
+    _split_stream_break,
     _stamp_anchor_meta,
     AsyncPipelinedKernel,
     get_slot,
@@ -254,6 +255,11 @@ class _SparseGemm(torch.nn.Module):
                 for s in plan.in_specs[: plan.kw_idx["A_indptr"]]
                 if s is not None
             )
+        # Classified once: the traced per-step kernel rebuild cannot walk
+        # a graph.
+        self.tail_split = _split_stream_break(
+            plan.fused_gm, in_place=plan.num_k > 1
+        )
         # The K accumulator, when the reduction needs one.  The kernel built
         # alongside it is rebuilt per step (with the grid index captured) and
         # discarded here; only the specs are needed before the loop exists.
@@ -334,6 +340,8 @@ class _SparseGemm(torch.nn.Module):
             # chained tail would trace its stores into the commit.
             chain_tail=False,
             async_pipeline=self.async_pipeline,
+            # An ``_EpilogueTail`` stages its own stores and is never split.
+            split=self.tail_split if tail is plan.fused_gm else None,
         )
 
     # --- the gather ---------------------------------------------------------

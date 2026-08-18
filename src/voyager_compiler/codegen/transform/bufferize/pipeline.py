@@ -1744,6 +1744,11 @@ def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
             in_specs[i].first_use_at_exit = True
 
 
+# Sentinel for ``_gemm_scratch_and_kernel``'s ``split``: classify the tail
+# here rather than taking a caller's precomputed result.
+_CLASSIFY = object()
+
+
 def _gemm_scratch_and_kernel(
     gemm_kernel,
     fused_gm,
@@ -1759,6 +1764,7 @@ def _gemm_scratch_and_kernel(
     chain_tail,
     async_pipeline,
     single_buffer_tail=False,
+    split=_CLASSIFY,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -1779,6 +1785,10 @@ def _gemm_scratch_and_kernel(
         chain_tail: Whether the tail chains into the async finalize pass.
         async_pipeline: The async kernel variants, or the sync ones.
         single_buffer_tail: Collapse a sync reduction's operand banks to one.
+        split: The tail's ``_split_stream_break`` result, precomputed by a
+            caller whose kernel is rebuilt under export tracing (the sparse
+            GEMM), where the classification's graph walk cannot run; the
+            sentinel classifies here.
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -1793,7 +1803,8 @@ def _gemm_scratch_and_kernel(
 
     out_dtype = anchor.value.dtype
     acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
-    split = _split_stream_break(fused_gm, in_place=num_k > 1)
+    if split is _CLASSIFY:
+        split = _split_stream_break(fused_gm, in_place=num_k > 1)
     if num_k == 1 and split is None:
         scratch_specs = []
         kernel = _map_kernel(
