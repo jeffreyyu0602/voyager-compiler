@@ -222,6 +222,7 @@ class _SparseGemm(torch.nn.Module):
         data_dtype,
         *,
         out_geom=None,
+        accumulate_fusible: bool,
         num_slots: int = _DEFAULT_NUM_SLOTS,
         accumulate_fp32: bool = False,
         async_pipeline: bool = False,
@@ -285,6 +286,11 @@ class _SparseGemm(torch.nn.Module):
         self.chain_epilogue = (
             out_geom is not None and self.n_sub == 1 and plan.num_k > 1
         )
+        # A pure consumer's fusible tail chains exactly as a dense GEMM's.
+        # A producer's tail is an ``_EpilogueTail`` and follows the gate
+        # above: a non-chained one runs its CSR stores inside the tail,
+        # which must never ride the pass.
+        self.chain_fused_tail = accumulate_fusible and out_geom is None
         if geom is not None:
             # ``in_sems`` carries one semaphore per *tiled* operand — a
             # ``None``-spec operand is passed through without one — so the
@@ -385,8 +391,9 @@ class _SparseGemm(torch.nn.Module):
             # A multi-slice epilogue re-reads the staged accumulator — its
             # interleaved stores cannot ride the pass; a single-slice tail
             # is pure compute and chains, its stores running bare in
-            # ``_kernel`` / ``_async_kernel``.
-            chain_tail=self.chain_epilogue,
+            # ``_kernel`` / ``_async_kernel``.  A consumer's fusible tail
+            # chains like a dense GEMM's.
+            chain_tail=self.chain_epilogue or self.chain_fused_tail,
             async_pipeline=self.async_pipeline,
             # An ``_EpilogueTail`` stages its own stores and is never split.
             split=self.tail_split if tail is plan.fused_gm else None,
@@ -987,6 +994,7 @@ def build_sparse_gemm(
         geom,
         data_dtype,
         out_geom=out_geom,
+        accumulate_fusible=node.meta.get("accumulate_fusible", False),
         num_slots=num_slots,
         accumulate_fp32=accumulate_fp32,
         async_pipeline=async_pipeline,
