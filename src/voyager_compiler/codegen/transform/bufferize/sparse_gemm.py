@@ -76,6 +76,11 @@ from voyager_compiler.shape_prop import set_node_value, ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
 
+# Stores ``_store_staged_csr`` issues per staged CSR block (indptr, packed
+# data, packed indices), all posting ``store_sem`` — the posts one drain
+# must consume.
+_CSR_STORES = 3
+
 
 class _EpilogueTail(torch.nn.Module):
     """The fused tail of a CSR-producing GEMM, plus its CSR stores.
@@ -514,13 +519,30 @@ class _SparseGemm(torch.nn.Module):
         A compute result reaches DRAM through a scratchpad tile (see
         ``_OutlierProducer._slice_loop``); the chained epilogue stages
         d/i/p itself, as its pass's destinations, and calls
-        ``_store_staged_csr`` from the loop body instead.
+        ``_store_staged_csr`` from the loop body instead.  Sub-slices
+        reuse the staging tiles back-to-back within one round, so the
+        stores are drained here, inline.
         """
         bufs = self._bufs
         voyager.insert(d, bufs.store_data_tile)
         voyager.insert(i, bufs.store_index_tile)
         voyager.insert(p, bufs.store_indptr_tile)
         self._store_staged_csr(idx, j)
+        self._drain_csr_stores()
+
+    def _drain_csr_stores(self):
+        """Consume one staged-store round's posts from ``store_sem``."""
+        for _ in range(_CSR_STORES):
+            voyager.async_wait(self._bufs.store_sem)
+
+    def _prior_finalize(self, idx):
+        """Whether an earlier output tile has finalized — some
+        non-reduction grid coordinate is past its first value."""
+        dims = [d for d in range(len(self.plan.grid)) if d != self.grid_k]
+        prior = idx[dims[0]] != 0
+        for d in dims[1:]:
+            prior = prior | (idx[d] != 0)
+        return prior
 
     def _store_staged_csr(self, idx, j):
         """Append one staged CSR block to the packed stream.
@@ -528,7 +550,11 @@ class _SparseGemm(torch.nn.Module):
         The same layout the row-swept producer writes, one block at a time:
         the row pointers land in their slice's continuous array, the data and
         indices at the stream position ``base`` names, and the block's position
-        goes into the shared table for its consumer.
+        goes into the shared table for its consumer.  The ``_CSR_STORES``
+        copies post ``store_sem`` unwaited; the caller owns the drain — the
+        chained modes lag it to the next finalize (``_kernel`` /
+        ``_async_kernel``, the last round's in ``forward``), the interleaved
+        mode drains inline (``_store_csr``).
         """
         g, bufs = self.out_geom, self._bufs
         nb, ones = g.nb, g.ones
@@ -552,7 +578,6 @@ class _SparseGemm(torch.nn.Module):
             None,
             [1] * nb + [1, g.rows],
         )
-        voyager.async_wait(bufs.store_sem)
 
         last = _entry(p, g.rows, nb, ones)
         nnz = _scalar(last) - _scalar(_entry(p, 0, nb, ones))
@@ -574,7 +599,6 @@ class _SparseGemm(torch.nn.Module):
                 [1] * (nb + 1),
                 count=[1] * nb + [nnz],
             )
-            voyager.async_wait(bufs.store_sem)
 
         voyager.insert(
             base_ref.reshape(ones + (1, 1)).clone(),
@@ -603,6 +627,16 @@ class _SparseGemm(torch.nn.Module):
             n_in = len(self.plan.in_specs)
             out_slots = slots[n_in : n_in + len(self.plan.out_specs)]
             tail = _EpilogueTail(self, idx, out_slots)
+        if self.chain_epilogue:
+            # The previous finalize's store DMAs drained under the rounds
+            # between; consume their posts before this finalize's pass
+            # reuses the staging tiles.  The first finalize has none in
+            # flight; the last round's stores drain in ``forward``.
+            effect_cond(
+                (idx[self.grid_k] == self.plan.num_k - 1)
+                & self._prior_finalize(idx),
+                self._drain_csr_stores,
+            )
         self._scratch_and_kernel(tail)[1](idx, *slots)
         if self.chain_epilogue:
             # The chained pass staged this tile's CSR; its DMAs and
@@ -660,6 +694,17 @@ class _SparseGemm(torch.nn.Module):
                 bufs.store_indptr_tile,
                 self._offset_at(idx, 0),
             ]
+            # Consume the previous finalize's store posts before this
+            # step's finalize commit is enqueued: the pass reuses the
+            # staging tiles as its destinations, and the commit runs
+            # only after its dispatch, so enqueue-after-drain orders the
+            # overwrite behind the DMAs.  By now those DMAs have had the
+            # reduction rounds between to drain, so the waits are free.
+            effect_cond(
+                (idx[self.grid_k] == self.plan.num_k - 1)
+                & self._prior_finalize(idx),
+                self._drain_csr_stores,
+            )
         self._scratch_and_kernel(tail)[1](
             idx, tiles, out_slots, scratch, deps, out_sems, post
         )
@@ -738,6 +783,10 @@ class _SparseGemm(torch.nn.Module):
             # already waited that commit's post, so it stores here.  The
             # final coordinate is every grid dim at its maximum.
             self._store_staged_csr([g - 1 for g in self.plan.grid], 0)
+        if self.chain_epilogue:
+            # The last finalize's stores are still in flight, and the
+            # consumer's nest reads the CSR next.
+            self._drain_csr_stores()
         scale, inliers = (dense if isinstance(dense, tuple) else (dense,))[:2]
         return (
             bufs.csr_data,
