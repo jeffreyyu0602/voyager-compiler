@@ -51,8 +51,8 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _Bufs,
-    _check_block_budget,
     _entry,
+    _fit_block_budget,
     _Geometry,
     _QUANTIZE_MX_OUTLIER,
     _scalar,
@@ -270,6 +270,13 @@ class _SparseGemm(torch.nn.Module):
 
             self.epi_q_args = [resolve(a) for a in qnode.args[1:]]
             self.epi_q_kwargs = {k: resolve(v) for k, v in qnode.kwargs.items()}
+            # A fitted budget reaches the per-sub-slice calls through their
+            # ``max_pct``; an unfitted geometry leaves the op's own
+            # arguments untouched.
+            if out_geom.op_max_pct != out_geom.max_pct:
+                if len(qnode.args) > 9:
+                    self.epi_q_args = self.epi_q_args[:8]
+                self.epi_q_kwargs["max_pct"] = ("lit", out_geom.op_max_pct)
         # The CSR-store epilogue runs bare in the loop body after the
         # commit — its DMAs, waits and stream bookkeeping cannot live in a
         # commit subgraph — which requires a single-slot scratch
@@ -858,15 +865,14 @@ def _epilogue_geometry(node, plan, tiler) -> _Geometry:
         budget=int(plan.tile_m * tk * max_pct),
         max_pct=max_pct,
     )
-    # The tile search has already run, so the submodule carries the GEMM's real
-    # output -- what the quantize will see, and the only chance to catch a
-    # block that does not fit before ``_pad_csr`` silently drops its tail.
-    _check_block_budget(
+    # The tile search has already run, so the submodule carries the GEMM's
+    # real output -- what the quantize will see, and the only chance to size
+    # a block that does not fit before ``_pad_csr`` silently drops its tail.
+    return _fit_block_budget(
         getattr(qnode.args[0], "value", None),
         qnode.args[8] if len(qnode.args) > 8 else None,
         geom,
     )
-    return geom
 
 
 def _retarget_csr_views(node) -> None:

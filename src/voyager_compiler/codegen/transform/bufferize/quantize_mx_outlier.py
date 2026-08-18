@@ -40,7 +40,7 @@ its CSR is independent and its pointers restart at zero.
 
 import logging
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import torch
@@ -136,8 +136,11 @@ class _Geometry:
             each block's columns land inside the weight tile.
         block_size: Microscaling block size, which ``tk`` must be a multiple of.
         budget: Nonzeros one block may hold, the cap ``_pad_csr`` enforces.
-        max_pct: Fraction of a tile the outliers may occupy, which sets both
-            ``budget`` and the declared buffer length.
+            The block's proportional share of the stream, unless
+            ``_fit_block_budget`` grew it to hold the calibration
+            activation's worst block.
+        max_pct: Fraction of the whole matrix the declared stream holds; the
+            graph-level op's own bound.
         dropped: Leading batch dims a reshape removed between the producer and
             this consumer; 0 on a producer's own geometry.
     """
@@ -156,13 +159,6 @@ class _Geometry:
     # consumer's own rank.
     dropped: int = 0
 
-    def __post_init__(self):
-        if self.packed > self.stream:
-            raise ValueError(
-                f"packed CSR stream {self.packed} exceeds the declared "
-                f"{self.stream} entries at rows={self.rows} tk={self.tk}"
-            )
-
     @property
     def n_rb(self) -> int:
         return self.M // self.rows
@@ -172,20 +168,30 @@ class _Geometry:
         return self.K // self.tk
 
     @property
-    def packed(self) -> int:
-        """Entries one batch element's packed blocks actually occupy."""
-        return self.n_rb * self.n_k * self.budget
-
-    @property
     def stream(self) -> int:
         """Declared length of one batch element's ``data`` / ``indices``.
 
         The op's own bound, which the rest of the graph is already built
         against -- a view flattening the batch dim, and a consumer's operand
-        buffers, both carry it as a literal.  The packed blocks occupy a prefix
-        of it: each block's budget truncates, so ``packed`` is never larger.
+        buffers, both carry it as a literal.  The packed blocks occupy a
+        prefix of it sized by the real nonzero counts; with a fitted
+        ``budget`` the blocks at their caps would collectively overrun it,
+        but the calibrated global rate holds the occupancy far below the
+        bound.
         """
         return int(self.M * self.K * self.max_pct)
+
+    @property
+    def op_max_pct(self) -> float:
+        """``max_pct`` for a per-tile op call, sized so the call pads its
+        block to exactly ``budget`` entries.  ``max_pct`` itself when the
+        budget is the block's proportional share; else a fraction that
+        lands on ``budget`` after the op's ``int(rows * tk * pct)`` (the
+        half-entry offset absorbs float rounding either way).
+        """
+        if self.budget == int(self.rows * self.tk * self.max_pct):
+            return self.max_pct
+        return (self.budget + 0.5) / (self.rows * self.tk)
 
     @property
     def nb(self) -> int:
@@ -197,26 +203,33 @@ class _Geometry:
         return (1,) * self.nb
 
 
-def _check_block_budget(act, threshold, geom) -> None:
-    """Raise unless the worst block of ``act`` fits ``geom.budget``.
+def _fit_block_budget(act, threshold, geom) -> _Geometry:
+    """Grow ``geom.budget`` to hold the worst block of ``act``, if it must.
 
     Outliers concentrate by channel, so a K slice covering outlier-heavy
     channels holds far more than the whole tensor's average rate -- the
-    ``max_pct`` a block's capacity is derived from. ``_pad_csr`` truncates such
-    a block rather than raising, because shape propagation runs a nest over
-    buffers no step has written yet and would read uninitialized memory as
-    nearly all-outlier; the activation here is the live one, so this is where
-    an undersized budget is caught.
+    proportional share ``budget`` starts from. ``_pad_csr`` truncates an
+    overfull block rather than raising, because shape propagation runs a
+    nest over buffers no step has written yet and would read uninitialized
+    memory as nearly all-outlier; the activation here is the live one, so
+    this is where the real capacity is read off. The declared stream keeps
+    the op's own ``max_pct`` bound — only the per-block cap (and the
+    on-chip windows sized from it) grows.
 
     Args:
         act: The tensor the quantize sees, ``[*batch, M, K]``; ``None`` when
-            no value reached this node, which leaves nothing to check.
+            no value reached this node, which leaves the share in place.
         threshold: Magnitude above which an element is an outlier; ``None``
-            disables the check, there being no CSR.
-        geom: The producer's geometry, giving the block shape and its budget.
+            means no CSR, nothing to fit.
+        geom: The producer's geometry, with ``budget`` at the block's
+            proportional share of the stream.
+
+    Returns:
+        ``geom``, its ``budget`` raised to the calibration worst block when
+        that exceeds the share.
     """
     if act is None or threshold is None or act.is_meta:
-        return
+        return geom
     counts = (
         act.abs()
         .gt(threshold)
@@ -224,12 +237,18 @@ def _check_block_budget(act, threshold, geom) -> None:
         .sum(dim=(-3, -1))
     )
     worst = int(counts.max())
-    if worst > geom.budget:
-        raise ValueError(
-            f"a {geom.rows}x{geom.tk} block holds up to {worst} outliers but "
-            f"its budget is {geom.budget} ({geom.max_pct:.0%} of the block); "
-            f"widen the k tile to pool more channels, or raise max_pct"
-        )
+    if worst <= geom.budget:
+        return geom
+    logger.warning(
+        "a %dx%d block holds up to %d outliers (%.1f%% of the block); "
+        "raising its budget from the %d-entry share to fit",
+        geom.rows,
+        geom.tk,
+        worst,
+        100 * worst / (geom.rows * geom.tk),
+        geom.budget,
+    )
+    return replace(geom, budget=worst)
 
 
 class _Bufs:
@@ -815,7 +834,7 @@ def build_quantize_mx_outlier(
         max_pct=max_pct,
     )
     threshold = get_arg_value(qnode, 8, "threshold")
-    _check_block_budget(act, threshold, geom)
+    geom = _fit_block_budget(act, threshold, geom)
 
     # Operand roles. The activation tiles along the row-block grid dim and
     # keeps K whole (the inner loop dices it); codebooks load whole.
@@ -881,7 +900,7 @@ def build_quantize_mx_outlier(
             get_arg_value(qnode, 4, "quant_max"),
             get_arg_value(qnode, 5, "force_scale_power_of_two", False),
             threshold,
-            max_pct,
+            geom.op_max_pct,
         ),
         out_dtypes=(vals[0].dtype, vals[3].dtype, vals[4].dtype),
         mid_dtype=act.dtype,
