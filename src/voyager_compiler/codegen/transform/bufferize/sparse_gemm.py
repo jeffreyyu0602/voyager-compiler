@@ -84,15 +84,16 @@ class _EpilogueTail(torch.nn.Module):
     its search picked.  Wrapping rather than threading extra arguments keeps
     the tail's arity: the reduction kernel applies it inside a ``torch.cond``
     on the last reduction step and calls it with the group's own operands.
-    The offset and the grid index it needs are captured here instead, which
-    is also what puts the stores on the step that actually completes an
-    output tile.
+    The offset, the grid index and the output slots it needs are captured
+    here instead, which is also what puts the stores on the step that
+    actually completes an output tile.
     """
 
-    def __init__(self, owner, idx):
+    def __init__(self, owner, idx, out_slots):
         super().__init__()
         self.owner = owner
         self.idx = idx
+        self.out_slots = out_slots
 
     def forward(self, acc, *operands):
         o = self.owner
@@ -108,9 +109,9 @@ class _EpilogueTail(torch.nn.Module):
         # A value shared by several sub-slices must cross a *buffer*: DPS
         # outlining grows one op per store, and ops sharing an SSA edge
         # cannot come out disjoint.  So with several sub-slices the prefix
-        # result lands in a staging buffer the slices window, and each
-        # slice's scale / inlier tiles land in a full-tile staging buffer
-        # the kernel then moves into the output slot.
+        # result lands in a staging buffer the slices window; each slice's
+        # scale / inlier results then write their own column window of the
+        # output slots directly.
         if o.epi_prefix is None:
             x = acc
         elif o.n_sub == 1:
@@ -119,6 +120,7 @@ class _EpilogueTail(torch.nn.Module):
             voyager.insert(o.epi_prefix(*bound), bufs.epi_mid)
             x = None
 
+        scale_slot, inlier_slot = self.out_slots
         for j in range(o.n_sub):
             if x is None:
                 tile = voyager.subview(
@@ -145,7 +147,7 @@ class _EpilogueTail(torch.nn.Module):
             voyager.insert(
                 s,
                 voyager.subview(
-                    bufs.epi_scale_tile,
+                    scale_slot,
                     [0] * nb + [0, j * sb],
                     ones + (og.rows, sb),
                     (1,) * (nb + 2),
@@ -155,14 +157,14 @@ class _EpilogueTail(torch.nn.Module):
             voyager.insert(
                 q,
                 voyager.subview(
-                    bufs.epi_out_tile,
+                    inlier_slot,
                     [0] * nb + [0, j * og.tk],
                     ones + (og.rows, og.tk),
                     (1,) * (nb + 2),
                     [],
                 ),
             )
-        return bufs.epi_scale_tile, bufs.epi_out_tile
+        return None
 
 
 class _SparseGemm(torch.nn.Module):
@@ -360,13 +362,9 @@ class _SparseGemm(torch.nn.Module):
         bidx = [idx[i] for i in range(nb)]
         m_c, k = idx[self.grid_m], idx[self.grid_k]
 
-        # The loaded pointer tile is a slot window, so an entry read off it
-        # would window a window (see ``_scalar``); stage it first.
-        ptr = slots[plan.kw_idx["A_indptr"]]
-        voyager.insert(
-            ptr.reshape(ones + (plan.tile_m + 1,)).clone(), bufs.gather_ptr_tile
-        )
-        p = bufs.gather_ptr_tile
+        # The pointer tile's slice axis is addressing, not data (see
+        # ``gemm_kernel``); entry reads window the loaded slot directly.
+        p = slots[plan.kw_idx["A_indptr"]].reshape(ones + (plan.tile_m + 1,))
         lo = _scalar(_entry(p, 0, nb, ones))
 
         sems = []
@@ -402,9 +400,8 @@ class _SparseGemm(torch.nn.Module):
                     )
                     sem = bufs.gather_sem
                 else:
-                    # The slot offset composes into one subview: a window of
-                    # a ``get_slot`` window could not fold into a single
-                    # ``TensorBoxRef``.
+                    # The slot offset and the block window compose into one
+                    # subview of the staging buffer.
                     window = voyager.subview(
                         dst,
                         [parity] + [0] * nb + [start],
@@ -530,7 +527,10 @@ class _SparseGemm(torch.nn.Module):
             self._gather(idx, slots)
         tail = self.plan.fused_gm
         if self.out_geom is not None:
-            tail = _EpilogueTail(self, idx)
+            # The scheduler passes ``*in_slots, *out_slots, *scratch``.
+            n_in = len(self.plan.in_specs)
+            out_slots = slots[n_in : n_in + len(self.plan.out_specs)]
+            tail = _EpilogueTail(self, idx, out_slots)
         self._scratch_and_kernel(tail)[1](idx, *slots)
 
     def _async_kernel(
@@ -559,7 +559,7 @@ class _SparseGemm(torch.nn.Module):
             tiles.append(get_slot(self._bufs.gather_indices, parity))
         tail = self.plan.fused_gm
         if self.out_geom is not None:
-            tail = _EpilogueTail(self, idx)
+            tail = _EpilogueTail(self, idx, out_slots)
         self._scratch_and_kernel(tail)[1](
             idx, tiles, out_slots, scratch, deps, out_sems, post
         )
@@ -585,9 +585,6 @@ class _SparseGemm(torch.nn.Module):
             )
             bufs.base_table = voyager.alloc(
                 base_table_shape(g), torch.int32, _SRAM
-            )
-            bufs.gather_ptr_tile = voyager.alloc(
-                list(g.ones) + [self.plan.tile_m + 1], torch.int32, _SRAM
             )
             bufs.gather_sem = voyager.zeros([], torch.int64, sem_slots)
 
@@ -624,23 +621,11 @@ class _SparseGemm(torch.nn.Module):
                 list(og.ones) + [og.rows + 1], torch.int32, _SRAM
             )
             # Sub-slice staging (see ``_EpilogueTail``): the shared prefix
-            # result, and the reassembled scale / inlier column tiles.
+            # result.
             if self.epi_prefix is not None and self.n_sub > 1:
                 bufs.epi_mid = voyager.alloc(
                     list(og.ones) + [og.rows, self.plan.tile_n],
                     self.plan.out_dtype,
-                    _SRAM,
-                )
-            if self.n_sub > 1:
-                bufs.epi_scale_tile = voyager.alloc(
-                    list(og.ones)
-                    + [og.rows, self.plan.tile_n // og.block_size],
-                    vals[3].dtype,
-                    _SRAM,
-                )
-                bufs.epi_out_tile = voyager.alloc(
-                    list(og.ones) + [og.rows, self.plan.tile_n],
-                    vals[4].dtype,
                     _SRAM,
                 )
         self._bufs = bufs

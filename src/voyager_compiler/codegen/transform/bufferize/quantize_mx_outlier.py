@@ -104,8 +104,7 @@ def _scalar(t: torch.Tensor):
     runs under fake tracing; the aten op yields the unbacked symbol directly.
     """
     if t.numel() == 1:
-        # Already one element: indexing it would window a window, which a
-        # TensorBoxRef cannot carry.
+        # Already one element: indexing it would only stack a second window.
         return torch.ops.aten._local_scalar_dense.default(t)
     return torch.ops.aten._local_scalar_dense.default(t.reshape(-1)[0])
 
@@ -307,13 +306,13 @@ class _OutlierProducer(torch.nn.Module):
 
     def _kernel(self, idx, *slots):
         """One row block: run whatever was fused, then sweep its K slices."""
-        mid = self._bufs.row_block
         if self.prefix_gm is None:
-            # The loaded tile is a slot window already, and the K slice below
-            # would window a window (see ``_scalar``); stage it into a buffer
-            # of its own instead.
-            voyager.insert(slots[self.act_idx].clone(), mid)
+            # No fused prefix: the loaded tile itself is the intermediate
+            # the slices window (a K-slice subview composes with the slot's
+            # own window into one reference).
+            mid = slots[self.act_idx]
         else:
+            mid = self._bufs.row_block
             voyager.insert(self.prefix_gm(*slots), mid)
         self._slice_loop(idx, mid, slots)
 
@@ -479,9 +478,11 @@ class _OutlierProducer(torch.nn.Module):
             list(g.batch) + [g.M, g.K], self.inlier_dtype
         )
 
-        bufs.row_block = voyager.alloc(
-            list(g.ones) + [g.rows, g.K], self.mid_dtype, _SRAM
-        )
+        # The fused prefix's result; a bare quantize slices the loaded tile.
+        if self.prefix_gm is not None:
+            bufs.row_block = voyager.alloc(
+                list(g.ones) + [g.rows, g.K], self.mid_dtype, _SRAM
+            )
         # ``alloc`` rather than ``zeros``: a ``zeros`` is read as a semaphore
         # buffer and carries no memory space, so an ``insert`` into one is a
         # tile-store violation. These are tensor buffers the loop writes.

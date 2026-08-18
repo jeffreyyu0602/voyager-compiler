@@ -462,27 +462,104 @@ class _Emitter:
         ``bank_stride_bytes``.  A window over the *whole* referenced buffer is
         the buffer, and is left off.  ``squeeze_dim`` is not addressing — it is
         the rank the *tensor* takes, and the bytes it names are the same.
+
+        A subview of a source that already carries a window (a tile's
+        sub-slice picked off a ``get_slot`` slot) folds into the one window
+        the reference carries — see ``_compose_window``.
         """
         source, offsets, sizes, strides = node.args[:4]
         ref = self._ref(source, env, internal)
-        if ref.offsets:
-            raise ValueError(
-                f"'{node.name}' windows '{source.name}', which is already a "
-                f"window of '{ref.box.node}': a TensorBoxRef carries one "
-                f"window, so the two would have to be composed"
-            )
         shape = list(_value(source).shape)
         if (
             all(o == 0 for o in offsets)
             and list(sizes) == shape
             and all(s == 1 for s in strides)
         ):
-            return ref  # the whole buffer
-
+            return ref  # the whole window (or buffer)
+        if ref.offsets:
+            return self._compose_window(
+                node, ref, shape, offsets, sizes, strides, env
+            )
         ref.offsets.extend(self._scalar(o, env) for o in offsets)
         ref.sizes.extend(int(s) for s in sizes)
         ref.strides.extend(int(s) for s in strides)
         return ref
+
+    def _compose_window(
+        self, node, ref, shape, offsets, sizes, strides, env
+    ) -> TensorBoxRef:
+        """Fold a subview of an already-windowed source into the one window a
+        ``TensorBoxRef`` carries.
+
+        The carried window addresses the buffer's rank, while the new subview
+        indexes the tensor rank its source presents — the carried window's
+        squeezed size-1 dims dropped.  Dims are matched greedily by size,
+        which is unambiguous because an offset into a size-1 dim can only be
+        0.  Per matched dim the offsets add (the new one scaled by the
+        carried stride), the strides multiply, and the new sizes stand.  A
+        composed offset must still be one ``ScalarValue``: two literals sum,
+        and a runtime scalar absorbs a zero; a dim both windows offset at
+        runtime (or a runtime offset over a strided or offset dim) has no
+        single scalar to carry, and raises.
+        """
+        composed = TensorBoxRef()
+        composed.CopyFrom(ref)
+        del composed.offsets[:]
+        del composed.sizes[:]
+        del composed.strides[:]
+        j = 0
+        for inner_off, inner_size, inner_stride in zip(
+            ref.offsets, ref.sizes, ref.strides
+        ):
+            if j >= len(shape) or inner_size != shape[j]:
+                if inner_size != 1:
+                    raise ValueError(
+                        f"'{node.name}': the windowed source's shape "
+                        f"{shape} does not match the carried window's "
+                        f"sizes {list(ref.sizes)}"
+                    )
+                # A squeezed dim of the carried window: the new subview
+                # never sees it, so it passes through unchanged.
+                composed.offsets.append(inner_off)
+                composed.sizes.append(inner_size)
+                composed.strides.append(inner_stride)
+                continue
+            outer_off = offsets[j]
+            outer_size = int(sizes[j])
+            outer_stride = int(strides[j])
+            j += 1
+            inner_literal = (
+                inner_off.int_value
+                if inner_off.WhichOneof("value") == "int_value"
+                else None
+            )
+            if not isinstance(outer_off, Node) and inner_literal is not None:
+                off = ScalarValue(
+                    int_value=inner_literal + int(outer_off) * int(inner_stride)
+                )
+            elif (
+                isinstance(outer_off, Node)
+                and inner_literal == 0
+                and int(inner_stride) == 1
+            ):
+                off = self._scalar(outer_off, env)
+            elif not isinstance(outer_off, Node) and int(outer_off) == 0:
+                off = inner_off
+            else:
+                raise ValueError(
+                    f"'{node.name}' offsets a dim of '{ref.box.node}' whose "
+                    f"window already offsets it at runtime: the sum does "
+                    f"not fit one ScalarValue"
+                )
+            composed.offsets.append(off)
+            composed.sizes.append(outer_size)
+            composed.strides.append(int(inner_stride) * outer_stride)
+        if j != len(shape):
+            raise ValueError(
+                f"'{node.name}': the windowed source's shape {shape} does "
+                f"not match the carried window's sizes {list(ref.sizes)}"
+            )
+        return composed
 
     def _scalar(self, value, env) -> ScalarValue:
         """``value`` as a scalar operand — a literal, or the SSA name of one

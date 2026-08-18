@@ -1370,6 +1370,10 @@ def _map_kernel(
         in_slots = args[: end - num_outputs]
         out_slots = args[end - num_outputs : end]
         results = compute(*in_slots, *args[end:])
+        if results is None:
+            # The compute wrote the output slots itself (a CSR-producing
+            # epilogue): nothing left to store.
+            return
         if not isinstance(results, (tuple, list)):
             results = (results,)
         for slot, value in zip(out_slots, results):
@@ -1609,11 +1613,14 @@ def _reduction_fused_kernel(
 
     def _finalize(in_slots, out_slots, scratch):
         """Cast the completed accumulator, apply the fused tail once, and store
-        each output."""
+        each output.  A tail that writes the output slots itself returns
+        ``None``, leaving nothing to store."""
         outs = scratch if op_dtype is None else scratch.to(op_dtype)
         if fused_gm is not None:
             fused = [in_slots[i] for i in fused_operand_indices]
             outs = fused_gm(outs, *fused)
+            if outs is None:
+                return
         if not isinstance(outs, (tuple, list)):
             outs = (outs,)
         for slot, out in zip(out_slots, outs):
