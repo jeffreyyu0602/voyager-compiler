@@ -316,6 +316,8 @@ _IF_DIMS = (le.OX, le.OY, le.IC, le.ON)
 _FL_DIMS = (le.OC, le.IC, le.FX, le.FY)
 _OF_DIMS = (le.OC, le.OY, le.OX, le.ON)
 
+_QUANTIZE_MX_OUTLIER = torch.ops.quantized_ops.quantize_mx_outlier.default
+
 
 def output_is_psum(point, level):
     """Whether the output stored at ``level`` is still a partial sum: it is,
@@ -341,6 +343,7 @@ def make_size_fn(
     batch=1,
     weight_batch=1,
     outlier_pct=0.0,
+    out_outlier_pct=0.0,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -386,6 +389,13 @@ def make_size_fn(
         of_scale_dtype, of_dtype = out_dtype[-2], out_dtype[-1]
     else:
         of_scale_dtype, of_dtype = None, out_dtype
+    # A CSR-producing tail returns (data, indices, indptr, scale, inliers).
+    # One staged entry is an outlier value plus its column index.
+    out_csr_bits = (
+        get_dtype_width(out_dtype[0]) + get_dtype_width(out_dtype[1])
+        if isinstance(out_dtype, (list, tuple)) and len(out_dtype) == 5
+        else 0
+    )
     if_bits = _node_dtype_bits(node.args[0])
     fl_bits = _node_dtype_bits(node.args[1])
     of_bits = get_dtype_width(of_dtype) if of_dtype else _node_dtype_bits(node)
@@ -499,6 +509,22 @@ def make_size_fn(
                     _OF,
                     slots(dims, distinct),
                     {("fused", i)},
+                )
+            )
+
+        # A CSR the tail emits stages before its packed stores: one region
+        # (refilled within a round, so not ``num_slots``) for a block's
+        # (value, index) pairs, row pointers and stream bookkeeping.  The
+        # quantize sees the output tile, so the budget follows it.
+        if out_csr_bits:
+            rows = of_count / max(1.0, extent(le.OC))
+            groups.append(
+                (
+                    of_count * out_outlier_pct * out_csr_bits / 8.0
+                    + (rows + 1) * 4,
+                    _OF,
+                    1,
+                    {"csr_out"},
                 )
             )
 
@@ -1113,20 +1139,24 @@ def _prepare_search(node, tiler):
     # tile even for a single-round reduction (``_gemm_scratch_and_kernel``);
     # the footprint model must charge that region for unsplit mappings too.
     staged_tail = stream_breaking_quantize(sub_gm, in_place=False) is not None
-    if not staged_tail and sub_gm is not None:
+    # The tail's own ``quantize_mx_outlier``, if it has one: this group is
+    # then a CSR producer as well as (possibly) a consumer.
+    out_quant = None
+    if sub_gm is not None:
+        out_quant = next(
+            (n for n in sub_gm.graph.nodes if n.target is _QUANTIZE_MX_OUTLIER),
+            None,
+        )
+    if not staged_tail and out_quant is not None:
         # A CSR-producing epilogue (``_EpilogueTail``) re-dices its tile at
-        # the consumers' slice width: ops between the anchor and its
-        # ``quantize_mx_outlier`` run once on the whole tile, and their
-        # result is staged in the scratch whenever a slice is finer than
-        # the column tile.  The slice count is a consumer property the
-        # search cannot see, so every prefixed producer tail charges the
-        # staged region.
-        staged_tail = any(
-            n.op == "call_function"
-            and n.target is torch.ops.quantized_ops.quantize_mx_outlier.default
-            and isinstance(n.args[0], torch.fx.Node)
-            and n.args[0].target is not anchor.target
-            for n in sub_gm.graph.nodes
+        # the consumers' slice width: ops between the anchor and the
+        # quantize run once on the whole tile, and their result is staged in
+        # the scratch whenever a slice is finer than the column tile.  The
+        # slice count is a consumer property the search cannot see, so every
+        # prefixed producer tail charges the staged region.
+        staged_tail = (
+            isinstance(out_quant.args[0], torch.fx.Node)
+            and out_quant.args[0].target is not anchor.target
         )
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
@@ -1147,6 +1177,23 @@ def _prepare_search(node, tiler):
         rows, cols = anchor.args[0].value.shape[-2:]
         outlier_pct = a_data.value.shape[-1] / (rows * cols)
 
+    # A CSR producer's stream is unquantized, so ``meta["dtype"]`` leaves its
+    # entries empty; resolve them against the traced values (the rule
+    # ``_node_dtype_bits`` documents) to price the store staging.
+    out_outlier_pct = 0.0
+    if out_quant is not None:
+        out_outlier_pct = get_arg_value(out_quant, 9, "max_pct", 0.01)
+        vals = getattr(node, "value", None)
+        if isinstance(vals, (list, tuple)):
+            tracked = (
+                out_dtype
+                if isinstance(out_dtype, (list, tuple))
+                else [None] * len(vals)
+            )
+            out_dtype = [
+                d if d is not None else v.dtype for d, v in zip(tracked, vals)
+            ]
+
     key = _layer_cache_key(anchor) + (
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
@@ -1154,6 +1201,7 @@ def _prepare_search(node, tiler):
         staged_tail,
         oc_align,
         outlier_pct,
+        out_outlier_pct,
     )
 
     if key in tiler.cache:
@@ -1231,6 +1279,7 @@ def _prepare_search(node, tiler):
             batch=batch,
             weight_batch=batch // weight_repeat,
             outlier_pct=outlier_pct,
+            out_outlier_pct=out_outlier_pct,
         )
         for extra_sharing in range(4 + len(fused_specs))
     ]

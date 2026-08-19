@@ -62,7 +62,9 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     PipelinedKernel,
+    _bank_group_list,
     _DEFAULT_NUM_SLOTS,
+    _stamp_bank_groups,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _compute_input_spec,
@@ -947,6 +949,22 @@ def build_quantize_mx_outlier(
     with _lenient_verifier():
         gm = export_model(producer, inputs)
     gm = _finalize_exported_gm(gm)
+    # This nest's per-block staging tiles are the outputs the search already
+    # sized -- ``_build_vector_op_shape_map`` tiles every one of the five --
+    # so they take the bank it charged for them, with the stream bookkeeping
+    # riding along.  The fused prefix's row-block intermediate is uncharged
+    # and stays loose.  Order tracks ``_OutlierProducer.forward``.
+    groups = node.meta.get("bank_groups")
+    if groups is not None:
+        out_group = next(
+            (i for i, members in enumerate(groups) if node in members), None
+        )
+        hand_groups = [None] if prefix_gm is not None else []
+        # slice_nnz, stream_pos, base_table, then the five staging tiles
+        hand_groups += [out_group] * 8
+        _stamp_bank_groups(
+            gm, hand_groups + _bank_group_list(node, in_specs, [])
+        )
     _tag_loop_extents(gm, [[(0, producer.num_steps, 1)], [(0, geom.n_k, 1)]])
     tag_base_table(gm, node.name, base_table_shape(geom))
     # The consumer has to know how the stream was diced -- how many blocks span
