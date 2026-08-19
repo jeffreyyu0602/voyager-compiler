@@ -7,6 +7,7 @@ import sys
 import torch
 import torch.nn as nn
 from datasets import load_dataset
+from torch.testing import assert_close
 from torch.utils._pytree import tree_flatten
 from torchao.quantization.pt2e.quantizer.utils import (
     annotate_output_qspec as _annotate_output_qspec,
@@ -82,6 +83,15 @@ def _is_constant_div(node):
 
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
 QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
+
+# Tolerance for comparing the lowered graph's output against the original's.
+# Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
+# mantissa bits away from the reference one (an ulp is 2**-8 relative, and a
+# split reduction compounds several); the two are numerically equivalent but
+# not bit-identical.  Exceeding this warns rather than fails, since telling a
+# real lowering error from an unlucky accumulation needs a human.
+OUTPUT_RTOL = 5e-2
+OUTPUT_ATOL = 1e-4
 
 VECTOR_PIPELINE = [
     [
@@ -746,10 +756,28 @@ def main():
         return
 
     try:
-        assert torch.all(old_output == new_output)
-        print("Results match")
+        old_flat, old_spec = tree_flatten(old_output)
+        new_flat, new_spec = tree_flatten(new_output)
+        n_old, n_new = len(old_flat), len(new_flat)
+        assert n_old == n_new, f"{n_old} outputs became {n_new}"
+        # The reference comes from ShapeProp, which hands back the output
+        # node's value and so keeps the graph's output tuple, while calling
+        # the module unwraps a single-element one.  Only the leaves matter.
+        if old_spec != new_spec:
+            print(f"Note: output structure {old_spec} vs {new_spec}")
+        worst = 0.0
+        for old, new in zip(old_flat, new_flat):
+            if not isinstance(old, torch.Tensor):
+                assert old == new, f"non-tensor output {old!r} != {new!r}"
+                continue
+            deviation = (new - old).abs().to(torch.float32) / (
+                old.abs().to(torch.float32) + OUTPUT_ATOL
+            )
+            worst = max(worst, deviation.max().item())
+            assert_close(new, old, rtol=OUTPUT_RTOL, atol=OUTPUT_ATOL)
+        print(f"Results match (max deviation {worst:.2e})")
     except Exception as e:
-        print(e)
+        print(f"WARNING: output verification failed: {e}")
         print(old_output)
         print(new_output)
 

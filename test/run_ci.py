@@ -98,6 +98,7 @@ _LLM_MP = _LLM + " --enable_mixed_precision"
 _LLM_SPMM = _LLM_MP + " --outlier_pct 0.01"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
+_LLM_SPMM_DB = _LLM_SPMM + " " + _DB
 
 
 @dataclass(frozen=True)
@@ -140,10 +141,14 @@ COMMANDS = [
     Command("resnet50", "MXNF4", "64,64"),
     Command("vit", "MXNF4", "64,64"),
     Command("bert", "MXNF4", "64,64"),
-    # -- double-buffered L2 (conv / prefill / decode each pipeline apart) --
+    # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
+    # pipeline apart) --
     Command("resnet18", "MXNF4", "64,64", "resnet18_db", _DB),
     Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
     Command("llm_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
+    Command(
+        "llm_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
+    ),
 ]
 
 # Timestamp folder format; lexicographic sort == chronological sort.
@@ -188,11 +193,14 @@ def _build(command, run_dir):
 
     The argv runs this repo's test_codegen.py with --model_output_dir pointed
     into the timestamped run folder; --dump_tensors is never added.
+    ``--debug`` is always added: without it test_codegen never evaluates the
+    lowered graph, so the run checks codegen only and no numeric comparison
+    happens at all.
     """
     label = _label(command)
     dest = run_dir / label
 
-    argv = [sys.executable, str(TEST_CODEGEN), command.model]
+    argv = [sys.executable, str(TEST_CODEGEN), command.model, "--debug"]
     argv += shlex.split(SCHEME_ARGS[command.scheme])
     argv += ["--pe_array_size", command.unrolling]
     argv += shlex.split(command.extra)
@@ -211,7 +219,11 @@ def _run_one(label, dest, argv):
     """Run one command; capture combined output to ``dest/run.log``.
 
     Returns a status string: ``ok`` / ``error`` (nonzero exit) /
-    ``no_output`` (exited 0 but no model.txt).
+    ``no_output`` (exited 0 but no model.txt) / ``numeric_drift`` (the
+    lowered graph's output left test_codegen's tolerance) / ``unverified``
+    (the model ran no comparison despite --debug).  test_codegen only warns
+    about the last two, so they have to be read back out of the log; neither
+    fails the run.
     """
     dest.mkdir(parents=True, exist_ok=True)
     log_path = dest / "run.log"
@@ -226,6 +238,11 @@ def _run_one(label, dest, argv):
         return "error"
     if not (dest / "model.txt").exists():
         return "no_output"
+    log = log_path.read_text()
+    if "Skipping output verification" in log:
+        return "unverified"
+    if "Results match" not in log:
+        return "numeric_drift"
     return "ok"
 
 
@@ -245,7 +262,7 @@ def _compare(label, status, run_dir, prev_run):
     Returns ``(verdict, diff_excerpt)``.  ``diff_excerpt`` is non-empty only
     for a MISMATCH.
     """
-    if status != "ok":
+    if status in ("error", "no_output"):
         return "FAILED", ""
 
     cur = (run_dir / label / "model.txt").read_text()
@@ -377,6 +394,14 @@ def _build_report(results, run_dir, prev_run):
         if excerpt:
             for dl in excerpt.splitlines():
                 lines.append(f"      {dl}")
+
+    # Numeric warnings: reported, never gated.
+    warned = [r for r in results if r[1] in ("numeric_drift", "unverified")]
+    if warned:
+        lines.append("")
+        lines.append("numeric warnings (not gated):")
+        for label, status, _, _ in warned:
+            lines.append(f"  - {status}: {label} [see {label}/run.log]")
 
     # Labels present in the previous run but absent now.
     if prev_run is not None:
