@@ -17,6 +17,10 @@ those space-annotated buffers/tiles into a concrete map:
     boundaries.  A software-pipelined buffer is one alloc of ``num_slots``
     slots, laid out contiguously: slot ``i`` sits at ``base + i *
     slot_stride``, so the slot a step writes can stay a *runtime* index.
+    On a banked config, buffers stamped with the tile search's bank
+    partition (``meta['bank_group']``) are placed in whole banks at
+    bank-aligned addresses, each pipeline slot in its own bank(s) — see
+    ``_plan_scratchpad``.
 
 The planner does not move values between DRAM and Scratchpad (that is fixed by
 bufferization); it only decides addresses, reuse, and pool sizes.  Addresses are
@@ -181,24 +185,28 @@ class MemoryPlan:
 
 
 def _greedy_best_fit(
-    items: List[Tuple[object, int, int, int]],
+    items: List[Tuple[object, int, int, int, int]],
 ) -> Tuple[Dict[object, int], int]:
     """Assign each item the lowest address free of every overlapping-lifetime
     item.
 
-    ``items`` is ``[(key, size, def_t, last_t), ...]``.  Process largest-first,
-    and place each at the lowest offset that doesn't collide (in address) with
-    an already-placed item whose lifetime overlaps — the standard "greedy by
-    size" offset planner, whose high-water mark approaches the max concurrent
-    demand (so sequential regions collapse onto the same low addresses, rather
-    than each item getting a fresh slot).  Returns ``({key: offset},
+    ``items`` is ``[(key, size, def_t, last_t, align), ...]``.  Process
+    largest-first, and place each at the lowest ``align``-multiple offset that
+    doesn't collide (in address) with an already-placed item whose lifetime
+    overlaps — the standard "greedy by size" offset planner, whose high-water
+    mark approaches the max concurrent demand (so sequential regions collapse
+    onto the same low addresses, rather than each item getting a fresh slot).
+    A bank-grouped scratchpad item passes ``bank_size`` so it occupies whole
+    banks; everything else passes 1.  Returns ``({key: offset},
     total_bytes)``.
     """
     placed: List[Tuple[object, int, int, int, int]] = (
         []
     )  # (key, lo, hi, start, end)
     total = 0
-    for key, size, lo, hi in sorted(items, key=lambda it: (-it[1], it[2])):
+    for key, size, lo, hi, align in sorted(
+        items, key=lambda it: (-it[1], it[2])
+    ):
         occupied = sorted(
             (start, end)
             for _k, a, b, start, end in placed
@@ -206,9 +214,11 @@ def _greedy_best_fit(
         )
         off = 0
         for start, end in occupied:
-            if off + size <= start:  # fits in the gap before this block
+            candidate = math.ceil(off / align) * align
+            if candidate + size <= start:  # fits in the gap before this block
                 break
             off = max(off, end)
+        off = math.ceil(off / align) * align
         placed.append((key, lo, hi, off, off + size))
         total = max(total, off + size)
     return {key: start for key, _lo, _hi, start, _end in placed}, total
@@ -296,7 +306,7 @@ def _plan_dram(model: GraphModule, buffer_of, config) -> int:
 
     # Reusable activation buffers: greedy best-fit, laid out after the
     # persistent region.
-    items = [(b, _nbytes(b, config), def_t[b], last_t[b]) for b in reusable]
+    items = [(b, _nbytes(b, config), def_t[b], last_t[b], 1) for b in reusable]
     placed, reuse_bytes = _greedy_best_fit(items)
     for b in reusable:
         start = offset + placed[b]
@@ -477,6 +487,28 @@ def _buffer_lifetimes(model, buffer_of, order, config) -> Dict[Node, _Buf]:
     return bufs
 
 
+def _bank_group_key(buf: "_Buf"):
+    """The ``(scope, group)`` key of a buffer's searched bank group, or
+    ``None`` for one the search left loose.  ``scope`` is the per-splice nest
+    tag (``bufferize_graph``), so two nests spliced from one cached build
+    never share a group."""
+    for m in buf.members:
+        if (group := m.meta.get("bank_group")) is not None:
+            return (m.meta.get("scope"), group)
+    return None
+
+
+def _slot_payload(buf: "_Buf", config) -> Tuple[int, int]:
+    """One slot's allocated bytes of a scratchpad buffer and its pipeline
+    depth, ``(payload, slots)`` — the whole buffer at depth 1 for an
+    unslotted one.  Sized off the member that set the buffer's size."""
+    m = max(buf.members, key=lambda x: _nbytes(x, config))
+    slots = _slots(m)
+    if slots:
+        return _slot_stride(m, config), slots
+    return _nbytes(m, config), 1
+
+
 def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
     """Pack every Scratchpad buffer with greedy best-fit, exactly like DRAM.
 
@@ -488,20 +520,83 @@ def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
     *structural*: distinct slots are distinct allocs, so simultaneously-live
     slots land at distinct addresses automatically — no per-op
     pipelining strategy
-    or region grouping is needed.  ``config`` (the hardware description) is
-    unread by this baseline packer: the sizes in ``bufs`` already carry its
-    alignment and tail slack.
+    or region grouping is needed.
+
+    A buffer carrying a searched bank group (``meta['bank_group']``, stamped
+    by the builders from the tile search's winning partition) is packed as
+    part of that group instead: the group's members lie side by side in a
+    slot region rounded to whole banks, the region repeats once per pipeline
+    slot (a member shallower than the group occupies region 0 only — the
+    hole is exactly what the search charged), and the group is placed at a
+    bank-aligned base.  Slot ``s`` of every member thus sits in its own whole
+    bank(s), so a ping-ponged load never lands in the bank the compute is
+    reading, and the byte total matches the search's bank-quantized fit
+    check.  A group occupies whole banks at a bank-aligned base, so a loose
+    buffer that is address-disjoint is bank-disjoint from it automatically —
+    one allocator pass places both.
     """
+    bank = config.bank_size
+    groups: Dict[tuple, List[Node]] = {}
+    if bank:
+        for root, buf in bufs.items():
+            if (key := _bank_group_key(buf)) is not None:
+                groups.setdefault(key, []).append(root)
+    in_group = {root for roots in groups.values() for root in roots}
+
     items = [
-        (root, buf.size, buf.def_t, buf.last_t) for root, buf in bufs.items()
+        (root, buf.size, buf.def_t, buf.last_t, 1)
+        for root, buf in bufs.items()
+        if root not in in_group
     ]
+
+    # Slot-major group layout: member offsets within the slot region, the
+    # region rounded to whole banks, and the group's depth.
+    layouts = {}  # key -> (group_slot_bytes, {root: offset})
+    for key, roots in groups.items():
+        offsets, offset, depth = {}, 0, 1
+        for root in roots:
+            payload, slots = _slot_payload(bufs[root], config)
+            offsets[root] = offset
+            offset += payload
+            depth = max(depth, slots)
+        group_slot_bytes = math.ceil(offset / bank) * bank
+        layouts[key] = (group_slot_bytes, offsets)
+        items.append(
+            (
+                ("bank_group", key),
+                depth * group_slot_bytes,
+                min(bufs[r].def_t for r in roots),
+                max(bufs[r].last_t for r in roots),
+                bank,
+            )
+        )
+
     bases, total = _greedy_best_fit(items)
-    for root, base in bases.items():
-        seg = Segment(base, base + bufs[root].size, MemoryLevel.SRAM, root)
-        for m in bufs[root].members:
+
+    for root, buf in bufs.items():
+        if root in in_group:
+            continue
+        base = bases[root]
+        seg = Segment(base, base + buf.size, MemoryLevel.SRAM, root)
+        for m in buf.members:
             m.meta.setdefault("scratchpad", seg)
 
-    return int(total), {"buffers": len(items)}
+    for key, roots in groups.items():
+        base = bases[("bank_group", key)]
+        group_slot_bytes, offsets = layouts[key]
+        for root in roots:
+            payload, slots = _slot_payload(bufs[root], config)
+            start = base + offsets[root]
+            end = start + payload + (slots - 1) * group_slot_bytes
+            seg = Segment(start, end, MemoryLevel.SRAM, root)
+            for m in bufs[root].members:
+                m.meta.setdefault("scratchpad", seg)
+                # The member's slots step by the group's region, not by its
+                # own payload — ``_stamp_slots`` reads this override.
+                if _slots(m):
+                    m.meta["bank_group_stride"] = group_slot_bytes
+
+    return int(total), {"buffers": len(items), "bank_groups": len(groups)}
 
 
 def _buf_desc(buf: "_Buf", config) -> str:
@@ -538,12 +633,17 @@ def _stamp_slots(model: GraphModule, config) -> None:
     ``bank_count`` / ``bank_stride_bytes`` rather than as a tensor dimension.
     A slot is then addressed ``base + slot * meta['slot_stride']``, which is
     what lets a runtime slot index (``step % num_slots``) stay a runtime value.
+    A bank-grouped buffer's slots step by the group's whole slot region
+    (``meta['bank_group_stride']``, set by ``_plan_scratchpad``) rather than
+    by its own payload.
     """
     for node in _walk(model):
         if not (slots := _slots(node)):
             continue
         node.meta["slot_count"] = slots
-        node.meta["slot_stride"] = _slot_stride(node, config)
+        node.meta["slot_stride"] = node.meta.get(
+            "bank_group_stride"
+        ) or _slot_stride(node, config)
 
 
 # ---------------------------------------------------------------------------
@@ -553,12 +653,16 @@ def _stamp_slots(model: GraphModule, config) -> None:
 
 def _check_overlaps(arena: str, items) -> None:
     """Warn if two simultaneously-live buffers share an address range.
-    ``items`` is ``[(name, def_t, last_t, Segment), ...]`` — overlapping
-    lifetimes must map to disjoint address ranges."""
+    ``items`` is ``[(name, def_t, last_t, Segment, group), ...]`` —
+    overlapping lifetimes must map to disjoint address ranges.  Two members
+    of one searched bank group (equal non-``None`` ``group``) are exempt:
+    their slot-interleaved segments overlap by construction."""
     for i in range(len(items)):
-        n1, a1, b1, s1 = items[i]
+        n1, a1, b1, s1, g1 = items[i]
         for j in range(i + 1, len(items)):
-            n2, a2, b2, s2 = items[j]
+            n2, a2, b2, s2, g2 = items[j]
+            if g1 is not None and g1 == g2:
+                continue
             if (
                 a1 <= b2
                 and a2 <= b1
@@ -592,7 +696,7 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
             and isinstance(_val(n), torch.Tensor)
         ):
             last = max([pos[n]] + [pos[u] for u in n.users if u in pos])
-            dram.append((n.name, pos.get(n, 0), last, seg))
+            dram.append((n.name, pos.get(n, 0), last, seg, None))
     _check_overlaps("DRAM", dram)
 
     scratch = []
@@ -606,7 +710,9 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
             None,
         )
         if seg is not None:
-            scratch.append((root.name, bf.def_t, bf.last_t, seg))
+            scratch.append(
+                (root.name, bf.def_t, bf.last_t, seg, _bank_group_key(bf))
+            )
     _check_overlaps("Scratchpad", scratch)
 
 

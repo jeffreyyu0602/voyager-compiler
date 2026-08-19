@@ -126,6 +126,10 @@ GEMV_BANK_GROUPS = (
     ("A_data", "A_indices", "A_indptr"),
 )
 
+# Member marking the ``reduction_scratch`` regions in a bank partition: they
+# are no FX node, but they occupy a bank and may merge like any other group.
+BANK_GROUP_RESERVED = "reserved"
+
 
 def _tensor_bytes(node, shape, config):
     """Bytes one tile of ``node`` occupies on chip, each output sized by
@@ -185,6 +189,25 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
     Returns:
         Bytes one slot needs, with every group rounded to whole banks.
     """
+    sized = _bank_groups(node, tiled_shapes, config, extra_sharing)
+    if not sized:
+        return 0
+    if not config.bank_size:
+        return sum(size for size, _ in sized)
+    return sum(
+        math.ceil(size / config.bank_size) * config.bank_size
+        for size, _ in sized
+    )
+
+
+def _bank_groups(node, tiled_shapes, config, extra_sharing):
+    """The bank partition one candidate tile implies: ``(bytes, members)``
+    pairs, one per bank, already merged smallest-first while the groups
+    outnumber the banks (see ``scratchpad_bytes``, which prices exactly this
+    partition).  ``members`` are the operand FX nodes sharing the bank — the
+    op node itself stands for the output, ``BANK_GROUP_RESERVED`` for the
+    ``reduction_scratch`` regions.  Unmerged (one group per operand) when
+    ``config.bank_size`` is unset."""
     # ``groups`` is the bank layout, one entry per bank: the groups that match,
     # then any operand they do not name on its own.  A ``where`` lays out as
     # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
@@ -196,7 +219,7 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
     grouped = {n for group in groups for n in group}
     groups += [[n] for n in tiled_shapes if n not in grouped]
 
-    sizes = []
+    sized = []
     for group in groups:
         total = 0
         for n in group:
@@ -205,7 +228,7 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
                 continue
             total += _tensor_bytes(n, shape, config)
         if total:
-            sizes.append(total)
+            sized.append((total, group))
 
     # No DMA moves the reserved regions, so they share one bank rather than
     # taking one apiece.
@@ -218,24 +241,20 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
         )
     )
     if reserved:
-        sizes.append(reserved)
+        sized.append((reserved, [BANK_GROUP_RESERVED]))
 
-    if not sizes:
-        return 0
-    if not config.bank_size:
-        return sum(sizes)
+    if not sized or not config.bank_size:
+        return sized
 
-    target = len(sizes)
+    target = len(sized)
     if config.num_banks:
         target = config.num_banks // config.num_slots
     target = max(1, target - extra_sharing)
-    while len(sizes) > target:
-        sizes.sort()
-        sizes = [sizes[0] + sizes[1]] + sizes[2:]
-
-    return sum(
-        math.ceil(s / config.bank_size) * config.bank_size for s in sizes
-    )
+    while len(sized) > target:
+        sized.sort(key=lambda g: g[0])
+        (s0, m0), (s1, m1) = sized[0], sized[1]
+        sized = [(s0 + s1, m0 + m1)] + sized[2:]
+    return sized
 
 
 def _search_tiling(
@@ -264,6 +283,11 @@ def _search_tiling(
     residue the model leaves behind would buy any amount of traffic for a
     rounding error.  This is how the interstellar tiler picks a mapping too
     (``mapping_point_generator``, with energy in place of bytes).
+
+    Returns:
+        ``(tile_sizes, groups)`` -- the winning tile plus its bank partition
+        (each ``_bank_groups`` member list), or ``None`` when nothing fits at
+        any sharing level.
     """
 
     slot_size = config.scratchpad_size // config.num_slots
@@ -273,7 +297,7 @@ def _search_tiling(
     # fits at any tile size.  Retry with progressively more sharing and keep
     # the first (least-shared) tiling that maps.
     for extra_sharing in range(len(GEMV_BANK_GROUPS)):
-        scored = []  # (latency, dram_bytes, tile_sizes)
+        scored = []  # (latency, dram_bytes, tile_sizes, tiled_shapes)
         for tile_sizes, tiling in get_valid_tiling(
             full_shape,
             multiple_of=multiple_of,
@@ -290,17 +314,25 @@ def _search_tiling(
                 continue
 
             if cost_fn is None:
-                return tile_sizes
+                scored.append((0, 0, tile_sizes, tiled_shapes))
+                break
 
             latency, traffic = cost_fn(node, tile_sizes, tiled_shapes, tiling)
-            scored.append((latency, traffic, tile_sizes))
+            scored.append((latency, traffic, tile_sizes, tiled_shapes))
 
         if scored:
             budget = min(s[0] for s in scored) * (1.0 + tolerance)
-            return min(
+            best = min(
                 (s for s in scored if s[0] <= budget),
                 key=lambda s: (s[1], s[0]),
-            )[2]
+            )
+            groups = [
+                members
+                for _, members in _bank_groups(
+                    node, best[3], config, extra_sharing
+                )
+            ]
+            return best[2], groups
 
     logger.debug(f"Failed to tile {node} into a {slot_size}-byte slot.")
     return None
@@ -491,6 +523,10 @@ def gemv_op_tiling(node, config):
             ``call_module`` around one.
         config (AcceleratorConfig): The hardware description.
 
+    On a banked config the winning tile's bank partition is stamped as
+    ``node.meta["bank_groups"]`` (member lists per bank), which the builders
+    copy onto their SRAM allocs for the memory planner.
+
     Returns:
         ``(n_m, n_n, n_k)`` -- the M, output and reduction tile counts -- or
         ``None`` when the op is not a GEMV.
@@ -547,12 +583,15 @@ def gemv_op_tiling(node, config):
     # ``get_valid_tiling`` reduces in ``order``, leaving what it already
     # reduced at its smallest, so C whole is only ever reachable from the first
     # pass -- the cost function ranks within one, it cannot cross them.
-    tile_sizes = search(order=(2,)) or search(order=(1, 2))
-    if tile_sizes is None:
+    found = search(order=(2,)) or search(order=(1, 2))
+    if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
+    tile_sizes, groups = found
+    if config.bank_size:
+        node.meta["bank_groups"] = groups
 
     x_tiled, c_tiled, k_tiled = tile_sizes
     return X // x_tiled, K // k_tiled, C // c_tiled
@@ -650,6 +689,9 @@ def vector_op_tiling(node, config):
             one.  Its output shape drives the grid.
         config (AcceleratorConfig): The hardware description.
 
+    On a banked config the winning tile's bank partition is stamped as
+    ``node.meta["bank_groups"]`` (see ``gemv_op_tiling``).
+
     Returns:
         Tile counts over ``node``'s output, or ``None`` when the op is not one
         this tiles.
@@ -676,7 +718,7 @@ def vector_op_tiling(node, config):
     )
 
     output_shape = _output_shape(node)
-    tile_sizes = _search_tiling(
+    found = _search_tiling(
         node=node,
         full_shape=output_shape,
         multiple_of=multiple_of,
@@ -685,11 +727,14 @@ def vector_op_tiling(node, config):
         config=config,
         cost_fn=cost_fn,
     )
-    if tile_sizes is None:
+    if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
+    tile_sizes, groups = found
+    if config.bank_size:
+        node.meta["bank_groups"] = groups
     return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
 
 
@@ -795,6 +840,9 @@ def pool_op_tiling(node, config):
             one.
         config (AcceleratorConfig): The hardware description.
 
+    On a banked config the winning tile's bank partition is stamped as
+    ``node.meta["bank_groups"]`` (see ``gemv_op_tiling``).
+
     Returns:
         Tile counts over ``(N, H_out, W_out, C)`` for a non-adaptive pool or
         ``(N, C)`` for an adaptive one, or ``None`` when the op is not a pool.
@@ -832,7 +880,7 @@ def pool_op_tiling(node, config):
     else:
         return None
 
-    tile_sizes = _search_tiling(
+    found = _search_tiling(
         node=node,
         full_shape=full_shape,
         multiple_of=multiple_of,
@@ -840,9 +888,12 @@ def pool_op_tiling(node, config):
         shape_builder_fn=shape_builder_fn,
         config=config,
     )
-    if tile_sizes is None:
+    if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
+    tile_sizes, groups = found
+    if config.bank_size:
+        node.meta["bank_groups"] = groups
     return tuple(s // ts for s, ts in zip(full_shape, tile_sizes))

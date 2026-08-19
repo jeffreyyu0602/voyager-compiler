@@ -55,12 +55,14 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
+    BANK_GROUP_RESERVED,
     pool_op_tiling,
     vector_op_tiling,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
+    _fused_operand_nodes,
     get_tiling,
 )
 from voyager_compiler.export_utils import export_model
@@ -1067,20 +1069,11 @@ def build_pipelined_buffers(
     async_pipeline: bool = False,
     kwargs: Optional[dict] = None,
     wrapper: Optional[Callable] = None,
+    bank_groups: Optional[Sequence[Optional[int]]] = None,
 ) -> torch.fx.GraphModule:
     """Build the bufferized FX graph (a single rolled ``while_loop`` over
     ``voyager.*`` primitives) for ``kernel`` over ``grid``.  Mirrors
     ``build_pointwise_buffers``'s export / finalize / extent-tag flow.
-
-    ``async_pipeline`` selects :class:`AsyncPipelinedKernel` (cross-tile
-    ramp-up/ramp-down overlap via ``voyager.commit``) instead of the
-    synchronous :class:`PipelinedKernel`.  ``kernel`` must then be an async
-    kernel template (``_map_kernel(async_pipeline=True)``) that issues the
-    ``commit`` itself.
-
-    ``wrapper`` optionally wraps the pattern module before export (``pattern =
-    wrapper(pattern)``) -- e.g. the GQA fold that reshapes operands in and the
-    output back out; ``inputs`` are then the wrapper's (unfolded) operands.
     """
     cls = AsyncPipelinedKernel if async_pipeline else PipelinedKernel
     pattern = cls(
@@ -1097,6 +1090,22 @@ def build_pipelined_buffers(
     with _lenient_verifier():
         gm = export_model(pattern, inputs, kwargs=kwargs)
     gm = _finalize_exported_gm(gm)
+    if bank_groups is not None:
+        allocs = [
+            n
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+            and n.target is voyager.alloc.default
+            and len(n.args) > 2
+            and n.args[2] == _SRAM
+        ]
+        assert len(allocs) == len(bank_groups), (
+            f"{len(allocs)} SRAM allocs vs {len(bank_groups)} bank-group "
+            f"entries: _allocate's allocation order no longer matches"
+        )
+        for alloc, group in zip(allocs, bank_groups):
+            if group is not None:
+                alloc.meta["bank_group"] = group
     _tag_loop_extents(gm, [[(0, num_steps, 1)]])
     # Stamp a concrete-offset ``.value`` on every node (incl. loop / cond
     # bodies) so the tail re-fusion's ShapeProp never sees export's symbolic
@@ -1750,6 +1759,105 @@ def _single_buffer_reduction_operands(in_specs, out_specs, fused_idx):
             in_specs[i].first_use_at_exit = True
 
 
+def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
+    """The searched bank group of each SRAM slot alloc, in allocation order.
+
+    The partition comes from ``node.meta["bank_groups"]`` (the GEMV / vector /
+    pool search: member lists of operand FX nodes, with ``node`` itself for
+    the output and ``BANK_GROUP_RESERVED`` for the reduction scratch) or,
+    failing that, from the anchor's ``meta["tiling"]["bank_groups"]``
+    (interstellar: role sets).  A role names one of the anchor's own args /
+    kwargs — the operands ``make_size_fn`` defined the roles from — so it
+    resolves right back to them, the weight and scales through the same
+    ``weight_transforms`` peel the builders key their specs by.  A member or
+    role with no spec — a whole-loaded codebook, an operand the search did
+    not model — is skipped: its buffer stays loose and the planner packs it
+    byte-wise.
+
+    Args:
+        node: The node being built (the fused ``call_module``, or the op).
+        in_specs: One spec per ``node.all_input_nodes`` entry, in order
+            (``None`` for a whole-loaded operand, dropped exactly as
+            ``_allocate`` drops it).
+        out_specs: The nest's output specs — the partition's output member.
+        scratch_specs: The nest's scratch specs — they all share the
+            partition's scratch group.
+
+    Returns:
+        One group index (or ``None`` = loose) per SRAM slot alloc — the
+        non-``None`` ``in_specs`` entries, the outputs, then the scratch —
+        i.e. ``build_pipelined_buffers``'s ``bank_groups`` argument.
+    """
+    ordered = [s for s in in_specs if s is not None] + list(out_specs)
+    index_of = {id(s): i for i, s in enumerate(ordered)}
+    assigned = [None] * len(ordered)
+    scratch_group = None
+
+    # Operand FX node -> spec, under the ``source_node`` resolution both
+    # partition formats name their members by.
+    node_specs = {
+        n.meta.get("source_node", n): spec
+        for n, spec in zip(node.all_input_nodes, in_specs)
+    }
+
+    def tag(spec, group):
+        if spec is not None and id(spec) in index_of:
+            assigned[index_of[id(spec)]] = group
+
+    groups = node.meta.get("bank_groups")
+    if groups is None:
+        anchor = get_anchor_node(node)
+        roles = (
+            anchor.meta.get("tiling", {}).get("bank_groups")
+            if anchor is not None
+            else None
+        )
+        if roles is None:
+            return assigned + [None] * len(scratch_specs)
+
+        src = lambda n: n.meta.get("source_node", n)
+        fused = _fused_operand_nodes(node, anchor)
+
+        def operand(role):
+            """The member a role names: one of the anchor's own operands,
+            the output (``node``), or the scratch marker."""
+            if role == "scratch":
+                return BANK_GROUP_RESERVED
+            if role == "output":
+                return node
+            if role == "input":
+                return src(anchor.args[0])
+            if role == "weight":
+                return src(weight_transforms(anchor.args[1])[0])
+            if role == "bias":
+                bias = get_arg_value(anchor, 2, "bias")
+                return src(bias) if isinstance(bias, torch.fx.Node) else None
+            if role in ("input_scale", "weight_scale"):
+                scale = anchor.kwargs.get(role)
+                if not isinstance(scale, torch.fx.Node):
+                    return None
+                return src(weight_transforms(scale)[0])
+            if isinstance(role, tuple) and role[1] < len(fused):
+                return src(fused[role[1]])  # ("fused", i)
+            return None  # "csr": the sparse nest allocates outside this path
+
+        groups = [
+            [m for m in map(operand, role_set) if m is not None]
+            for role_set in roles
+        ]
+
+    for group, members in enumerate(groups):
+        for member in members:
+            if member == BANK_GROUP_RESERVED:
+                scratch_group = group
+            elif member is node:
+                for spec in out_specs:
+                    tag(spec, group)
+            else:
+                tag(node_specs.get(member), group)
+    return assigned + [scratch_group] * len(scratch_specs)
+
+
 # Sentinel for ``_gemm_scratch_and_kernel``'s ``split``: classify the tail
 # here rather than taking a caller's precomputed result.
 _CLASSIFY = object()
@@ -2106,6 +2214,7 @@ def build_conv2d(
         scratch_specs=scratch_specs,
         num_slots=num_slots,
         async_pipeline=async_pipeline,
+        bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
     )
     if num_k > 1 or info is not None:
         outline_dps_ops(gm)
@@ -2509,6 +2618,9 @@ def build_gemm(
         scratch_specs=scratch_specs,
         num_slots=num_slots,
         async_pipeline=async_pipeline,
+        bank_groups=_bank_group_list(
+            node, plan.in_specs, plan.out_specs, scratch_specs
+        ),
     )
     if plan.outline_dps:
         outline_dps_ops(gm)
@@ -2703,6 +2815,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         tuple(inputs),
         scratch_specs=scratch_specs,
         num_slots=num_slots,
+        bank_groups=_bank_group_list(node, in_specs, out_specs, scratch_specs),
     )
 
     if node.op == "call_module" and anchor is not None:
@@ -2805,6 +2918,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
             out_specs,
             (input_t,),
             num_slots=num_slots,
+            bank_groups=_bank_group_list(node, [in_spec], out_specs),
         )
 
     # Fused: run the whole submodule per tile.  The pool's input loads the halo;
@@ -2838,10 +2952,15 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-
     kernel = _map_kernel(submod, len(outputs))
     gm = build_pipelined_buffers(
-        kernel, grid, in_specs, out_specs, tuple(inputs), num_slots=num_slots
+        kernel,
+        grid,
+        in_specs,
+        out_specs,
+        tuple(inputs),
+        num_slots=num_slots,
+        bank_groups=_bank_group_list(node, in_specs, out_specs),
     )
     outline_dps_ops(gm)
     return gm

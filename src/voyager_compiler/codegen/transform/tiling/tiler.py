@@ -245,39 +245,56 @@ def _output_pos_to_loop_dim(anchor):
     return [le.ON] * (ndim - 2) + [le.OX, le.OC]
 
 
-def _fused_operand_specs(node, anchor):
-    """Per fused post-op operand of a fused ``call_module`` ``node``: a
-    ``(dims, dtype_bits)`` pair, where ``dims`` are the interstellar output loop
-    dims (a subset of ``ON/OC/OY/OX``) the operand is *tiled* along — broadcast
-    (size-1) dims dropped, so its tile size is ``prod(out_tile[d] for d in
-    dims)``.  Empty for a bare node, or one whose fused ops add no tiled tensor
-    operand (codebooks / scalars don't count).
+def _fused_operand_nodes(node, anchor):
+    """The fused post-op operand placeholders of ``node``'s submodule, in the
+    order ``_fused_operand_specs`` sizes them — so a ``("fused", i)`` role in
+    a bank partition names ``_fused_operand_nodes(node, anchor)[i]``.
 
     A post-op operand is any submodule placeholder that is *not* one of the
     anchor's own operands (act / weight / scales, traced through any input
     dequantize / reshape — those are counted by the interstellar ``Layer``) and
     is not a codebook / qmap or scalar.  Defining it by exclusion catches an
     operand fed through a ``dequantize`` (e.g. the attention mask).  The
-    submodule is already ShapeProp'd (placeholders carry ``.value``).
+    submodule is already ShapeProp'd (placeholders carry ``.value``).  Empty
+    for a bare node.
     """
     submod = node.meta.get("submodule")
     if submod is None:
         return []
-
-    pos_to_loop_dim = _output_pos_to_loop_dim(anchor)
-    out_ndim = anchor.value.ndim
 
     anchor_operands = set(_operand_placeholders(anchor))
     codebooks = set()
     for n in submod.graph.nodes:
         codebooks |= quant_param_arg_nodes(n)
 
+    return [
+        p
+        for p in submod.graph.nodes
+        if p.op == "placeholder"
+        and p.value.numel() != 1
+        and p not in anchor_operands
+        and p not in codebooks
+    ]
+
+
+def _fused_operand_specs(node, anchor):
+    """Per fused post-op operand of a fused ``call_module`` ``node``: a
+    ``(dims, dtype_bits)`` pair, where ``dims`` are the interstellar output loop
+    dims (a subset of ``ON/OC/OY/OX``) the operand is *tiled* along — broadcast
+    (size-1) dims dropped, so its tile size is ``prod(out_tile[d] for d in
+    dims)``.  Empty for a bare node, or one whose fused ops add no tiled tensor
+    operand (codebooks / scalars don't count).  The operands themselves come
+    from ``_fused_operand_nodes``, in the same order.
+    """
+    operands = _fused_operand_nodes(node, anchor)
+    if not operands:
+        return []
+
+    pos_to_loop_dim = _output_pos_to_loop_dim(anchor)
+    out_ndim = anchor.value.ndim
+
     specs = []
-    for p in submod.graph.nodes:
-        if p.op != "placeholder":
-            continue
-        if p.value.numel() == 1 or p in anchor_operands or p in codebooks:
-            continue
+    for p in operands:
         op_shape = tuple(p.shape)
         offset = out_ndim - len(op_shape)  # right-align (broadcast)
         dims = tuple(
@@ -359,6 +376,11 @@ def make_size_fn(
 
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
     ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
+
+    The returned ``size_fn`` exposes the partition itself as
+    ``size_fn.compute_groups``: ``_finish_search`` replays it for the winning
+    mapping and stamps the surviving role partition for the memory planner,
+    so the plan realizes exactly the banking the fit check priced.
     """
     if isinstance(out_dtype, (list, tuple)):
         of_scale_dtype, of_dtype = out_dtype[-2], out_dtype[-1]
@@ -383,7 +405,17 @@ def make_size_fn(
     def _scale_bytes(count, bits):
         return count / block_size * bits / 8.0 if bits else 0.0
 
-    def size_fn(counts, point, level, partitioning_accum, bank_size, num_banks):
+    def compute_groups(
+        counts, point, level, partitioning_accum, bank_size, num_banks
+    ):
+        """The bank partition of one candidate tile: the merged ``(bytes,
+        kind, slots, roles)`` groups plus the scratch region's bytes, or
+        ``(None, 0.0)`` for a vetoed tile.  ``roles`` is the set of operand
+        roles sharing the bank (``"input"``, ``"input_scale"``, ``"csr"``,
+        ``"weight"``/``"weight_scale"``/``"bias"``, ``"output"``,
+        ``("fused", i)``); a merge unions the two sets.  ``size_fn`` sums
+        exactly these groups, so the stamped partition and the fit check can
+        never disagree."""
         if_count, of_count, fl_count = counts
         is_psum = output_is_psum(point, level)
 
@@ -400,7 +432,7 @@ def make_size_fn(
         # Veto an OC tile that splits an attention head — the MHA relayout must
         # store whole heads.
         if oc_align and extent(le.OC) % oc_align != 0:
-            return (float("inf"),) * 3
+            return None, 0.0
 
         # The output is a wide partial sum until IC is fully reduced; only the
         # final value carries an output scale.
@@ -423,16 +455,23 @@ def make_size_fn(
             return num_slots if tiles > 1 else 1
 
         groups = [
-            (if_count * if_bits / 8.0, _IF, slots(_IF_DIMS, batch)),
+            (
+                if_count * if_bits / 8.0,
+                _IF,
+                slots(_IF_DIMS, batch),
+                {"input"},
+            ),
             (
                 _scale_bytes(if_count, if_scale_bits),
                 _IF,
                 slots(_IF_DIMS, batch),
+                {"input_scale"},
             ),
             (
                 if_count * outlier_pct * csr_bits / 8.0,
                 _IF,
                 slots(_IF_DIMS, batch),
+                {"csr"},
             ),
             (
                 fl_count * fl_bits / 8.0
@@ -440,15 +479,28 @@ def make_size_fn(
                 + bias,
                 _FL,
                 slots(_FL_DIMS, weight_batch),
+                {"weight", "weight_scale", "bias"},
             ),
-            (of_count * out_bits / 8.0 + of_scale, _OF, slots(_OF_DIMS, batch)),
+            (
+                of_count * out_bits / 8.0 + of_scale,
+                _OF,
+                slots(_OF_DIMS, batch),
+                {"output"},
+            ),
         ]
-        for dims, bits in fused_specs:
+        for i, (dims, bits) in enumerate(fused_specs):
             count = 1
             for d in dims:
                 count *= extent(d)
             distinct = batch if le.ON in dims else 1
-            groups.append((count * bits / 8.0, _OF, slots(dims, distinct)))
+            groups.append(
+                (
+                    count * bits / 8.0,
+                    _OF,
+                    slots(dims, distinct),
+                    {("fused", i)},
+                )
+            )
 
         # An absent operand (no scale, no bias) occupies no bank.
         groups = [g for g in groups if g[0] > 0]
@@ -465,12 +517,8 @@ def make_size_fn(
         else:
             scratch = 0.0
 
-        out = [0.0, 0.0, 0.0]
         if not bank_size:
-            for size, kind, n in groups:
-                out[kind] += n * size
-            out[_OF] += scratch
-            return tuple(out)
+            return groups, scratch
 
         scratch_banks = math.ceil(scratch / bank_size) if scratch else 0
         # Banks left for the ping-ponged sources, in whole sources.
@@ -478,18 +526,35 @@ def make_size_fn(
         target = max(1, budget // num_slots - extra_sharing)
         for _ in range(max(0, len(groups) - target)):
             groups.sort(key=lambda g: g[0])
-            (s0, k0, n0), (s1, k1, n1) = groups[0], groups[1]
+            (s0, k0, n0, r0), (s1, k1, n1, r1) = groups[0], groups[1]
             # Charge the shared bank to the larger member's operand, and to the
             # deeper pipeline: one buffer holding both has to ping-pong if
             # either of them does.
-            merged = (s0 + s1, k0 if s0 >= s1 else k1, max(n0, n1))
+            merged = (s0 + s1, k0 if s0 >= s1 else k1, max(n0, n1), r0 | r1)
             groups = [merged] + groups[2:]
+        return groups, scratch
 
-        for size, kind, n in groups:
+    def size_fn(counts, point, level, partitioning_accum, bank_size, num_banks):
+        groups, scratch = compute_groups(
+            counts, point, level, partitioning_accum, bank_size, num_banks
+        )
+        if groups is None:
+            return (float("inf"),) * 3
+
+        out = [0.0, 0.0, 0.0]
+        if not bank_size:
+            for size, kind, n, _ in groups:
+                out[kind] += n * size
+            out[_OF] += scratch
+            return tuple(out)
+
+        for size, kind, n, _ in groups:
             out[kind] += n * math.ceil(size / bank_size) * bank_size
-        out[_OF] += scratch_banks * bank_size
+        if scratch:
+            out[_OF] += math.ceil(scratch / bank_size) * bank_size
         return tuple(out)
 
+    size_fn.compute_groups = compute_groups
     return size_fn
 
 
@@ -1205,6 +1270,60 @@ def _run_search(search):
     )
 
 
+def _winning_bank_groups(search, index, mapping):
+    """The role partition the winning mapping's L2 fit was checked with.
+
+    Rebuilds interstellar's scratchpad-level ``size_fn`` invocation
+    (``cost_model.get_block_size``): the element counts from the blocking /
+    partitioning products through L2, the bank geometry from the
+    architecture — and replays the winning ``size_fn``'s own group
+    construction, so the partition is exactly the one the fit check priced.
+
+    Returns:
+        A list of role sets, one per bank group — plus a ``{"scratch"}``
+        entry when the search charged the reduction scratch its own region —
+        or ``None`` when the architecture has no banked level.
+    """
+    level = 2
+    buf = search.tiler.arch.buffer(level)
+    bank_size = buf.bank_size
+    if not bank_size:
+        return None
+    capacity = buf.capacity
+    if isinstance(capacity, list):
+        capacity = capacity[0]
+    num_banks = capacity // bank_size
+
+    blocking_accum = []
+    partitioning_accum = []
+    for i in range(le.NUM):
+        blocking_accum.append(math.prod(mapping.loop_blocking(i)[: level + 1]))
+        partitioning_accum.append(
+            math.prod(mapping.loop_partitioning(i)[: level + 1])
+        )
+    partitioning = list(zip(*mapping.loop_partitionings))[level]
+
+    cost_model = interstellar.cost_model
+    counts = (
+        cost_model.get_if_size(
+            blocking_accum, partitioning_accum, partitioning, search.layer
+        ),
+        cost_model.get_of_size(
+            blocking_accum, partitioning_accum, partitioning
+        ),
+        cost_model.get_fl_size(
+            blocking_accum, partitioning_accum, partitioning
+        ),
+    )
+    groups, scratch = search.size_fns[index].compute_groups(
+        counts, mapping, level, partitioning_accum, bank_size, num_banks
+    )
+    partition = [roles for _, _, _, roles in groups]
+    if scratch:
+        partition.append({"scratch"})
+    return partition
+
+
 def _finish_search(search, found):
     """Log ``found``'s tile sizes and price it, in the parent.
 
@@ -1213,11 +1332,12 @@ def _finish_search(search, found):
     worker's copy.
 
     Returns:
-        ``(mapping, per_tile_cycles, access_list)`` -- the best MappingPoint
-        (its ``loop_blockings`` give the per-level tile factors), the compute
-        cycles of one L3 tile under it (the reporting model's utilization
-        denominator), and the per-level ``(input, output, weight)`` access
-        counts the ``Tiling`` proto reports.
+        ``(mapping, per_tile_cycles, access_list, bank_groups)`` -- the best
+        MappingPoint (its ``loop_blockings`` give the per-level tile factors),
+        the compute cycles of one L3 tile under it (the reporting model's
+        utilization denominator), the per-level ``(input, output, weight)``
+        access counts the ``Tiling`` proto reports, and the winning bank
+        partition (``_winning_bank_groups``).
     """
     index, runtime, mapping = found
     search.layer.size_fn = search.size_fns[index]
@@ -1249,7 +1369,8 @@ def _finish_search(search, found):
     _, _, access_list = interstellar.cost_model.get_cost(
         search.tiler.arch, mapping, search.layer
     )
-    return mapping, per_tile_cycles, access_list
+    bank_groups = _winning_bank_groups(search, index, mapping)
+    return mapping, per_tile_cycles, access_list, bank_groups
 
 
 # Prepared in the parent before forking; a worker reads its job by index so
@@ -1294,7 +1415,7 @@ def prefetch_tilings(nodes, tiler):
         if key in tiler.cache:
             continue
         if search is None:
-            tiler.cache[key] = (None, None, None)  # interstellar skips it
+            tiler.cache[key] = (None,) * 4  # interstellar skips it
             continue
         jobs[key] = search
 
@@ -1463,7 +1584,7 @@ def get_tiling(node, tiler=None):
 
     key, search = _prepare_search(node, tiler)
     if key in tiler.cache:
-        mapping, per_tile_cycles, access_list = tiler.cache[key]
+        mapping, per_tile_cycles, access_list, bank_groups = tiler.cache[key]
         logger.debug(
             "[tiling] %s: mapping cache hit (%d entries)",
             anchor.name,
@@ -1473,9 +1594,9 @@ def get_tiling(node, tiler=None):
         logger.info("[tiling] %s: running interstellar", anchor.name)
         t0 = time.perf_counter()
         if search is None:
-            mapping = per_tile_cycles = access_list = None
+            mapping = per_tile_cycles = access_list = bank_groups = None
         else:
-            mapping, per_tile_cycles, access_list = _finish_search(
+            mapping, per_tile_cycles, access_list, bank_groups = _finish_search(
                 search, _run_search(search)
             )
         logger.info(
@@ -1483,7 +1604,7 @@ def get_tiling(node, tiler=None):
             anchor.name,
             time.perf_counter() - t0,
         )
-        tiler.cache[key] = (mapping, per_tile_cycles, access_list)
+        tiler.cache[key] = (mapping, per_tile_cycles, access_list, bank_groups)
 
     if mapping is None:
         return None, None
@@ -1491,11 +1612,14 @@ def get_tiling(node, tiler=None):
     # The builders copy these onto the nest they build (the anchor is erased on
     # splice): ``per_tile_cycles`` so the reporting cost model can turn it into
     # a utilization, the mapping / architecture so the proto emitter can
-    # serialize the ``Tiling`` message.
+    # serialize the ``Tiling`` message, and ``bank_groups`` (the winning role
+    # partition) so the builders can stamp each SRAM alloc with its bank group
+    # for the memory planner.
     anchor.meta["tiling"] = {
         "per_tile_cycles": per_tile_cycles,
         "interstellar_tiling": (mapping, access_list),
         "interstellar_architecture": tiler.arch,
+        "bank_groups": bank_groups,
     }
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
