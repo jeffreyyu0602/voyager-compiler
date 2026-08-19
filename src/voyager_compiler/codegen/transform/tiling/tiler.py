@@ -344,6 +344,8 @@ def make_size_fn(
     weight_batch=1,
     outlier_pct=0.0,
     out_outlier_pct=0.0,
+    bank_width=None,
+    vector_lanes=None,
 ):
     """Build a ``Layer.size_fn``: the bytes a tile occupies at a byte-pool
     level.
@@ -377,6 +379,13 @@ def make_size_fn(
     each slot must keep its own bank.  ``extra_sharing`` forces further merges;
     ``_run_search`` raises it when nothing maps even at the minimum.
 
+    Every operand is sized the way ``tensor_alloc_bytes`` sizes it for the
+    planner -- payload, the slack a final store beat overshoots by, aligned to
+    ``bank_width`` -- and each operand of a shared bank is padded before they
+    are summed, because the planner lays them out one after another.  Sizing
+    a tile at its raw payload instead lets a group whose payload lands on a
+    bank boundary claim one more bank in the plan than the search charged.
+
     ``fused_specs`` are the ``(dims, dtype_bits)`` pairs from
     ``_fused_operand_specs``.  ``bank_size is None`` -> no banking: just sum.
 
@@ -389,12 +398,13 @@ def make_size_fn(
         of_scale_dtype, of_dtype = out_dtype[-2], out_dtype[-1]
     else:
         of_scale_dtype, of_dtype = None, out_dtype
-    # A CSR-producing tail returns (data, indices, indptr, scale, inliers).
-    # One staged entry is an outlier value plus its column index.
-    out_csr_bits = (
-        get_dtype_width(out_dtype[0]) + get_dtype_width(out_dtype[1])
+    # A CSR-producing tail returns (data, indices, indptr, scale, inliers);
+    # a staged entry is an outlier value and its column index, each its own
+    # buffer.
+    out_csr_data_bits, out_csr_index_bits = (
+        (get_dtype_width(out_dtype[0]), get_dtype_width(out_dtype[1]))
         if isinstance(out_dtype, (list, tuple)) and len(out_dtype) == 5
-        else 0
+        else (0, 0)
     )
     if_bits = _node_dtype_bits(node.args[0])
     fl_bits = _node_dtype_bits(node.args[1])
@@ -407,13 +417,36 @@ def make_size_fn(
     # physical dtype (``_gemm_scratch_and_kernel``'s num_k == 1 staging).
     stage_bits = get_dtype_width(node.value.dtype)
     block_size = node.kwargs.get("block_size") or 1
-    # One gathered-CSR entry: the outlier value plus its column index.
+    # A gathered-CSR entry: the outlier value and its column index, each
+    # staged in its own buffer.
     csr_data_bits = _node_dtype_bits(node.kwargs.get("A_data"), 0)
     csr_index_bits = _node_dtype_bits(node.kwargs.get("A_indices"), 0)
-    csr_bits = csr_data_bits + csr_index_bits
+
+    def _align(size):
+        """Round ``size`` up to a whole ``bank_width`` store word."""
+        if not bank_width:
+            return size
+        return math.ceil(size / bank_width) * bank_width
+
+    def _alloc_bytes(count, bits):
+        """Bytes an on-chip buffer of ``count`` ``bits``-wide elements takes.
+
+        Mirrors ``tensor_alloc_bytes``, which is what the memory planner
+        allocates through: the payload, plus the slack a final store beat of
+        ``vector_lanes`` values overshoots the payload by, aligned to a whole
+        store word.
+        """
+        if not bits or count <= 0:
+            return 0.0
+        size = math.ceil(count * bits / 8.0)
+        if bank_width and vector_lanes:
+            beat = math.ceil(vector_lanes * bits / 8.0)
+            size += _align(beat) - beat
+        return float(_align(size))
 
     def _scale_bytes(count, bits):
-        return count / block_size * bits / 8.0 if bits else 0.0
+        """Bytes the scales of ``count`` values take: one per block."""
+        return _alloc_bytes(count / block_size, bits)
 
     def compute_groups(
         counts, point, level, partitioning_accum, bank_size, num_banks
@@ -448,7 +481,7 @@ def make_size_fn(
         # final value carries an output scale.
         out_bits = PSUM_BITS if is_psum else of_bits
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
-        bias = extent(le.OC) * bias_bits / 8.0 if bias_bits else 0.0
+        bias = _alloc_bytes(extent(le.OC), bias_bits)
 
         def slots(dims, distinct):
             """Banks an operand spanning ``dims`` needs: a second holds the
@@ -464,9 +497,10 @@ def make_size_fn(
                 tiles *= point.loop_blocking(d)[3]
             return num_slots if tiles > 1 else 1
 
+        gathered = if_count * outlier_pct
         groups = [
             (
-                if_count * if_bits / 8.0,
+                _alloc_bytes(if_count, if_bits),
                 _IF,
                 slots(_IF_DIMS, batch),
                 {"input"},
@@ -478,13 +512,14 @@ def make_size_fn(
                 {"input_scale"},
             ),
             (
-                if_count * outlier_pct * csr_bits / 8.0,
+                _alloc_bytes(gathered, csr_data_bits)
+                + _alloc_bytes(gathered, csr_index_bits),
                 _IF,
                 slots(_IF_DIMS, batch),
                 {"csr"},
             ),
             (
-                fl_count * fl_bits / 8.0
+                _alloc_bytes(fl_count, fl_bits)
                 + _scale_bytes(fl_count, fl_scale_bits)
                 + bias,
                 _FL,
@@ -492,7 +527,7 @@ def make_size_fn(
                 {"weight", "weight_scale", "bias"},
             ),
             (
-                of_count * out_bits / 8.0 + of_scale,
+                _alloc_bytes(of_count, out_bits) + of_scale,
                 _OF,
                 slots(_OF_DIMS, batch),
                 {"output"},
@@ -505,7 +540,7 @@ def make_size_fn(
             distinct = batch if le.ON in dims else 1
             groups.append(
                 (
-                    count * bits / 8.0,
+                    _alloc_bytes(count, bits),
                     _OF,
                     slots(dims, distinct),
                     {("fused", i)},
@@ -516,12 +551,14 @@ def make_size_fn(
         # (refilled within a round, so not ``num_slots``) for a block's
         # (value, index) pairs, row pointers and stream bookkeeping.  The
         # quantize sees the output tile, so the budget follows it.
-        if out_csr_bits:
+        if out_csr_data_bits:
             rows = of_count / max(1.0, extent(le.OC))
+            staged = of_count * out_outlier_pct
             groups.append(
                 (
-                    of_count * out_outlier_pct * out_csr_bits / 8.0
-                    + (rows + 1) * 4,
+                    _alloc_bytes(staged, out_csr_data_bits)
+                    + _alloc_bytes(staged, out_csr_index_bits)
+                    + _alloc_bytes(rows + 1, 32),
                     _OF,
                     1,
                     {"csr_out"},
@@ -537,9 +574,9 @@ def make_size_fn(
         # stream-breaking tail (``staged_tail``) stages even a single
         # round's finished tile, in the anchor's own dtype.
         if has_tail and point.loop_blocking(le.IC)[3] > 1:
-            scratch = of_count * PSUM_BITS / 8.0
+            scratch = _alloc_bytes(of_count, PSUM_BITS)
         elif has_tail and staged_tail:
-            scratch = of_count * stage_bits / 8.0
+            scratch = _alloc_bytes(of_count, stage_bits)
         else:
             scratch = 0.0
 
@@ -1280,6 +1317,8 @@ def _prepare_search(node, tiler):
             weight_batch=batch // weight_repeat,
             outlier_pct=outlier_pct,
             out_outlier_pct=out_outlier_pct,
+            bank_width=tiler.config.bank_width,
+            vector_lanes=tiler.config.vector_lanes,
         )
         for extra_sharing in range(4 + len(fused_specs))
     ]
