@@ -1057,6 +1057,27 @@ class AsyncPipelinedKernel(PipelinedKernel):
         return out_bufs[0] if len(out_bufs) == 1 else tuple(out_bufs)
 
 
+def _stamp_bank_groups(gm, bank_groups):
+    """Order-zip the gm's SRAM slot allocs with ``bank_groups`` (one entry
+    per alloc, ``None`` = loose) and stamp ``meta["bank_group"]`` on each
+    grouped one for the memory planner."""
+    allocs = [
+        n
+        for n in gm.graph.nodes
+        if n.op == "call_function"
+        and n.target is voyager.alloc.default
+        and len(n.args) > 2
+        and n.args[2] == _SRAM
+    ]
+    assert len(allocs) == len(bank_groups), (
+        f"{len(allocs)} SRAM allocs vs {len(bank_groups)} bank-group "
+        f"entries: the allocation order no longer matches"
+    )
+    for alloc, group in zip(allocs, bank_groups):
+        if group is not None:
+            alloc.meta["bank_group"] = group
+
+
 def build_pipelined_buffers(
     kernel: Callable,
     grid: Tuple[int, ...],
@@ -1091,21 +1112,7 @@ def build_pipelined_buffers(
         gm = export_model(pattern, inputs, kwargs=kwargs)
     gm = _finalize_exported_gm(gm)
     if bank_groups is not None:
-        allocs = [
-            n
-            for n in gm.graph.nodes
-            if n.op == "call_function"
-            and n.target is voyager.alloc.default
-            and len(n.args) > 2
-            and n.args[2] == _SRAM
-        ]
-        assert len(allocs) == len(bank_groups), (
-            f"{len(allocs)} SRAM allocs vs {len(bank_groups)} bank-group "
-            f"entries: _allocate's allocation order no longer matches"
-        )
-        for alloc, group in zip(allocs, bank_groups):
-            if group is not None:
-                alloc.meta["bank_group"] = group
+        _stamp_bank_groups(gm, bank_groups)
     _tag_loop_extents(gm, [[(0, num_steps, 1)]])
     # Stamp a concrete-offset ``.value`` on every node (incl. loop / cond
     # bodies) so the tail re-fusion's ShapeProp never sees export's symbolic
@@ -1837,9 +1844,12 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
                 if not isinstance(scale, torch.fx.Node):
                     return None
                 return src(weight_transforms(scale)[0])
+            if role == "csr":
+                ptr = anchor.kwargs.get("A_indptr")
+                return src(ptr) if isinstance(ptr, torch.fx.Node) else None
             if isinstance(role, tuple) and role[1] < len(fused):
                 return src(fused[role[1]])  # ("fused", i)
-            return None  # "csr": the sparse nest allocates outside this path
+            return None
 
         groups = [
             [m for m in map(operand, role_set) if m is not None]
@@ -1879,6 +1889,7 @@ def _gemm_scratch_and_kernel(
     async_pipeline,
     single_buffer_tail=False,
     split=_CLASSIFY,
+    staged=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -1903,6 +1914,10 @@ def _gemm_scratch_and_kernel(
             caller whose kernel is rebuilt under export tracing (the sparse
             GEMM), where the classification's graph walk cannot run; the
             sentinel classifies here.
+        staged: Force the staged path even for an unsplit single round —
+            the tail re-reads its tile from scratch (a CSR-producing
+            epilogue staging its prefix result), so the ``num_k == 1``
+            map shortcut must not apply.
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -1919,7 +1934,7 @@ def _gemm_scratch_and_kernel(
     acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
     if split is _CLASSIFY:
         split = _split_stream_break(fused_gm, in_place=num_k > 1)
-    if num_k == 1 and split is None:
+    if num_k == 1 and split is None and not staged:
         scratch_specs = []
         kernel = _map_kernel(
             compute, len(out_specs), async_pipeline=async_pipeline

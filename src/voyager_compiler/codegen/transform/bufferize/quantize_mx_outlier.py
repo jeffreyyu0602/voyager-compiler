@@ -512,6 +512,7 @@ class _OutlierProducer(torch.nn.Module):
         bufs.inliers = voyager.alloc(
             list(g.batch) + [g.M, g.K], self.inlier_dtype
         )
+        bufs.base_table_dram = voyager.alloc(base_table_shape(g), torch.int32)
 
         # The fused prefix's result; a bare quantize slices the loaded tile.
         if self.prefix_gm is not None:
@@ -529,6 +530,7 @@ class _OutlierProducer(torch.nn.Module):
             list(g.batch) + [g.n_k, g.n_rb], torch.int32, _SRAM
         )
         bufs.store_sem = voyager.zeros([], torch.int64)
+        bufs.table_sem = voyager.zeros([], torch.int64)
         # Per-block staging tiles for ``_slice_loop``'s stores.
         bufs.store_data_tile = voyager.alloc(
             list(g.ones) + [g.budget], self.data_dtype, _SRAM
@@ -554,6 +556,12 @@ class _OutlierProducer(torch.nn.Module):
         # nest reads the CSR next.
         for _ in range(_SLICE_STORES):
             voyager.async_wait(bufs.store_sem)
+        copy_base_table(
+            bufs.base_table,
+            bufs.base_table_dram,
+            base_table_shape(g),
+            bufs.table_sem,
+        )
         return (
             bufs.csr_data,
             bufs.csr_indices,
@@ -567,13 +575,34 @@ def base_table_shape(geom: _Geometry) -> list:
     """Shape of the base table both the producer and its consumers allocate.
 
     Always the producer's rank: a consumer reached through a reshape sees
-    fewer batch dims, but the table is one buffer and both must agree.
+    fewer batch dims, but the DRAM table is one buffer and both must agree.
     """
     return [1] * geom.dropped + list(geom.batch) + [geom.n_k, geom.n_rb]
 
 
+def copy_base_table(src, dst, shape, semaphore) -> None:
+    """Move a whole base table between its DRAM home and a nest's SRAM tile.
+
+    One bulk transfer per nest, waited before what needs it runs: a producer
+    fills its SRAM table an entry at a time across the loop and dumps it once
+    at the end, and each consumer loads it once before the gathers read the
+    scalars that address them. Source and destination share the table's full
+    shape, so the transfer names the whole block and the two buffers' memory
+    spaces give its direction.
+
+    Args:
+        src: The buffer read whole.
+        dst: The buffer written whole.
+        shape: The table's shape, which both buffers have.
+        semaphore: Semaphore the copy posts and the wait here consumes.
+    """
+    voyager.async_copy(src, dst, [0] * len(shape), list(shape), semaphore)
+    voyager.async_wait(semaphore)
+
+
 def tag_base_table(gm, producer_name: str, shape: list) -> None:
-    """Mark this nest's base-table alloc as belonging to ``producer_name``.
+    """Mark this nest's DRAM base-table alloc as belonging to
+    ``producer_name``.
 
     The producer and each consumer allocate the table independently, because
     neither can see the other's graph; a pass in ``bufferize_graph`` merges the
@@ -587,16 +616,20 @@ def tag_base_table(gm, producer_name: str, shape: list) -> None:
             continue
         if n.meta.get(BASE_TABLE_TAG) is not None:
             continue
+        # Only the DRAM home is shared; the same-shaped SRAM tile each nest
+        # copies it through is private to that nest.
+        if len(n.args) > 2 and n.args[2] == _SRAM:
+            continue
         if list(n.args[0]) == list(shape) and n.args[1] == torch.int32:
             n.meta[BASE_TABLE_TAG] = producer_name
             return
 
 
 def merge_base_tables(model) -> None:
-    """Collapse each producer's base-table allocs into one buffer.
+    """Collapse each producer's DRAM base-table allocs into one buffer.
 
     A producer writes every block's position in its packed CSR stream into a
-    scratchpad table its consumers read; neither can see the other's graph, so
+    table its consumers read from DRAM; neither can see the other's graph, so
     each nest allocates the table itself and tags it with the producer's name
     (:func:`tag_base_table`). Once every nest is spliced, the group is one
     buffer: keep the first alloc, repoint the rest at it and erase them.

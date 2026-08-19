@@ -1113,6 +1113,21 @@ def _prepare_search(node, tiler):
     # tile even for a single-round reduction (``_gemm_scratch_and_kernel``);
     # the footprint model must charge that region for unsplit mappings too.
     staged_tail = stream_breaking_quantize(sub_gm, in_place=False) is not None
+    if not staged_tail and sub_gm is not None:
+        # A CSR-producing epilogue (``_EpilogueTail``) re-dices its tile at
+        # the consumers' slice width: ops between the anchor and its
+        # ``quantize_mx_outlier`` run once on the whole tile, and their
+        # result is staged in the scratch whenever a slice is finer than
+        # the column tile.  The slice count is a consumer property the
+        # search cannot see, so every prefixed producer tail charges the
+        # staged region.
+        staged_tail = any(
+            n.op == "call_function"
+            and n.target is torch.ops.quantized_ops.quantize_mx_outlier.default
+            and isinstance(n.args[0], torch.fx.Node)
+            and n.args[0].target is not anchor.target
+            for n in sub_gm.graph.nodes
+        )
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
     # else _detect_mha_relayout can't store the tile.

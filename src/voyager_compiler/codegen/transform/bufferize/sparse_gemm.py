@@ -39,12 +39,14 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     UNPIPELINED,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
+    _bank_group_list,
     _DEFAULT_NUM_SLOTS,
     _DONE_DEPTH,
     _gemm_plan,
     _gemm_scratch_and_kernel,
     _split_stream_break,
     _stamp_anchor_meta,
+    _stamp_bank_groups,
     AsyncPipelinedKernel,
     get_slot,
     PipelinedKernel,
@@ -59,6 +61,7 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _split_prefix,
     base_table_shape,
     consumer_k_tile,
+    copy_base_table,
     GEOMETRY_META,
     PRODUCER_META,
     tag_base_table,
@@ -103,11 +106,12 @@ class _EpilogueTail(torch.nn.Module):
     interleaved.
     """
 
-    def __init__(self, owner, idx, out_slots):
+    def __init__(self, owner, idx, out_slots, scratch=None):
         super().__init__()
         self.owner = owner
         self.idx = idx
         self.out_slots = out_slots
+        self.scratch = scratch
 
     def forward(self, acc, *operands):
         o = self.owner
@@ -133,30 +137,32 @@ class _EpilogueTail(torch.nn.Module):
             kind, v = t
             return bound[v] if kind == "arg" else v
 
-        # A value shared by several sub-slices must cross a *buffer*: DPS
-        # outlining grows one op per store, and ops sharing an SSA edge
-        # cannot come out disjoint.  So with several sub-slices the prefix
-        # result lands in a staging buffer the slices window; each slice's
-        # scale / inlier results then write their own column window of the
-        # output slots directly.
         if o.epi_prefix is None:
             x = acc
         elif o.n_sub == 1:
             x = o.epi_prefix(*bound)
         else:
-            voyager.insert(o.epi_prefix(*bound), bufs.epi_mid)
+            res = o.epi_prefix(*bound)
+            if res.dtype != self.scratch.dtype:
+                # An fp32 accumulator stages the bf16 result upcast
+                # (exact); each windowed read casts back below, so the
+                # quantize's code map reads bf16 bit patterns.
+                res = res.to(self.scratch.dtype)
+            voyager.insert(res, self.scratch)
             x = None
 
         scale_slot, inlier_slot = self.out_slots
         for j in range(o.n_sub):
             if x is None:
                 tile = voyager.subview(
-                    bufs.epi_mid,
+                    self.scratch,
                     [0] * nb + [0, j * og.tk],
                     ones + (og.rows, og.tk),
                     (1,) * (nb + 2),
                     [],
                 )
+                if tile.dtype != o.plan.out_dtype:
+                    tile = tile.to(o.plan.out_dtype)
             elif o.n_sub > 1:
                 tile = x[..., j * og.tk : (j + 1) * og.tk]
             else:
@@ -320,6 +326,16 @@ class _SparseGemm(torch.nn.Module):
         # The K accumulator, when the reduction needs one.  The kernel built
         # alongside it is rebuilt per step (with the grid index captured) and
         # discarded here; only the specs are needed before the loop exists.
+        # A multi-sub-slice epilogue's prefix result fans out to several
+        # outlined quantize calls, so it must cross a buffer: the reduction
+        # scratch, whose staged region the tile search charges.  ``staged``
+        # keeps the single-round case on ``_reduction_fused_kernel`` so
+        # that scratch exists there too.
+        self.stage_prefix = (
+            out_geom is not None
+            and self.n_sub > 1
+            and self.epi_prefix is not None
+        )
         self.scratch_specs = self._scratch_and_kernel(plan.fused_gm)[0]
         if async_pipeline:
             kernel, kernel_cls = self._async_kernel, AsyncPipelinedKernel
@@ -409,6 +425,7 @@ class _SparseGemm(torch.nn.Module):
             async_pipeline=self.async_pipeline,
             # An ``_EpilogueTail`` stages its own stores and is never split.
             split=self.tail_split if tail is plan.fused_gm else None,
+            staged=self.stage_prefix,
         )
 
     # --- the gather ---------------------------------------------------------
@@ -632,8 +649,12 @@ class _SparseGemm(torch.nn.Module):
         if self.out_geom is not None:
             # The scheduler passes ``*in_slots, *out_slots, *scratch``.
             n_in = len(self.plan.in_specs)
-            out_slots = slots[n_in : n_in + len(self.plan.out_specs)]
-            tail = _EpilogueTail(self, idx, out_slots)
+            n_out = len(self.plan.out_specs)
+            out_slots = slots[n_in : n_in + n_out]
+            scratch = slots[n_in + n_out :]
+            tail = _EpilogueTail(
+                self, idx, out_slots, scratch[0] if scratch else None
+            )
         if self.chain_epilogue:
             # The previous finalize's store DMAs drained under the rounds
             # between; consume their posts before this finalize's pass
@@ -692,7 +713,9 @@ class _SparseGemm(torch.nn.Module):
             tiles.append(get_slot(self._bufs.gather_indices, parity))
         tail = self.plan.fused_gm
         if self.out_geom is not None:
-            tail = _EpilogueTail(self, idx, out_slots)
+            tail = _EpilogueTail(
+                self, idx, out_slots, scratch[0] if scratch else None
+            )
         if self.chain_epilogue:
             bufs = self._bufs
             tiles += [
@@ -719,12 +742,26 @@ class _SparseGemm(torch.nn.Module):
     # --- entry --------------------------------------------------------------
 
     def forward(self, *inputs):
+        """Allocate every buffer this nest owns, then run its loop.
+
+        The SRAM allocations below are ORDER-SENSITIVE. ``build_sparse_gemm``
+        stamps their bank groups positionally, by zipping them against its
+        own ``hand_groups`` list, so adding, removing or reordering one
+        here silently misassigns banks unless that list is changed to
+        match. Semaphores and DRAM allocations are skipped and may move
+        freely.
+        """
         bufs = _Bufs()
         g = self.geom
         if g is not None:
             num_slots = _DONE_DEPTH if self.async_pipeline else UNPIPELINED
             sem_slots = (
                 _DONE_DEPTH * 2 * self.R if self.async_pipeline else UNPIPELINED
+            )
+            # Names the producer's table rather than adding one:
+            # ``merge_base_tables`` collapses the group onto its alloc.
+            bufs.base_table_dram = voyager.alloc(
+                base_table_shape(g), torch.int32
             )
             bufs.gather_data = voyager.alloc(
                 list(g.ones) + [self.span],
@@ -739,6 +776,7 @@ class _SparseGemm(torch.nn.Module):
                 base_table_shape(g), torch.int32, _SRAM
             )
             bufs.gather_sem = voyager.zeros([], torch.int64, sem_slots)
+            bufs.table_sem = voyager.zeros([], torch.int64)
 
         og = self.out_geom
         if og is not None:
@@ -752,6 +790,9 @@ class _SparseGemm(torch.nn.Module):
             bufs.csr_indptr = voyager.alloc(
                 list(og.batch) + [og.n_k, og.M + 1], torch.int32
             )
+            bufs.out_base_table_dram = voyager.alloc(
+                base_table_shape(og), torch.int32
+            )
             bufs.slice_nnz = voyager.alloc(
                 list(og.batch) + [og.n_k], torch.int32, _SRAM
             )
@@ -762,6 +803,7 @@ class _SparseGemm(torch.nn.Module):
                 base_table_shape(og), torch.int32, _SRAM
             )
             bufs.store_sem = voyager.zeros([], torch.int64)
+            bufs.out_table_sem = voyager.zeros([], torch.int64)
             # Per-tile staging for ``_store_csr``'s stores.
             bufs.store_data_tile = voyager.alloc(
                 list(og.ones) + [og.budget], vals[0].dtype, _SRAM
@@ -772,15 +814,16 @@ class _SparseGemm(torch.nn.Module):
             bufs.store_indptr_tile = voyager.alloc(
                 list(og.ones) + [og.rows + 1], torch.int32, _SRAM
             )
-            # Sub-slice staging (see ``_EpilogueTail``): the shared prefix
-            # result.
-            if self.epi_prefix is not None and self.n_sub > 1:
-                bufs.epi_mid = voyager.alloc(
-                    list(og.ones) + [og.rows, self.plan.tile_n],
-                    self.plan.out_dtype,
-                    _SRAM,
-                )
         self._bufs = bufs
+        if g is not None:
+            # The gather reads the table's scalars to address its copies, so
+            # the whole table lands on chip before the loop runs.
+            copy_base_table(
+                bufs.base_table_dram,
+                bufs.base_table,
+                base_table_shape(g),
+                bufs.table_sem,
+            )
         dense = self.inner(*inputs)
         if og is None:
             return dense
@@ -794,6 +837,12 @@ class _SparseGemm(torch.nn.Module):
             # The last finalize's stores are still in flight, and the
             # consumer's nest reads the CSR next.
             self._drain_csr_stores()
+        copy_base_table(
+            bufs.out_base_table,
+            bufs.out_base_table_dram,
+            base_table_shape(og),
+            bufs.out_table_sem,
+        )
         scale, inliers = (dense if isinstance(dense, tuple) else (dense,))[:2]
         return (
             bufs.csr_data,
@@ -1059,6 +1108,37 @@ def build_sparse_gemm(
     with _lenient_verifier():
         gm = export_model(pattern, plan.inputs)
     gm = _finalize_exported_gm(gm)
+    # The scheduler's allocs take the same bank groups a dense GEMM's would;
+    # ``forward``'s hand allocs precede them in allocation order.  Every
+    # buffer that addresses the CSR joins the ``"csr"`` bank the search
+    # charged: the gather staging pair, the pointer tile (a scheduler slot,
+    # grouped by role) and the base-table tile whose scalars place the
+    # gather's copies -- all of them this nest's own, and all read on the
+    # same serialized fetch chain.  The producer's bookkeeping, its store
+    # staging and its own table are uncharged and stay loose.
+    roles = plan.anchor.meta.get("tiling", {}).get("bank_groups")
+    if roles is not None:
+        csr_group = next(
+            (i for i, role_set in enumerate(roles) if "csr" in role_set),
+            None,
+        )
+        # One entry per SRAM alloc ``_SparseGemm.forward`` makes, in its
+        # order -- keep the two in step.
+        hand_groups = []
+        if geom is not None:
+            # gather_data, gather_indices, base_table
+            hand_groups += [csr_group] * 3
+        if out_geom is not None:
+            # slice_nnz, stream_pos, out_base_table and the three
+            # store-staging tiles
+            hand_groups += [None] * 6
+        _stamp_bank_groups(
+            gm,
+            hand_groups
+            + _bank_group_list(
+                node, plan.in_specs, plan.out_specs, pattern.scratch_specs
+            ),
+        )
     _tag_loop_extents(gm, [[(0, pattern.inner.num_steps, 1)]])
     if geom is not None:
         tag_base_table(gm, ptr.meta[PRODUCER_META], base_table_shape(geom))
