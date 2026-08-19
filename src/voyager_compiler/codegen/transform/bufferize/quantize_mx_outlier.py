@@ -39,6 +39,7 @@ its CSR is independent and its pointers restart at zero.
 """
 
 import logging
+import math
 import operator
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
@@ -55,6 +56,7 @@ from voyager_compiler.codegen.node_info import (
     is_gemm_op,
     is_nop,
     quant_param_arg_nodes,
+    reduction_scratch,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
     MemoryLevel,
@@ -64,12 +66,14 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
     PipelinedKernel,
     _bank_group_list,
     _DEFAULT_NUM_SLOTS,
+    _naming_scratch,
     _stamp_bank_groups,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _compute_input_spec,
     _finalize_exported_gm,
     _lenient_verifier,
+    _ScratchSpec,
     _tag_loop_extents,
     effect_cond,
     outline_dps_ops,
@@ -270,8 +274,15 @@ class _OutlierProducer(torch.nn.Module):
     every buffer is allocated here and closed over, because the packed stores
     are addressed by loop state rather than by the grid. ``base``, ``run`` and
     the shared table use ``voyager.alloc`` in Scratchpad rather than a
-    ``_ScratchSpec``, which would arrive as a trailing kernel argument on a
-    signature every dense GEMM and conv shares.
+    ``_ScratchSpec``: they are loop-carried state living the whole sweep, not
+    per-step scratch, and the table has a DRAM twin the consumers read.
+
+    A reduction fused ahead of the quantize (a ``layer_norm``, a ``softmax``)
+    does take ``_ScratchSpec``s -- the regions its backend kernel keeps beside
+    the row-block intermediate. The scheduler allocates them and appends them
+    to the kernel arguments, which is exactly where the prefix wants them: it
+    is traced against the twin that names them (``_naming_scratch``), whose
+    extra placeholders follow its own.
     """
 
     def __init__(
@@ -285,6 +296,7 @@ class _OutlierProducer(torch.nn.Module):
         prefix_gm: Optional[torch.nn.Module],
         act_idx: int,
         kw_idx: dict,
+        scratch_specs=(),
         num_slots: int = _DEFAULT_NUM_SLOTS,
     ):
         super().__init__()
@@ -295,11 +307,13 @@ class _OutlierProducer(torch.nn.Module):
         self.prefix_gm = prefix_gm
         self.act_idx = act_idx
         self.kw_idx = kw_idx
+        self.num_inputs = len(in_specs)
         self.inner = PipelinedKernel(
             self._kernel,
             grid=geom.batch + (geom.n_rb,),
             in_specs=in_specs,
             out_specs=[],
+            scratch_specs=scratch_specs,
             num_slots=num_slots,
         )
 
@@ -332,16 +346,21 @@ class _OutlierProducer(torch.nn.Module):
     # --- the two loops ------------------------------------------------------
 
     def _kernel(self, idx, *slots):
-        """One row block: run whatever was fused, then sweep its K slices."""
+        """One row block: run whatever was fused, then sweep its K slices.
+
+        The scheduler hands the loaded tiles first and the reduction scratch
+        after them; only the prefix sees the scratch.
+        """
+        tiles, scratch = slots[: self.num_inputs], slots[self.num_inputs :]
         if self.prefix_gm is None:
             # No fused prefix: the loaded tile itself is the intermediate
             # the slices window (a K-slice subview composes with the slot's
             # own window into one reference).
-            mid = slots[self.act_idx]
+            mid = tiles[self.act_idx]
         else:
             mid = self._bufs.row_block
-            voyager.insert(self.prefix_gm(*slots), mid)
-        self._slice_loop(idx, mid, slots)
+            voyager.insert(self.prefix_gm(*tiles, *scratch), mid)
+        self._slice_loop(idx, mid, tiles)
 
     def _slice_loop(self, idx, mid, slots):
         g, bufs = self.geom, self._bufs
@@ -781,28 +800,40 @@ def consumer_k_tile(node, tiler) -> Tuple[Optional[int], Optional[int]]:
 # boundary.  Three buffers scale with the row block -- the intermediate, the
 # input tile it is produced from (the same rows at the same width), and the
 # per-slice staging tiles, which together span one K slice and so cannot
-# exceed the intermediate either.
+# exceed the intermediate either.  A fused reduction's scratch scales with it
+# too, and is charged on top from its own shapes.
 _NEST_ROW_BLOCK_COPIES = 3
 
 
-def _row_block(node, tiler, geom_shape, mid_bytes_per_row, cap=None) -> int:
+def _row_block(
+    node, tiler, geom_shape, mid_bytes_per_row, scratch_bytes_per_row, cap=None
+) -> int:
     """Rows the outer loop handles per step.
 
     Starts from the vector-op tile search (which sizes the operands the fused
     group loads) and shrinks until everything in the nest that scales with the
     row block fits the scratchpad -- not the intermediate alone, which is only
-    a third of it (``_NEST_ROW_BLOCK_COPIES``).
+    a third of it (``_NEST_ROW_BLOCK_COPIES``), plus whatever a fused
+    reduction keeps beside it.
 
-    ``cap`` is the smallest row tile any sparse consumer uses. A consumer
-    gathers a whole number of blocks, so the block must divide its row tile --
-    which makes a block no larger than one.
+    Args:
+        node: The producer being lowered.
+        tiler: The interstellar ``TilerContext``.
+        geom_shape: Rows the activation has in all (``M``).
+        mid_bytes_per_row: Bytes one row of the ``[rows, K]`` intermediate
+            occupies.
+        scratch_bytes_per_row: Bytes one row of the fused reduction's scratch
+            regions occupies, 0 when the prefix keeps none.
+        cap: The smallest row tile any sparse consumer uses. A consumer
+            gathers a whole number of blocks, so the block must divide its row
+            tile -- which makes a block no larger than one.
     """
     M = geom_shape
     tiling = vector_op_tiling(node, tiler.config)
     rows = M if tiling is None else max(1, M // max(1, tiling[-2]))
     if cap is not None:
         rows = min(rows, cap)
-    per_row = _NEST_ROW_BLOCK_COPIES * mid_bytes_per_row
+    per_row = _NEST_ROW_BLOCK_COPIES * mid_bytes_per_row + scratch_bytes_per_row
     slot_size = tiler.config.scratchpad_size // tiler.config.num_slots
     while rows > 1 and rows * per_row > slot_size:
         rows //= 2
@@ -855,7 +886,29 @@ def build_quantize_mx_outlier(
         else None
     )
 
-    rows = _row_block(node, tiler, M, K * act.element_size(), cap=tm_consumer)
+    # The prefix's reduction keeps regions on chip beside the intermediate it
+    # produces (a layer_norm's mean, variance and normalized tile).  Every one
+    # scales linearly with the row block, so a one-row tile prices a row of
+    # them -- which is what the row-block search needs before it knows how
+    # many rows there are.
+    lanes = tiler.config.vector_lanes
+    ones = [1] * len(batch)
+    scratch_per_row = (
+        sum(
+            math.prod(shape) * dtype.itemsize
+            for _, shape, dtype in reduction_scratch(node, ones + [1, K], lanes)
+        )
+        if prefix_gm is not None
+        else 0
+    )
+    rows = _row_block(
+        node,
+        tiler,
+        M,
+        K * act.element_size(),
+        scratch_per_row,
+        cap=tm_consumer,
+    )
     if M % rows:
         raise ValueError(f"{node.name}: row block {rows} does not divide M={M}")
     geom = _Geometry(
@@ -870,6 +923,18 @@ def build_quantize_mx_outlier(
     )
     threshold = get_arg_value(qnode, 8, "threshold")
     geom = _fit_block_budget(act, threshold, geom)
+
+    # The reduction is traced against the twin that names its scratch, which
+    # takes the prefix's own operands plus one trailing placeholder per
+    # region.  Sized off the row-block intermediate, the tile it reduces.
+    scratch = (
+        reduction_scratch(node, ones + [rows, K], lanes)
+        if prefix_gm is not None
+        else []
+    )
+    scratch_specs = [_ScratchSpec(tuple(shape), dt) for _, shape, dt in scratch]
+    if prefix_gm is not None:
+        prefix_gm = _naming_scratch(prefix_gm, [name for name, _, _ in scratch])
 
     # Operand roles. The activation tiles along the row-block grid dim and
     # keeps K whole (the inner loop dices it); codebooks load whole.
@@ -942,6 +1007,7 @@ def build_quantize_mx_outlier(
         prefix_gm=prefix_gm,
         act_idx=act_idx,
         kw_idx=kw_idx,
+        scratch_specs=scratch_specs,
         num_slots=num_slots,
     )
 
@@ -963,7 +1029,8 @@ def build_quantize_mx_outlier(
         # slice_nnz, stream_pos, base_table, then the five staging tiles
         hand_groups += [out_group] * 8
         _stamp_bank_groups(
-            gm, hand_groups + _bank_group_list(node, in_specs, [])
+            gm,
+            hand_groups + _bank_group_list(node, in_specs, [], scratch_specs),
         )
     _tag_loop_extents(gm, [[(0, producer.num_steps, 1)], [(0, geom.n_k, 1)]])
     tag_base_table(gm, node.name, base_table_shape(geom))
