@@ -684,12 +684,18 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
 def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
     """Bytes one on-chip tensor of ``numel`` ``dtype`` elements occupies.
 
-    The store path writes a beat of ``vector_lanes`` values as whole
-    ``bank_width``-byte words, so a beat whose payload is not a whole number
-    of words (a sub-byte dtype) writes past the tensor's end on its final
-    beat.  That tail slack is reserved after the payload -- otherwise the
-    overshoot lands on the next buffer -- and the total is aligned to
-    ``bank_width``.  The tile search and the memory planner both size
+    The store path writes whole beats of ``vector_lanes`` values as whole
+    ``bank_width``-byte words, and masks neither end: a tensor is charged the
+    beats it takes to cover ``numel``, not the bytes its elements occupy, and
+    a beat whose payload is not a whole number of words (a sub-byte dtype)
+    also writes past its own end.  Both overshoots are reserved here --
+    otherwise they land on the next buffer -- and the total is aligned to
+    ``bank_width``.
+
+    Charging beats rather than elements only matters when ``numel`` is not a
+    whole number of them: a tile always is, but a CSR row-pointer or nonzero
+    capacity need not be, and one of those is charged a whole beat for its
+    handful of entries.  The tile search and the memory planner both size
     through here, so a tile the search accepts is a tile the planner can
     place.
 
@@ -710,7 +716,8 @@ def tensor_alloc_bytes(numel, dtype, bank_width, vector_lanes=None):
     size = math.ceil(numel * dtype_byte_size(dtype))
     if vector_lanes is not None and bank_width is not None:
         beat = math.ceil(vector_lanes * dtype_byte_size(dtype))
-        size += _align_size(beat) - beat
+        beats = math.ceil(numel / vector_lanes)
+        size = (beats - 1) * beat + _align_size(beat)
     return int(_align_size(size))
 
 
