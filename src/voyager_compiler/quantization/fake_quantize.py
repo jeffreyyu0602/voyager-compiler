@@ -271,7 +271,8 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
 
         # Generate quantization map buffers
         quant_map = get_quantization_map(dtype, device)
-        if isinstance(quant_map, tuple):
+        self.is_codebook_quantization = isinstance(quant_map, tuple)
+        if self.is_codebook_quantization:
             indices, values = quant_map
             quant_map = values[indices]
         self.register_buffer("qmap", quant_map, persistent=False)

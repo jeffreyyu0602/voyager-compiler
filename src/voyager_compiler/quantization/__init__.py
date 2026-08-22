@@ -9,6 +9,22 @@ from voyager_compiler.quantization.fake_quantize import (
     FusedAmaxObsFakeQuantize,
     get_quantization_map,
 )
+from voyager_compiler.quantization.gptq import (
+    CACHE_RESERVE,
+    compensate_weight,
+    gptq,
+)
+from voyager_compiler.quantization.lcq import (
+    CodebookGrid,
+    Histogram,
+    codebook_qmap,
+    fit_codebooks,
+    load_codebooks,
+    normal_float_levels,
+    optimal_codebook,
+    unit_scale,
+    weighted_lloyd,
+)
 from voyager_compiler.quantization.qconfig import QConfig, get_qconfig
 from voyager_compiler.quantization.qspec import QScheme
 from voyager_compiler.quantization.quantize import (
@@ -36,19 +52,29 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 )
 
 __all__ = [
+    "CACHE_RESERVE",
+    "CodebookGrid",
+    "Histogram",
     "DerivedQuantizationSpec",
     "FusedAmaxObsFakeQuantize",
     "QConfig",
-    "QuantizationConfig",
     "QScheme",
+    "QuantizationConfig",
     "QuantizationSpec",
+    "codebook_qmap",
+    "compensate_weight",
     "convert",
     "convert_pt2e",
     "derive_bias_qparams_fn",
+    "fit_codebooks",
     "get_conv_bn_layers",
     "get_default_quantizer",
     "get_qconfig",
     "get_quantization_map",
+    "gptq",
+    "load_codebooks",
+    "normal_float_levels",
+    "optimal_codebook",
     "prepare",
     "prepare_pt2e",
     "propagate_config",
@@ -56,4 +82,6 @@ __all__ = [
     "replace_softmax",
     "sink_obs_or_fq",
     "swap_matmul_inputs",
+    "unit_scale",
+    "weighted_lloyd",
 ]

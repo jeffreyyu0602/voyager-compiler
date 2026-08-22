@@ -34,7 +34,7 @@ def parse_args():
         "--max_length", type=int, default=1024, help="Maximum sequence length"
     )
     parser.add_argument(
-        "--stride", type=int, default=512, help="Stride for processing the data"
+        "--stride", type=int, default=1024, help="Stride for processing the data"
     )
     parser.add_argument(
         "--output_dir", default=None, help="Output directory for histograms"

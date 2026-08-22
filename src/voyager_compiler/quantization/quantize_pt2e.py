@@ -453,14 +453,16 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             f"{node.target} has maximum outlier percentage {max_outlier_pct:.2%}"
         )
 
-    quant_map = get_quantization_map(activation_post_process.dtype, device)
     dequant_code, quant_code = None, None
+    if activation_post_process.is_codebook_quantization:
+        table = activation_post_process.qmap
+        values = torch.unique(table)
+        indices = torch.searchsorted(values, table).to(torch.int64)
 
-    if isinstance(quant_map, tuple):
-        matches = re.findall(r"\d+", activation_post_process.dtype)
-        activation_post_process.dtype = f"int{matches[0]}"
-
-        indices, values = quant_map
+        level_bits = re.fullmatch(r".*_(\d+)", activation_post_process.dtype)
+        activation_post_process.dtype = (
+            f"int{math.ceil(math.log2(values.numel()))}"
+        )
         activation_post_process.qmap = indices
 
         with graph.inserting_before(node):
@@ -473,9 +475,8 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     model, graph, "code", midpoints
                 )
 
-        # NF4_[B] means approximate NormalFloat4 with B-bit integer
-        if len(matches) > 1:
-            dequant_code.meta["dtype"] = f"int{matches[1]}"
+        if level_bits is not None:
+            dequant_code.meta["dtype"] = f"int{level_bits.group(1)}"
 
     if input_node.op == "get_attr":
         # quantize model parameter and remove the fq module
