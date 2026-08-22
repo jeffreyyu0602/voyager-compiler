@@ -98,7 +98,29 @@ def get_quantization_map(dtype, device=None):
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-class MXFakeQuantFunction(torch.autograd.Function):
+class FakeQuantizeFunction(torch.autograd.Function):
+    """This function quantizes the inputs against an observed scale."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        fake_quant_enabled: torch.Tensor,
+        qmap: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if fake_quant_enabled[0] == 0:
+            return input
+        scale = scale.to(input.dtype)
+        return vmap(input / scale, qmap) * scale
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Straight-through estimator: only ``input`` takes a gradient."""
+        return (grad_output,) + (None,) * 3
+
+
+class MXFakeQuantizeFunction(torch.autograd.Function):
     """This function performs MX quantization by calculating the scaling
     factor using absolute maximum values in the input.
     """
@@ -185,77 +207,13 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
         sf = expand(sf, input.shape, block_size)
         zp = expand(zp, input.shape, block_size)
 
-        # Quantize
         q = torch.clamp(torch.round(input / sf + zp), quant_min, quant_max)
-
-        # Dequantize
-        input = (q - zp) * sf
-
-        return input
+        return (q - zp) * sf
 
     @staticmethod
     def backward(ctx, grad_output):
         """Straight-through estimator: only ``input`` takes a gradient."""
         return (grad_output,) + (None,) * 8
-
-
-class FusedAmaxObsFakeQuantFunction(torch.autograd.Function):
-    """This function observes the amax statistics of inputs and
-    quantize the inputs based on the observed amax values.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        observer_enabled: torch.Tensor,
-        fake_quant_enabled: torch.Tensor,
-        qmap: torch.Tensor,
-        amax_history: torch.Tensor,
-        scale: torch.Tensor,
-        amax_history_len: int,
-        quant_max: float,
-        ch_axis: Optional[int] = None,
-        per_row_fake_quant=False,
-        force_scale_power_of_two=False,
-    ) -> torch.Tensor:
-        if observer_enabled[0] == 1:
-            if per_row_fake_quant:
-                ch_axis = ch_axis + input.ndim if ch_axis < 0 else ch_axis
-                dim = tuple(i for i in range(input.ndim) if i != ch_axis)
-                amax_cur = torch.amax(torch.abs(input), dim=dim, keepdim=True)
-            else:
-                amax_cur = torch.amax(torch.abs(input))
-
-            if amax_history.numel() == 0:
-                size = amax_cur.shape
-                amax_history.resize_((amax_history_len,) + size).fill_(0.0)
-                scale.resize_(size).fill_(1.0)
-
-            amax = torch.amax(amax_history, dim=0)
-
-            if amax_history.shape[0] > 1:
-                new_amax_history = torch.roll(amax_history, -1, 0)
-                amax_history.copy_(new_amax_history)
-            amax_history[0] = amax_cur
-
-            sf = amax / quant_max
-            sf = torch.where(amax > 0.0, sf, scale)
-            sf = torch.where(torch.isfinite(amax), sf, scale)
-            if force_scale_power_of_two:
-                sf = torch.pow(2, torch.ceil(torch.log2(sf)))
-            scale.copy_(sf)
-
-        if fake_quant_enabled[0] == 1:
-            scale = scale.to(input.dtype)
-            input = vmap(input / scale, qmap) * scale
-
-        return input
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 10
 
 
 class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
@@ -346,6 +304,41 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         else:
             self.outlier_threshold = outlier_threshold
 
+    @torch.no_grad()
+    def _update_amax_scale(self, x: torch.Tensor) -> None:
+        """Fold ``x``'s amax into the history and recompute ``scale``.
+
+        The absolute maximum is taken over every axis, or over every axis
+        but ``ch_axis`` when the observer is per-channel. The history and
+        the scale are lazily sized on the first call, since the observed
+        shape is only known once a tensor arrives.
+
+        Args:
+            x: The tensor being observed.
+        """
+        if self.is_per_channel:
+            ch_axis = self.ch_axis % x.ndim
+            dim = tuple(i for i in range(x.ndim) if i != ch_axis)
+            amax_cur = torch.amax(torch.abs(x), dim=dim, keepdim=True)
+        else:
+            amax_cur = torch.amax(torch.abs(x))
+
+        if self.amax_history.numel() == 0:
+            size = (self.amax_history_len,) + amax_cur.shape
+            self.amax_history.resize_(size).fill_(0.0)
+            self.scale.resize_(amax_cur.shape).fill_(1.0)
+
+        amax = torch.amax(self.amax_history, dim=0)
+        self.amax_history.copy_(torch.roll(self.amax_history, -1, 0))
+        self.amax_history[0] = amax_cur
+
+        sf = amax / self.quant_max
+        sf = torch.where(amax > 0.0, sf, self.scale)
+        sf = torch.where(torch.isfinite(amax), sf, self.scale)
+        if self.force_scale_power_of_two:
+            sf = torch.pow(2, torch.ceil(torch.log2(sf)))
+        self.scale.copy_(sf)
+
     @torch.jit.export
     def calculate_qparams(self):
         if self.qscheme == QScheme.GROUP_WISE_AFFINE:
@@ -401,7 +394,7 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
 
         if self.qscheme == QScheme.MICROSCALING:
-            x = MXFakeQuantFunction.apply(
+            x = MXFakeQuantizeFunction.apply(
                 x,
                 self.fake_quant_enabled,
                 self.scale,
@@ -425,18 +418,10 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 self.scale_qmap,
             )
         else:
-            x = FusedAmaxObsFakeQuantFunction.apply(
-                x,
-                self.observer_enabled,
-                self.fake_quant_enabled,
-                self.qmap,
-                self.amax_history,
-                self.scale,
-                self.amax_history_len,
-                self.quant_max,
-                self.ch_axis,
-                self.is_per_channel,
-                self.force_scale_power_of_two,
+            if self.observer_enabled[0] == 1:
+                self._update_amax_scale(x)
+            x = FakeQuantizeFunction.apply(
+                x, self.fake_quant_enabled, self.qmap, self.scale
             )
 
         # Restore all outlier positions.
@@ -501,15 +486,8 @@ class _DerivedObserverOrFakeQuantize(FakeQuantizeBase):
         if len(devices) != 1 or next(iter(devices)) != x.device:
             self.to(x.device)
 
-        return FusedAmaxObsFakeQuantFunction.apply(
-            x,
-            self.observer_enabled,
-            self.fake_quant_enabled,
-            self.qmap,
-            None,
-            self.calculate_qparams(),
-            None,
-            None,
+        return FakeQuantizeFunction.apply(
+            x, self.fake_quant_enabled, self.qmap, self.calculate_qparams()
         )
 
     def calculate_qparams(self):
