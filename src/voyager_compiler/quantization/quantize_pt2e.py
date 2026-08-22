@@ -456,21 +456,32 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     dequant_code, quant_code = None, None
     if activation_post_process.is_codebook_quantization:
         table = activation_post_process.qmap
-        values = torch.unique(table)
-        indices = torch.searchsorted(values, table).to(torch.int64)
+        # A codebook is already the levels, one row per attention head; a
+        # lookup table holds them once per bfloat16 bit pattern.
+        per_head = table.dim() > 1
+        values = table if per_head else torch.unique(table)
 
         level_bits = re.fullmatch(r".*_(\d+)", activation_post_process.dtype)
         activation_post_process.dtype = (
-            f"int{math.ceil(math.log2(values.numel()))}"
+            f"int{math.ceil(math.log2(values.shape[-1]))}"
         )
-        activation_post_process.qmap = indices
+        # A lookup table answers with the index directly, since it is
+        # indexed by the value itself.  A codebook stays the levels, and
+        # the midpoints it is compared against travel beside it as the
+        # quantize's ``output_code``, which is what turns a value into an
+        # index there.
+        activation_post_process.qmap = (
+            values
+            if per_head
+            else torch.searchsorted(values, table).to(torch.int64)
+        )
 
         with graph.inserting_before(node):
             dequant_code = create_getattr_from_value(
                 model, graph, "code", values
             )
             if input_node.op != "get_attr":
-                midpoints = (values[:-1] + values[1:]) / 2
+                midpoints = (values[..., :-1] + values[..., 1:]) / 2
                 quant_code = create_getattr_from_value(
                     model, graph, "code", midpoints
                 )

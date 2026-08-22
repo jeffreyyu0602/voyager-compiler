@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
+from voyager_compiler.ops.quantized import HEAD_AXIS, QMAP_SIZE
 from voyager_compiler.quantization.dtypes import create_normal_map
 
 logger = logging.getLogger(__name__)
@@ -626,12 +627,34 @@ def _accumulate(tensor, module, energy, histogram):
     histogram.add(normalized, weights)
 
 
+def install_codebook(module, levels):
+    """Write fitted levels into a fake-quant, in place.
+
+    The levels replace the fake-quant's quantization map outright, since
+    that map is what ``quantize`` reads and what ``convert_pt2e`` hands to
+    the graph.  One table per tensor stays a lookup table, so nothing
+    downstream sees a change; one table per head cannot be a lookup table
+    -- an entry per bfloat16 bit pattern has no room for a second index --
+    and is installed as the codebook itself, which ``quantize`` searches.
+
+    Args:
+        module: The fake-quant the levels belong to.
+        levels: One table of integers, or one table per attention head.
+    """
+    device = module.qmap.device
+    if isinstance(levels[0], (list, tuple)):
+        module.qmap = torch.tensor(levels, dtype=torch.float32, device=device)
+    else:
+        module.qmap = codebook_qmap(levels, device)
+
+
 def fit_codebooks(
     model,
     calibration,
     skip=(),
     weighted=True,
     weight_by=(),
+    per_head=(),
     pin_zero=True,
     quantized_inputs=False,
     dump=None,
@@ -659,6 +682,10 @@ def fit_codebooks(
             a decoder layer's two sharing sites.  Empty adds every partner's
             energy, which is what the error actually does, and a site no
             substring matches falls back to that.
+        per_head: Substrings picking tensors to fit one codebook per
+            attention head rather than one for the whole tensor --
+            ``("|q", "|k")`` names the two operands of Q @ K^T.  The
+            partner that weights such a fit is resolved per head too.
         pin_zero: Require a zero level.  Without it the optimum spends that
             level elsewhere, leaving a block's many small values unable to
             quantize to zero.
@@ -704,6 +731,20 @@ def fit_codebooks(
         or [named.get(partner) for partner in group]
         for name, (_, _, group) in operands.items()
     }
+    split = {
+        name for name in operands if any(pick in name for pick in per_head)
+    }
+    # A split tensor's error reaches the output through its partner's own
+    # head, so that partner's energy is resolved per head as well.
+    resolved = split | {
+        other for name in split for other in partners[name] if other
+    }
+    if split:
+        logger.info(
+            "fitting %d of them one codebook per head: %s",
+            len(split),
+            ", ".join(sorted(split)[:3]) + (" ..." if len(split) > 3 else ""),
+        )
     energies, floors, histograms = {}, {}, {}
 
     live = {
@@ -716,7 +757,15 @@ def fit_codebooks(
             module.fake_quant_enabled.zero_()
 
     def measure(name, module, tensor):
-        share = _channel_energy(tensor, module.ch_axis)
+        if name in resolved:
+            share = torch.stack(
+                [
+                    _channel_energy(head, module.ch_axis)
+                    for head in tensor.unbind(HEAD_AXIS)
+                ]
+            )
+        else:
+            share = _channel_energy(tensor, module.ch_axis)
         held = energies.get(name)
         energies[name] = share if held is None else held + share
         lowest = tensor.detach().min()
@@ -724,14 +773,18 @@ def fit_codebooks(
         floors[name] = lowest if held is None else torch.minimum(held, lowest)
 
     def collect(name, module, tensor):
+        slabs = tensor.unbind(HEAD_AXIS) if name in split else (tensor,)
         if name not in histograms:
             # A tensor that never went negative -- a softmax output -- would
             # spend half its levels on values that cannot occur.  The floor
             # is read off the whole tensor in the pass before this one.
             floor = floors[name].item()
-            histograms[name] = Histogram(
-                0.0 if floor >= 0 else -module.quant_max, module.quant_max
-            )
+            histograms[name] = [
+                Histogram(
+                    0.0 if floor >= 0 else -module.quant_max, module.quant_max
+                )
+                for _ in slabs
+            ]
         energy = None
         if weighted:
             # A tensor read by several ops reaches the output through all of
@@ -739,7 +792,13 @@ def fit_codebooks(
             for share in (energies.get(other) for other in partners[name]):
                 if share is not None:
                     energy = share if energy is None else energy + share
-        _accumulate(tensor, module, energy, histograms[name])
+        for head, (slab, histogram) in enumerate(zip(slabs, histograms[name])):
+            share = energy
+            if share is not None and share.dim() == 2:
+                # Pooling a per-head energy is averaging it: every head
+                # contributes the same number of elements to the mean.
+                share = share[head] if name in split else share.mean(0)
+            _accumulate(slab, module, share, histogram)
 
     # A parameter is the same tensor on every calibration input, so binning
     # it once is binning it every time: the three moments scale together and
@@ -789,23 +848,31 @@ def fit_codebooks(
 
     tables, unsigned = {}, []
     for name, (module, _, _) in operands.items():
-        histogram = histograms.get(name)
-        if histogram is None or histogram.weight is None:
+        group = histograms.get(name)
+        if group is None or group[0].weight is None:
             logger.warning(
                 "%s: nothing accumulated, so it keeps the table it was "
                 "seeded with",
                 name,
             )
             continue
-        if histogram.quant_min == 0.0:
+        if group[0].quant_min == 0.0:
             unsigned.append(name)
-        # How many levels the table holds is the dtype's to say, and the
-        # seeded lookup already says it.
-        k = int(torch.unique(module.qmap).numel())
-        levels = optimal_codebook(histogram, k=k, pin_zero=pin_zero)
-        tables[name] = levels
-        module.qmap.copy_(codebook_qmap(levels, module.qmap.device))
-        logger.debug("%s: %s", name, levels)
+        # How many levels there are is the dtype's to say, and what the
+        # module already carries says it: a lookup table by how many
+        # distinct entries it holds, a codebook by its width.
+        k = (
+            module.qmap.shape[-1]
+            if module.qmap.numel() < QMAP_SIZE
+            else int(torch.unique(module.qmap).numel())
+        )
+        fitted = [
+            optimal_codebook(histogram, k=k, pin_zero=pin_zero)
+            for histogram in group
+        ]
+        tables[name] = fitted if name in split else fitted[0]
+        install_codebook(module, tables[name])
+        logger.debug("%s: %s", name, tables[name])
 
     logger.info("fitted %d of %d tensors", len(tables), len(operands))
     if unsigned:
@@ -829,7 +896,9 @@ def load_codebooks(model, tables, skip=()):
     Args:
         model: Graph module from ``prepare_pt2e``.
         tables: ``name -> levels``, or the path of a JSON file holding it,
-            as ``fit_codebooks`` writes with ``dump``.
+            as ``fit_codebooks`` writes with ``dump``.  An entry that is a
+            list of tables rather than one is a codebook per attention
+            head.
         skip: Substrings of operand names to leave alone.
 
     Returns:
@@ -851,8 +920,7 @@ def load_codebooks(model, tables, skip=()):
             f"quantizes, starting with {unknown[0]}"
         )
     for name, levels in tables.items():
-        module = operands[name][0]
-        module.qmap.copy_(codebook_qmap(levels, module.qmap.device))
+        install_codebook(operands[name][0], levels)
     logger.info("installed %d codebooks", len(tables))
 
     unfitted = sorted(set(operands) - set(tables))

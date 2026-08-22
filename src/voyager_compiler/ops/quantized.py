@@ -121,6 +121,105 @@ def vmap(
     return output.to(input_dtype)
 
 
+#: Entries in a bfloat16-indexed lookup table, one per bit pattern.  A
+#: quantization map that size is such a table; a smaller one is the
+#: codebook itself, and is searched rather than indexed.
+QMAP_SIZE = 2**16
+
+#: Axis an attention operand carries its heads on: Q, K, P and V all enter
+#: their matmul as ``[batch, head, ...]``.  A microscaling block never
+#: straddles two heads, so a head owns whole blocks and can carry its own
+#: codebook.
+HEAD_AXIS = 1
+
+
+def encode(
+    input: torch.Tensor,
+    codebook: torch.Tensor,
+    bounds: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Quantize each element against a codebook.
+
+    The entries are ascending, so which one an element rounds to is the
+    interval it falls in between their midpoints -- the same rule a
+    lookup table bakes in, without materialising an entry per bfloat16
+    bit pattern.  Searching those midpoints yields the entry's index, and
+    reading the entry back is one more gather.
+
+    Args:
+        input: Tensor to quantize, already divided by its block scale.
+        codebook: Entries in ascending order.  A 2-D codebook holds one
+            row per attention head and is indexed by ``input``'s
+            ``HEAD_AXIS``, which lets one tensor carry a table per head.
+        bounds: The midpoints between entries, passed when the caller
+            wants the index each element falls to rather than the entry
+            itself -- what a compiled graph stores, to be decoded where
+            it is read.  None derives them and returns the entry.
+
+    Returns:
+        Tensor shaped like ``input``, holding either the entry each
+        element rounded to or that entry's index.
+
+    Raises:
+        ValueError: A per-head codebook has a different number of rows
+            than the tensor has heads.
+    """
+    edges = bounds
+    if edges is None:
+        edges = (codebook[..., :-1] + codebook[..., 1:]) / 2
+
+    # Rounding to bfloat16 first is what the lookup table does by
+    # construction, so the two agree on everything but the entries.
+    if codebook.dim() == 1:
+        index = torch.searchsorted(edges, input.bfloat16().float())
+        picked = index if bounds is not None else codebook[index]
+        return picked.to(input.dtype)
+
+    # One row per head, which ``searchsorted`` reaches only when the head
+    # leads both operands: the rest of the tensor flattens behind it.
+    heads = codebook.shape[0]
+    if input.shape[HEAD_AXIS] != heads:
+        raise ValueError(
+            f"the codebook holds {heads} rows, but the tensor reaching it "
+            f"has {input.shape[HEAD_AXIS]} heads"
+        )
+    moved = input.movedim(HEAD_AXIS, 0)
+    flat = moved.reshape(heads, -1).bfloat16().float()
+    index = torch.searchsorted(edges.contiguous(), flat.contiguous())
+    picked = index if bounds is not None else codebook.gather(1, index)
+    return picked.view(moved.shape).movedim(0, HEAD_AXIS).to(input.dtype)
+
+
+def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """Read each stored index back as the entry it names.
+
+    Args:
+        input: Tensor of indices, as ``encode`` emitted them.
+        codebook: The entries.  A 2-D codebook holds one row per attention
+            head and is indexed by ``input``'s ``HEAD_AXIS``.
+
+    Returns:
+        Tensor shaped like ``input``, holding the entry each index names.
+
+    Raises:
+        ValueError: A per-head codebook has a different number of rows
+            than the tensor has heads.
+    """
+    index = input.to(torch.long)
+    if codebook.dim() == 1:
+        return codebook[index].to(input.dtype)
+
+    heads = codebook.shape[0]
+    if input.shape[HEAD_AXIS] != heads:
+        raise ValueError(
+            f"the codebook holds {heads} rows, but the tensor reaching it "
+            f"has {input.shape[HEAD_AXIS]} heads"
+        )
+    moved = index.movedim(HEAD_AXIS, 0)
+    picked = codebook.gather(1, moved.reshape(heads, -1)).view(moved.shape)
+    return picked.movedim(0, HEAD_AXIS).to(input.dtype)
+
+
 quantized_ops_lib.define(
     "quantize(Tensor input, Tensor scale, Tensor? zero_point=None, "
     "SymInt[]? axes=None, int? block_size=None, Tensor? qmap=None, "
@@ -149,7 +248,10 @@ def quantize(
         block_size (int): block size for group-wise quantization,
             default is None
         qmap (torch.Tensor): quantization map for mapping from float to
-            quantized values
+            quantized values. A map of ``QMAP_SIZE`` entries is a lookup
+            table indexed by the bfloat16 bit pattern; a smaller one is a
+            codebook, searched for the nearest entry, and a 2-D codebook
+            carries one row per attention head.
         output_code (torch.Tensor): codebook for quantizing the output
 
     Returns:
@@ -169,7 +271,12 @@ def quantize(
     else:
         input = input / scale + zero_point
 
-    return vmap(input, qmap)
+    # Both a value table and the index table ``convert_pt2e`` swaps in have
+    # one entry per bit pattern, so size is what tells a table from a
+    # codebook -- their dtypes differ.
+    if qmap.numel() == QMAP_SIZE and qmap.dim() == 1:
+        return vmap(input, qmap)
+    return encode(input, qmap, output_code)
 
 
 quantized_ops_lib.define(
@@ -259,9 +366,9 @@ def conv2d_mx(
 
     # For codebook quantization, decode input and weight into float values first
     if input_code is not None:
-        input = input_code[input.to(torch.long)].to(input.dtype)
+        input = decode(input, input_code)
     if weight_code is not None:
-        weight = weight_code[weight.to(torch.long)].to(weight.dtype)
+        weight = decode(weight, weight_code)
 
     # Replicate scales to match input and weight shapes
     if input_scale is not None:
@@ -311,14 +418,14 @@ def linear_mx(
     assert weight_layout in ("kc", "ck"), weight_layout
 
     if input_code is not None:
-        input = input_code[input.to(torch.long)].to(input.dtype)
+        input = decode(input, input_code)
 
     if input_scale is not None:
         input = input * expand(input_scale, input.shape, block_size)
 
     decoded_weight = weight
     if weight_code is not None:
-        decoded_weight = weight_code[weight.to(torch.long)].to(weight.dtype)
+        decoded_weight = decode(weight, weight_code)
 
     if weight_scale is not None:
         decoded_weight = decoded_weight * expand(
@@ -386,13 +493,13 @@ def matmul_mx(
     assert weight_layout in ("kc", "ck"), weight_layout
 
     if input_code is not None:
-        self = input_code[self.to(torch.long)].to(self.dtype)
+        self = decode(self, input_code)
     if input_scale is not None:
         self = self * expand(input_scale, self.shape, block_size)
 
     decoded_other = other
     if weight_code is not None:
-        decoded_other = weight_code[other.to(torch.long)].to(other.dtype)
+        decoded_other = decode(other, weight_code)
     if weight_scale is not None:
         decoded_other = decoded_other * expand(
             weight_scale, other.shape, block_size
@@ -525,7 +632,7 @@ def quantize_mx(
         force_scale_power_of_two=force_scale_power_of_two,
         scale_qmap=scale_qmap,
     )
-    input = quantize(input, scale, None, axes, block_size, qmap)
+    input = quantize(input, scale, None, axes, block_size, qmap, output_code)
     return scale, input
 
 
@@ -673,7 +780,8 @@ def quantize_mx_outlier(
         force_scale_power_of_two: Round each block scale down to a power
             of two.
         scale_qmap: Codebook the scales are quantized into.
-        output_code: Unused; present to match the sibling quantize ops.
+        output_code: What a codebook emits per entry, in place of the
+            entry itself; ignored when ``qmap`` is a lookup table.
         threshold: Magnitude above which an element is an outlier.
         max_pct: Fraction of the matrix the CSR is sized to hold.
         indptr_offset: Value the returned row pointers start from, so a
@@ -696,7 +804,9 @@ def quantize_mx_outlier(
         force_scale_power_of_two=force_scale_power_of_two,
         scale_qmap=scale_qmap,
     )
-    inliers = quantize(inliers, scale, None, axes, block_size, qmap)
+    inliers = quantize(
+        inliers, scale, None, axes, block_size, qmap, output_code
+    )
 
     return data, indices, indptr, scale, inliers
 
@@ -827,7 +937,7 @@ def spmm_csr(
     assert weight_layout in ("kc", "ck"), weight_layout
 
     if B_code is not None:
-        B = B_code[B.to(torch.long)]
+        B = decode(B, B_code)
     if B_scale is not None:
         B = B * expand(B_scale, B.shape, block_size)
 
