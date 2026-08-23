@@ -1047,10 +1047,11 @@ class AsyncPipelinedKernel(PipelinedKernel):
         final_store = final[3]
         if self.num_steps >= 1:
             last = self.num_steps - 1
-            coord = out_refs[0]._unravel(last)
             voyager.async_wait(get_slot(done_sem, last % _DONE_DEPTH))
-            for i in range(num_outputs):
-                _store_out(i, coord, final_store[i])
+            if num_outputs:
+                coord = out_refs[0]._unravel(last)
+                for i in range(num_outputs):
+                    _store_out(i, coord, final_store[i])
         for i in range(num_outputs):
             out_refs[i].drain(final_store[i])
 

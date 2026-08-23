@@ -80,10 +80,10 @@ from voyager_compiler.shape_prop import set_node_value, ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
 
-# Stores ``_store_staged_csr`` issues per staged CSR block (indptr, packed
-# data, packed indices), all posting ``store_sem`` — the posts one drain
-# must consume.
-_CSR_STORES = 3
+# Stores ``_store_staged_csr`` issues per staged sub-slice (the CSR's
+# indptr, packed data and packed indices, then the dense scale and
+# inliers), all posting ``store_sem`` — the posts one drain must consume.
+_CSR_STORES = 5
 
 
 class _EpilogueTail(torch.nn.Module):
@@ -100,18 +100,17 @@ class _EpilogueTail(torch.nn.Module):
     actually completes an output tile.
 
     With ``chain_epilogue`` the tail is pure compute, chained on the live
-    total inside the anchor's own pass: d/i/p land in the staging tiles as
-    destinations and the stores run bare afterwards — on the same round in
-    the sync nest (``_SparseGemm._kernel``), two steps later in the async
-    one (``_SparseGemm._async_kernel``).  Otherwise the stores run here,
-    interleaved.
+    total inside the anchor's own pass: all five results land in the staging
+    tiles as destinations and the stores run bare afterwards — on the same
+    round in the sync nest (``_SparseGemm._kernel``), two steps later in
+    the async one (``_SparseGemm._async_kernel``).  Otherwise the stores
+    run here, interleaved.
     """
 
-    def __init__(self, owner, idx, out_slots, scratch=None):
+    def __init__(self, owner, idx, scratch=None):
         super().__init__()
         self.owner = owner
         self.idx = idx
-        self.out_slots = out_slots
         self.scratch = scratch
 
     def forward(self, acc, *operands):
@@ -126,12 +125,17 @@ class _EpilogueTail(torch.nn.Module):
         # reaches both directly.
         offset = None
         if o.chain_epilogue and o.async_pipeline:
-            d_tile, i_tile, p_tile, offset = operands[-4:]
-            operands = operands[:-4]
-        elif o.chain_epilogue:
-            d_tile = bufs.store_data_tile
-            i_tile = bufs.store_index_tile
-            p_tile = bufs.store_indptr_tile
+            tiles = operands[-6:-1]
+            offset = operands[-1]
+            operands = operands[:-6]
+        else:
+            tiles = (
+                bufs.store_data_tile,
+                bufs.store_index_tile,
+                bufs.store_indptr_tile,
+                bufs.store_scale_tile,
+                bufs.store_inlier_tile,
+            )
         bound = (acc,) + operands
 
         def val(t):
@@ -152,7 +156,6 @@ class _EpilogueTail(torch.nn.Module):
             voyager.insert(res, self.scratch)
             x = None
 
-        scale_slot, inlier_slot = self.out_slots
         for j in range(o.n_sub):
             if x is None:
                 tile = voyager.subview(
@@ -176,37 +179,15 @@ class _EpilogueTail(torch.nn.Module):
                     offset if offset is not None else o._offset_at(self.idx, j)
                 ),
             )
-            if o.chain_epilogue:
-                # Chained: d/i/p land in the staging tiles as this pass's
-                # destinations; the stores run outside the pass.
-                voyager.insert(d, d_tile)
-                voyager.insert(i, i_tile)
-                voyager.insert(p, p_tile)
-            else:
-                o._store_csr(self.idx, j, d, i, p)
-            if o.n_sub == 1:
-                return s, q
-            sb = og.tk // og.block_size
-            voyager.insert(
-                s,
-                voyager.subview(
-                    scale_slot,
-                    [0] * nb + [0, j * sb],
-                    ones + (og.rows, sb),
-                    (1,) * (nb + 2),
-                    [],
-                ),
-            )
-            voyager.insert(
-                q,
-                voyager.subview(
-                    inlier_slot,
-                    [0] * nb + [0, j * og.tk],
-                    ones + (og.rows, og.tk),
-                    (1,) * (nb + 2),
-                    [],
-                ),
-            )
+            # Every result lands in its staging tile as this pass's
+            # destination.  A chained tail is pure compute, so its stores
+            # run outside the pass; otherwise they run here, and the next
+            # sub-slice reuses the tiles, so they drain inline.
+            for res, tile in zip((d, i, p, s, q), tiles):
+                voyager.insert(res, tile)
+            if not o.chain_epilogue:
+                o._store_staged_csr(self.idx, j)
+                o._drain_csr_stores()
         return None
 
 
@@ -249,9 +230,9 @@ class _SparseGemm(torch.nn.Module):
         self.span = self.R * geom.budget if geom is not None else 0
         self.grid_m, self.grid_n, self.grid_k = plan.grid_dims
         if out_geom is not None:
-            # The CSR outputs are stored by hand; only the dense pair is diced
-            # by the output grid.
-            plan.out_specs = list(plan.out_specs)[3:]
+            # Every output is stored by hand, the dense pair by the same
+            # route as the CSR, so the output grid dices none of them.
+            plan.out_specs = list(plan.out_specs)[5:]
             # The quantize runs per ``tk``-wide sub-slice of the accumulator
             # tile (see ``_EpilogueTail``): split the tail at the quantize and
             # bind the op's own arguments to their positions in the tail's
@@ -405,7 +386,7 @@ class _SparseGemm(torch.nn.Module):
             # operands (after the gather views); ``_finalize`` hands them
             # to the tail with the group's own operands.
             base = num_operands + (2 if self.geom is not None else 0)
-            fused_idx += [base, base + 1, base + 2, base + 3]
+            fused_idx += [base + n for n in range(6)]
         return _gemm_scratch_and_kernel(
             gemm_kernel,
             tail,
@@ -549,23 +530,6 @@ class _SparseGemm(torch.nn.Module):
         torch._check(off >= 0)
         return off
 
-    def _store_csr(self, idx, j, d, i, p):
-        """Stage one sub-slice's CSR results and store them.
-
-        A compute result reaches DRAM through a scratchpad tile (see
-        ``_OutlierProducer._slice_loop``); the chained epilogue stages
-        d/i/p itself, as its pass's destinations, and calls
-        ``_store_staged_csr`` from the loop body instead.  Sub-slices
-        reuse the staging tiles back-to-back within one round, so the
-        stores are drained here, inline.
-        """
-        bufs = self._bufs
-        voyager.insert(d, bufs.store_data_tile)
-        voyager.insert(i, bufs.store_index_tile)
-        voyager.insert(p, bufs.store_indptr_tile)
-        self._store_staged_csr(idx, j)
-        self._drain_csr_stores()
-
     def _drain_csr_stores(self):
         """Consume one staged-store round's posts from ``store_sem``."""
         for _ in range(_CSR_STORES):
@@ -581,16 +545,17 @@ class _SparseGemm(torch.nn.Module):
         return prior
 
     def _store_staged_csr(self, idx, j):
-        """Append one staged CSR block to the packed stream.
+        """Store one staged sub-slice: its CSR block and its dense pair.
 
         The same layout the row-swept producer writes, one block at a time:
         the row pointers land in their slice's continuous array, the data and
-        indices at the stream position ``base`` names, and the block's position
+        indices at the stream position ``base`` names, the scale and inliers
+        at the sub-slice's own place in the grid, and the block's position
         goes into the shared table for its consumer.  The ``_CSR_STORES``
         copies post ``store_sem`` unwaited; the caller owns the drain — the
         chained modes lag it to the next finalize (``_kernel`` /
         ``_async_kernel``, the last round's in ``forward``), the interleaved
-        mode drains inline (``_store_csr``).
+        mode drains inline (``_EpilogueTail.forward``).
         """
         g, bufs = self.out_geom, self._bufs
         nb, ones = g.nb, g.ones
@@ -636,6 +601,20 @@ class _SparseGemm(torch.nn.Module):
                 count=[1] * nb + [nnz],
             )
 
+        for tile, dst, width in (
+            (bufs.store_scale_tile, bufs.scale, g.tk // g.block_size),
+            (bufs.store_inlier_tile, bufs.inliers, g.tk),
+        ):
+            voyager.async_copy(
+                tile,
+                dst,
+                bidx + [m, k],
+                ones + (g.rows, width),
+                bufs.store_sem,
+                None,
+                [1] * nb + [g.rows, width],
+            )
+
         voyager.insert(
             base_ref.reshape(ones + (1, 1)).clone(),
             voyager.subview(
@@ -659,14 +638,10 @@ class _SparseGemm(torch.nn.Module):
             self._gather_rolled(idx, slots)
         tail = self.plan.fused_gm
         if self.out_geom is not None:
-            # The scheduler passes ``*in_slots, *out_slots, *scratch``.
-            n_in = len(self.plan.in_specs)
-            n_out = len(self.plan.out_specs)
-            out_slots = slots[n_in : n_in + n_out]
-            scratch = slots[n_in + n_out :]
-            tail = _EpilogueTail(
-                self, idx, out_slots, scratch[0] if scratch else None
-            )
+            # The scheduler passes ``*in_slots, *out_slots, *scratch``, and
+            # this nest declares no scheduler-managed output.
+            scratch = slots[len(self.plan.in_specs) :]
+            tail = _EpilogueTail(self, idx, scratch[0] if scratch else None)
         if self.chain_epilogue:
             # The previous finalize's store DMAs drained under the rounds
             # between; consume their posts before this finalize's pass
@@ -725,15 +700,15 @@ class _SparseGemm(torch.nn.Module):
             tiles.append(get_slot(self._bufs.gather_indices, parity))
         tail = self.plan.fused_gm
         if self.out_geom is not None:
-            tail = _EpilogueTail(
-                self, idx, out_slots, scratch[0] if scratch else None
-            )
+            tail = _EpilogueTail(self, idx, scratch[0] if scratch else None)
         if self.chain_epilogue:
             bufs = self._bufs
             tiles += [
                 bufs.store_data_tile,
                 bufs.store_index_tile,
                 bufs.store_indptr_tile,
+                bufs.store_scale_tile,
+                bufs.store_inlier_tile,
                 self._offset_at(idx, 0),
             ]
             # Consume the previous finalize's store posts before this
@@ -803,6 +778,12 @@ class _SparseGemm(torch.nn.Module):
             bufs.csr_indptr = voyager.alloc(
                 list(og.batch) + [og.n_k, og.M + 1], torch.int32
             )
+            bufs.scale = voyager.alloc(
+                list(og.batch) + [og.M, og.K // og.block_size], vals[3].dtype
+            )
+            bufs.inliers = voyager.alloc(
+                list(og.batch) + [og.M, og.K], vals[4].dtype
+            )
             bufs.out_base_table_dram = voyager.alloc(
                 base_table_shape(og), torch.int32
             )
@@ -817,7 +798,8 @@ class _SparseGemm(torch.nn.Module):
             )
             bufs.store_sem = voyager.zeros([], torch.int64)
             bufs.out_table_sem = voyager.zeros([], torch.int64)
-            # Per-tile staging for ``_store_csr``'s stores.
+            # Per-sub-slice staging: a compute result reaches DRAM through
+            # a scratchpad tile, never straight from the op.
             bufs.store_data_tile = voyager.alloc(
                 list(og.ones) + [og.budget], vals[0].dtype, _SRAM
             )
@@ -826,6 +808,14 @@ class _SparseGemm(torch.nn.Module):
             )
             bufs.store_indptr_tile = voyager.alloc(
                 list(og.ones) + [og.rows + 1], torch.int32, _SRAM
+            )
+            bufs.store_scale_tile = voyager.alloc(
+                list(og.ones) + [og.rows, og.tk // og.block_size],
+                vals[3].dtype,
+                _SRAM,
+            )
+            bufs.store_inlier_tile = voyager.alloc(
+                list(og.ones) + [og.rows, og.tk], vals[4].dtype, _SRAM
             )
         self._bufs = bufs
         if g is not None:
@@ -856,13 +846,12 @@ class _SparseGemm(torch.nn.Module):
             base_table_shape(og),
             bufs.out_table_sem,
         )
-        scale, inliers = (dense if isinstance(dense, tuple) else (dense,))[:2]
         return (
             bufs.csr_data,
             bufs.csr_indices,
             bufs.csr_indptr,
-            scale,
-            inliers,
+            bufs.scale,
+            bufs.inliers,
         )
 
 
@@ -1147,9 +1136,9 @@ def build_sparse_gemm(
             # gather_data, gather_indices, base_table
             hand_groups += [group_of("csr")] * 3
         if out_geom is not None:
-            # slice_nnz, stream_pos, out_base_table and the three
+            # slice_nnz, stream_pos, out_base_table and the five
             # store-staging tiles
-            hand_groups += [group_of("csr_out")] * 6
+            hand_groups += [group_of("csr_out")] * 8
         _stamp_bank_groups(
             gm,
             hand_groups

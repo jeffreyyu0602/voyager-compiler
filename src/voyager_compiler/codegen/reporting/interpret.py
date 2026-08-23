@@ -350,9 +350,6 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             env[node] = _run_commit(node, gm, env, ctx, path)
         elif t is _ASYNC_COPY:
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
-            count = get_arg_value(node, 11, "count", None)
-            if count is not None:
-                sizes = tuple(int(_resolve(c, env)) for c in count)
             n_bytes = tile_bytes(buf, sizes)
             key = _sem_key(node.args[4], env, ctx.bind)
             post_count = _resolve(get_arg_value(node, 10, "post_count", 1), env)
