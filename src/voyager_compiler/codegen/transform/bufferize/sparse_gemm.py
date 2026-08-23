@@ -27,6 +27,7 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
+from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler.codegen.node_info import (
     get_anchor_node,
@@ -428,23 +429,26 @@ class _SparseGemm(torch.nn.Module):
             staged=self.stage_prefix,
         )
 
-    # --- the gather ---------------------------------------------------------
+    def _gather_rolled(self, idx, slots, parity=None):
+        """``_gather``, rolled into a ``while_loop`` over the ``R`` blocks.
 
-    def _gather(self, idx, slots, parity=None):
-        """Concatenate this row tile's ``R`` blocks into one CSR.
-
-        Source addresses come from the resident base table (a plain read, not a
-        fetch); destinations and lengths come from the pointer tile that was
-        loaded with the dense operands, so no arithmetic beyond reading scalars.
+        The same copies in the same order; only the ``R`` repetitions the
+        graph spells out collapse.  Two things are picked before the loop:
+        the pointer tile's first entry, which every block subtracts, and
+        this parity's row of the semaphore array, so a copy inside names the
+        slot it signals as ``2 * j + b`` -- the same expression the caller
+        applies to the same row to rebuild those views for the compute
+        commit's dependency list, which a ``while_loop`` body cannot hand
+        back.  A trip reads both of its own block's bounds rather than
+        carrying the boundary it shares with the next one, so the loop
+        carries nothing but its index, at one extra scalar read per block.
 
         Args:
             idx: The grid coordinate.
             slots: The operand tiles, positionally.
-            parity: The gather slot this step writes (async mode): the copies
-                land in slot ``parity`` of the two-slot staging buffers and
-                each signals its own semaphore slot, returned for the compute
-                commit's dependency list.  ``None`` is the synchronous mode —
-                single-slot buffers, every copy waited inline.
+            parity: The gather slot this step writes (async mode), or ``None``
+                for the synchronous mode -- single-slot buffers, every copy
+                waited inline.
 
         Returns:
             The semaphore-slot views the copies signal (async), else ``[]``.
@@ -454,13 +458,18 @@ class _SparseGemm(torch.nn.Module):
         bidx = [idx[i] for i in range(nb)]
         m_c, k = idx[self.grid_m], idx[self.grid_k]
 
-        # The pointer tile's slice axis is addressing, not data (see
-        # ``gemm_kernel``); entry reads window the loaded slot directly.
         p = slots[plan.kw_idx["A_indptr"]].reshape(ones + (plan.tile_m + 1,))
         lo = _scalar(_entry(p, 0, nb, ones))
+        pairs = (
+            (slots[plan.kw_idx["A_data"]], bufs.gather_data),
+            (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
+        )
+        row = None if parity is None else get_slot(bufs.gather_sem, parity)
 
-        sems = []
-        for j in range(self.R):
+        def cond_fn(j):
+            return j < self.R
+
+        def body_fn(j):
             slot = voyager.subview(
                 bufs.base_table,
                 [0] * g.dropped + bidx + [k, m_c * self.R + j],
@@ -476,12 +485,7 @@ class _SparseGemm(torch.nn.Module):
             count = _scalar(_entry(p, (j + 1) * g.rows, nb, ones)) - at_j
             torch._check(count >= 0)
 
-            for b, (src, dst) in enumerate(
-                (
-                    (slots[plan.kw_idx["A_data"]], bufs.gather_data),
-                    (slots[plan.kw_idx["A_indices"]], bufs.gather_indices),
-                )
-            ):
+            for b, (src, dst) in enumerate(pairs):
                 if parity is None:
                     window = voyager.subview(
                         dst,
@@ -492,8 +496,6 @@ class _SparseGemm(torch.nn.Module):
                     )
                     sem = bufs.gather_sem
                 else:
-                    # The slot offset and the block window compose into one
-                    # subview of the staging buffer.
                     window = voyager.subview(
                         dst,
                         [parity] + [0] * nb + [start],
@@ -501,10 +503,7 @@ class _SparseGemm(torch.nn.Module):
                         (1,) * (nb + 2),
                         [0],
                     )
-                    sem = get_slot(
-                        bufs.gather_sem, parity * 2 * self.R + 2 * j + b
-                    )
-                    sems.append(sem)
+                    sem = get_slot(row, 2 * j + b)
                 voyager.async_copy(
                     src,
                     window,
@@ -517,7 +516,20 @@ class _SparseGemm(torch.nn.Module):
                 )
                 if parity is None:
                     voyager.async_wait(sem)
-        return sems
+            return (j + 1,)
+
+        # An unused ``while_loop`` is pruned, taking the body's copies with
+        # it, so the trip count has to be consumed.
+        (j_end,) = while_loop(cond_fn, body_fn, (0,))
+        torch._check(j_end >= 0)
+        if parity is None:
+            return []
+        # The body cannot return these; rebuild them off the same row, in
+        # the order the copies inside signal them.  Their offsets are
+        # literal, so they cost no arithmetic of their own.
+        return [
+            get_slot(row, 2 * j + b) for j in range(self.R) for b in range(2)
+        ]
 
     def _offset_at(self, idx, j):
         """Sub-slice ``j``'s running nonzero count, the op's
@@ -644,7 +656,7 @@ class _SparseGemm(torch.nn.Module):
 
     def _kernel(self, idx, *slots):
         if self.geom is not None:
-            self._gather(idx, slots)
+            self._gather_rolled(idx, slots)
         tail = self.plan.fused_gm
         if self.out_geom is not None:
             # The scheduler passes ``*in_slots, *out_slots, *scratch``.
@@ -708,7 +720,7 @@ class _SparseGemm(torch.nn.Module):
         deps, tiles = list(in_sems), list(in_slots)
         if self.geom is not None:
             voyager.async_wait(deps.pop(self.ptr_sem_index))
-            deps += self._gather(idx, in_slots, parity)
+            deps += self._gather_rolled(idx, in_slots, parity)
             tiles.append(get_slot(self._bufs.gather_data, parity))
             tiles.append(get_slot(self._bufs.gather_indices, parity))
         tail = self.plan.fused_gm
@@ -755,9 +767,6 @@ class _SparseGemm(torch.nn.Module):
         g = self.geom
         if g is not None:
             num_slots = _DONE_DEPTH if self.async_pipeline else UNPIPELINED
-            sem_slots = (
-                _DONE_DEPTH * 2 * self.R if self.async_pipeline else UNPIPELINED
-            )
             # Names the producer's table rather than adding one:
             # ``merge_base_tables`` collapses the group onto its alloc.
             bufs.base_table_dram = voyager.alloc(
@@ -775,7 +784,11 @@ class _SparseGemm(torch.nn.Module):
             bufs.base_table = voyager.alloc(
                 base_table_shape(g), torch.int32, _SRAM
             )
-            bufs.gather_sem = voyager.zeros([], torch.int64, sem_slots)
+            bufs.gather_sem = voyager.zeros(
+                [2 * self.R] if self.async_pipeline else [],
+                torch.int64,
+                num_slots,
+            )
             bufs.table_sem = voyager.zeros([], torch.int64)
 
         og = self.out_geom
@@ -1144,7 +1157,12 @@ def build_sparse_gemm(
                 node, plan.in_specs, plan.out_specs, pattern.scratch_specs
             ),
         )
-    _tag_loop_extents(gm, [[(0, pattern.inner.num_steps, 1)]])
+    # The rolled gather nests a second ``while_loop`` inside the step,
+    # over the ``R`` row blocks it concatenates.
+    extents = [[(0, pattern.inner.num_steps, 1)]]
+    if geom is not None:
+        extents.append([(0, pattern.R, 1)])
+    _tag_loop_extents(gm, extents)
     if geom is not None:
         tag_base_table(gm, ptr.meta[PRODUCER_META], base_table_shape(geom))
     if out_geom is not None:
