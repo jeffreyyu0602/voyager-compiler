@@ -235,9 +235,12 @@ def is_prunable_op(node: Node) -> bool:
     if node.target == torch.ops.aten.expand.default:
         return all(x == 1 or x == -1 for x in node.args[1])
 
-    # Dropout with zero probability is the identity.
+    # Dropout is the identity when the probability is zero or at inference.
     if node.target == torch.ops.aten.dropout.default:
-        return get_arg_value(node, 1, "p") == 0.0
+        return (
+            get_arg_value(node, 1, "p") == 0.0
+            or not get_arg_value(node, 2, "train")
+        )
 
     # A same-dtype ``to.dtype`` is a pure pass-through.
     if node.target == torch.ops.aten.to.dtype:
