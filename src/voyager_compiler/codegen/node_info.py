@@ -769,7 +769,27 @@ def _reduced_dims(node, ndim: int) -> set:
     return set(range(ndim - len(normalized_shape), ndim))
 
 
-def stream_breaking_quantize(gm, in_place=True):
+def _reorders(relayout, spine) -> bool:
+    """Whether ``relayout`` moves elements or only renames dims.
+
+    Proved by replaying the chain on an index tensor rather than by
+    recognizing ops, so a transpose of a size-1 dim reads as the identity it
+    is.  An unknown shape counts as reordering: the caller then stages the
+    tile, which is always safe.
+    """
+    value = _tensor_value(spine)
+    if value is None:
+        return True
+    shape = tuple(value.shape)
+    index = torch.arange(math.prod(shape)).reshape(shape)
+    for n in reversed(relayout):
+        index = n.target(
+            *(index if a is n.args[0] else a for a in n.args), **n.kwargs
+        )
+    return not torch.equal(index.reshape(-1), torch.arange(index.numel()))
+
+
+def stream_breaking_quantize(gm):
     """The terminal ``quantize_mx`` of a fused tail that cannot ride the
     compute pass, or ``None``.
 
@@ -777,16 +797,15 @@ def stream_breaking_quantize(gm, in_place=True):
     along the stream, so the tile must be materialized first.  The last
     axis may be spelled ``-1`` or ``ndim - 1`` — the data-layout pass
     writes the projected physical axis as a positive index.  A relayout
-    ahead of the quantize breaks only an in-place pass; a drain to a fresh
-    slot folds the permute into store addressing instead.  Shared by the
+    that moves elements breaks too: the store folds a permute into the
+    value's addressing but writes the scales in stream order, so the two
+    would disagree.  One that only renames dims rides.  Shared by the
     bufferize splitter (which cuts the tail here) and the tile search's
     footprint model (which must charge the staged tile this forces).
 
     Args:
         gm: The fused tail or submodule ending in the quantize; a
             non-``GraphModule`` never breaks.
-        in_place: Whether the pass re-reads the tile it streams — a
-            K-split finalize cone rather than a ``num_k == 1`` drain.
 
     Returns:
         ``None`` when the tail has no such quantize, else ``(quant,
@@ -812,13 +831,15 @@ def stream_breaking_quantize(gm, in_place=True):
     ):
         relayout.append(spine)
         spine = spine.args[0]
-    permuted = any(is_reshape_op(n) for n in relayout)
+    permuted = any(is_reshape_op(n) for n in relayout) and _reorders(
+        relayout, spine
+    )
 
     val = getattr(quant.args[0], "value", None)
     if val is None:
         val = quant.args[0].meta.get("val")
     ndim = getattr(val, "ndim", 0)
-    if (not permuted or not in_place) and all(
+    if not permuted and all(
         a == -1 or (ndim and a == ndim - 1)
         for a in get_arg_value(quant, 2, "axes")
     ):

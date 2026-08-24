@@ -1502,15 +1502,14 @@ def _split_part(fused_gm, part_ops, root, name, result):
     return torch.fx.GraphModule(torch.nn.Module(), pg)
 
 
-def _split_stream_break(fused_gm, in_place=True):
+def _split_stream_break(fused_gm):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
     ``stream_breaking_quantize`` decides: a non-last scale axis always
     breaks (the scale unit groups along the stream, so the tile must be
-    materialized first); a permuted relayout breaks only an in-place pass —
-    its store order no longer matches the read order and overwrites unread
-    elements, while a drain to a fresh slot folds the permute into store
-    addressing instead.
+    materialized first), as does a relayout that moves elements (the store
+    folds a permute into the value's addressing but writes the scales in
+    stream order).
 
     The cut lands *before* the relayout chain feeding the quantize: the
     staged tile keeps the accumulator's layout and the relayout rides the
@@ -1522,8 +1521,6 @@ def _split_stream_break(fused_gm, in_place=True):
         fused_gm: The fused tail ``[acc, *operands] -> output(s)``; a
             non-``GraphModule`` tail (``None``, a sparse ``_EpilogueTail``)
             is never split.
-        in_place: Whether the chained pass re-reads the tile it streams —
-            a K-split finalize cone rather than a ``num_k == 1`` drain.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
@@ -1531,7 +1528,7 @@ def _split_stream_break(fused_gm, in_place=True):
         the relayout + quantize applied to the staged tile, each taking the
         same operand list as ``fused_gm``.
     """
-    broken = stream_breaking_quantize(fused_gm, in_place)
+    broken = stream_breaking_quantize(fused_gm)
     if broken is None:
         return None
     quant, relayout, spine = broken
@@ -2024,7 +2021,7 @@ def _gemm_scratch_and_kernel(
             )
 
     if split is _CLASSIFY:
-        split = _split_stream_break(fused_gm, in_place=num_k > 1)
+        split = _split_stream_break(fused_gm)
     if num_k == 1 and split is None and not staged:
         scratch_specs = []
         kernel = _map_kernel(

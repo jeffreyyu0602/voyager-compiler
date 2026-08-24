@@ -1175,7 +1175,7 @@ def _prepare_search(node, tiler):
     # A tail whose quantize breaks the compute stream stages the finished
     # tile even for a single-round reduction (``_gemm_scratch_and_kernel``);
     # the footprint model must charge that region for unsplit mappings too.
-    staged_tail = stream_breaking_quantize(sub_gm, in_place=False) is not None
+    staged_tail = stream_breaking_quantize(sub_gm) is not None
     # The tail's own ``quantize_mx_outlier``, if it has one: this group is
     # then a CSR producer as well as (possibly) a consumer.
     out_quant = None
