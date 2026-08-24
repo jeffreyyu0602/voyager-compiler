@@ -18,6 +18,7 @@ import torch
 from torch import fx
 
 from voyager_compiler.codegen.node_info import (
+    AXES_ARG_INDEX_MAP,
     ancestors,
     get_anchor_node,
     is_aliasing_op,
@@ -45,6 +46,15 @@ _RELAYOUT_OPS = {
     "view": torch.ops.aten.view.default,
     "reshape": torch.ops.aten.reshape.default,
 }
+
+
+def _blocking_axes(node: fx.Node) -> Optional[Sequence[int]]:
+    """The axes ``node`` blocks its quantization along, or ``None`` if it
+    quantizes per tensor or does not quantize at all."""
+    index = AXES_ARG_INDEX_MAP.get(node.target)
+    if index is None or index >= len(node.args):
+        return None
+    return node.args[index] or None
 
 
 class NormalizationError(RuntimeError):
@@ -774,6 +784,16 @@ class IterationSpaceNormalizer:
             if is_aliasing_op(node) and node not in keep
         ]
 
+        # An axis named from the front is stated against the rank the tensor
+        # carries before the shape-nops go, so record that rank per blocking op.
+        ranks = {}
+        for node in child.graph.nodes:
+            if _blocking_axes(node) is None:
+                continue
+            shape = getattr(node.args[0], "shape", None)
+            if shape is not None:
+                ranks[node] = len(shape)
+
         for node in removable:
             source = node.all_input_nodes[0] if node.all_input_nodes else None
             if source is None:
@@ -782,6 +802,18 @@ class IterationSpaceNormalizer:
                 )
             node.replace_all_uses_with(source)
             child.graph.erase_node(node)
+
+        for node, rank in ranks.items():
+            shape = getattr(node.args[0], "shape", None)
+            if shape is None or len(shape) == rank:
+                continue
+            node.update_arg(
+                AXES_ARG_INDEX_MAP[node.target],
+                tuple(
+                    a + len(shape) - rank if a >= 0 else a
+                    for a in _blocking_axes(node)
+                ),
+            )
 
     def _rewrite_parent_output(
         self,

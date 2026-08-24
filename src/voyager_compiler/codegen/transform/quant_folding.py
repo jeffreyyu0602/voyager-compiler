@@ -117,6 +117,7 @@ def _axes_above(
     out_shape = tuple(node.value.shape)
     in_shape = tuple(node.args[0].value.shape)
     rank = len(out_shape)
+    axes = tuple(a - rank if a >= 0 else a for a in axes)
 
     if node.target is torch.ops.aten.transpose.int:
         a, b = (int(d) % rank - rank for d in node.args[1:3])

@@ -7,6 +7,7 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.aten_classifier import is_elementwise_op
 from voyager_compiler.codegen.node_info import (
+    AXES_ARG_INDEX_MAP,
     get_arg_value,
     is_conv2d,
     is_depthwise_conv,
@@ -397,13 +398,6 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
     transposed.meta["dtype"] = arg.meta.get("dtype")
     propagate_shape(transposed, model)
     return transposed
-
-
-AXES_ARG_INDEX_MAP = {
-    torch.ops.quantized_ops.dequantize.default: 3,
-    torch.ops.quantized_ops.quantize.default: 3,
-    torch.ops.quantized_ops.quantize_mx.default: 2,
-}
 
 
 def _remap_dim_args_after_transpose(node: Node) -> None:

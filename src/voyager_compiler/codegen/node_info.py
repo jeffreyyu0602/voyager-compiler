@@ -29,6 +29,13 @@ QMAP_PARAMS = {"qmap", "scale_qmap", "input_qmap", "output_qmap"}
 CODEBOOK_PARAMS = {"code", "input_code", "weight_code", "output_code"}
 QUANT_PARAMS = QMAP_PARAMS | CODEBOOK_PARAMS
 
+# Positional arg holding the axes a quantize blocks along, per op.
+AXES_ARG_INDEX_MAP = {
+    torch.ops.quantized_ops.dequantize.default: 3,
+    torch.ops.quantized_ops.quantize.default: 3,
+    torch.ops.quantized_ops.quantize_mx.default: 2,
+}
+
 
 # --------------------------------------------------------------------------
 # Graph walking
