@@ -310,9 +310,7 @@ class _SparseGemm(torch.nn.Module):
             )
         # Classified once: the traced per-step kernel rebuild cannot walk
         # a graph.
-        self.tail_split = _split_stream_break(
-            plan.fused_gm, in_place=plan.num_k > 1
-        )
+        self.tail_split = _split_stream_break(plan.fused_gm)
         # A multi-sub-slice epilogue reads windows of its tile at an index
         # the rolled loop supplies at runtime, and only a buffer can be
         # addressed that way.  ``staged`` is what puts the tile in one: its

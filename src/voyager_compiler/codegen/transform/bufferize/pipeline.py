@@ -2012,7 +2012,11 @@ def _gemm_scratch_and_kernel(
     # the accumulator already scaled -- the psum type lives on chip only.  Every
     # round scales its own partial, so the head rides the op rather than the
     # tail.
-    if num_k > 1 and (dequant_split := _split_leading_dequantize(fused_gm)):
+    if (
+        split is _CLASSIFY
+        and num_k > 1
+        and (dequant_split := _split_leading_dequantize(fused_gm))
+    ):
         dequantize, fused_gm = dequant_split
 
         def gemm_kernel(in_tiles, first, op=gemm_kernel):
