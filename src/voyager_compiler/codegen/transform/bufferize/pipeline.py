@@ -80,6 +80,8 @@ _SRAM = int(MemoryLevel.SRAM)
 # is what the body returns and the permute sits one step above it.
 _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
 
+_DEQUANTIZE = torch.ops.quantized_ops.dequantize.default
+
 # Default software-pipeline depth (2 = double buffering).  Single source of
 # truth for the ``num_slots`` default across the scheduler and op builders; a
 # spec may override it per operand (``_InputSpec`` / ``_OutputSpec.num_slots``).
@@ -1480,6 +1482,26 @@ def _reduction_inplace_kernel(
     return kernel
 
 
+def _split_part(fused_gm, part_ops, root, name, result):
+    """One side of a split tail: ``part_ops`` re-rooted on a placeholder named
+    ``name`` standing for ``root``, returning ``result`` and taking the same
+    trailing operands as ``fused_gm``."""
+    phs = [n for n in fused_gm.graph.nodes if n.op == "placeholder"]
+    pg = torch.fx.Graph()
+    remap = {root: pg.placeholder(name)}
+    for p in phs[1:]:
+        remap[p] = pg.placeholder(p.name)
+    for n in part_ops:
+        remap[n] = pg.node_copy(n, lambda x: remap[x])
+    pg.output(
+        tuple(remap[r] for r in result)
+        if isinstance(result, (tuple, list))
+        else remap[result]
+    )
+    pg.lint()
+    return torch.fx.GraphModule(torch.nn.Module(), pg)
+
+
 def _split_stream_break(fused_gm, in_place=True):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
@@ -1517,22 +1539,78 @@ def _split_stream_break(fused_gm, in_place=True):
     phs = [n for n in graph.nodes if n.op == "placeholder"]
     ops = [n for n in graph.nodes if n.op == "call_function"]
 
-    def build(part_ops, root, name, out):
-        pg = torch.fx.Graph()
-        remap = {root: pg.placeholder(name)}
-        for p in phs[1:]:
-            remap[p] = pg.placeholder(p.name)
-        for n in part_ops:
-            remap[n] = pg.node_copy(n, lambda x: remap[x])
-        pg.output(remap[out])
-        pg.lint()
-        return torch.fx.GraphModule(torch.nn.Module(), pg)
-
     relayout.reverse()
     head_ops = [n for n in ops[:-1] if n not in relayout]
-    head_gm = build(head_ops, phs[0], "acc", spine)
-    quant_gm = build(relayout + [quant], spine, "staged", quant)
+    head_gm = _split_part(fused_gm, head_ops, phs[0], "acc", spine)
+    quant_gm = _split_part(fused_gm, relayout + [quant], spine, "staged", quant)
     return head_gm, quant_gm
+
+
+def _out_of_place(target):
+    """The functional twin of an in-place op, or ``target`` unchanged."""
+    if not hasattr(target, "_schema"):
+        return target
+    namespace, name = target._schema.name.split("::")
+    if not name.endswith("_"):
+        return target
+    packet = getattr(getattr(torch.ops, namespace), name[:-1])
+    return getattr(packet, target._overloadname)
+
+
+def _split_leading_dequantize(fused_gm):
+    """Split a fused tail's leading ``dequantize`` off the rest of the tail.
+
+    A reduction of more than one round accumulates in L2, which holds
+    vector-domain values only -- never the op's own psum type -- so the scale
+    rides each partial rather than the finished sum.  It is per-tensor and
+    loop-invariant, so ``s * sum(p) == sum(s * p)`` and the rest of the tail
+    still reads the value it read before.
+
+    Args:
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``.
+
+    Returns:
+        ``None`` when the tail does not scale the accumulated value with a
+        dequantize, else ``(dequantize, rest_gm)``: a call scaling one
+        partial, and the tail's remaining ops on the accumulated value, both
+        taking the same operand list as ``fused_gm``.  The scale is a direct
+        op call rather than a graph module because it runs inside the
+        reduction's ``torch.cond`` branches, which capture no submodules.
+    """
+    if not isinstance(fused_gm, torch.fx.GraphModule):
+        return None
+    graph = fused_gm.graph
+    phs = [n for n in graph.nodes if n.op == "placeholder"]
+    ops = [n for n in graph.nodes if n.op == "call_function"]
+    if not phs or not ops or len(phs[0].users) != 1:
+        return None
+    acc = phs[0]
+    node = next(iter(acc.users))
+    # Anything else reading the raw accumulator would read it unscaled, and a
+    # second reader of the scale's result would not see the rewrite below.
+    if node.target is not _DEQUANTIZE or node.kwargs or len(node.users) != 1:
+        return None
+    operand_index = {p: i for i, p in enumerate(phs[1:])}
+    scale_args = [(operand_index.get(a), a) for a in node.args[1:]]
+
+    def dequantize(partial, *operands):
+        return _DEQUANTIZE(
+            partial,
+            *[a if i is None else operands[i] for i, a in scale_args],
+        )
+
+    out = next(n for n in graph.nodes if n.op == "output").args[0]
+    rest = [n for n in ops if n is not node]
+    rest_gm = _split_part(fused_gm, rest, node, "acc", out)
+    # The tail mutated the scale's own result in place; rooted on the
+    # accumulator it would mutate the buffer it reads, which a region cannot do.
+    acc_ph = next(n for n in rest_gm.graph.nodes if n.op == "placeholder")
+    for n in rest_gm.graph.nodes:
+        if n.op == "call_function" and n.args and n.args[0] is acc_ph:
+            n.target = _out_of_place(n.target)
+            break
+    rest_gm.recompile()
+    return dequantize, rest_gm
 
 
 def _reduction_fused_kernel(
@@ -1933,6 +2011,18 @@ def _gemm_scratch_and_kernel(
 
     out_dtype = anchor.value.dtype
     acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
+    # A multi-round reduction accumulates in L2, so its partials have to reach
+    # the accumulator already scaled -- the psum type lives on chip only.  Every
+    # round scales its own partial, so the head rides the op rather than the
+    # tail.
+    if num_k > 1 and (dequant_split := _split_leading_dequantize(fused_gm)):
+        dequantize, fused_gm = dequant_split
+
+        def gemm_kernel(in_tiles, first, op=gemm_kernel):
+            return dequantize(
+                op(in_tiles, first), *[in_tiles[i] for i in fused_idx]
+            )
+
     if split is _CLASSIFY:
         split = _split_stream_break(fused_gm, in_place=num_k > 1)
     if num_k == 1 and split is None and not staged:
