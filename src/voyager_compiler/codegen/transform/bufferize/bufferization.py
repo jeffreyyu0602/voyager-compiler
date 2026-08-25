@@ -69,6 +69,9 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     build_quantize_mx_outlier,
     merge_base_tables,
 )
+from voyager_compiler.codegen.transform.bufferize.view_lowering import (
+    lower_views,
+)
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _InputSpec,
@@ -803,6 +806,8 @@ def bufferize_graph(
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
     """
+    lower_views(model)
+
     graph = model.graph
     num_slots = 2 if pipelined else 1
     build_cache = {}
