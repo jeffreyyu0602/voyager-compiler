@@ -320,6 +320,9 @@ def replace_conv2d_with_im2col(model: GraphModule):
                 break
             next_node = next(iter(next_node.users))
 
+        if not fusable_ops:
+            continue
+
         linear_node.replace_all_uses_with(fusable_ops[-1])
         fusable_ops[0].replace_input_with(output, linear_node)
         next_node.replace_input_with(fusable_ops[-1], output)
