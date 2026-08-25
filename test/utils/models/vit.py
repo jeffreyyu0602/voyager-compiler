@@ -11,6 +11,7 @@ from voyager_compiler import (
     QuantizationSpec,
     convert_pt2e,
     export_model,
+    replace_conv2d_with_im2col,
     prepare_pt2e,
     transform,
     compile,
@@ -87,6 +88,9 @@ def quantize_and_dump_model(
     pad_vit_embeddings_output(
         gm, model.vit.embeddings, example_args, unroll=vector_lanes
     )
+
+    if args.conv2d_im2col:
+        replace_conv2d_with_im2col(gm)
 
     gm = prepare_pt2e(gm, quantizer)
 
