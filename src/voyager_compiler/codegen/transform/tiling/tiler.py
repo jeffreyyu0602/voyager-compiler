@@ -572,10 +572,8 @@ def make_size_fn(
         # the builders allocate once for the whole kernel, not per ping-pong
         # half -- so it is charged one region, outside ``num_slots``.  A
         # stream-breaking tail (``staged_tail``) stages even a single
-        # round's finished tile, in the anchor's own dtype.
-        if has_tail and point.loop_blocking(le.IC)[3] > 1:
-            scratch = _alloc_bytes(of_count, PSUM_BITS)
-        elif has_tail and staged_tail:
+        # round's finished tile.
+        if has_tail and (point.loop_blocking(le.IC)[3] > 1 or staged_tail):
             scratch = _alloc_bytes(of_count, stage_bits)
         else:
             scratch = 0.0
