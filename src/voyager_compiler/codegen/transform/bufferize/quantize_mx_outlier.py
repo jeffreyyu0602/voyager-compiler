@@ -941,7 +941,6 @@ def build_quantize_mx_outlier(
     in_nodes = list(node.all_input_nodes)
     order = {n: i for i, n in enumerate(in_nodes)}
     codebooks = quant_param_arg_nodes(qnode)
-    src = lambda n: n.meta.get("source_node", n)
 
     # A fused submodule's placeholders sit in ``all_input_nodes`` order, so an
     # operand the quantize names inside the submodule is found by position.
@@ -951,8 +950,8 @@ def build_quantize_mx_outlier(
         outer = lambda v: slot.get(v)
         codebooks = {in_nodes[slot[c]] for c in codebooks if c in slot}
     else:
-        outer = lambda v: order.get(src(v)) if isinstance(v, Node) else None
-        codebooks = {src(c) for c in codebooks}
+        outer = lambda v: order.get(v) if isinstance(v, Node) else None
+        codebooks = set(codebooks)
 
     # Tile *counts*: every batch dim is diced to the element (one grid step per
     # batch element, since each carries its own CSR), rows to the row block,

@@ -7,6 +7,7 @@ import torch
 
 from voyager_compiler.codegen.node_info import (
     _pair,
+    bound_operands,
     compute_output_tiled_shapes,
     compute_tiled_shape,
     get_anchor_node,
@@ -476,7 +477,9 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     anchor = get_anchor_node(node)
     tiles = _build_gemm_shape_map(anchor, tile_sizes, tiling)
     out_tile = tiles.pop("output")
-    shapes = normalize_shape(anchor, tiles)
+    shapes = normalize_shape(
+        anchor, tiles, bound_operands(node, node.meta.get("submodule"))
+    )
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
 
     if node is not anchor:
@@ -748,7 +751,9 @@ def _pool_shapes(node, anchor, in_tile, out_tile):
     plus whatever a fused tail loads of its own -- diced by the output block,
     the way the builder dices it.  ``anchor`` resolves the halo to the node the
     kernel really loads, which a fused ``call_module`` cannot name itself."""
-    shapes = normalize_shape(anchor, {"input": in_tile})
+    shapes = normalize_shape(
+        anchor, {"input": in_tile}, bound_operands(node, node.meta.get("submodule"))
+    )
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
     if node is not anchor:
         for n in node.all_input_nodes:

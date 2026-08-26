@@ -30,27 +30,6 @@ from voyager_compiler.shape_prop import (
 logger = logging.getLogger(__name__)
 
 
-def update_submod_user_meta(model, node, named_modules=None):
-    """
-    Update the metadata of all user nodes that consume the given node.
-    """
-    if named_modules is None:
-        named_modules = dict(model.named_modules())
-
-    for user in list(node.users):
-        if user.op != "call_module":
-            continue
-
-        index = user.all_input_nodes.index(node)
-
-        submod = named_modules[user.target]
-        placeholders = [n for n in submod.graph.nodes if n.op == "placeholder"]
-
-        assert index < len(placeholders)
-
-        placeholder = placeholders[index]
-        placeholder.name = node.name
-        placeholder.meta["source_node"] = node
 
 
 def copy_graph_module(
@@ -90,14 +69,6 @@ def copy_graph_module(
             c.value, c.shape = val, getattr(n, "shape", None)
     new._graph = new_graph
 
-    if root:
-        # Rebind ``source_node`` to this copy: it is how codegen resolves a
-        # fused op's tile (name / address / value), and left alone it points
-        # into the template the build cache shares between identical ops.
-        for copied in remap.values():
-            src = copied.meta.get("source_node")
-            if src in remap:
-                copied.meta["source_node"] = remap[src]
     return new
 
 
@@ -183,7 +154,6 @@ def create_subgraph(nodes: List[Node]):
             if n not in value_remap:
                 value_remap[n] = new_graph.placeholder(n.name)
                 new_args.append(n)
-                value_remap[n].meta["source_node"] = n
         value_remap[node] = new_graph.node_copy(node, lambda n: value_remap[n])
 
     new_graph.output(value_remap[nodes[-1]])
@@ -278,11 +248,9 @@ def rename_nodes_with_param_names(model: GraphModule):
     if not is_torch_greater_or_equal("2.5"):
         return
     graph = model.graph
-    named_modules = dict(model.named_modules())
     for node in list(graph.nodes):
         if node.target in OP_PARAM_ARG_INDEX:
             node.name = get_submodule_name(model, [node])
-            update_submod_user_meta(model, node, named_modules)
     graph.lint()
     model.recompile()
 

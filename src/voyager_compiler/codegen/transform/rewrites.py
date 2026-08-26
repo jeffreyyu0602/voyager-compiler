@@ -18,10 +18,7 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_prunable_op,
 )
-from voyager_compiler.codegen.subgraph import (
-    replace_node_with_graph_module,
-    update_submod_user_meta,
-)
+from voyager_compiler.codegen.subgraph import replace_node_with_graph_module
 from voyager_compiler.codegen.transform.operator_fusion import _nodes_sequential
 from voyager_compiler.export_utils import (
     create_getattr_from_value,
@@ -97,12 +94,6 @@ def deduplicate_nodes(model: GraphModule):
 
     for old, new in mapping.items():
         logger.debug(f"Deduplicated {old} to {new}")
-
-    named_modules = dict(model.named_modules())
-
-    nodes_to_update = set(mapping.values())
-    for node in nodes_to_update:
-        update_submod_user_meta(model, node, named_modules)
 
     graph.lint()
     model.recompile()

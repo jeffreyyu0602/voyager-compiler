@@ -21,6 +21,7 @@ from torch.fx import Node
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
+    bound_operands,
     dtype_byte_size,
     get_anchor_node,
     get_node_to_key_map,
@@ -125,8 +126,9 @@ def vector_op_utilization(
     """
     anchor = get_anchor_node(node) or node
     if is_fully_connected(anchor):
+        bound = bound_operands(node, node.meta.get("submodule"))
         weight = anchor.args[1]
-        widths = [_node_dtype_bits(weight.meta.get("source_node", weight))]
+        widths = [_node_dtype_bits(bound.get(weight, weight))]
     else:
         widths = [
             _node_dtype_bits(n)
@@ -255,15 +257,18 @@ def operand_roles(node) -> dict:
     grouping into banks.
 
     A fused ``call_module``'s operands have no roles of their own, so read them
-    off the anchor: ``get_node_to_key_map`` traces each placeholder back through
-    ``meta['source_node']`` to the outer node the shape map is keyed by.  What
-    the tail brought of its own the anchor never reads, so it stays unnamed and
-    takes a bank of its own.  A bare node is its own anchor.
+    off the anchor: ``get_node_to_key_map`` maps each placeholder back to the
+    outer node the shape map is keyed by (``bound_operands`` -- the call binds
+    them positionally).  What the tail brought of its own the anchor never
+    reads, so it stays unnamed and takes a bank of its own.  A bare node is
+    its own anchor.
     """
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor):
         return {}
-    roles = get_node_to_key_map(anchor)
+    roles = get_node_to_key_map(
+        anchor, bound_operands(node, node.meta.get("submodule"))
+    )
     # The output is named on the outer node -- what the shape map keys it by --
     # in place of the anchor's own entry, which is inside the submodule.
     del roles[anchor]

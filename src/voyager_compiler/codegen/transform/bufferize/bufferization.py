@@ -23,6 +23,7 @@ import torch.fx as fx
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
+    bound_operands,
     get_anchor_node,
     is_aliasing_op,
     is_compute_op,
@@ -35,10 +36,7 @@ from voyager_compiler.codegen.node_info import (
     reduction_op,
     reduction_scratch,
 )
-from voyager_compiler.codegen.subgraph import (
-    replace_node_with_graph_module,
-    update_submod_user_meta,
-)
+from voyager_compiler.codegen.subgraph import replace_node_with_graph_module
 from voyager_compiler.codegen.transform.bufferize.attention import (
     build_attention,
 )
@@ -717,7 +715,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
         used.add(node.name)
 
     def rename_node(
-        gm: GraphModule, n: Node, scope: str, anchor_target, keep: set
+        gm: GraphModule, n: Node, scope: str, anchor_target, keep: set, bound
     ) -> None:
         """Name ``n``, then recurse into whatever region it opens."""
         sub = _subgraph(gm, n.target) if n.op == "call_module" else None
@@ -729,7 +727,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
             candidate = (
                 scope + _FUSED_SUFFIX if fuses_anchor else f"{scope}_{n.name}"
             )
-        elif (source := n.meta.get("source_node")) is not None:
+        elif (source := bound.get(n)) is not None:
             n._rename(source.name)
             return
         elif n.target is anchor_target:
@@ -741,7 +739,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
         rename(n, candidate)
 
         if sub is not None:
-            rename_graph(sub, scope, None, keep=set())
+            rename_graph(sub, scope, None, bound_operands(n, sub), keep=set())
         elif n.op == "call_function" and n.target is _WHILE_LOOP:
             if (body := _subgraph(gm, n.args[1].target)) is not None:
                 rename_graph(body, scope, anchor_target)
@@ -754,7 +752,11 @@ def rename_nest_nodes(model: GraphModule) -> None:
                 rename_graph(body, scope, anchor_target)
 
     def rename_graph(
-        gm: GraphModule, scope: str, anchor_target, keep: Optional[set] = None
+        gm: GraphModule,
+        scope: str,
+        anchor_target,
+        bound={},
+        keep: Optional[set] = None,
     ) -> None:
         if keep is None:
             keep = _keeps_scope(gm)
@@ -763,7 +765,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
                 continue
             if n.op == "get_attr" and _subgraph(gm, n.target) is not None:
                 continue  # a loop body / cond branch handle: never emitted
-            rename_node(gm, n, scope, anchor_target, keep)
+            rename_node(gm, n, scope, anchor_target, keep, bound)
 
     keep = _keeps_scope(model)
     for node in list(model.graph.nodes):
@@ -772,7 +774,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
         name, anchor_target = scope
         if name.endswith(_FUSED_SUFFIX):
             name = name[: -len(_FUSED_SUFFIX)]
-        rename_node(model, node, name, anchor_target, keep)
+        rename_node(model, node, name, anchor_target, keep, {})
 
     model.recompile()
 
@@ -828,7 +830,6 @@ def bufferize_graph(
         if is_nop(node) and not is_aliasing_op(node):
             inp = node.all_input_nodes[0]
             node.replace_all_uses_with(inp)
-            update_submod_user_meta(model, inp)
             graph.erase_node(node)
             continue
 
@@ -1006,7 +1007,6 @@ def bufferize_graph(
         if n_out == 1:
             if "dtype" in node.meta:
                 results[0].meta["dtype"] = node.meta["dtype"]
-            update_submod_user_meta(model, results[0])
         else:
             dtypes = node.meta.get("dtype")
             for user in list(node.users):
@@ -1020,7 +1020,6 @@ def bufferize_graph(
                     and dtypes[idx] is not None
                 ):
                     res.meta["dtype"] = dtypes[idx]
-                update_submod_user_meta(model, res)
                 graph.erase_node(user)
         graph.erase_node(node)
 
@@ -1114,9 +1113,6 @@ def _dedup_regions(gm: GraphModule) -> None:
         node.replace_all_uses_with(orig)
         gm.graph.erase_node(node)
         merged.add(orig)
-    named = dict(gm.named_modules())
-    for node in merged:
-        update_submod_user_meta(gm, node, named)
     gm.graph.lint()
     gm.recompile()
     for node in list(gm.graph.nodes):

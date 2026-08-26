@@ -65,6 +65,24 @@ def get_anchor_node(node):
     return anchor_node
 
 
+def bound_operands(node, submod) -> dict:
+    """Each ``submod`` placeholder -> the operand ``node`` binds to it.
+
+    A call site binds operands to its region's placeholders positionally --
+    the invariant emit resolves every reference by -- so the parent operand
+    a placeholder stands for is derived from the call, never cached on the
+    placeholder's meta (a cached pointer goes stale the moment a rewire
+    replaces the operand).  ``submod`` is the graph object the caller walks
+    (``node.meta['submodule']`` for a fused call), so the map's keys are the
+    very placeholder objects the caller holds; ``None`` -> an empty map, the
+    identity for a bare op whose operands are already top-level.
+    """
+    if not isinstance(submod, GraphModule):
+        return {}
+    placeholders = [n for n in submod.graph.nodes if n.op == "placeholder"]
+    return dict(zip(placeholders, node.all_input_nodes))
+
+
 def ancestors(node: Node) -> set:
     """Every transitive input node of ``node`` (its operand prelude): for a
     matmul ``Q @ Kᵀ`` this is the operand placeholders *and* the ``transpose``
@@ -108,9 +126,10 @@ def require_allocation(node: torch.fx.Node) -> bool:
     """
     for user in node.users:
         gm = user.meta.get("submodule")
+        bound = bound_operands(user, gm)
         for op in gm.graph.nodes if gm is not None else [user]:
             params = quant_param_arg_nodes(op)
-            if any(p.meta.get("source_node", p) is node for p in params):
+            if any(bound.get(p, p) is node for p in params):
                 return False
 
     if (val := getattr(node, "value", None)) is None:
@@ -598,24 +617,26 @@ def dtype_byte_size(dtype):
 # --------------------------------------------------------------------------
 
 
-def normalize_shape(node, shape):
-    node_to_key = get_node_to_key_map(node)
+def normalize_shape(node, shape, bound=None):
+    node_to_key = get_node_to_key_map(node, bound)
     shape = {n: shape[k] for n, k in node_to_key.items() if k in shape}
     return shape
 
 
-def get_node_to_key_map(node):
+def get_node_to_key_map(node, bound=None):
     """Each operand FX node -> the role it plays for ``node``.
 
-    A fused ``call_module`` has no signature to normalize, so its inputs key on
-    their own node names.  Roles that share a bank are named per op and a node
-    name is never one of them, so each fused input is sized on its own.
+    An anchor inside a fused submodule names its operands by the submodule's
+    placeholders; ``bound`` (``bound_operands`` of the outer call) maps those
+    back to the outer nodes the shape maps are keyed by.  A bare op's
+    operands are already top-level, so no map is needed.
     """
+    bound = bound or {}
     args_and_kwargs = normalize_function(
         node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
     )
     node_to_key = {
-        n.meta.get("source_node", n): k
+        bound.get(n, n): k
         for k, n in args_and_kwargs.kwargs.items()
         if isinstance(n, Node)
     }

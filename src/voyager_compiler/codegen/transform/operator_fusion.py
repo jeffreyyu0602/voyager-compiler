@@ -23,10 +23,7 @@ from voyager_compiler.codegen.node_info import (
     repeat_of,
     swaps_last_two_dims,
 )
-from voyager_compiler.codegen.subgraph import (
-    create_and_insert_subgraph,
-    update_submod_user_meta,
-)
+from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
 from voyager_compiler.shape_prop import propagate_shape
 
 logger = logging.getLogger(__name__)
@@ -776,7 +773,6 @@ def fuse_operator(
         )
         if node is None:
             continue
-        update_submod_user_meta(model, node)
         propagate_shape(node, model)
         if anchor is not None:
             node.meta["accumulate_fusible"] = fusible

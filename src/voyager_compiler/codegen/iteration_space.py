@@ -758,8 +758,6 @@ class IterationSpaceNormalizer:
                 # Shallow copy: a deepcopy would touch a FakeTensor ``val``.
                 formatted.meta = dict(value.meta)
                 propagate_shape(formatted, parent)
-                # Retarget the placeholder's ``source_node`` to the new ``view``
-                plan.placeholder.meta["source_node"] = formatted
                 if binding_kind == "arg":
                     args[binding_key] = formatted
                 else:

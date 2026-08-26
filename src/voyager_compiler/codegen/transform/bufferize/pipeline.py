@@ -20,13 +20,12 @@ from torch._higher_order_ops.while_loop import while_loop
 from voyager_compiler.codegen.node_info import (
     _pair,
     ancestors,
+    bound_operands,
     compute_output_tiled_shapes,
     get_anchor_node,
     get_arg_value,
     is_bmm,
     is_conv2d,
-    is_nop,
-    is_reshape_op,
     quant_param_arg_nodes,
     reduction_op,
     reduction_scratch,
@@ -1145,8 +1144,8 @@ class _FusedInfo:
 
     Attributes:
         anchor: The GEMM/conv reference op -- inside the submodule, so its
-            ``args`` are submodule placeholders whose ``meta['source_node']``
-            points back to the outer graph.
+            ``args`` are submodule placeholders, mapped back to the outer
+            graph positionally (``bound_operands`` of the outer call).
         fused_gm: Runs the post-op ops as ``[acc, *fused] -> output(s)`` on
             the anchor's result tile; ``None`` when there is no tail to run
             (a submodule can hold the anchor and nothing but its prelude, a
@@ -1317,7 +1316,8 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     fused_gm = (
         _build_fused_gm(submod, anchor, fused_ops, phs) if fused_ops else None
     )
-    in_nodes = [n.meta.get("source_node", n) for n in phs]
+    bound = bound_operands(node, submod)
+    in_nodes = [bound.get(n, n) for n in phs]
 
     multi_outputs = isinstance(node.value, (list, tuple))
     vals = list(node.value) if multi_outputs else [node.value]
@@ -1876,11 +1876,8 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
     assigned = [None] * len(ordered)
     scratch_group = None
 
-    # Operand FX node -> spec, under the ``source_node`` resolution both
-    # partition formats name their members by.
     node_specs = {
-        n.meta.get("source_node", n): spec
-        for n, spec in zip(node.all_input_nodes, in_specs)
+        n: spec for n, spec in zip(node.all_input_nodes, in_specs)
     }
 
     def tag(spec, group):
@@ -1898,7 +1895,8 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
         if roles is None:
             return assigned + [None] * len(scratch_specs)
 
-        src = lambda n: n.meta.get("source_node", n)
+        bound = bound_operands(node, node.meta.get("submodule"))
+        src = lambda n: bound.get(n, n)
         fused = _fused_operand_nodes(node, anchor)
 
         def operand(role):
@@ -2192,7 +2190,8 @@ def build_conv2d(
     else:
         out_specs = list(info.out_specs)
 
-    src = lambda n: n.meta.get("source_node", n)
+    bound = bound_operands(node, node.meta.get("submodule"))
+    src = lambda n: bound.get(n, n)
     node_to_spec = {
         src(anchor.args[0]): (inp, in_spec),
         src(anchor.args[1]): (w, w_spec),
@@ -2506,7 +2505,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     else:
         out_specs = list(info.out_specs)
 
-    src = lambda n: n.meta.get("source_node", n)
+    bound = bound_operands(node, node.meta.get("submodule"))
+    src = lambda n: bound.get(n, n)
     node_to_spec = {
         src(anchor.args[0]): (act, act_spec),
         src(weight_node): (weight, weight_spec),
@@ -2842,12 +2842,13 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
             return None
         # Codebook operands (whole): map the submodule's codebook placeholders
         # back to their outer input nodes.
+        bound = bound_operands(node, submod)
         codebooks = set()
         for sn in submod.graph.nodes:
             if sn.op != "call_function":
                 continue
             for cb in quant_param_arg_nodes(sn):
-                codebooks.add(cb.meta.get("source_node", cb))
+                codebooks.add(bound.get(cb, cb))
 
         compute = _naming_scratch(submod, scratch_names)
 
@@ -2957,7 +2958,8 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     if node.op != "call_module" and tiling is None:
         return None
 
-    in_node = anchor.args[0].meta.get("source_node", anchor.args[0])
+    bound = bound_operands(node, node.meta.get("submodule"))
+    in_node = bound.get(anchor.args[0], anchor.args[0])
     input_t = in_node.value.clone()
 
     val = node.value
@@ -3031,11 +3033,12 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     # Fused: run the whole submodule per tile.  The pool's input loads the halo;
     # every other operand tiles at the output block (codebooks / scalars whole).
     submod = node.meta["submodule"]
+    bound = bound_operands(node, submod)
     codebooks = set()
     for sn in submod.graph.nodes:
         if sn.op == "call_function":
             for cb in quant_param_arg_nodes(sn):
-                codebooks.add(cb.meta.get("source_node", cb))
+                codebooks.add(bound.get(cb, cb))
 
     inputs, in_specs = [], []
     for n in node.all_input_nodes:
