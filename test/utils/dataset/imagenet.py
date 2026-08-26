@@ -65,7 +65,9 @@ def retrieve_dataset(num_samples, model_type):
     return processed_dataset
 
 
-def dump_imagenet(output_dir, dataset, model_type, preprocess_fn, torch_dtype):
+def dump_imagenet(output_dir, dataset, input_name, preprocess_fn, torch_dtype):
+    """Dump each preprocessed sample under the compiled model's input name,
+    which is what the accuracy tester loads it back by."""
     preprocessed_dataset = []
     for i, image_label_pair in enumerate(tqdm(dataset, desc="Dumping dataset")):
         label = image_label_pair["label"]
@@ -74,14 +76,10 @@ def dump_imagenet(output_dir, dataset, model_type, preprocess_fn, torch_dtype):
         os.makedirs(dir_name, exist_ok=True)
         image = preprocess_fn(image)
 
-        filename = (
-            "x_preprocess.bin"
-            if model_type == "resnet"
-            else "pixel_values_preprocess.bin"
-        )
-
         preprocessed_dataset.append(
             {"image": image.to(torch_dtype), "label": label}
         )
-        write_tensor_to_file(image, os.path.join(dir_name, filename))
+        write_tensor_to_file(
+            image, os.path.join(dir_name, f"{input_name}.bin")
+        )
     return preprocessed_dataset

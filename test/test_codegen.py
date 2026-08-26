@@ -81,6 +81,12 @@ def _is_constant_div(node):
     return True
 
 
+def model_input_name(gm):
+    """The compiled graph's input placeholder, which names the per-sample
+    tensor files the accuracy tester loads."""
+    return next(n.name for n in gm.graph.nodes if n.op == "placeholder")
+
+
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
 QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
 
@@ -316,7 +322,7 @@ def main():
             preprocessed_imagenet = imagenet.dump_imagenet(
                 args.dataset_output_dir,
                 imagenet_dataset,
-                "resnet",
+                model_input_name(gm),
                 preprocess_fn,
                 torch_dtype,
             )
@@ -741,7 +747,7 @@ def main():
             preprocessed_imagenet = imagenet.dump_imagenet(
                 args.dataset_output_dir,
                 imagenet_dataset,
-                "vit",
+                model_input_name(gm),
                 preprocess_fn,
                 torch_dtype,
             )
