@@ -32,8 +32,54 @@ logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
 
+def is_timm_model(args):
+    """Whether the checkpoint is a timm one, loaded through timm itself.
+
+    A ``timm/`` repository holds a timm-native checkpoint: its config names
+    a timm architecture and its weights are keyed the timm way, so
+    ``ViTForImageClassification`` cannot load it.
+    """
+    name = args.model_name_or_path
+    return name is not None and name.startswith("timm/")
+
+
+class TimmEmbeddings(torch.nn.Module):
+    """The patch, class-token and position embeddings of a timm ViT.
+
+    ``pad_vit_embeddings_output`` locates the embedding output by matching a
+    pattern traced from a module. timm computes the class-token concat and
+    the position add in ``_pos_embed``, a method rather than a module, so
+    the pattern is assembled here.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, pixel_values):
+        return self.model._pos_embed(self.model.patch_embed(pixel_values))
+
+
+def get_logits(output):
+    """timm returns the logits tensor; transformers wraps it in an output."""
+    return output.logits if hasattr(output, "logits") else output
+
+
 def load_model(args):
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+    if is_timm_model(args):
+        import timm
+
+        model = timm.create_model(
+            args.model_name_or_path.removeprefix("timm/"), pretrained=True
+        )
+        # The array consumes the attention matmuls individually; timm's
+        # fused path exports as one scaled_dot_product_attention node.
+        for block in model.blocks:
+            block.attn.fused_attn = False
+        return model.eval().to(torch_dtype)
+
     model_name_or_path = (
         args.model_name_or_path or "google/vit-base-patch16-224"
     )
@@ -58,7 +104,9 @@ def quantize_and_dump_model(
             model, modules_to_fuse, inplace=True
         )
 
-    quantizer.set_module_name("classifier", None)
+    timm_model = is_timm_model(args)
+
+    quantizer.set_module_name("head" if timm_model else "classifier", None)
 
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
@@ -75,7 +123,10 @@ def quantize_and_dump_model(
 
         qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
         quantizer.set_module_name(
-            "^vit.embeddings.patch_embeddings.projection$", qconfig
+            "^patch_embed.proj$"
+            if timm_model
+            else "^vit.embeddings.patch_embeddings.projection$",
+            qconfig,
         )
 
     example_args = (calibration_data[0]["image"].to(torch_dtype),)
@@ -83,10 +134,14 @@ def quantize_and_dump_model(
         args.pe_array_size[1] if args.pe_array_size is not None else None
     )
 
+    embeddings = (
+        TimmEmbeddings(model) if timm_model else model.vit.embeddings
+    )
+
     gm = export_model(model, example_args)
     remove_zero_attention_mask(gm, example_args)
     pad_vit_embeddings_output(
-        gm, model.vit.embeddings, example_args, unroll=vector_lanes
+        gm, embeddings, example_args, unroll=vector_lanes
     )
 
     if args.conv2d_im2col:
@@ -103,7 +158,7 @@ def quantize_and_dump_model(
 
     convert_pt2e(gm, args.bias)
 
-    old_output = gm(*example_args).logits
+    old_output = get_logits(gm(*example_args))
 
     transform(gm, example_args, **transform_args, skip_op_fusion=True)
 
@@ -113,7 +168,7 @@ def quantize_and_dump_model(
     fuse_operator(gm, vector_stages)
     gm.graph.print_tabular()
 
-    new_output = gm(*example_args).logits if args.debug else None
+    new_output = get_logits(gm(*example_args)) if args.debug else None
 
     compile(gm, example_args, **compile_args)
     return gm, old_output, new_output, preprocess_fn
@@ -133,8 +188,7 @@ def evaluate(model, dataset):
             image = image_label_pair["image"].to(device)
             label = image_label_pair["label"]
 
-            outputs = model(image)
-            logits = outputs.logits
+            logits = get_logits(model(image))
             prediction = torch.argmax(logits, dim=-1)
             if prediction.item() == label:
                 correct_predictions += 1
