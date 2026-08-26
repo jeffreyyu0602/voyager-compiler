@@ -114,6 +114,7 @@ def _produces_tensor(node: Node) -> bool:
 
 
 _VOYAGER_INSERT = torch.ops.voyager.insert.default
+_ATEN_CLONE = torch.ops.aten.clone.default
 _VOYAGER_ZEROS = torch.ops.voyager.zeros.default
 _VOYAGER_FILL = torch.ops.voyager.fill.default
 _SUBVIEW = torch.ops.voyager.subview.default
@@ -333,8 +334,13 @@ def _annotate_and_validate(
         elif _is_compute(node):
             _validate_compute(node, codebooks, ctx)
         elif node.target is _VOYAGER_INSERT:
-            dst = node.args[1]
-            if _space(dst) != "Scratchpad":
+            src, dst = node.args[0], node.args[1]
+            # The Scratchpad rule is about datapath tiles.  A cloned buffer
+            # stored off-chip (``insert(src.clone(), <DRAM window>)`` — the
+            # view-lowering pass's parameter copy) is a host move the control
+            # processor runs, not a tile leaving the array.
+            host_move = isinstance(src, Node) and src.target is _ATEN_CLONE
+            if _space(dst) != "Scratchpad" and not host_move:
                 raise Exception(
                     f"tile store violation: '{node.name}' writes '{dst.name}', "
                     f"which is in {_space(dst)}, not Scratchpad"
@@ -808,8 +814,6 @@ def bufferize_graph(
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
     """
-    lower_views(model)
-
     graph = model.graph
     num_slots = 2 if pipelined else 1
     build_cache = {}
@@ -1026,6 +1030,7 @@ def bufferize_graph(
     merge_base_tables(model)
     graph.lint()
     model.recompile()
+    lower_views(model)
     _dedup_regions(model)
     annotate_tensor_spaces(model)
     rename_nest_nodes(model)

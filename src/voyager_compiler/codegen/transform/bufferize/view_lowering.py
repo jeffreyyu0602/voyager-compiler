@@ -1,63 +1,192 @@
-"""Fold foldable view ops into ``voyager.subview`` windows.
+"""Fold view-like glue ops into ``voyager.subview`` windows.
 
-An ``aten.select`` the model performs (a BERT-family CLS read, a ViT class
-token) survives bufferization as an executed cpu op with a buffer of its
-own, which the runtime must then implement.  But when the bytes it reads
-are one contiguous run, the op is pure addressing: lower it to a
-``voyager.subview`` here, before ``bufferize_graph`` runs, and emit folds
-the window into the consumer's ``TensorBoxRef`` -- no instruction, no
-allocation, and the consumer reads the parent buffer in place.
+Runs at the end of ``bufferize_graph``, on the bufferized graph: the nests
+and their output allocs exist, and emit resolves every reference through
+the graph itself (sub-graph placeholders bind positionally), so rewiring
+here reaches everything the builders made.
 
-A select folds exactly when every dim before the selected one has extent
-1 -- otherwise the selected bytes are several disjoint runs, which a
-window cannot express (the backend's ``resolve_window`` rejects it).  A
-select *on* an extent-1 dim is already a nop (``is_nop``) and stays on
-that path.  Anything unfoldable is left in place.
+``aten.select`` (read side): when every dim before the selected one has
+extent 1, the selected bytes are one contiguous run of the source, so the
+op is pure addressing -- replace it with a ``voyager.subview`` and emit
+folds the window into each consumer's ``TensorBoxRef``.  A select on an
+extent-1 dim is already a nop (``is_nop``); a non-contiguous select stays
+an op.
 
-Future view ops that reduce to windows belong here too -- ``stack`` and
-friends fold on the destination side (each producer writes a window of
-the stacked buffer), which is a separate rule, not a variant of this one.
+``aten.cat`` (write side): when every dim before the cat dim has extent 1,
+each source occupies one contiguous window of the result.  Allocate the
+result once, then point each source's storage at its window: a source
+produced by a nest has its output alloc *replaced* by the window, so the
+nest stores straight into the cat buffer -- zero copies; a source with no
+alloc to redirect (a parameter) is host-copied into its window with
+``insert(clone(src), window)``, the sanctioned buffer-to-buffer move.
 """
 
+import operator
+
 import torch
-from torch.fx import GraphModule
+from torch.fx import GraphModule, Node
 
-from voyager_compiler.codegen.subgraph import update_submod_user_meta
-from voyager_compiler.shape_prop import propagate_shape
+from voyager_compiler.codegen.node_info import is_nop
+from voyager_compiler.codegen.transform.bufferize.ops import MemoryLevel
+from voyager_compiler.shape_prop import set_node_value
 
+_ALLOC = torch.ops.voyager.alloc.default
+_CAT = torch.ops.aten.cat.default
+_CLONE = torch.ops.aten.clone.default
+_INSERT = torch.ops.voyager.insert.default
 _SELECT = torch.ops.aten.select.int
 _SUBVIEW = torch.ops.voyager.subview.default
+_WHILE_LOOP = torch.ops.higher_order.while_loop
 
 
 def lower_views(model: GraphModule) -> GraphModule:
-    """Rewrite each foldable ``aten.select`` into a ``voyager.subview``."""
-    graph = model.graph
-    for node in list(graph.nodes):
-        if node.op != "call_function" or node.target is not _SELECT:
+    """Rewrite foldable ``select`` / ``cat`` nodes into subview windows."""
+    for node in list(model.graph.nodes):
+        if node.op != "call_function":
             continue
-        source, dim, index = node.args
-        value = getattr(source, "value", None)
-        if not isinstance(value, torch.Tensor):
-            continue
-        shape = list(value.shape)
-        dim = dim + len(shape) if dim < 0 else dim
-        index = index + shape[dim] if index < 0 else index
-        if shape[dim] == 1 or any(s != 1 for s in shape[:dim]):
-            continue
-        offsets = [0] * len(shape)
-        offsets[dim] = index
-        sizes = list(shape)
-        sizes[dim] = 1
-        with graph.inserting_before(node):
-            subview = graph.call_function(
-                _SUBVIEW,
-                (source, offsets, sizes, [1] * len(shape)),
-                {"squeeze_dim": [dim]},
-            )
-        propagate_shape(subview, model)
-        node.replace_all_uses_with(subview)
-        update_submod_user_meta(model, subview)
-        graph.erase_node(node)
-    graph.lint()
+        if node.target is _SELECT:
+            _fold_select(model, node)
+        elif node.target is _CAT:
+            _fold_cat(model, node)
+    model.graph.lint()
     model.recompile()
     return model
+
+
+def _leading_unit_dims(shape, dim) -> bool:
+    return all(s == 1 for s in shape[:dim])
+
+
+def _fold_select(model: GraphModule, node: Node) -> None:
+    source, dim, index = node.args
+    value = getattr(source, "value", None)
+    if not isinstance(value, torch.Tensor):
+        return
+    shape = list(value.shape)
+    dim = dim + len(shape) if dim < 0 else dim
+    index = index + shape[dim] if index < 0 else index
+    # An extent-1 dim is a pure rename (``is_nop``); a non-unit dim ahead
+    # of the selected one makes the bytes several disjoint runs, which one
+    # window cannot express.
+    if shape[dim] == 1 or not _leading_unit_dims(shape, dim):
+        return
+    offsets = [0] * len(shape)
+    offsets[dim] = index
+    sizes = list(shape)
+    sizes[dim] = 1
+    graph = model.graph
+    with graph.inserting_before(node):
+        subview = graph.call_function(
+            _SUBVIEW,
+            (source, offsets, sizes, [1] * len(shape)),
+            {"squeeze_dim": [dim]},
+        )
+    set_node_value(subview, node.value)
+    node.replace_all_uses_with(subview)
+    graph.erase_node(node)
+
+
+def _storage_of(node):
+    """The builder-created output ``alloc`` whose bytes ``node`` names, walked
+    through result handles and views; ``None`` when there is none to redirect
+    (a parameter, or a shape this walk does not cover)."""
+    while isinstance(node, Node):
+        if node.op != "call_function":
+            return None
+        if node.target is _ALLOC:
+            return node
+        if node.target is operator.getitem:
+            src, index = node.args
+            if isinstance(src, Node) and src.target is _WHILE_LOOP:
+                carried = list(src.args[2])
+                if index < len(carried):
+                    node = carried[index]
+                    continue
+            return None
+        if node.target is _SUBVIEW or is_nop(node):
+            node = node.args[0]
+            continue
+        return None
+    return None
+
+
+def _fold_cat(model: GraphModule, node: Node) -> None:
+    sources = list(node.args[0])
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+    value = getattr(node, "value", None)
+    if not isinstance(value, torch.Tensor):
+        return
+    out_shape = list(value.shape)
+    rank = len(out_shape)
+    dim = dim + rank if dim < 0 else dim
+    if not _leading_unit_dims(out_shape, dim):
+        return
+    values = [getattr(s, "value", None) for s in sources]
+    if any(
+        not isinstance(v, torch.Tensor)
+        or len(v.shape) != rank
+        or v.dtype != value.dtype
+        for v in values
+    ):
+        return
+    # A shared producer cannot land in two windows at once.
+    targets = [_storage_of(s) for s in sources]
+    redirected = [t for t in targets if t is not None]
+    if len(set(redirected)) != len(redirected):
+        return
+
+    graph = model.graph
+    ordered = list(graph.nodes)
+    order = {n: i for i, n in enumerate(ordered)}
+    anchors = [t if t is not None else s for t, s in zip(targets, sources)]
+    first = min(anchors, key=lambda n: order[n])
+
+    # A layers.txt extent covers one contiguous scope run, and an op between
+    # two runs is selected by no layer -- so the fold's host ops must join a
+    # neighboring layer's span: the alloc joins the first producer's, the
+    # parameter copies join the consumer's (the first scoped op after the cat).
+    consumer_scope = next(
+        (
+            s
+            for n in ordered[order[node] :]
+            if (s := n.meta.get("scope")) is not None
+        ),
+        None,
+    )
+
+    # The cat's storage, alive from the first producer's stores onward.
+    # Space rides positionally: ``annotate_tensor_spaces`` reads ``args[2]``.
+    with graph.inserting_before(first):
+        buf = graph.call_function(
+            _ALLOC, (out_shape, value.dtype, int(MemoryLevel.DRAM), 0)
+        )
+    set_node_value(buf, value)
+    if (scope := first.meta.get("scope")) is not None:
+        buf.meta["scope"] = scope
+
+    offset = 0
+    last = buf
+    for s, t, v in zip(sources, targets, values):
+        offsets = [0] * rank
+        offsets[dim] = offset
+        offset += v.shape[dim]
+        with graph.inserting_after(last):
+            window = graph.call_function(
+                _SUBVIEW, (buf, offsets, list(v.shape), [1] * rank)
+            )
+        set_node_value(window, v)
+        last = window
+        if t is not None:
+            t.replace_all_uses_with(window)
+            graph.erase_node(t)
+        else:
+            with graph.inserting_before(node):
+                clone = graph.call_function(_CLONE, (s,))
+                insert = graph.call_function(_INSERT, (clone, window))
+            set_node_value(clone, v)
+            if consumer_scope is not None:
+                clone.meta["scope"] = consumer_scope
+                insert.meta["scope"] = consumer_scope
+
+    node.replace_all_uses_with(buf)
+    graph.erase_node(node)
