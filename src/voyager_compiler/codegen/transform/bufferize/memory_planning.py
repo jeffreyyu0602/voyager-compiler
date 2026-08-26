@@ -110,12 +110,18 @@ _SLOTS_ARG = {_ALLOC: 3, _ZERO: 2, _FILL: 3}
 
 
 def _val(node) -> Optional[torch.Tensor]:
-    """The single tensor a node produces (its ShapeProp ``value`` or, inside a
-    loop body, the exported ``meta['val']``); ``None`` for tuples /
-    non-tensors."""
+    """The single tensor a node produces -- the value ShapeProp stamped on it;
+    ``None`` for tuples / non-tensors.
+
+    ``value`` is the only source, the same one the emitter reads.  The exported
+    ``meta['val']`` is deliberately not consulted: a pass that reshapes a node
+    after export re-stamps ``value`` and leaves ``meta['val']`` at its
+    export-time shape -- padding a sequence length is one -- so sizing a buffer
+    from it reserves less than the emitter goes on to declare.
+    """
     if not isinstance(node, Node):
         return None
-    v = node.meta.get("val", getattr(node, "value", None))
+    v = getattr(node, "value", None)
     return v if isinstance(v, torch.Tensor) else None
 
 
