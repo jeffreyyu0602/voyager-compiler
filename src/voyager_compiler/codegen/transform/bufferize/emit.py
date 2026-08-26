@@ -16,9 +16,10 @@ non-bufferized path).  Three ideas carry the whole translation:
   * **Every instruction stands alone.**  A ``TensorBox`` — a model input, a
     weight, a ``voyager.alloc`` / ``voyager.zeros`` — declares an allocation.
     Every *use* of it is a ``TensorBoxRef`` repeating that declaration in full
-    (name, dtype, memory level and address, pipelining) under the *operand's*
-    shape, plus the window it reads — a ``voyager.subview``, which for a
-    software-pipeline slot is the slot a step picks.  Aliasing ops and the
+    (name, dtype, memory level and address, pipelining) under the *windowed
+    source's* shape, plus the window it reads — a ``voyager.subview``, which
+    for a software-pipeline slot is the slot a step picks — and
+    ``output_shape``, the shape of the operand itself.  Aliasing ops and the
     ``subview`` collapse into the reference, the slot stays a *runtime* offset,
     and nothing has to be resolved to execute an instruction.
   * **Compute is destination-passing.**  ``voyager.insert(src, dst)`` is how the
@@ -389,21 +390,25 @@ class _Emitter:
 
         The reference repeats the allocation — name, dtype, memory level and
         address, pipelining — so an instruction is executable without resolving
-        anything else.  Its shape is ``node``'s own whenever an aliasing op
-        (a reshape, a rank-reducing ``subview``) stands between the two.
+        anything else.  ``box.shape`` stays in the window's coordinate system
+        (see ``_window``); the shape of the operand itself is
+        ``output_shape``, ``node``'s own whenever an aliasing op (a reshape, a
+        rank-reducing ``subview``) stands between the two.
         """
         ref = self._resolve(node, env, internal)
         value = _value(node)
-        # ``value.shape`` still leads with the slot dim that ``_tensor_box``
-        # factors into ``bank_count``, so an operand naming the allocation
-        # itself keeps the declared shape rather than restoring that dim.  Every
-        # operand of a pipelined buffer reaches it through
-        # ``get_slot``, whose
-        # ``squeeze_dim`` has already dropped the dim.
-        if not _owns_storage(node) and isinstance(value, torch.Tensor):
-            del ref.box.shape[:]
-            ref.box.shape.extend(int(d) for d in value.shape)
-            ref.box.dtype = _dtype_str(node)
+        if isinstance(value, torch.Tensor):
+            if _owns_storage(node):
+                # A ref carried through ``env`` keeps the shape stamped at its
+                # bind site; a fresh box is its own operand, at the declared
+                # shape (one slot's payload — not ``value.shape``, which still
+                # leads with the slot dim).
+                if not ref.output_shape:
+                    ref.output_shape.extend(ref.box.shape)
+            else:
+                del ref.output_shape[:]
+                ref.output_shape.extend(int(d) for d in value.shape)
+                ref.box.dtype = _dtype_str(node)
         return ref
 
     def _resolve(self, node, env, internal) -> TensorBoxRef:
@@ -456,12 +461,17 @@ class _Emitter:
         through — an offset may be a runtime scalar (the slot a step writes),
         while sizes and strides are static.
 
-        The referenced dims of a pipelined buffer are
-        ``[slot_count, *shape]``, so
-        dim 0 offsets the slot and the backend pitches it by
-        ``bank_stride_bytes``.  A window over the *whole* referenced buffer is
-        the buffer, and is left off.  ``squeeze_dim`` is not addressing — it is
-        the rank the *tensor* takes, and the bytes it names are the same.
+        The window indexes its source's presented dims, so ``box.shape`` is
+        set to them: offsets / sizes / strides read against it one entry for
+        one, and row-major strides over it are the allocation's true element
+        strides (the views the resolution crosses are order-preserving).  The
+        referenced dims of a pipelined buffer are ``[slot_count, *shape]``, so
+        dim 0 offsets the slot, the backend pitches it by
+        ``bank_stride_bytes``, and ``box.shape`` stays the payload of one
+        slot.  A window over the *whole* referenced buffer is the buffer, and
+        is left off.  ``squeeze_dim`` is not addressing — it is the rank the
+        *tensor* takes (``output_shape``), and the bytes it names are the
+        same.
 
         A subview of a source that already carries a window (a tile's
         sub-slice picked off a ``get_slot`` slot) folds into the one window
@@ -480,6 +490,11 @@ class _Emitter:
             return self._compose_window(
                 node, ref, shape, offsets, sizes, strides, env
             )
+        dims = shape
+        if ref.box.bank_count > 1 and dims[:1] == [ref.box.bank_count]:
+            dims = dims[1:]  # the slot dim is banking, not a tensor dim
+        del ref.box.shape[:]
+        ref.box.shape.extend(int(d) for d in dims)
         ref.offsets.extend(self._scalar(o, env) for o in offsets)
         ref.sizes.extend(int(s) for s in sizes)
         ref.strides.extend(int(s) for s in strides)

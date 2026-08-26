@@ -103,9 +103,12 @@ message ScalarValueList {
 // consulting any other part of the model.
 //
 // box repeats the referenced allocation -- node name, dtype, memory (level,
-// partition, resolved address) and banking -- under the shape of the *operand*,
-// which differs from the declaration's whenever an aliasing op (a reshape, a
-// rank-reducing subview) sits between the allocation and the use.
+// partition, resolved address) and banking -- under the shape of the tensor
+// the window indexes: the windowed source's own dims, which offsets / sizes /
+// strides address one entry for one. It differs from the declaration's only
+// by the order-preserving views (a reshape) standing between the allocation
+// and the window; row-major strides over it are therefore the allocation's
+// true element strides.
 //
 // offsets, sizes and strides have one entry per referenced dimension and are
 // omitted together to reference the whole allocation. An offset may be a
@@ -113,15 +116,21 @@ message ScalarValueList {
 //
 // The referenced dimensions of a banked TensorBox are [bank_count, *shape]:
 // dimension 0 selects the bank, pitched by bank_stride_bytes.
+//
+// output_shape is the shape of the operand itself -- the window's sizes with
+// its squeezed unit dims dropped, or the shape a rank-changing view presents.
+// It is set on every tensor operand.
 message TensorBoxRef {
-  // The referenced allocation, with the operand's own shape. A box with no
-  // memory names a value produced by an earlier PrimOp of the same fusion,
+  // The referenced allocation, under the windowed source's shape. A box with
+  // no memory names a value produced by an earlier PrimOp of the same fusion,
   // which never leaves the datapath and so owns no storage.
   TensorBox box = 1;
 
   repeated ScalarValue offsets = 2;
   repeated int64 sizes = 3;
   repeated int64 strides = 4;
+
+  repeated int64 output_shape = 5;
 }
 
 message TensorBoxRefList {
