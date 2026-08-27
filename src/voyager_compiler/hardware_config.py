@@ -15,6 +15,13 @@ reporting model reads this object directly as its cost knobs.
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+DEFAULT_PE_ARRAY_SIZE = (32, 32)
+DEFAULT_FREQUENCY_GHZ = 1.0
+DEFAULT_INPUT_BUFFER_SIZE = 1024
+DEFAULT_WEIGHT_BUFFER_SIZE = 1024
+DEFAULT_ACCUM_BUFFER_SIZE = 1024
+DEFAULT_SCRATCHPAD_OFFSET = 0
+DEFAULT_DOUBLE_BUFFERED_L2 = True
 DEFAULT_DRAM_SIZE_GB = 16.0
 DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
 DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
@@ -22,38 +29,74 @@ DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
 
 @dataclass(frozen=True)
 class AcceleratorConfig:
-    """Full accelerator hardware architecture.
+    """Compiler-visible hardware parameters for Voyager accelerators.
 
-    ``scratchpad_size`` is the **whole physical** L2 SRAM and ``num_banks`` the
-    banks it divides into, whatever the buffering -- neither is scaled by
-    ``double_buffered_l2``.  What that flag changes is ``num_slots``: a
-    ping-ponged buffer occupies two banks instead of one, so a tile is sized
-    against ``scratchpad_size // num_slots``.
+    Voyager couples two programmable compute engines: a weight-stationary
+    2-D systolic array for convolution and GEMM, and a multi-stage vector
+    unit for elementwise operations, reductions, nonlinear activations,
+    normalization, and quantization. During a matrix tile, weights remain
+    in the processing elements, activations flow horizontally, and partial
+    sums propagate vertically. The matrix output can stream directly into
+    the vector unit for operator fusion or pass through a double-buffered
+    accumulation buffer to decouple the two engines.
 
-    Concrete defaults live in ``cli_args.py`` (the single source of truth); the
-    fields here default to ``None`` and just carry whatever the entry point was
-    given.  ``vector_unit_width`` of ``None`` means the vector unit is as wide
-    as the PE array's column count.
+    The systolic array uses dedicated input, weight, and accumulation
+    buffers backed by a banked L2 scratchpad. This configuration describes
+    the accelerator's compute parallelism, clock frequency, and on-chip
+    memory hierarchy. The optional DRAM capacity, bandwidth, and latency
+    parameters are later system-modeling extensions, rather than parameters
+    of the Voyager accelerator template described in the paper.
     """
 
     # Compute
-    pe_array_size: Tuple[int, int]  # (rows, cols); systolic array unrolling
+    pe_array_size: Tuple[int, int] = DEFAULT_PE_ARRAY_SIZE
     vector_unit_width: Optional[int] = None  # None -> pe_array_size[1]
-    frequency: float = 1.0  # GHz (accelerator clock)
+    frequency: float = DEFAULT_FREQUENCY_GHZ  # accelerator clock
     # L1 systolic buffers (# elements)
-    input_buffer_size: Optional[int] = None
-    weight_buffer_size: Optional[int] = None
-    accum_buffer_size: Optional[int] = None
+    input_buffer_size: Optional[int] = DEFAULT_INPUT_BUFFER_SIZE
+    weight_buffer_size: Optional[int] = DEFAULT_WEIGHT_BUFFER_SIZE
+    accum_buffer_size: Optional[int] = DEFAULT_ACCUM_BUFFER_SIZE
     double_buffered_accum_buffer: bool = False
     # L2 scratchpad
     scratchpad_size: Optional[int] = None
+    scratchpad_offset: int = DEFAULT_SCRATCHPAD_OFFSET  # bytes at the base
     num_banks: Optional[int] = None
     bank_width: Optional[int] = None
-    double_buffered_l2: bool = False
-    # DRAM
-    dram_size: Optional[float] = None  # GB
-    dram_bandwidth: Optional[float] = None  # GB/s
-    dram_access_latency: Optional[float] = None  # ns
+    double_buffered_l2: bool = DEFAULT_DOUBLE_BUFFERED_L2
+    # L3 DRAM
+    dram_size: Optional[float] = DEFAULT_DRAM_SIZE_GB
+    dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
+    dram_access_latency: Optional[float] = DEFAULT_DRAM_ACCESS_LATENCY_NS
+
+    def __post_init__(self):
+        """Reject a reservation the rest of the compiler could not honour.
+
+        Inert at the default of 0, so a config that names no scratchpad at
+        all still constructs.
+        """
+        if self.scratchpad_offset < 0:
+            raise ValueError(
+                f"scratchpad_offset {self.scratchpad_offset} is negative"
+            )
+        if not self.scratchpad_offset:
+            return
+        if self.scratchpad_size is None:
+            raise ValueError(
+                "scratchpad_offset needs a scratchpad_size to reserve from"
+            )
+        if self.scratchpad_offset >= self.scratchpad_size:
+            raise ValueError(
+                f"scratchpad_offset {self.scratchpad_offset} leaves nothing of "
+                f"scratchpad_size {self.scratchpad_size}"
+            )
+        # A reservation that split a bank would put the planner's bank-aligned
+        # groups and the tile search's bank budget on different geometries.
+        bank = self.bank_size
+        if bank is not None and self.scratchpad_offset % bank:
+            raise ValueError(
+                f"scratchpad_offset {self.scratchpad_offset} is not a multiple "
+                f"of the {bank} B bank size"
+            )
 
     @property
     def vector_lanes(self) -> int:
@@ -81,6 +124,25 @@ class AcceleratorConfig:
             return None
         return self.scratchpad_size // self.num_banks
 
+    @property
+    def usable_scratchpad_size(self) -> Optional[int]:
+        """What the plan may spend: the SRAM above ``scratchpad_offset``."""
+        if self.scratchpad_size is None:
+            return None
+        return self.scratchpad_size - self.scratchpad_offset
+
+    @property
+    def usable_banks(self) -> Optional[int]:
+        """Banks above the reservation.
+
+        Counted off ``num_banks`` rather than divided out of the usable
+        bytes, so it is exactly ``num_banks`` at an offset of 0 even when the
+        banks do not divide the SRAM evenly.
+        """
+        if self.num_banks is None or self.bank_size is None:
+            return None
+        return self.num_banks - self.scratchpad_offset // self.bank_size
+
     @classmethod
     def from_args(cls, args) -> "AcceleratorConfig":
         """Build the config from parsed CLI args (``add_compile_args``)."""
@@ -93,6 +155,7 @@ class AcceleratorConfig:
             accum_buffer_size=args.accum_buffer_size,
             double_buffered_accum_buffer=args.double_buffered_accum_buffer,
             scratchpad_size=args.scratchpad_size,
+            scratchpad_offset=args.scratchpad_offset,
             num_banks=args.num_banks,
             bank_width=args.bank_width,
             double_buffered_l2=args.double_buffered_l2,

@@ -579,6 +579,10 @@ def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
 
     bases, total = _greedy_best_fit(items)
 
+    reserved = config.scratchpad_offset
+    if reserved:
+        bases = {key: base + reserved for key, base in bases.items()}
+
     for root, buf in bufs.items():
         if root in in_group:
             continue
@@ -602,7 +606,10 @@ def _plan_scratchpad(model: GraphModule, bufs: Dict[Node, "_Buf"], config):
                 if _slots(m):
                     m.meta["bank_group_stride"] = group_slot_bytes
 
-    return int(total), {"buffers": len(items), "bank_groups": len(groups)}
+    return int(total) + reserved, {
+        "buffers": len(items),
+        "bank_groups": len(groups),
+    }
 
 
 def _buf_desc(buf: "_Buf", config) -> str:
@@ -775,10 +782,17 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
         )
         if len(live) > len(shown):
             detail += f"\n    ... (+{len(live) - len(shown)} more)"
+        reserved = config.scratchpad_offset
+        note = (
+            f" ({reserved} B of it reserved by scratchpad_offset)"
+            if reserved
+            else ""
+        )
         raise ValueError(
-            f"[plan_memory] scratchpad plan needs {scratchpad_bytes} bytes > "
-            f"scratchpad_size {capacity}; peak concurrency {peak_bytes} B "
-            f"across {len(live)} live scratchpad buffers:\n{detail}"
+            f"[plan_memory] scratchpad plan needs {scratchpad_bytes} bytes"
+            f"{note} > scratchpad_size {capacity}; peak concurrency "
+            f"{peak_bytes} B across {len(live)} live scratchpad buffers:"
+            f"\n{detail}"
         )
 
     logger.info(

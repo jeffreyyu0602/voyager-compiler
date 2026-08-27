@@ -1,9 +1,16 @@
 import argparse
 
 from voyager_compiler.hardware_config import (
+    DEFAULT_ACCUM_BUFFER_SIZE,
+    DEFAULT_DOUBLE_BUFFERED_L2,
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
     DEFAULT_DRAM_BANDWIDTH_GBS,
     DEFAULT_DRAM_SIZE_GB,
+    DEFAULT_FREQUENCY_GHZ,
+    DEFAULT_INPUT_BUFFER_SIZE,
+    DEFAULT_PE_ARRAY_SIZE,
+    DEFAULT_SCRATCHPAD_OFFSET,
+    DEFAULT_WEIGHT_BUFFER_SIZE,
 )
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
@@ -282,6 +289,14 @@ def add_compile_args(parser=None):
         help="Total L2 SRAM size (bytes).",
     )
     parser.add_argument(
+        "--scratchpad_offset",
+        type=int,
+        default=DEFAULT_SCRATCHPAD_OFFSET,
+        help="Bytes reserved at the base of the L2 SRAM, for a program the "
+        "accelerator shares the scratchpad with; allocations start above "
+        "it. Must be a multiple of the bank size.",
+    )
+    parser.add_argument(
         "--num_banks",
         type=int,
         default=None,
@@ -296,25 +311,25 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--double_buffered_l2",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=DEFAULT_DOUBLE_BUFFERED_L2,
         help="Overlap DRAM I/O with compute (ping-pong); halves L2 for tiling.",
     )
     parser.add_argument(
         "--input_buffer_size",
         type=int,
-        default=1024,
+        default=DEFAULT_INPUT_BUFFER_SIZE,
         help="Input buffer size per IC dim (# elements).",
     )
     parser.add_argument(
         "--weight_buffer_size",
         type=int,
-        default=1024,
+        default=DEFAULT_WEIGHT_BUFFER_SIZE,
         help="Weight buffer size per OC dim (# elements).",
     )
     parser.add_argument(
         "--accum_buffer_size",
         type=int,
-        default=1024,
+        default=DEFAULT_ACCUM_BUFFER_SIZE,
         help="Accum buffer size per OC dim (# elements).",
     )
     parser.add_argument(
@@ -344,7 +359,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--frequency",
         type=float,
-        default=1.0,
+        default=DEFAULT_FREQUENCY_GHZ,
         help="Clock frequency in GHz (with --dram_bandwidth -> bytes/cycle).",
     )
 
@@ -366,7 +381,7 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--pe_array_size",
         type=lambda x: tuple(map(int, x.split(","))),
-        default=None,
+        default=DEFAULT_PE_ARRAY_SIZE,
         help="Systolic PE array size (rows,cols), e.g. 16,16.",
     )
     parser.add_argument(

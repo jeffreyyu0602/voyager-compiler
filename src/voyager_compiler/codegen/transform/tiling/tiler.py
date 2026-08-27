@@ -103,9 +103,10 @@ def build_interstellar_tiler(
     those stay in bytes.
 
     L2 is planned exactly the way ``plan_memory`` allocates it: the capacity is
-    ``scratchpad_size``, the whole physical scratchpad, and a ping-ponged source
-    is charged one bank per slot (``size_fn``) rather than the capacity being
-    halved.  Halving cannot express a buffer that is allocated only once -- the
+    ``usable_scratchpad_size``, the scratchpad above whatever
+    ``scratchpad_offset`` reserves, and a ping-ponged source is charged one
+    bank per slot (``size_fn``) rather than the capacity being halved.
+    Halving cannot express a buffer that is allocated only once -- the
     reduction scratch -- and it is that omission that let the tiler hand back
     tilings the allocator could not place.
 
@@ -123,7 +124,7 @@ def build_interstellar_tiler(
                 config.accum_buffer_size * oc_dim,
                 config.weight_buffer_size * oc_dim,
             ],
-            [config.scratchpad_size],
+            [config.usable_scratchpad_size],
             [config.dram_size * 1024**3],  # GB -> bytes
         ],
         buf_access_cost_list=[

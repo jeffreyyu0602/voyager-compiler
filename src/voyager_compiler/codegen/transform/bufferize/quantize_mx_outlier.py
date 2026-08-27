@@ -834,7 +834,7 @@ def _row_block(
     if cap is not None:
         rows = min(rows, cap)
     per_row = _NEST_ROW_BLOCK_COPIES * mid_bytes_per_row + scratch_bytes_per_row
-    slot_size = tiler.config.scratchpad_size // tiler.config.num_slots
+    slot_size = tiler.config.usable_scratchpad_size // tiler.config.num_slots
     while rows > 1 and rows * per_row > slot_size:
         rows //= 2
     while rows > 1 and (M % rows or (cap is not None and cap % rows)):
