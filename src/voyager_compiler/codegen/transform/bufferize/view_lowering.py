@@ -240,19 +240,6 @@ def _fold_join(model: GraphModule, node: Node) -> None:
     anchors = [t if t is not None else s for t, s in zip(targets, sources)]
     first = min(anchors, key=lambda n: order[n])
 
-    # A layers.txt extent covers one contiguous scope run, and an op between
-    # two runs is selected by no layer -- so the fold's host ops must join a
-    # neighboring layer's span: the alloc joins the first producer's, the
-    # parameter copies join the consumer's (the first scoped op after the cat).
-    consumer_scope = next(
-        (
-            s
-            for n in ordered[order[node] :]
-            if (s := n.meta.get("scope")) is not None
-        ),
-        None,
-    )
-
     # The cat's storage, alive from the first producer's stores onward.
     # Space rides positionally: ``annotate_tensor_spaces`` reads ``args[2]``.
     with graph.inserting_before(first):
@@ -297,11 +284,8 @@ def _fold_join(model: GraphModule, node: Node) -> None:
         else:
             with graph.inserting_before(node):
                 clone = graph.call_function(_CLONE, (s,))
-                insert = graph.call_function(_INSERT, (clone, window))
+                graph.call_function(_INSERT, (clone, window))
             set_node_value(clone, v)
-            if consumer_scope is not None:
-                clone.meta["scope"] = consumer_scope
-                insert.meta["scope"] = consumer_scope
 
     node.replace_all_uses_with(buf)
     graph.erase_node(node)
