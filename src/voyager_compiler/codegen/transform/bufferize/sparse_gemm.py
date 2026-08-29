@@ -912,10 +912,7 @@ def gemm_produces_csr(node) -> bool:
     anchor = get_anchor_node(node)
     if anchor is None or not is_gemm_op(anchor):
         return False
-    if not any(
-        n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
-        for n in submod.graph.nodes
-    ):
+    if not any(n.target is _QUANTIZE_MX_OUTLIER for n in submod.graph.nodes):
         return False
     return isinstance(node.value, (list, tuple)) and len(node.value) == 5
 
@@ -924,12 +921,11 @@ def _epilogue_geometry(node, plan, tiler) -> _Geometry:
     """The CSR geometry a GEMM epilogue produces.
 
     The quantize sees the GEMM's output tile, so the row block *is* the row
-    tile.  The K slice, though, is the *consumers'* k tile: the tail dices
-    each column tile into ``tk``-wide sub-slices (``_EpilogueTail``), so the
-    slice width follows the consumers — never coarser than a consumer's own
-    search validated — while this GEMM's tiling stays its own.  The gcd with
-    ``tile_n`` keeps a slice inside one column tile; forcing *finer* than a
-    consumer asked only shrinks its tiles, which is always safe.
+    tile.  The K slice is the widest width that divides the column tile the
+    producer cuts it from, holds whole microscaling blocks, and is no wider
+    than the finest consumer's own k tile — forcing a consumer finer only
+    shrinks its tiles, which is always safe, while this GEMM's tiling stays
+    its own.
     """
     vals = node.value
     inliers = vals[4]
@@ -937,18 +933,17 @@ def _epilogue_geometry(node, plan, tiler) -> _Geometry:
     M, K = inliers.shape[-2], inliers.shape[-1]
     submod = node.meta["submodule"]
     qnode = next(
-        n
-        for n in submod.graph.nodes
-        if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER
+        n for n in submod.graph.nodes if n.target is _QUANTIZE_MX_OUTLIER
     )
     bs = qnode.args[3]
     max_pct = qnode.args[9] if len(qnode.args) > 9 else 0.01
     tk_pref, _ = consumer_k_tile(node, tiler)
-    tk = plan.tile_n if tk_pref is None else math.gcd(tk_pref, plan.tile_n)
-    if tk % bs:
-        # A slice must hold whole microscaling blocks; fall back to the
-        # column tile (the consumer's own guard reports the mismatch).
-        tk = plan.tile_n
+    tk = plan.tile_n
+    if tk_pref is not None and tk_pref < plan.tile_n:
+        for width in range(tk_pref, 0, -1):
+            if plan.tile_n % width == 0 and width % bs == 0:
+                tk = width
+                break
     geom = _Geometry(
         batch=batch,
         M=M,
