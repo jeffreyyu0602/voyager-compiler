@@ -29,6 +29,7 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
     reduction_op,
     reduction_scratch,
+    relayout_view_shape,
     stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
@@ -1502,14 +1503,19 @@ def _split_part(fused_gm, part_ops, root, name, result):
     return torch.fx.GraphModule(torch.nn.Module(), pg)
 
 
-def _split_stream_break(fused_gm):
+def _split_stream_break(fused_gm, acc_shape):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
     ``stream_breaking_quantize`` decides: a non-last scale axis always
     breaks (the scale unit groups along the stream, so the tile must be
     materialized first), as does a relayout that moves elements (the store
     folds a permute into the value's addressing but writes the scales in
-    stream order).
+    stream order).  It reads the shape off the chain's input, and a fused
+    tail's accumulator placeholder carries none, so a chain rooted there is
+    replayed on the tile shape first: one that only renames the tile's dims
+    -- an MHA context matmul's ``transpose(1, 2)`` lifts the head dim past
+    the sequence, but a tile holds one head -- is respelled as a view, which
+    breaks nothing, and the quantize rides the op's output pass.
 
     The cut lands *before* the relayout chain feeding the quantize: the
     staged tile keeps the accumulator's layout and the relayout rides the
@@ -1518,9 +1524,11 @@ def _split_stream_break(fused_gm):
     any) immediately before it.
 
     Args:
-        fused_gm: The fused tail ``[acc, *operands] -> output(s)``; a
-            non-``GraphModule`` tail (``None``, a sparse ``_EpilogueTail``)
-            is never split.
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``, whose
+            relayout may be rewritten in place; a non-``GraphModule`` tail
+            (``None``, a sparse ``_EpilogueTail``) is never split.
+        acc_shape: The accumulator tile's shape -- what the tail's first
+            placeholder is handed.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
@@ -1535,6 +1543,23 @@ def _split_stream_break(fused_gm):
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
     ops = [n for n in graph.nodes if n.op == "call_function"]
+
+    if relayout and spine is phs[0]:
+        view_shape = relayout_view_shape(relayout, tuple(acc_shape))
+        if view_shape is not None:
+            with graph.inserting_before(relayout[0]):
+                view = graph.call_function(
+                    torch.ops.aten.view.default, (spine, list(view_shape))
+                )
+            relayout[0].replace_all_uses_with(view)
+            for n in relayout:
+                graph.erase_node(n)
+            graph.lint()
+            fused_gm.recompile()
+            broken = stream_breaking_quantize(fused_gm)
+            if broken is None:
+                return None
+            quant, relayout, spine = broken
 
     relayout.reverse()
     head_ops = [n for n in ops[:-1] if n not in relayout]
@@ -2023,7 +2048,7 @@ def _gemm_scratch_and_kernel(
             )
 
     if split is _CLASSIFY:
-        split = _split_stream_break(fused_gm)
+        split = _split_stream_break(fused_gm, acc_shape)
     if num_k == 1 and split is None and not staged:
         scratch_specs = []
         kernel = _map_kernel(

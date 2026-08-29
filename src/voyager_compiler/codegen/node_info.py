@@ -790,24 +790,30 @@ def _reduced_dims(node, ndim: int) -> set:
     return set(range(ndim - len(normalized_shape), ndim))
 
 
-def _reorders(relayout, spine) -> bool:
-    """Whether ``relayout`` moves elements or only renames dims.
+def relayout_view_shape(relayout, shape):
+    """The shape a relayout chain gives an input of ``shape``, or ``None``
+    when the chain moves elements rather than only renaming dims.
 
     Proved by replaying the chain on an index tensor rather than by
     recognizing ops, so a transpose of a size-1 dim reads as the identity it
-    is.  An unknown shape counts as reordering: the caller then stages the
-    tile, which is always safe.
+    is.
+
+    Args:
+        relayout: The chain, walked input-ward -- the op nearest the value
+            first, as ``stream_breaking_quantize`` returns it.
+        shape: The shape the chain's input tensor has.
+
+    Returns:
+        The chain's output shape when it only renames dims, else ``None``.
     """
-    value = _tensor_value(spine)
-    if value is None:
-        return True
-    shape = tuple(value.shape)
     index = torch.arange(math.prod(shape)).reshape(shape)
     for n in reversed(relayout):
         index = n.target(
             *(index if a is n.args[0] else a for a in n.args), **n.kwargs
         )
-    return not torch.equal(index.reshape(-1), torch.arange(index.numel()))
+    if not torch.equal(index.reshape(-1), torch.arange(index.numel())):
+        return None
+    return tuple(index.shape)
 
 
 def stream_breaking_quantize(gm):
@@ -852,9 +858,15 @@ def stream_breaking_quantize(gm):
     ):
         relayout.append(spine)
         spine = spine.args[0]
-    permuted = any(is_reshape_op(n) for n in relayout) and _reorders(
-        relayout, spine
-    )
+    permuted = False
+    if any(is_reshape_op(n) for n in relayout):
+        # An unknown shape counts as reordering: the caller then stages the
+        # tile, which is always safe.
+        value = _tensor_value(spine)
+        permuted = (
+            value is None
+            or relayout_view_shape(relayout, tuple(value.shape)) is None
+        )
 
     val = getattr(quant.args[0], "value", None)
     if val is None:
