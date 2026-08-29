@@ -96,10 +96,9 @@ def op_utilization(
 ) -> float:
     """The utilization to charge ``node``.
 
-    A matrix op the interstellar tiler mapped carries the RuntimeCalculator's
-    per-tile compute cycles (stamped on it by the builder), which is what one of
-    its tiled executions really costs -- so its utilization is the ideal-to-
-    actual ratio.
+    A matrix op the interstellar tiler mapped carries its RuntimeCalculator
+    and mapping (stamped on it by the builder); the calculator prices one
+    tiled execution, so its utilization is the ideal-to-actual ratio.
 
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
@@ -108,8 +107,9 @@ def op_utilization(
     tile's, so it also folds in the per-launch overhead the tiling model
     charges, and the two cannot disagree on what a tile costs.
     """
-    per_tile = node.meta.get("per_tile_cycles")
-    if "mma" in units and per_tile and ideal_cycles > 0:
+    tiling = node.meta.get("interstellar_tiling")
+    if "mma" in units and tiling is not None and ideal_cycles > 0:
+        per_tile = node.meta["runtime_calculator"].matrix_cycles(tiling[0])
         return min(1.0, ideal_cycles / per_tile)
     return vector_op_utilization(
         node, cost.vector_lanes, cost.bytes_per_cycle, ideal_cycles

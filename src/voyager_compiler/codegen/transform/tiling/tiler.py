@@ -11,6 +11,7 @@ interstellar directly.  A reduction factor greater than 1 is what drives the
 to each builder; per-node element widths are read from the nodes themselves.
 """
 
+import copy
 import gc
 import logging
 import math
@@ -1145,10 +1146,7 @@ def _prepare_search(node, tiler):
         ``(key, search)``, or ``None`` when no interstellar run is needed: not
         a matrix op, a GEMV (``gemv_op_tiling`` searches those instead), or an
         anchor that already carries an ``l2_tiling``.  ``search`` is ``None``
-        when there is nothing left to run -- ``key`` is already in
-        ``tiler.cache``, or interstellar skips the layer -- so a caller tells
-        the two apart by looking the key up; either way the key names the
-        entry.
+        when interstellar skips the layer.
     """
     anchor = get_anchor_node(node)
     if (
@@ -1239,9 +1237,6 @@ def _prepare_search(node, tiler):
         outlier_pct,
         out_outlier_pct,
     )
-
-    if key in tiler.cache:
-        return key, None
 
     layer = _extract_layer_from_node(anchor)
     if layer is None:
@@ -1434,12 +1429,10 @@ def _finish_search(search, found):
     worker's copy.
 
     Returns:
-        ``(mapping, per_tile_cycles, access_list, bank_groups)`` -- the best
-        MappingPoint (its ``loop_blockings`` give the per-level tile factors),
-        the compute cycles of one L3 tile under it (the reporting model's
-        utilization denominator), the per-level ``(input, output, weight)``
-        access counts the ``Tiling`` proto reports, and the winning bank
-        partition (``_winning_bank_groups``).
+        ``(mapping, access_list, bank_groups)`` -- the best MappingPoint (its
+        ``loop_blockings`` give the per-level tile factors), the per-level
+        ``(input, output, weight)`` access counts the ``Tiling`` proto
+        reports, and the winning bank partition (``_winning_bank_groups``).
     """
     index, runtime, mapping = found
     search.layer.size_fn = search.size_fns[index]
@@ -1460,19 +1453,14 @@ def _finish_search(search, found):
         f"IC={b[le.IC][3]} OC={b[le.OC][3]} "
         f"OX={b[le.OX][3]} OY={b[le.OY][3]} ON={b[le.ON][3]}"
     )
-    per_tile_cycles = search.rc.matrix_cycles(mapping)
     logger.info(f"[interstellar] {search.name} estimated runtime: {runtime}")
-    logger.info(
-        f"[interstellar] {search.name} per-tile compute cycles: "
-        f"{per_tile_cycles}"
-    )
     logger.info(interstellar.utils.format_tiling(mapping))
 
     _, _, access_list = interstellar.cost_model.get_cost(
         search.tiler.arch, mapping, search.layer
     )
     bank_groups = _winning_bank_groups(search, index, mapping)
-    return mapping, per_tile_cycles, access_list, bank_groups
+    return mapping, access_list, bank_groups
 
 
 # Prepared in the parent before forking; a worker reads its job by index so
@@ -1517,7 +1505,7 @@ def prefetch_tilings(nodes, tiler):
         if key in tiler.cache:
             continue
         if search is None:
-            tiler.cache[key] = (None,) * 4  # interstellar skips it
+            tiler.cache[key] = (None,) * 3  # interstellar skips it
             continue
         jobs[key] = search
 
@@ -1595,6 +1583,27 @@ def prefetch_tilings(nodes, tiler):
             len(searches) - cached,
             PREFETCH_TIMEOUT_S,
         )
+
+
+def recost_k_split(tiling_meta, k_tiles):
+    """Rewrite a stamped mapping and its access counts for a builder-imposed
+    K split.
+
+    Args:
+        tiling_meta: The anchor's ``meta["tiling"]`` dict, edited in place.
+        k_tiles: Reduction-tile count of the nest the builder emits.
+    """
+    mapping, _ = tiling_meta["interstellar_tiling"]
+    corrected = copy.deepcopy(mapping)
+    corrected.loop_blockings = [list(b) for b in corrected.loop_blockings]
+    b = corrected.loop_blockings[le.IC]
+    b[1], b[2], b[3] = 1, b[1] * b[2] * b[3] // k_tiles, k_tiles
+    _, _, access_list = interstellar.cost_model.get_cost(
+        tiling_meta["interstellar_architecture"],
+        corrected,
+        tiling_meta["layer"],
+    )
+    tiling_meta["interstellar_tiling"] = (corrected, access_list)
 
 
 def _l3_order_from_mapping(mapping, canonical, loop_of):
@@ -1686,7 +1695,7 @@ def get_tiling(node, tiler=None):
 
     key, search = _prepare_search(node, tiler)
     if key in tiler.cache:
-        mapping, per_tile_cycles, access_list, bank_groups = tiler.cache[key]
+        mapping, access_list, bank_groups = tiler.cache[key]
         logger.debug(
             "[tiling] %s: mapping cache hit (%d entries)",
             anchor.name,
@@ -1696,9 +1705,9 @@ def get_tiling(node, tiler=None):
         logger.info("[tiling] %s: running interstellar", anchor.name)
         t0 = time.perf_counter()
         if search is None:
-            mapping = per_tile_cycles = access_list = bank_groups = None
+            mapping = access_list = bank_groups = None
         else:
-            mapping, per_tile_cycles, access_list, bank_groups = _finish_search(
+            mapping, access_list, bank_groups = _finish_search(
                 search, _run_search(search)
             )
         logger.info(
@@ -1706,22 +1715,21 @@ def get_tiling(node, tiler=None):
             anchor.name,
             time.perf_counter() - t0,
         )
-        tiler.cache[key] = (mapping, per_tile_cycles, access_list, bank_groups)
+        tiler.cache[key] = (mapping, access_list, bank_groups)
 
     if mapping is None:
         return None, None
 
-    # The builders copy these onto the nest they build (the anchor is erased on
-    # splice): ``per_tile_cycles`` so the reporting cost model can turn it into
-    # a utilization, the mapping / architecture so the proto emitter can
-    # serialize the ``Tiling`` message, and ``bank_groups`` (the winning role
-    # partition) so the builders can stamp each SRAM alloc with its bank group
-    # for the memory planner.
+    # The builders copy these onto the nest they build (the anchor is erased
+    # on splice): the mapping / architecture for the proto's ``Tiling``,
+    # ``bank_groups`` for the memory planner, and the calculator / layer so
+    # the reporting model prices the mapping actually emitted.
     anchor.meta["tiling"] = {
-        "per_tile_cycles": per_tile_cycles,
         "interstellar_tiling": (mapping, access_list),
         "interstellar_architecture": tiler.arch,
         "bank_groups": bank_groups,
+        "runtime_calculator": search.rc,
+        "layer": search.layer,
     }
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim

@@ -2093,8 +2093,8 @@ def _gemm_scratch_and_kernel(
 
 
 def _stamp_anchor_meta(gm, anchor) -> None:
-    """Copy the anchor's interstellar results -- the per-tile compute cycles the
-    reporting model turns into a utilization, and the mapping / architecture the
+    """Copy the anchor's interstellar results -- the mapping and calculator the
+    reporting model prices a tile with, and the mapping / architecture the
     proto emitter turns into a ``Tiling`` -- onto the nest just built, at every
     nesting level (loop body, cond branch); the anchor itself is erased on
     splice.

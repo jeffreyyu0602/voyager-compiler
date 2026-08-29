@@ -67,6 +67,7 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     PRODUCER_META,
     tag_base_table,
 )
+from voyager_compiler.codegen.transform.tiling.tiler import recost_k_split
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _finalize_exported_gm,
     _lenient_verifier,
@@ -1134,6 +1135,11 @@ def build_sparse_gemm(
                 f"{node.name}: row tile {plan.tile_m} is not a whole number "
                 f"of the producer's {geom.rows}-row blocks"
             )
+        # The stamped mapping still describes the search's K split; a GEMV
+        # consumer (lm_head) carries no mapping and none to correct.
+        tiling_meta = plan.anchor.meta.get("tiling")
+        if tiling_meta is not None:
+            recost_k_split(tiling_meta, geom.n_k)
         data_dtype = operands[plan.kw_idx["A_data"]].value.dtype
 
     out_geom = _epilogue_geometry(node, plan, tiler) if produces else None
