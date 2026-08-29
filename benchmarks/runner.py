@@ -21,6 +21,17 @@ The output is a single ``results.xlsx`` with one named sheet per sweep:
     python benchmarks/runner.py
     python benchmarks/runner.py --only quant --only hardware
     python benchmarks/runner.py --jobs 8 --fast
+
+``--no-pipelined`` and ``--no-fuse-operators`` turn off software pipelining
+(L2 double buffering) and operator fusion (the MXU dequant / activation /
+requantize tails and the GQA KV-repeat fold) for *every* point in the run, so
+one sweep per arm into its own ``--out`` gives the ablation across all axes:
+
+    python benchmarks/runner.py --out results/full
+    python benchmarks/runner.py --no-pipelined --out results/nopipe
+    python benchmarks/gen_diff.py --out ablation_pipelining.md \
+        --old results/nopipe/results.xlsx --new results/full/results.xlsx \
+        --old-tag no-pipelining --new-tag full
 """
 
 import argparse

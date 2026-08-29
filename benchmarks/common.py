@@ -192,7 +192,14 @@ class SweepConfig:
     ``mode`` selects the graph shape: ``"prefill"`` feeds the whole model an
     ``input_ids`` of length ``prompt_len`` (``use_cache=False``); ``"decode"``
     measures one token over a KIVI split cache whose main cache holds ``kv_len``
-    entries.  Bit-widths are each one of {16, 8, 4} (and 2 for KV only)."""
+    entries.  Bit-widths are each one of {16, 8, 4} (and 2 for KV only).
+
+    ``pipelined`` and ``fuse_operators`` are the two lowering switches: off,
+    ``pipelined`` single-buffers every L2 tile (no prefetch overlap) and
+    ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
+    dequant / activation / requantize tail becomes separate kernels and the
+    GQA KV repeat is materialised in memory instead of folding into the
+    block index."""
 
     model_id: str = DEFAULT_MODEL
     mode: str = "prefill"  # "prefill" | "decode"
@@ -213,6 +220,8 @@ class SweepConfig:
     dram_access_latency_ns: float = BASELINE_DRAM_ACCESS_LATENCY_NS
 
     attn_implementation: str = "eager"
+    pipelined: bool = True
+    fuse_operators: bool = True
     single_buffer_tail: bool = False
     num_layers_override: Optional[int] = None
 
@@ -221,8 +230,9 @@ class SweepConfig:
 
     @property
     def acc_config(self) -> AcceleratorConfig:
-        """The accelerator description this sweep point compiles for.  L2 is
-        double-buffered, so a buffer occupies two of ``num_banks`` banks."""
+        """The accelerator description this sweep point compiles for.  Under
+        ``pipelined`` L2 is double-buffered, so a buffer occupies two of
+        ``num_banks`` banks rather than one."""
         return AcceleratorConfig(
             pe_array_size=self.pe,
             scratchpad_size=self.scratchpad_size,
@@ -235,7 +245,7 @@ class SweepConfig:
             input_buffer_size=1024,
             weight_buffer_size=1024,
             accum_buffer_size=1024,
-            double_buffered_l2=True,
+            double_buffered_l2=self.pipelined,
             dram_size=64.0,
             dram_bandwidth=self.dram_bandwidth_gbs,
             dram_access_latency=self.dram_access_latency_ns,
@@ -366,6 +376,15 @@ def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
 
 NON_DESIGN_FIELDS = ("dump_dir",)
 _UNUSED_BY_MODE = {"prefill": "kv_len", "decode": "prompt_len"}
+# The scope each export records for LlamaRotaryEmbedding.  The decode wrapper
+# nests the model one level deeper than the prefill export, the same way it
+# nests the layers (``model_model_layers_0_`` against ``model_layers_0_``), so
+# one name cannot serve both -- and a name matching nothing exempts nothing,
+# silently.
+_ROTARY_SCOPE_BY_MODE = {
+    "prefill": "model.rotary_emb",
+    "decode": "model.model.rotary_emb",
+}
 _PROBE_FIELDS = ("num_layers_override",)
 
 
@@ -396,9 +415,11 @@ def _cfg_stem(cfg: SweepConfig) -> str:
 
 def build_quantizer(cfg: SweepConfig):
     """A quantizer for ``cfg``'s weight / activation precision (microscaling for
-    8/4-bit, unquantized bf16 for 16-bit).  KV-cache precision is *not* set here
-    -- it is applied by annotating the main cache tensors in
-    ``_annotate_kv_cache`` (KIVI keeps the full-precision residual untouched).
+    8/4-bit, unquantized bf16 for 16-bit).  The rotary embedding's matmul is
+    exempted by the scope ``cfg.mode``'s export records for it.  KV-cache
+    precision is *not* set here -- it is applied by annotating the main cache
+    tensors in ``_annotate_kv_cache`` (KIVI keeps the full-precision residual
+    untouched).
     """
     group = cfg.group
     quantizer = get_default_quantizer(
@@ -407,7 +428,10 @@ def build_quantizer(cfg: SweepConfig):
         force_scale_power_of_two=True,
     )
     quantizer.set_module_name_object_type_order(
-        "model.model.rotary_emb", torch.ops.aten.matmul.default, 0, None
+        _ROTARY_SCOPE_BY_MODE[cfg.mode],
+        torch.ops.aten.matmul.default,
+        0,
+        None,
     )
     return quantizer
 
@@ -439,13 +463,26 @@ def _prompt_ids(cfg: SweepConfig, tokenizer, length: int):
 def build_prefill(cfg: SweepConfig):
     """Export a prefill graph: the whole ``AutoModelForCausalLM`` fed
     ``input_ids`` of shape ``(batch, prompt_len)`` with ``use_cache=False``.
+
+    ``logits_to_keep=1`` keeps only the last position's logits -- all that
+    generation reads.  The graph then slices the hidden states before
+    ``lm_head``, so the vocabulary projection lowers as a matrix-vector product
+    instead of a GEMM over every position, which both drops the discarded
+    logit rows and removes the weight re-fetch that tiling the rows forces.
+    A full-sequence objective (training, perplexity) needs every position and
+    must not export this way.
+
     Returns ``(gm, model, example_args, example_kwargs)`` -- the exported graph
     module and the underlying model."""
     model = _load_model(cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     input_ids = _prompt_ids(cfg, tokenizer, cfg.prompt_len)
     example_args = (input_ids,)
-    example_kwargs = {"return_dict": False, "use_cache": False}
+    example_kwargs = {
+        "return_dict": False,
+        "use_cache": False,
+        "logits_to_keep": 1,
+    }
     gm = export_model(model, example_args, example_kwargs)
     return gm, model, example_args, example_kwargs
 
@@ -687,6 +724,7 @@ def _frontend(cfg: SweepConfig):
         example_args,
         example_kwargs=example_kwargs,
         patterns=FUSION_PIPELINE,
+        skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
         context_len=cfg.kv_len if is_decode else None,
@@ -729,7 +767,7 @@ def _compile(cfg: SweepConfig):
     gm, model, tiler = _frontend(cfg)
     bufferize_graph(
         gm,
-        pipelined=True,
+        pipelined=cfg.pipelined,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
     )
@@ -1048,7 +1086,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
     sub = _extract_standalone(gm, node)
     bufferize_graph(
         sub,
-        pipelined=True,
+        pipelined=cfg.pipelined,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
     )
