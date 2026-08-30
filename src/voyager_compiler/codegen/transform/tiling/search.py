@@ -5,6 +5,7 @@ from typing import Generator, Optional, Tuple
 
 import torch
 
+import interstellar
 from voyager_compiler.codegen.node_info import (
     _pair,
     bound_operands,
@@ -45,12 +46,21 @@ __all__ = [
 # Shared with the interstellar tiler, which selects the same way.
 DEFAULT_RUNTIME_TOLERANCE = 0.01
 
+# Which ``(X, C, K)`` tile a GEMV's search sizes each interstellar loop by:
+# the rows, the input features (the reduction) and the output features.
+_GEMV_LOOP_TILE = {
+    interstellar.le.OX: 0,
+    interstellar.le.IC: 1,
+    interstellar.le.OC: 2,
+}
+
 
 def get_valid_tiling(
     input_shape: Tuple[int, ...],
     multiple_of: Optional[Tuple[int, ...]] = None,
     order: Optional[Tuple[int, ...]] = None,
     last_dim: Optional[int] = None,
+    pinned: Optional[dict] = None,
 ) -> Generator[Tuple[Tuple[int, ...], Tuple[int, ...]], None, None]:
     """Yield tile shapes from the full shape downwards.
 
@@ -65,6 +75,8 @@ def get_valid_tiling(
         order: Dim indices to reduce, first reduced first; default is left to
             right.
         last_dim: Dims from here onwards stay at full size.
+        pinned: ``{dim: size}`` tiles held at one size while the other dims
+            reduce; nothing is yielded when a pinned size is not valid.
 
     Yields:
         ``(tile_shape, tiling_factors)``, largest tile first.
@@ -100,6 +112,11 @@ def get_valid_tiling(
             )
             valid = [extent]
         sizes[dim] = valid
+    for dim, size in (pinned or {}).items():
+        dim = resolve(dim)
+        if input_shape[dim] % size or size % multiples[dim]:
+            return
+        sizes[dim] = [size]
 
     tile = [sizes[dim][0] for dim in range(ndim)]
 
@@ -268,11 +285,13 @@ def _search_tiling(
     multiple_of=None,
     cost_fn=None,
     tolerance=0.0,
+    pinned=None,
 ):
     """
     Generic driver over the valid tilings, scoring each by the scratchpad it
     needs (``scratchpad_bytes``: one bank per operand group, the two smallest
-    merged while they outnumber the banks).
+    merged while they outnumber the banks).  ``pinned`` holds dims at one
+    tile size (``get_valid_tiling``).
 
     ``get_valid_tiling`` yields candidates largest -> smallest.  Without
     ``cost_fn`` the first tiling that fits one slot wins (the largest fitting
@@ -286,9 +305,10 @@ def _search_tiling(
     (``mapping_point_generator``, with energy in place of bytes).
 
     Returns:
-        ``(tile_sizes, groups)`` -- the winning tile plus its bank partition
-        (each ``_bank_groups`` member list), or ``None`` when nothing fits at
-        any sharing level.
+        ``(tile_sizes, groups, runtime)`` -- the winning tile, its bank
+        partition (each ``_bank_groups`` member list) and its modeled
+        latency in cycles (0 without ``cost_fn``), or ``None`` when nothing
+        fits at any sharing level.
     """
 
     slot_size = config.usable_scratchpad_size // config.num_slots
@@ -304,6 +324,7 @@ def _search_tiling(
             multiple_of=multiple_of,
             order=order,
             last_dim=last_dim,
+            pinned=pinned,
         ):
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
@@ -333,7 +354,7 @@ def _search_tiling(
                     node, best[3], config, extra_sharing
                 )
             ]
-            return best[2], groups
+            return best[2], groups, best[0]
 
     logger.debug(f"Failed to tile {node} into a {slot_size}-byte slot.")
     return None
@@ -513,7 +534,7 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     return shapes
 
 
-def gemv_op_tiling(node, config):
+def gemv_op_tiling(node, config, constraint=None):
     """Per-dim tile counts for a matrix-vector GEMM, bare or fused.
 
     Called from ``get_tiling`` during bufferization, so it sees the layout the
@@ -525,10 +546,14 @@ def gemv_op_tiling(node, config):
         node: The op to tile -- a fully-connected GEMM, or a fused
             ``call_module`` around one.
         config (AcceleratorConfig): The hardware description.
+        constraint: A ``TileConstraint`` (``tiler.py``) on the rows
+            (``le.OX``), input-feature (``le.IC``) or output-feature
+            (``le.OC``) tile.
 
     On a banked config the winning tile's bank partition is stamped as
     ``node.meta["bank_groups"]`` (member lists per bank), which the builders
-    copy onto their SRAM allocs for the memory planner.
+    copy onto their SRAM allocs for the memory planner; the winner's modeled
+    latency is stamped as ``node.meta["tiling_runtime"]``.
 
     Returns:
         ``(n_m, n_n, n_k)`` -- the M, output and reduction tile counts -- or
@@ -561,6 +586,14 @@ def gemv_op_tiling(node, config):
     # A C tile short of a whole microscaling block leaves the scale tile
     # with no elements to expand against the input.
     block_size = anchor.kwargs.get("block_size") or 1
+    multiple = [1, block_size, math.lcm(config.vector_lanes, head_dim or 1)]
+    pinned = {}
+    if constraint is not None:
+        for loop, value in constraint.exact:
+            pinned[_GEMV_LOOP_TILE[loop]] = value
+        for loop, value in constraint.multiple:
+            dim = _GEMV_LOOP_TILE[loop]
+            multiple[dim] = math.lcm(multiple[dim], value)
 
     logger.info(f"Running L2 tiling for GEMV: {node}")
 
@@ -568,7 +601,7 @@ def gemv_op_tiling(node, config):
         _search_tiling,
         node=node,
         full_shape=(X, C, K),
-        multiple_of=(block_size, math.lcm(config.vector_lanes, head_dim or 1)),
+        multiple_of=tuple(multiple),
         shape_builder_fn=_build_gemv_shape_map,
         config=config,
         cost_fn=(
@@ -577,6 +610,7 @@ def gemv_op_tiling(node, config):
             else None
         ),
         tolerance=DEFAULT_RUNTIME_TOLERANCE,
+        pinned=pinned,
     )
 
     # C whole leaves the input vector loop-invariant, so its guarded load
@@ -592,9 +626,10 @@ def gemv_op_tiling(node, config):
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups = found
+    tile_sizes, groups, runtime = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
+    node.meta["tiling_runtime"] = runtime
 
     x_tiled, c_tiled, k_tiled = tile_sizes
     return X // x_tiled, K // k_tiled, C // c_tiled
@@ -735,7 +770,7 @@ def vector_op_tiling(node, config):
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups = found
+    tile_sizes, groups, _ = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
     return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
@@ -900,7 +935,7 @@ def pool_op_tiling(node, config):
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups = found
+    tile_sizes, groups, _ = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
     return tuple(s // ts for s, ts in zip(full_shape, tile_sizes))

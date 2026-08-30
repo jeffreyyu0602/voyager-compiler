@@ -1,6 +1,7 @@
 import collections.abc
 import logging
 import math
+import operator
 import re
 from itertools import repeat
 from typing import Any, Optional
@@ -256,9 +257,8 @@ def is_prunable_op(node: Node) -> bool:
 
     # Dropout is the identity when the probability is zero or at inference.
     if node.target == torch.ops.aten.dropout.default:
-        return (
-            get_arg_value(node, 1, "p") == 0.0
-            or not get_arg_value(node, 2, "train")
+        return get_arg_value(node, 1, "p") == 0.0 or not get_arg_value(
+            node, 2, "train"
         )
 
     # A same-dtype ``to.dtype`` is a pure pass-through.
@@ -934,3 +934,73 @@ def reduction_scratch(node, out_tile, vector_lanes):
         scratch += [(name, row, dtype) for name in rows]
         scratch += [(name, tile, dtype) for name in tiles]
     return scratch
+
+
+# --- outlier CSR producers and consumers -------------------------------------
+
+
+def csr_quantize_node(node):
+    """The ``quantize_mx_outlier`` ``node`` lowers, or ``None``.
+
+    A bare node is its own; a fused ``call_module`` carries it as an op of
+    its submodule.
+    """
+    target = torch.ops.quantized_ops.quantize_mx_outlier.default
+    if node.op == "call_function" and node.target is target:
+        return node
+    if node.op != "call_module":
+        return None
+    submod = node.meta.get("submodule")
+    if not isinstance(submod, GraphModule):
+        return None
+    return next(
+        (
+            n
+            for n in submod.graph.nodes
+            if n.op == "call_function" and n.target is target
+        ),
+        None,
+    )
+
+
+def gemm_produces_csr(node) -> bool:
+    """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
+
+    Such a group is a producer as well as (possibly) a consumer: the quantize
+    runs on the accumulator tile, so its CSR is emitted per output tile and
+    has to be stored by hand rather than diced by the output grid.  A group
+    whose *anchor* is the quantize is not one -- that is the row-swept case.
+    """
+    anchor = get_anchor_node(node)
+    if anchor is None or not is_gemm_op(anchor):
+        return False
+    if csr_quantize_node(node) is None:
+        return False
+    return isinstance(node.value, (list, tuple)) and len(node.value) == 5
+
+
+def csr_consumers(producer):
+    """The GEMMs that consume the outlier CSR ``producer`` emits.
+
+    Each is the bare ``linear_mx`` / ``matmul_mx`` or the fused
+    ``call_module`` around one, reached from the producer's ``getitem``
+    results through any nop view in between (the reshape between a decoder
+    layer and ``lm_head``).
+    """
+    found = []
+    for use in producer.users:
+        if use.target is not operator.getitem:
+            continue
+        stack = list(use.users)
+        while stack:
+            user = stack.pop()
+            if is_nop(user):
+                stack.extend(user.users)
+                continue
+            anchor = get_anchor_node(user)
+            if anchor is None or not is_gemm_op(anchor):
+                continue
+            if anchor.kwargs.get("A_indptr") is None or user in found:
+                continue
+            found.append(user)
+    return found

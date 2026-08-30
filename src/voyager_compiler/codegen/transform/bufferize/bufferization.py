@@ -24,6 +24,8 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     bound_operands,
+    csr_quantize_node,
+    gemm_produces_csr,
     get_anchor_node,
     is_aliasing_op,
     is_compute_op,
@@ -57,10 +59,8 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
 )
 from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
     build_sparse_gemm,
-    gemm_produces_csr,
 )
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
-    _quantize_node,
     BASE_TABLE_TAG,
     GEOMETRY_META,
     PRODUCER_META,
@@ -78,6 +78,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _subgraph,
 )
+from voyager_compiler.codegen.transform.tiling.sparse import plan_csr_slices
 from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
 from voyager_compiler.shape_prop import set_node_value
 
@@ -819,6 +820,7 @@ def bufferize_graph(
     build_cache = {}
     group_ids = itertools.count()
 
+    plan_csr_slices(list(graph.nodes), tiler)
     if tiler is not None:
         prefetch_tilings(
             [n for n in graph.nodes if is_gemm_op(get_anchor_node(n))],
@@ -888,7 +890,7 @@ def bufferize_graph(
                     if flash_attention_v3
                     else build_attention(node, num_slots=num_slots, tiler=tiler)
                 )
-            elif _quantize_node(node) is not None:
+            elif csr_quantize_node(node) is not None:
                 # A row-swept producer: the quantize needs a per-K-slice tiling
                 # its anchor cannot give it, so it gets its own two-loop nest
                 # rather than build_pointwise's single grid.  A GEMM-anchored

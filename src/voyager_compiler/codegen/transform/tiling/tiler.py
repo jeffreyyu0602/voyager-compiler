@@ -89,18 +89,53 @@ _GEMM_LOOP = {"M": le.OX, "N": le.OC}
 _CONV_LOOP = {"K": le.OC, "Y": le.OY, "X": le.OX}
 
 
+@dataclass(frozen=True)
+class TileConstraint:
+    """Loop extents a search must land on at the scratchpad level, keyed by
+    interstellar loop (``le.IC``, ``le.OC``, ...).  ``exact`` pins a loop's
+    tile to one extent, ``multiple`` requires it to be a whole number of the
+    value; both are ``((loop, value), ...)`` so a constraint can key the
+    tiling cache.  A GEMM feeding an MHA relayout takes a ``le.OC``
+    multiple of the head; a CSR consumer an exact ``le.IC`` (the slice
+    width) and a CSR producer a ``le.OC`` multiple of it (its column tile
+    is cut into slices), which is how ``plan_csr_slices`` searches the two
+    under one width.
+    """
+
+    exact: Tuple[Tuple[int, int], ...] = ()
+    multiple: Tuple[Tuple[int, int], ...] = ()
+
+    def allows(self, extent) -> bool:
+        """Whether tile extents ``extent(loop)`` satisfy every entry."""
+        return all(extent(loop) == v for loop, v in self.exact) and all(
+            extent(loop) % v == 0 for loop, v in self.multiple
+        )
+
+    def merged(self, other):
+        """This constraint and ``other`` (``None`` = nothing) together."""
+        if other is None:
+            return self
+        return TileConstraint(
+            tuple(sorted(self.exact + other.exact)),
+            tuple(sorted(self.multiple + other.multiple)),
+        )
+
+
 @dataclass
 class TilerContext:
     """The interstellar architecture + run options, built once and shared by
     every builder so each can map its anchor node on demand.  ``arch`` /
     ``schedule`` are built from ``config``; ``cache`` is per-run
-    memoization."""
+    memoization, and ``constraints`` the :class:`TileConstraint` a joint
+    optimization settled on for an anchor, which its search then runs
+    under."""
 
     arch: object
     schedule: object
     config: object  # AcceleratorConfig
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     cache: dict = field(default_factory=dict)
+    constraints: dict = field(default_factory=dict)
 
 
 def build_interstellar_tiler(
@@ -354,7 +389,7 @@ def make_size_fn(
     out_dtype=None,
     fused_specs=(),
     extra_sharing=0,
-    oc_align=None,
+    constraint=None,
     has_tail=False,
     staged_tail=False,
     num_slots=1,
@@ -495,9 +530,10 @@ def make_size_fn(
                 e *= partitioning_accum[d]
             return e
 
-        # Veto an OC tile that splits an attention head — the MHA relayout must
-        # store whole heads.
-        if oc_align and extent(le.OC) % oc_align != 0:
+        # Veto a tile off the pinned loop extents: an OC tile that splits an
+        # attention head (the MHA relayout must store whole heads), a CSR
+        # slice width the coupled ops agreed on.
+        if constraint is not None and not constraint.allows(extent):
             return None, 0.0
 
         # The output is a wide partial sum until IC is fully reduced; only the
@@ -1425,7 +1461,7 @@ class _Search:
     size_fns: list
 
 
-def _prepare_search(node, tiler):
+def _prepare_search(node, tiler, constraint=None):
     """Everything a GEMM/conv ``node`` needs before its mapping search.
 
     Reads the node -- shapes, dtypes, the fused tail's operands, the GQA weight
@@ -1438,6 +1474,11 @@ def _prepare_search(node, tiler):
     two size the same operands.  The L2 -> L1 bus carries ``min(unroll)`` input
     elements per cycle -- the rate the array's narrow side consumes them at --
     so its width is ``min(unroll) * if_bits / 8`` bytes per cycle.
+
+    ``constraint`` (a :class:`TileConstraint`) pins loop extents every size
+    function vetoes against -- the caller's, merged with the head alignment
+    an MHA relayout demands -- and keys the result apart from the free
+    search's.
 
     Returns:
         ``(key, search)``, or ``None`` when no interstellar run is needed: not
@@ -1491,13 +1532,14 @@ def _prepare_search(node, tiler):
         )
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
-    # else _detect_mha_relayout can't store the tile.
-    oc_align = None
+    # else _detect_mha_relayout can't store the tile: that joins whatever
+    # constraint the caller registered.
     if sub_gm is not None and not is_conv2d(anchor):
         nodes = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
         perm = trailing_mha_perm(nodes)
         if perm is not None and perm.value.ndim > anchor.value.ndim:
-            oc_align = perm.value.shape[-1]
+            head = TileConstraint(multiple=((le.OC, perm.value.shape[-1]),))
+            constraint = head.merged(constraint)
 
     # An outlier GEMM's CSR: what fraction of the activation the packed stream
     # is sized to hold.  Read off the operand rather than the producer's
@@ -1530,7 +1572,7 @@ def _prepare_search(node, tiler):
         tuple(fused_specs),
         has_tail,
         staged_tail,
-        oc_align,
+        constraint,
         outlier_pct,
         out_outlier_pct,
     )
@@ -1603,7 +1645,7 @@ def _prepare_search(node, tiler):
             out_dtype,
             fused_specs,
             extra_sharing,
-            oc_align,
+            constraint=constraint,
             has_tail=has_tail,
             staged_tail=staged_tail,
             num_slots=tiler.config.num_slots,
@@ -1791,38 +1833,29 @@ def _run_prefetch_job(index):
         return False, None
 
 
-def prefetch_tilings(nodes, tiler):
-    """Map every node's layer up front, concurrently, into ``tiler.cache``.
+# ``_search_in_pool``'s result for a search still running at the deadline,
+# as opposed to ``None`` for one that raised.
+SEARCH_TIMED_OUT = object()
 
-    Only the search is forked out; the nodes are read here, in the parent (see
-    :class:`_Search`).  ``fork`` lets a worker use the ``size_fn`` closures it
-    inherited instead of marshalling them, which matters because a closure
-    cannot be pickled.  A key that does not match the one ``get_tiling``
-    recomputes during the build simply misses and is redone serially — a stale
-    key costs time, never correctness, and the same holds for a search the
-    deadline passes over.  The deadline is on the pool, not on any one search:
-    whatever has finished when it expires is kept, and only the rest go serial.
+
+def _search_in_pool(searches):
+    """Run ``searches`` concurrently in forked workers.
+
+    Only the search is forked out; each :class:`_Search` was prepared in the
+    parent.  ``fork`` lets a worker use the ``size_fn`` closures it inherited
+    instead of marshalling them, which matters because a closure cannot be
+    pickled.  The deadline is on the pool, not on any one search: whatever
+    has finished when it expires is kept.
+
+    Returns:
+        One ``_run_search`` result per search, in order -- ``None`` for one
+        that raised (nothing fits, or a worker died), ``SEARCH_TIMED_OUT``
+        for one that missed the deadline.
     """
     global _PREFETCH_JOBS
 
-    jobs = {}
-    for node in nodes:
-        prepared = _prepare_search(node, tiler)
-        if prepared is None:
-            continue
-        key, search = prepared
-        if key in tiler.cache:
-            continue
-        if search is None:
-            tiler.cache[key] = (None,) * 3  # interstellar skips it
-            continue
-        jobs[key] = search
-
-    if len(jobs) < 2:
-        return
-
-    keys = list(jobs)
-    searches = [jobs[k] for k in keys]
+    if not searches:
+        return []
     _PREFETCH_JOBS = searches
     start = time.perf_counter()
     # Small cap: the runner already forks per design point, so an uncapped
@@ -1837,7 +1870,7 @@ def prefetch_tilings(nodes, tiler):
     pool = None
     # One slot per search; a slot still empty when the deadline expires is
     # left for the serial path.
-    results = [None] * len(searches)
+    results = [SEARCH_TIMED_OUT] * len(searches)
     try:
         context = multiprocessing.get_context("fork")
         pool = context.Pool(workers)
@@ -1857,6 +1890,7 @@ def prefetch_tilings(nodes, tiler):
             except multiprocessing.TimeoutError:
                 continue
             except Exception as e:  # a worker died outright
+                results[index] = None
                 logger.warning("[tiling] prefetched search failed (%s)", e)
     except Exception as e:
         logger.warning(
@@ -1870,13 +1904,55 @@ def prefetch_tilings(nodes, tiler):
             pool.join()
         gc.unfreeze()
         _PREFETCH_JOBS = []
+    return [
+        (
+            r
+            if r is SEARCH_TIMED_OUT
+            else (r[1] if r is not None and r[0] else None)
+        )
+        for r in results
+    ]
+
+
+def prefetch_tilings(nodes, tiler):
+    """Map every node's layer up front, concurrently, into ``tiler.cache``.
+
+    The nodes are read here, in the parent (see :class:`_Search`); only the
+    searches go to the pool (``_search_in_pool``), each under the constraint
+    ``plan_csr_slices`` may have registered for its anchor.  A key that does
+    not match the one ``get_tiling`` recomputes during the build simply
+    misses and is redone serially — a stale key costs time, never
+    correctness, and the same holds for a search the deadline passes over.
+    """
+    jobs = {}
+    for node in nodes:
+        prepared = _prepare_search(
+            node, tiler, tiler.constraints.get(get_anchor_node(node))
+        )
+        if prepared is None:
+            continue
+        key, search = prepared
+        if key in tiler.cache:
+            continue
+        if search is None:
+            tiler.cache[key] = (None,) * 3  # interstellar skips it
+            continue
+        jobs[key] = search
+
+    if len(jobs) < 2:
+        return
+
+    keys = list(jobs)
+    searches = [jobs[k] for k in keys]
+    start = time.perf_counter()
+    results = _search_in_pool(searches)
 
     cached = 0
-    for key, search, result in zip(keys, searches, results):
-        if result is None or not result[0]:
+    for key, search, found in zip(keys, searches, results):
+        if found is None or found is SEARCH_TIMED_OUT:
             continue
         try:
-            tiler.cache[key] = _finish_search(search, result[1])
+            tiler.cache[key] = _finish_search(search, found)
         except Exception:  # redone, and re-raised, by the serial path
             continue
         cached += 1
@@ -1999,10 +2075,12 @@ def get_tiling(node, tiler=None):
 
     # Interstellar maps a systolic array and skips a batch-1 GEMM; that one runs
     # on the vector unit and has a search of its own.
+    constraint = tiler.constraints.get(anchor)
     if is_fully_connected(anchor):
-        return gemm_batch + gemv_op_tiling(node, tiler.config), None
+        counts = gemv_op_tiling(node, tiler.config, constraint)
+        return gemm_batch + counts, None
 
-    key, search = _prepare_search(node, tiler)
+    key, search = _prepare_search(node, tiler, constraint)
     if key in tiler.cache:
         mapping, access_list, bank_groups = tiler.cache[key]
         logger.debug(

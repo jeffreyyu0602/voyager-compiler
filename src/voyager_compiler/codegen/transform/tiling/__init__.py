@@ -17,9 +17,14 @@ from voyager_compiler.codegen.transform.tiling.search import (
     pool_op_tiling,
     vector_op_tiling,
 )
+from voyager_compiler.codegen.transform.tiling.sparse import (
+    DEFAULT_MIN_CSR_SLICE,
+    plan_csr_slices,
+)
 from voyager_compiler.codegen.transform.tiling.tiler import (
     CONV_L3_ORDER,
     GEMM_L3_ORDER,
+    TileConstraint,
     TilerContext,
     build_interstellar_tiler,
     get_tiling,
@@ -28,13 +33,16 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
 
 __all__ = [
     "CONV_L3_ORDER",
+    "DEFAULT_MIN_CSR_SLICE",
     "DEFAULT_RUNTIME_TOLERANCE",
     "GEMM_L3_ORDER",
+    "TileConstraint",
     "TilerContext",
     "build_interstellar_tiler",
     "gemv_op_tiling",
     "gemv_tile_latency",
     "get_tiling",
+    "plan_csr_slices",
     "pool_op_tiling",
     "prefetch_tilings",
     "vector_op_tiling",

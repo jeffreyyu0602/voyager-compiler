@@ -40,7 +40,6 @@ its CSR is independent and its pointers restart at zero.
 
 import logging
 import math
-import operator
 from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
@@ -51,10 +50,10 @@ from torch.fx import Node
 
 from voyager_compiler.codegen.node_info import (
     ancestors,
+    csr_consumers,
+    csr_quantize_node,
     get_anchor_node,
     get_arg_value,
-    is_gemm_op,
-    is_nop,
     quant_param_arg_nodes,
     reduction_scratch,
 )
@@ -679,25 +678,6 @@ def merge_base_tables(model) -> None:
             )
 
 
-def _quantize_node(node):
-    """The ``quantize_mx_outlier`` this node lowers, or ``None``.
-
-    A bare node is its own; a fused ``call_module`` carries it as the terminal
-    op of its submodule.
-    """
-    if node.op == "call_function" and node.target is _QUANTIZE_MX_OUTLIER:
-        return node
-    if node.op != "call_module":
-        return None
-    submod = node.meta.get("submodule")
-    if not isinstance(submod, torch.fx.GraphModule):
-        return None
-    for n in submod.graph.nodes:
-        if n.op == "call_function" and n.target is _QUANTIZE_MX_OUTLIER:
-            return n
-    return None
-
-
 def _split_prefix(submod, qnode):
     """Everything the fused group computes ahead of the quantize, as a gm.
 
@@ -733,65 +713,21 @@ def _split_prefix(submod, qnode):
     return torch.fx.GraphModule(submod, g)
 
 
-def consumer_k_tile(node, tiler) -> Tuple[Optional[int], Optional[int]]:
-    """The ``tk`` every sparse consumer of ``node`` agrees on.
-
-    Each consumer reads column indices local to the weight tile it multiplies
-    and the engine cannot rebase them, so a producer feeding several GEMMs must
-    slice K the way all of them do. ``bufferize_graph`` runs
-    ``prefetch_tilings`` over every GEMM before the build loop, so their
-    tilings are already decided by the time this is asked.
-
-    Args:
-        node: The producer being lowered.
-        tiler: The interstellar ``TilerContext``.
-
-    Returns:
-        ``(tk, tm)`` — the K slice every consumer will read, and the smallest
-        row tile any of them uses. ``(None, None)`` when no sparse consumer
-        names one: a producer whose CSR feeds the model output, for instance,
-        in which case the caller keeps K whole and sizes rows itself.
-    """
-    found, rows = {}, []
-    for use in node.users:
-        if use.target is not operator.getitem:
+def consumer_row_tile(node, tiler) -> Optional[int]:
+    """The smallest row tile any sparse consumer of ``node`` uses, or
+    ``None`` when no consumer names one -- a producer whose CSR feeds the
+    model output, for instance.  ``bufferize_graph`` runs the tile searches
+    before the build loop, so the consumers' tilings are already decided by
+    the time this is asked."""
+    rows = []
+    for user in csr_consumers(node):
+        tiling = get_tiling(user, tiler)[0]
+        if tiling is None:
             continue
-        # A nop view can sit between the CSR and its consumer (the reshape
-        # between a decoder layer and ``lm_head``); walk through it.
-        stack = list(use.users)
-        while stack:
-            user = stack.pop()
-            if is_nop(user):
-                stack.extend(user.users)
-                continue
-            anchor = get_anchor_node(user)
-            if anchor is None or not is_gemm_op(anchor):
-                continue
-            if anchor.kwargs.get("A_indptr") is None:
-                continue
-            tiling = get_tiling(user, tiler)[0]
-            if tiling is None:
-                continue
-            shape = anchor.args[0].value.shape
-            found[user.name] = shape[-1] // tiling[-1]
-            nb = anchor.value.ndim - 2
-            rows.append(shape[-2] // tiling[nb])
-    if not found:
-        return None, None
-    # Consumers of one producer often want different k tiles (q/k/v differ from
-    # each other in N, and gate_proj from up_proj), but the CSR is produced
-    # already partitioned, so they must share one. Take the finest: a consumer
-    # forced to a *smaller* k tile only ever shrinks its operand tiles, which
-    # cannot stop fitting the scratchpad, while a larger one could.
-    tk = min(found.values())
-    if len(set(found.values())) > 1:
-        logger.info(
-            "%s: sparse consumers want k tiles %s; using %d for all",
-            node.name,
-            found,
-            tk,
-        )
-    return tk, min(rows)
+        anchor = get_anchor_node(user)
+        nb = anchor.value.ndim - 2
+        rows.append(anchor.args[0].value.shape[-2] // tiling[nb])
+    return min(rows) if rows else None
 
 
 # What one row of the nest costs, in units of the ``[rows, K]`` intermediate.
@@ -858,7 +794,7 @@ def build_quantize_mx_outlier(
     Returns:
         The bufferized gm, or ``None`` when ``node`` is not one this builds.
     """
-    qnode = _quantize_node(node)
+    qnode = csr_quantize_node(node)
     if qnode is None or tiler is None:
         return None
 
@@ -870,8 +806,10 @@ def build_quantize_mx_outlier(
     batch, M, K = tuple(act.shape[:-2]), act.shape[-2], act.shape[-1]
 
     bs = qnode.args[3]
-    tk, tm_consumer = consumer_k_tile(node, tiler)
-    tk = tk or K
+    # ``plan_csr_slices`` settled the slice width with the consumers; a CSR
+    # nothing consumes is emitted whole.
+    tk = node.meta.get("csr_slice", K)
+    tm_consumer = consumer_row_tile(node, tiler)
     if K % tk or tk % bs:
         raise ValueError(
             f"{node.name}: k tile {tk} must divide K={K} and hold whole "

@@ -30,8 +30,7 @@ import torch
 from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler.codegen.node_info import (
-    get_anchor_node,
-    is_gemm_op,
+    gemm_produces_csr,
     is_nop,
 )
 from voyager_compiler.codegen.transform.bufferize.ops import (
@@ -61,7 +60,6 @@ from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _scalar,
     _split_prefix,
     base_table_shape,
-    consumer_k_tile,
     copy_base_table,
     GEOMETRY_META,
     PRODUCER_META,
@@ -298,7 +296,24 @@ class _SparseGemm(torch.nn.Module):
         if out_geom is not None and async_pipeline:
             plan.anchor.meta.setdefault("tiling", {})["scratch_slots"] = 1
         self.async_pipeline = async_pipeline
-        self.chain_epilogue = out_geom is not None and self.n_sub == 1
+        # A chained finalize's store is lagged ``_STORE_LAG`` steps, and the
+        # next finalize of the same K slice -- the same batch and column
+        # coordinates, another row tile -- reads the running nonzero count
+        # that store updates, so the two must be at least that far apart.
+        # They are ``num_k`` finalizes times the extent of every grid dim
+        # nested inside the row dim apart, and a nest with a single row tile
+        # never revisits a slice.  A nest whose gap is shorter stores inline
+        # instead.
+        inner = math.prod(
+            plan.grid[dim] for dim in range(self.grid_k) if dim > self.grid_m
+        )
+        same_slice_gap = (
+            plan.num_k * inner if plan.grid[self.grid_m] > 1 else math.inf
+        )
+        racing = async_pipeline and same_slice_gap < _STORE_LAG
+        self.chain_epilogue = (
+            out_geom is not None and self.n_sub == 1 and not racing
+        )
         self.chain_fused_tail = accumulate_fusible and out_geom is None
         if geom is not None:
             # ``in_sems`` carries one semaphore per *tiled* operand — a
@@ -314,10 +329,14 @@ class _SparseGemm(torch.nn.Module):
         self.tail_split = _split_stream_break(plan.fused_gm, plan.acc_shape)
         # A multi-sub-slice epilogue reads windows of its tile at an index
         # the rolled loop supplies at runtime, and only a buffer can be
-        # addressed that way.  ``staged`` is what puts the tile in one: its
-        # sole effect is to disqualify ``_map_kernel``, which allocates no
-        # scratch, leaving the reduction scratch to read windows out of.
-        self.stage_tile = out_geom is not None and self.n_sub > 1
+        # addressed that way; an unchained single-slice one runs its stores
+        # bare after the commit and needs the tile staged the same way.
+        # ``staged`` is what puts the tile in one: its sole effect is to
+        # disqualify ``_map_kernel``, which allocates no scratch, leaving
+        # the reduction scratch to read windows out of.
+        self.stage_tile = out_geom is not None and (
+            self.n_sub > 1 or not self.chain_epilogue
+        )
         # A finalize writes the five staging tiles, and the store that
         # empties them runs ``_STORE_LAG`` steps later; in between, no other
         # finalize may write them.  With ``num_k > 1`` finalizes are
@@ -898,34 +917,12 @@ class _SparseGemm(torch.nn.Module):
         )
 
 
-def gemm_produces_csr(node) -> bool:
-    """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
-
-    Such a group is a producer as well as (possibly) a consumer: the quantize
-    runs on the accumulator tile, so its CSR is emitted per output tile and has
-    to be stored by hand rather than diced by the output grid. A group whose
-    *anchor* is the quantize is not one -- that is the row-swept case.
-    """
-    submod = node.meta.get("submodule")
-    if not isinstance(submod, torch.fx.GraphModule):
-        return False
-    anchor = get_anchor_node(node)
-    if anchor is None or not is_gemm_op(anchor):
-        return False
-    if not any(n.target is _QUANTIZE_MX_OUTLIER for n in submod.graph.nodes):
-        return False
-    return isinstance(node.value, (list, tuple)) and len(node.value) == 5
-
-
-def _epilogue_geometry(node, plan, tiler) -> _Geometry:
+def _epilogue_geometry(node, plan) -> _Geometry:
     """The CSR geometry a GEMM epilogue produces.
 
     The quantize sees the GEMM's output tile, so the row block *is* the row
-    tile.  The K slice is the widest width that divides the column tile the
-    producer cuts it from, holds whole microscaling blocks, and is no wider
-    than the finest consumer's own k tile — forcing a consumer finer only
-    shrinks its tiles, which is always safe, while this GEMM's tiling stays
-    its own.
+    tile.  The K slice is the width ``plan_csr_slices`` settled on with the
+    consumers (``meta["csr_slice"]``), which the column tile is cut into.
     """
     vals = node.value
     inliers = vals[4]
@@ -937,13 +934,17 @@ def _epilogue_geometry(node, plan, tiler) -> _Geometry:
     )
     bs = qnode.args[3]
     max_pct = qnode.args[9] if len(qnode.args) > 9 else 0.01
-    tk_pref, _ = consumer_k_tile(node, tiler)
-    tk = plan.tile_n
-    if tk_pref is not None and tk_pref < plan.tile_n:
-        for width in range(tk_pref, 0, -1):
-            if plan.tile_n % width == 0 and width % bs == 0:
-                tk = width
-                break
+    tk = node.meta.get("csr_slice")
+    if tk is None:
+        raise ValueError(
+            f"{node.name}: no CSR slice width was planned for this epilogue "
+            f"(plan_csr_slices runs before bufferization)"
+        )
+    if plan.tile_n % tk:
+        raise ValueError(
+            f"{node.name}: column tile {plan.tile_n} is not a whole number "
+            f"of the planned {tk}-wide CSR slices"
+        )
     geom = _Geometry(
         batch=batch,
         M=M,
@@ -1137,7 +1138,7 @@ def build_sparse_gemm(
             recost_k_split(tiling_meta, geom.n_k)
         data_dtype = operands[plan.kw_idx["A_data"]].value.dtype
 
-    out_geom = _epilogue_geometry(node, plan, tiler) if produces else None
+    out_geom = _epilogue_geometry(node, plan) if produces else None
     pattern = _SparseGemm(
         plan,
         geom,
