@@ -633,6 +633,20 @@ class RuntimeCalculator:
     sweep -- a tile can outlast one step of compute, and averaging hides the
     stall.
 
+    The model follows the trends that set a mapping's runtime -- the operand
+    bytes fetched and stored through the scratchpad banks, the systolic
+    passes, the DRAM transfers -- not the cycle-exact datapath.  Known
+    simplifications: the accumulator drain is taken as pipelined with the
+    next block whatever ``DOUBLE_BUFFERED_ACCUM_BUFFER`` the hardware was
+    built with (a single-buffered array back-pressures on a multi-beat
+    store); per-operation costs -- parameter load, deserialisation, the
+    start/done handshake, the pipeline drain between uncommitted ops -- are
+    left out; the systolic fill/skew is a constant of the array dims; a
+    stream-breaking ``quantize_mx`` tail is charged as a staged region, not
+    as a drained pass; a conv input tile is sized without its halo; and the
+    bank port width is one number for every operand, ``sram_bandwidth``,
+    which the SoC is assumed to present as a single bus.
+
     Args:
         input_dtype_width: Input element width, bits.
         weight_dtype_width: Weight element width, bits.
@@ -641,12 +655,14 @@ class RuntimeCalculator:
         double_buffered_accum_buffer: Charge the once-per-step accumulator
             drain as a whole vector pass rather than as its beats past the
             first.
-        sram_bandwidth: L2 -> L1 bandwidth, bits per cycle.
+        sram_bandwidth: Width of a scratchpad bank's port, bits per cycle
+            -- one bus word; every operand a bank holds queues on it.
         dram_bandwidth: DRAM bandwidth, bytes per cycle (sizes are bytes).
         dram_access_latency_cycles: Fixed latency, once per transfer.
         double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
             costs ``max(dram, compute)`` and not their sum.
-        has_sparse_op: Double the weight load time.
+        has_sparse_op: A gathered (outlier) weight streams at half the
+            bank's bandwidth.
         batch: Grid steps the builder loops *outside* the mapping -- a bmm's
             leading dims, which share no operand.
         weight_batch: Distinct weight tiles over those ``batch`` steps, fewer
@@ -655,14 +671,17 @@ class RuntimeCalculator:
         has_tail: The node has a fused post-op, so a reduction drains through
             the vector unit; a bare GEMM reduces in place and does not.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
-            pairs, from ``_fused_operand_specs``; ``tail_fetch_cycles`` turns
-            them into a per-vector read cost and ``tail_tile_sizes`` into the
+            pairs, from ``_fused_operand_specs``, in the order the bank
+            partition's ``("fused", i)`` roles name them; ``vector_cycles``
+            reads them from their banks and ``tail_tile_sizes`` sizes the
             DRAM they stream per output tile.
         input_scale_width: Input block-scale width, bits (0 = not microscaled).
         weight_scale_width: Weight block-scale width, bits.
         output_scale_width: Output block-scale width, bits -- a fused
             ``quantize_mx`` tail stores the tile's scales next to its values.
         scale_block_size: Elements per block scale.
+        bias_width: Bias element width, bits (0 = no bias); read once per
+            output tile.
     """
 
     def __init__(
@@ -685,6 +704,7 @@ class RuntimeCalculator:
         weight_scale_width: int = 0,
         output_scale_width: int = 0,
         scale_block_size: int = 1,
+        bias_width: int = 0,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
@@ -704,6 +724,7 @@ class RuntimeCalculator:
         self.weight_scale_width = weight_scale_width
         self.output_scale_width = output_scale_width
         self.scale_block_size = scale_block_size
+        self.bias_width = bias_width
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -720,38 +741,107 @@ class RuntimeCalculator:
             sizes.append(count * bits / 8)
         return sizes
 
-    def tail_fetch_cycles(self, mapping):
-        """SRAM cycles to fetch one vector of the fused tail's operands -- the
-        read-side counterpart of ``store_cycles``.  Each operand has a bank of
-        its own, so they are read at once and the slowest sets the rate; one
-        broadcast along OC feeds a whole vector from a single element."""
-        oc_dim = mapping.loop_partitionings[le.OC][0]
-        return max(
-            (
-                math.ceil(
-                    bits
-                    * (oc_dim if le.OC in dims else 1)
-                    / self.sram_bandwidth
-                )
-                for dims, bits in self.tail_specs
-            ),
-            default=0,
+    def _bank_cycles(self, words, bank_groups):
+        """Cycles the busiest scratchpad bank spends moving ``words`` -- bus
+        words per operand role -- when the roles sharing a bank
+        (``bank_groups``: the search's partition as role sets, ``None`` =
+        nothing shares) queue on its single port.  A role the partition does
+        not name keeps a port of its own.
+        """
+        placed = set()
+        busiest = 0
+        for roles in bank_groups or ():
+            busiest = max(busiest, sum(words.get(role, 0) for role in roles))
+            placed.update(roles)
+        loose = [count for role, count in words.items() if role not in placed]
+        return max([busiest, *loose])
+
+    def _bus_words(self, count, bits, bandwidth=None):
+        """Bus words ``count`` elements of ``bits`` occupy at the bank's full
+        width, or at ``bandwidth`` bytes per cycle."""
+        if not bits or count <= 0:
+            return 0
+        return math.ceil(
+            count * bits / 8 / (bandwidth or self.sram_bandwidth / 8)
         )
 
-    def matrix_cycles(self, mapping):
+    @staticmethod
+    def _extent(mapping, loop, level):
+        """Elements along ``loop`` in one tile at ``level``: the blockings
+        through that level times the PE-array partition."""
+        extent = mapping.loop_partitionings[loop][0]
+        for blocking in mapping.loop_blockings[loop][1 : level + 1]:
+            extent *= blocking
+        return extent
+
+    def _load_words(self, mapping):
+        """Bus words one L1 tile's every-round operands take, per role: the
+        input and its block scales, the weight and its scales.  An input
+        scale is delivered one per bus word however narrow it is; a gathered
+        (sparse) weight streams at half the bank's bandwidth."""
+        ext = lambda loop: self._extent(mapping, loop, 1)
+        rows = ext(le.OX) * ext(le.OY) * ext(le.ON)
+        depth = ext(le.IC)
+        taps = ext(le.FX) * ext(le.FY)
+        weight_bandwidth = self.sram_bandwidth / 8
+        if self.has_sparse_op:
+            weight_bandwidth /= 2
+        words = {
+            "input": self._bus_words(rows * depth, self.input_dtype_width),
+            "weight": self._bus_words(
+                ext(le.OC) * depth * taps,
+                self.weight_dtype_width,
+                weight_bandwidth,
+            ),
+            "weight_scale": self._bus_words(
+                ext(le.OC) * depth * taps / self.scale_block_size,
+                self.weight_scale_width,
+            ),
+        }
+        if self.input_scale_width:
+            words["input_scale"] = math.ceil(
+                rows * depth / self.scale_block_size
+            )
+        return words
+
+    def _tail_words(self, mapping, level):
+        """Bus words the tail's operands take for one tile at ``level`` (1 =
+        an L1 output tile, 2 = the whole L3 output tile), per role: the
+        finished output with its block scales -- each scale leaves in a bus
+        word of its own, however narrow, as the input scales arrive -- and
+        each fused operand over the output dims it is tiled along."""
+        ext = lambda loop: self._extent(mapping, loop, level)
+        out = ext(le.OC) * ext(le.OY) * ext(le.OX) * ext(le.ON)
+        words = {"output": self._bus_words(out, self.output_dtype_width)}
+        if self.output_scale_width:
+            words["output"] += math.ceil(out / self.scale_block_size)
+        for i, (dims, bits) in enumerate(self.tail_specs):
+            words[("fused", i)] = self._bus_words(
+                math.prod(ext(dim) for dim in dims), bits
+            )
+        return words
+
+    def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
-        each costing the busier of the matrix unit and the vector unit
-        draining the previous tile's output through its scratchpad bank,
-        plus the once-per-sweep overhead (buffer fill, systolic skew,
-        accumulator drain) spread over the steps a double-buffered L2
-        overlaps it with.  Also the reporting model's per-tile utilization
-        denominator.
+        each costing the busier of the matrix unit and the scratchpad bank
+        with the most to move for it -- the every-round operands of its L1
+        sub-tiles, the accumulator read back and rewritten while the
+        reduction is split, the finished tile and the tail's operands when
+        it is not, each summed with whatever shares its bank -- plus the
+        once-per-sweep overhead (buffer fill, systolic skew, accumulator
+        drain) spread over the steps a double-buffered L2 overlaps it with.
+        Also the reporting model's per-tile utilization denominator.
+
+        Args:
+            mapping: The interstellar mapping to price.
+            bank_groups: Its bank partition as role sets (``bank_partition``),
+                or ``None`` when nothing shares a bank.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
         partitionings = mapping.loop_partitionings
 
-        # --- L1: weight-reuse tile timing (identical to RuntimeCalculator) ---
+        # --- L1: weight-reuse tile timing ---
         sa_weight_loading_time = partitionings[le.IC][0] + 2
 
         first_non_ox_oy_index = 6
@@ -776,57 +866,45 @@ class RuntimeCalculator:
         num_remaining_l1_tiles *= blockings[le.IC][2]
         computation_l1_time = weight_reuse_tile_time * num_remaining_l1_tiles
 
-        input_buffer_loading_size = 1
-        for loop in [le.IC, le.OY, le.OX]:
-            input_buffer_loading_size *= blockings[loop][1]
-        input_buffer_loading_time = (
-            input_buffer_loading_size
-            * self.input_dtype_width
-            / self.sram_bandwidth
-        )
-
-        weight_buffer_loading_size = 1
-        for loop in [le.IC, le.OC, le.FY, le.FX]:
-            weight_buffer_loading_size *= blockings[loop][1]
-        weight_buffer_loading_size *= partitionings[le.IC][0]
-        weight_buffer_loading_time = (
-            weight_buffer_loading_size
-            * self.weight_dtype_width
-            / self.sram_bandwidth
-        )
-        if self.has_sparse_op:
-            weight_buffer_loading_time *= 2
-
-        output_size = 1
-        for loop in [le.OC, le.OY, le.OX]:
-            output_size *= blockings[loop][1]
-        oc_dim = partitionings[le.OC][0]
+        # --- bus traffic of one L2 output block: the loads of its L1
+        # sub-tiles, then what the vector unit moves for the block itself ---
         num_k = blockings[le.IC][3]
-        output_width = (
-            self.accum_dtype_width if num_k > 1 else self.output_dtype_width
+        loads = self._load_words(mapping)
+        words = {
+            role: count * blockings[le.IC][2] for role, count in loads.items()
+        }
+        # With the whole reduction inside the block, a weight tile whose L2
+        # loop is outside the spatial ones is fetched once and held across
+        # them (the input is refetched every block), so its words are spread
+        # over the blocks that reuse it.
+        if blockings[le.IC][2] == 1:
+            held = 1
+            for loop in [le.OX, le.OY]:
+                if orders[loop][2] < orders[le.OC][2]:
+                    held *= blockings[loop][2]
+            words["weight"] /= held
+            words["weight_scale"] /= held
+        # The bias is read once per output tile: spread over its rounds.
+        words["bias"] = (
+            self._bus_words(self._extent(mapping, le.OC, 1), self.bias_width)
+            / num_k
         )
-        store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
-        # A split reduction reads the running partial back through the same
-        # single-ported bank it writes the new one to, so the output store
-        # runs at half the bank's bandwidth.
+        output_elems = 1
+        for loop in [le.OC, le.OY, le.OX, le.ON]:
+            output_elems *= self._extent(mapping, loop, 1)
         if num_k > 1:
-            store_cycles *= 2
-        # The tail runs only on the last K step: with num_k > 1 that step is
-        # charged by ``vector_cycles``, and the rest only accumulate --
-        # adding the output into a psum-width partial sum, reading no tail
-        # operand.
-        if num_k == 1:
-            store_cycles = max(store_cycles, self.tail_fetch_cycles(mapping))
-        vector_unit_time = output_size * store_cycles
-
+            # A split reduction reads the running partial back through the
+            # same single-ported bank it writes the new one to.
+            words["scratch"] = 2 * self._bus_words(
+                output_elems, self.accum_dtype_width
+            )
+        else:
+            words.update(self._tail_words(mapping, 1))
         # The matrix unit and the vector unit are pipelined -- one drains a
-        # tile while the other computes the next -- so a step costs the
+        # tile while the other computes the next -- so a block costs the
         # busier of the two.
-        l1_time = max(
-            computation_l1_time,
-            input_buffer_loading_time,
-            weight_buffer_loading_time,
-            vector_unit_time,
+        block_time = max(
+            computation_l1_time, self._bank_cycles(words, bank_groups)
         )
 
         # --- L2: outer spatial-tile loop ---
@@ -835,14 +913,24 @@ class RuntimeCalculator:
             if i != le.IC:
                 l2_blocks *= blockings[i][2]
 
-        buffer_fill = max(input_buffer_loading_time, weight_buffer_loading_time)
+        # The first tile's loads overlap nothing; the last tile's drain is a
+        # whole vector pass, or only its beats past the first.
+        buffer_fill = self._bank_cycles(loads, bank_groups)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
-        steady = l2_blocks * l1_time
+        output_size = 1
+        for loop in [le.OC, le.OY, le.OX]:
+            output_size *= blockings[loop][1]
+        oc_dim = partitionings[le.OC][0]
+        output_width = (
+            self.accum_dtype_width if num_k > 1 else self.output_dtype_width
+        )
+        store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
         if self.double_buffered_accum_buffer:
-            drain = vector_unit_time
+            drain = output_size * store_cycles
         else:
             drain = output_size * (store_cycles - 1)
         overhead = buffer_fill + skew + drain
+        steady = l2_blocks * block_time
 
         if not self.double_buffered_l2:
             return steady + overhead
@@ -850,15 +938,17 @@ class RuntimeCalculator:
         normalize_factor = self._l3_blocks(mapping) if num_k == 1 else num_k
         return steady + overhead / normalize_factor
 
-    def vector_cycles(self, mapping):
+    def vector_cycles(self, mapping, bank_groups):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
         step that ends a K sweep, after that step's accumulation.
 
-        One lane group per cycle, sized by the widest element the tail touches
-        -- the partial sum it reads, not the narrower value a ``quantize_mx``
-        writes.  Divides by ``dram_bandwidth``, not ``sram_bandwidth``: that is
-        what ``vector_op_utilization`` charges, and it prices this same tail in
-        the reporting model.
+        The busier of the unit's own rate -- one lane group per cycle, sized
+        by the widest element the tail touches (the partial sum it reads, not
+        the narrower value a ``quantize_mx`` writes) at ``dram_bandwidth``,
+        which is what ``vector_op_utilization`` charges for the same tail in
+        the reporting model -- and the busiest bank: the accumulator read
+        back, the finished tile and its scales written, each tail operand
+        read, summed wherever the partition puts them together.
         """
         blockings = mapping.loop_blockings
         output_size = 1
@@ -868,7 +958,13 @@ class RuntimeCalculator:
         widths = [self.output_dtype_width, self.accum_dtype_width]
         widths += [bits for _, bits in self.tail_specs]
         lane_bytes = max(widths) / 8 * oc_dim
-        return output_size * math.ceil(lane_bytes / self.dram_bandwidth)
+        lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
+        words = self._tail_words(mapping, 2)
+        if blockings[le.IC][3] > 1:
+            words["scratch"] = self._bus_words(
+                output_size * oc_dim, self.accum_dtype_width
+            )
+        return max(lanes, self._bank_cycles(words, bank_groups))
 
     @staticmethod
     def _l3_blocks(mapping):
@@ -994,8 +1090,13 @@ class RuntimeCalculator:
             for (dims, _), size in zip(self.tail_specs, tail_sizes)
         ]
 
-        matrix_cycles = self.matrix_cycles(mapping)
-        vector_cycles = self.vector_cycles(mapping) if self.has_tail else 0
+        bank_groups = bank_partition(
+            architecture, layer.size_fn, layer, mapping
+        )
+        matrix_cycles = self.matrix_cycles(mapping, bank_groups)
+        vector_cycles = (
+            self.vector_cycles(mapping, bank_groups) if self.has_tail else 0
+        )
 
         input_steps = self._batch_loads(mapping, _IF_DIMS, self.batch)
         weight_steps = self._batch_loads(mapping, _FL_DIMS, self.weight_batch)
@@ -1294,6 +1395,7 @@ def _prepare_search(node, tiler):
         output_scale_width=of_scale_bits,
         scale_block_size=anchor.kwargs.get("block_size") or 1,
         has_sparse_op=outlier_pct > 0,
+        bias_width=_node_dtype_bits(get_arg_value(anchor, 2, "bias", None), 0),
     )
 
     # Built up front rather than per attempt: each one reads the node, which
@@ -1369,22 +1471,27 @@ def _run_search(search):
     )
 
 
-def _winning_bank_groups(search, index, mapping):
-    """The role partition the winning mapping's L2 fit was checked with.
+def bank_partition(architecture, size_fn, layer, mapping):
+    """The role partition ``mapping``'s L2 fit is checked with.
 
     Rebuilds interstellar's scratchpad-level ``size_fn`` invocation
     (``cost_model.get_block_size``): the element counts from the blocking /
     partitioning products through L2, the bank geometry from the
-    architecture — and replays the winning ``size_fn``'s own group
-    construction, so the partition is exactly the one the fit check priced.
+    architecture -- and replays ``size_fn``'s own group construction, so the
+    partition is exactly the one the fit check priced.  The runtime model
+    prices every candidate mapping through it, and the winner's partition is
+    stamped for the memory planner and the reporting model.
 
     Returns:
-        A list of role sets, one per bank group — plus a ``{"scratch"}``
-        entry when the search charged the reduction scratch its own region —
-        or ``None`` when the architecture has no banked level.
+        A list of role sets, one per bank group -- plus a ``{"scratch"}``
+        entry when the search charged the reduction scratch its own region --
+        or ``None`` when the architecture has no banked level or there is no
+        ``size_fn`` (nothing checked the fit, so nothing shares a bank).
     """
+    if size_fn is None:
+        return None
     level = 2
-    buf = search.tiler.arch.buffer(level)
+    buf = architecture.buffer(level)
     bank_size = buf.bank_size
     if not bank_size:
         return None
@@ -1405,7 +1512,7 @@ def _winning_bank_groups(search, index, mapping):
     cost_model = interstellar.cost_model
     counts = (
         cost_model.get_if_size(
-            blocking_accum, partitioning_accum, partitioning, search.layer
+            blocking_accum, partitioning_accum, partitioning, layer
         ),
         cost_model.get_of_size(
             blocking_accum, partitioning_accum, partitioning
@@ -1414,9 +1521,11 @@ def _winning_bank_groups(search, index, mapping):
             blocking_accum, partitioning_accum, partitioning
         ),
     )
-    groups, scratch = search.size_fns[index].compute_groups(
+    groups, scratch = size_fn.compute_groups(
         counts, mapping, level, partitioning_accum, bank_size, num_banks
     )
+    if groups is None:
+        return None
     partition = [roles for _, _, _, roles in groups]
     if scratch:
         partition.append({"scratch"})
@@ -1434,7 +1543,7 @@ def _finish_search(search, found):
         ``(mapping, access_list, bank_groups)`` -- the best MappingPoint (its
         ``loop_blockings`` give the per-level tile factors), the per-level
         ``(input, output, weight)`` access counts the ``Tiling`` proto
-        reports, and the winning bank partition (``_winning_bank_groups``).
+        reports, and the winning bank partition (``bank_partition``).
     """
     index, runtime, mapping = found
     search.layer.size_fn = search.size_fns[index]
@@ -1461,7 +1570,9 @@ def _finish_search(search, found):
     _, _, access_list = interstellar.cost_model.get_cost(
         search.tiler.arch, mapping, search.layer
     )
-    bank_groups = _winning_bank_groups(search, index, mapping)
+    bank_groups = bank_partition(
+        search.tiler.arch, search.size_fns[index], search.layer, mapping
+    )
     return mapping, access_list, bank_groups
 
 
