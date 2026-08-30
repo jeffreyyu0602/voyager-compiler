@@ -638,7 +638,9 @@ class RuntimeCalculator:
         weight_dtype_width: Weight element width, bits.
         output_dtype_width: Output element width, bits.
         accum_dtype_width: Partial-sum width, bits, while K accumulates.
-        double_buffered_accum_buffer: Overlap the accumulator drain.
+        double_buffered_accum_buffer: Charge the once-per-step accumulator
+            drain as a whole vector pass rather than as its beats past the
+            first.
         sram_bandwidth: L2 -> L1 bandwidth, bits per cycle.
         dram_bandwidth: DRAM bandwidth, bytes per cycle (sizes are bytes).
         dram_access_latency_cycles: Fixed latency, once per transfer.
@@ -737,11 +739,13 @@ class RuntimeCalculator:
         )
 
     def matrix_cycles(self, mapping):
-        """Matrix-unit cycles of one L3 grid step: the L2 sweep of
-        weight-reuse tiles, plus the once-per-sweep overhead (buffer fill,
-        systolic skew, accumulator drain) spread over the steps a
-        double-buffered L2 overlaps it with.  Also the reporting model's
-        per-tile utilization denominator.
+        """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
+        each costing the busier of the matrix unit and the vector unit
+        draining the previous tile's output through its scratchpad bank,
+        plus the once-per-sweep overhead (buffer fill, systolic skew,
+        accumulator drain) spread over the steps a double-buffered L2
+        overlaps it with.  Also the reporting model's per-tile utilization
+        denominator.
         """
         blockings = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -802,30 +806,28 @@ class RuntimeCalculator:
             self.accum_dtype_width if num_k > 1 else self.output_dtype_width
         )
         store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
+        # A split reduction reads the running partial back through the same
+        # single-ported bank it writes the new one to, so the output store
+        # runs at half the bank's bandwidth.
+        if num_k > 1:
+            store_cycles *= 2
         # The tail runs only on the last K step: with num_k > 1 that step is
         # charged by ``vector_cycles``, and the rest only accumulate --
-        # adding the output into a psum-width partial sum, reading no operand.
+        # adding the output into a psum-width partial sum, reading no tail
+        # operand.
         if num_k == 1:
             store_cycles = max(store_cycles, self.tail_fetch_cycles(mapping))
         vector_unit_time = output_size * store_cycles
 
-        using_double_buffer_accum_buffer = (
-            self.double_buffered_accum_buffer and store_cycles > 1
+        # The matrix unit and the vector unit are pipelined -- one drains a
+        # tile while the other computes the next -- so a step costs the
+        # busier of the two.
+        l1_time = max(
+            computation_l1_time,
+            input_buffer_loading_time,
+            weight_buffer_loading_time,
+            vector_unit_time,
         )
-
-        if not using_double_buffer_accum_buffer:
-            l1_time = max(
-                computation_l1_time,
-                input_buffer_loading_time,
-                weight_buffer_loading_time,
-            )
-        else:
-            l1_time = max(
-                computation_l1_time,
-                input_buffer_loading_time,
-                weight_buffer_loading_time,
-                vector_unit_time,
-            )
 
         # --- L2: outer spatial-tile loop ---
         l2_blocks = 1
