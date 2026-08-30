@@ -1542,7 +1542,6 @@ def _split_stream_break(fused_gm, acc_shape):
     quant, relayout, spine = broken
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
-    ops = [n for n in graph.nodes if n.op == "call_function"]
 
     if relayout and spine is phs[0]:
         view_shape = relayout_view_shape(relayout, tuple(acc_shape))
@@ -1562,6 +1561,7 @@ def _split_stream_break(fused_gm, acc_shape):
             quant, relayout, spine = broken
 
     relayout.reverse()
+    ops = [n for n in graph.nodes if n.op == "call_function"]
     head_ops = [n for n in ops[:-1] if n not in relayout]
     head_gm = _split_part(fused_gm, head_ops, phs[0], "acc", spine)
     quant_gm = _split_part(fused_gm, relayout + [quant], spine, "staged", quant)
