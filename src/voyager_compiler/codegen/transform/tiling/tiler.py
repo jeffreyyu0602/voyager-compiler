@@ -13,13 +13,14 @@ to each builder; per-node element widths are read from the nodes themselves.
 
 import copy
 import gc
+import itertools
 import logging
 import math
 import multiprocessing
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -67,6 +68,13 @@ PSUM_BITS = 16
 # GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
 # per L3 step.
 OUTPUT_SLACK = 24
+
+# Cycles a read stream loses each time consecutive requests move to another
+# scratchpad bank.  The SoC's read masters take their responses in order, so
+# the fabric holds a request to a new bank until every outstanding response
+# from the previous one has returned -- one round trip, measured 8 cycles on
+# the Sphinx SoC (requests resume once the in-flight beats drain).
+BANK_SWITCH_CYCLES = 8
 
 # The non-reduction L3 loops a builder's grid may permute, outermost to
 # innermost, in the order it emits when nothing says otherwise.  The reduction
@@ -651,8 +659,10 @@ class RuntimeCalculator:
     uncommitted ops -- are left out; the systolic fill/skew is a constant of
     the array dims; a stream-breaking ``quantize_mx`` tail is charged as a
     staged region, not as a drained pass; a conv input tile is sized without
-    its halo; and the bank port width is one number for every operand,
-    ``sram_bandwidth``, which the SoC is assumed to present as a single bus.
+    its halo; the bank port width is one number for every operand,
+    ``sram_bandwidth``, which the SoC is assumed to present as a single bus;
+    and a stream's bank switches (``BANK_SWITCH_CYCLES``) are counted on
+    bank-aligned tile buffers, ignoring the block scales.
 
     Args:
         input_dtype_width: Input element width, bits.
@@ -691,6 +701,10 @@ class RuntimeCalculator:
         scale_block_size: Elements per block scale.
         bias_width: Bias element width, bits (0 = no bias); read once per
             output tile.
+        stride: The conv's ``(row, column)`` stride, which sets how many
+            input rows one output tile walks.
+        bank_size: Scratchpad bank size, bytes; ``None`` = no banking, so
+            no bank switches (``BANK_SWITCH_CYCLES``).
     """
 
     def __init__(
@@ -714,6 +728,8 @@ class RuntimeCalculator:
         output_scale_width: int = 0,
         scale_block_size: int = 1,
         bias_width: int = 0,
+        stride: Tuple[int, int] = (1, 1),
+        bank_size: Optional[int] = None,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
@@ -734,6 +750,8 @@ class RuntimeCalculator:
         self.output_scale_width = output_scale_width
         self.scale_block_size = scale_block_size
         self.bias_width = bias_width
+        self.stride = stride
+        self.bank_size = bank_size
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -830,6 +848,133 @@ class RuntimeCalculator:
             )
         return words
 
+    def _stream_switches(self, mapping, key_loops, ranges_of, held_loops=()):
+        """Scratchpad bank switches one L3 step's read stream makes.
+
+        A stream switches banks whenever the byte ranges it walks for one
+        L2 block straddle a bank boundary of its (bank-aligned) tile buffer,
+        and whenever a block starts in a bank other than the one the
+        previous block ended in.
+
+        ``key_loops`` are the L2 loops that move the stream's ranges;
+        ``ranges_of(idx)`` gives the ``(lo, hi)`` byte ranges walked, in
+        order, for their indices ``idx`` (a dict; a loop not in it is at 0).
+        Every other L2 loop repeats the same ranges, refetching them unless
+        it is in ``held_loops``, so the key sweep is walked once and the
+        repeats are folded in: a loop inside the innermost key loop repeats
+        each block back to back (a straddling block then switches once more
+        per repeat), a loop outside the outermost repeats the whole sweep
+        (one more switch per repeat when the sweep ends in another bank
+        than it starts in).  A loop nested between key loops is counted as
+        an inner repeat.
+        """
+        blockings, orders = mapping.loop_blockings, mapping.loop_orders
+        nest = [i for i in range(le.NUM) if blockings[i][2] > 1]
+        keys = sorted(
+            (i for i in nest if i in key_loops), key=lambda i: -orders[i][2]
+        )
+        outer = max((orders[i][2] for i in keys), default=-1)
+        m_outer = m_inner = 1
+        for i in nest:
+            if i in key_loops or i in held_loops:
+                continue
+            if orders[i][2] > outer:
+                m_outer *= blockings[i][2]
+            else:
+                m_inner *= blockings[i][2]
+
+        size = self.bank_size
+        total = 0
+        prev = first = None
+        for idx in itertools.product(*(range(blockings[i][2]) for i in keys)):
+            inner = 0
+            start = end = None
+            for lo, hi in ranges_of(dict(zip(keys, idx))):
+                lo_bank, hi_bank = int(lo // size), int((hi - 1) // size)
+                inner += hi_bank - lo_bank
+                if end is not None and lo_bank != end:
+                    inner += 1
+                if start is None:
+                    start = lo_bank
+                end = hi_bank
+            if first is None:
+                first = start
+            if prev is not None and start != prev:
+                total += 1
+            total += inner + (m_inner - 1) * (inner + (end != start))
+            prev = end
+        if m_outer > 1:
+            total = m_outer * total + (m_outer - 1) * (first != prev)
+        return total
+
+    def _bank_switch_cycles(self, mapping):
+        """Cycles one L3 step's input and weight streams lose to bank
+        switches, per role (``BANK_SWITCH_CYCLES`` each).
+
+        The ranges are those of the tile buffers the planner allocates on
+        whole banks: the input tile is ``[Y_in, X_in, IC]`` rows (halo
+        included), of which an L2 block walks its own output rows' input
+        rows at one IC block's offset; the weight tile is ``[FY*FX*IC, OC]``
+        rows, of which a block walks one IC block's rows under each tap at
+        its OC block's columns.  The block scales are a few bytes a row and
+        never straddle.  A weight tile held across the spatial loops (no L2
+        reduction, OC outside them) is not refetched by them.
+        """
+        if not self.bank_size:
+            return {}
+        b = mapping.loop_blockings
+        orders = mapping.loop_orders
+        ic3, oc3 = self._extent(mapping, le.IC, 2), self._extent(
+            mapping, le.OC, 2
+        )
+        ic1, oc1 = self._extent(mapping, le.IC, 1), self._extent(
+            mapping, le.OC, 1
+        )
+        fy, fx = b[le.FY][1], b[le.FX][1]
+        oy1, ox1 = b[le.OY][1], b[le.OX][1]
+        hs, ws = self.stride
+        x_in = (ox1 * b[le.OX][2] - 1) * ws + fx
+        pitch_in = ic3 * self.input_dtype_width / 8
+        beat_in = ic1 * self.input_dtype_width / 8
+
+        def input_ranges(idx):
+            y0 = idx.get(le.OY, 0) * oy1 * hs
+            x0 = idx.get(le.OX, 0) * ox1 * ws
+            first = y0 * x_in + x0
+            last = (y0 + (oy1 - 1) * hs + fy - 1) * x_in + x0
+            last += (ox1 - 1) * ws + fx - 1
+            return [(first * pitch_in, last * pitch_in + beat_in)]
+
+        pitch_w = oc3 * self.weight_dtype_width / 8
+        beat_w = oc1 * self.weight_dtype_width / 8
+
+        def weight_ranges(idx):
+            c0 = idx.get(le.IC, 0) * ic1
+            k_off = idx.get(le.OC, 0) * beat_w
+            return [
+                (
+                    (tap * ic3 + c0) * pitch_w + k_off,
+                    (tap * ic3 + c0 + ic1 - 1) * pitch_w + k_off + beat_w,
+                )
+                for tap in range(fy * fx)
+            ]
+
+        held = ()
+        if b[le.IC][2] == 1:
+            held = tuple(
+                loop
+                for loop in (le.OX, le.OY)
+                if orders[loop][2] < orders[le.OC][2]
+            )
+        return {
+            "input": BANK_SWITCH_CYCLES
+            * self._stream_switches(mapping, (le.OX, le.OY), input_ranges),
+            "weight": BANK_SWITCH_CYCLES
+            * self._stream_switches(
+                mapping, (le.OC, le.IC), weight_ranges, held
+            ),
+        }
+
     def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
@@ -838,7 +983,8 @@ class RuntimeCalculator:
         most to move for it -- the every-round operands of its L1 sub-tiles,
         the accumulator read back and rewritten while the reduction is
         split, the finished tile and the tail's operands when it is not,
-        each summed with whatever shares its bank -- plus the once-per-sweep
+        the round trips a stream idles for when it changes bank, each
+        summed with whatever shares its bank -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
         spread over the steps a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
@@ -921,6 +1067,12 @@ class RuntimeCalculator:
                 0, burst_vectors * vector_beats - burst_cycles - OUTPUT_SLACK
             )
 
+        # --- L2: outer spatial-tile loop ---
+        l2_blocks = 1
+        for i in range(le.NUM):
+            if i != le.IC:
+                l2_blocks *= blockings[i][2]
+
         # --- bus traffic of one L2 output block: the loads of its L1
         # sub-tiles, then what the vector unit moves for the block itself ---
         loads = self._load_words(mapping)
@@ -954,18 +1106,16 @@ class RuntimeCalculator:
             )
         else:
             words.update(self._tail_words(mapping, 1))
+        # A stream that changes bank idles its port for a round trip each
+        # time; spread the step's switches over its output blocks.
+        for role, cycles in self._bank_switch_cycles(mapping).items():
+            words[role] += cycles / l2_blocks
         # The matrix unit and the vector unit are pipelined -- one drains a
         # tile while the other computes the next -- so a block costs the
         # busier of the two.
         block_time = max(
             computation_l1_time, self._bank_cycles(words, bank_groups)
         )
-
-        # --- L2: outer spatial-tile loop ---
-        l2_blocks = 1
-        for i in range(le.NUM):
-            if i != le.IC:
-                l2_blocks *= blockings[i][2]
 
         # The first tile's loads overlap nothing; the last parked tile's drain
         # is a whole vector pass, while a single-buffered accumulator's drain
@@ -1444,6 +1594,8 @@ def _prepare_search(node, tiler):
         scale_block_size=anchor.kwargs.get("block_size") or 1,
         has_sparse_op=outlier_pct > 0,
         bias_width=_node_dtype_bits(get_arg_value(anchor, 2, "bias", None), 0),
+        stride=(layer.hstd, layer.wstd),
+        bank_size=tiler.config.bank_size,
     )
 
     # Built up front rather than per attempt: each one reads the node, which
