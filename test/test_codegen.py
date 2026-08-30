@@ -1,8 +1,6 @@
 import argparse
 import logging
-import os
 import re
-import sys
 
 import torch
 import torch.nn as nn
@@ -12,15 +10,11 @@ from torch.utils._pytree import tree_flatten
 from torchao.quantization.pt2e.quantizer.utils import (
     annotate_output_qspec as _annotate_output_qspec,
 )
-from torchvision import models, transforms
-from tqdm import tqdm
-from transformers import (
-    AutoImageProcessor,
-    AutoTokenizer,
-    StaticCache,
-)
+from torchvision import models
+from transformers import AutoTokenizer
 from utils.dataset import glue, imagenet
-from utils.models import bert, mobilebert, torchvision_models, vit
+from utils.models import bert, llama, mobilebert, torchvision_models, vit
+from utils.models.llama import QUANTIZATION_CONFIGS
 from utils.models.utils import get_compile_args, get_transform_args
 
 from voyager_compiler import (
@@ -34,13 +28,10 @@ from voyager_compiler import (
     compile,
     convert_and_export_with_split_cache,
     convert_pt2e,
-    export_model,
     extract_input_preprocessor,
     fuse_dequantize_quantize,
-    fuse_operator,
     get_default_quantizer,
     prepare_pt2e,
-    print_node_scope_tabular,
     sink_obs_or_fq,
     swap_llama_attention,
     transform,
@@ -129,35 +120,6 @@ VECTOR_PIPELINE = [
 ]
 
 
-def get_llama_qconfig(bs=64, outlier_pct=None):
-    if outlier_pct is None:
-        return {
-            torch.nn.Linear: [
-                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-            ],
-            torch.ops.aten.matmul.default: [
-                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-                f"int6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3",
-            ],
-            (r"lm_head", torch.ops.aten.linear.default, 0): [
-                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-            ],
-        }
-    else:
-        return {
-            torch.nn.Linear: [
-                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3,opct={outlier_pct}",
-                f"nf4_6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-            ],
-            torch.ops.aten.matmul.default: [
-                f"int6,qs=microscaling,bs={bs},ax=-1,scale=fp8_e5m3",
-                f"nf4_6,qs=microscaling,bs={bs},ax=-2,scale=fp8_e5m3,othr=6.0",
-            ],
-        }
-
-
 def main():
     torch.manual_seed(0)
     torch.set_printoptions(sci_mode=False, precision=10)
@@ -165,13 +127,20 @@ def main():
     torch.set_grad_enabled(False)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model")
+    parser.add_argument(
+        "model",
+        help=(
+            "Model to compile. Medusa stages are medusa_prefill and "
+            "medusa_decode."
+        ),
+    )
     parser.add_argument(
         "--model_name_or_path",
         default=None,
         help=(
             "Path to pretrained model or model identifier from "
-            "huggingface.co/models."
+            "huggingface.co/models. Use tiny-random for the offline Medusa "
+            "smoke model."
         ),
     )
     parser.add_argument(
@@ -221,15 +190,14 @@ def main():
         ),
     )
     parser.add_argument(
-        "--enable_mixed_precision",
-        action="store_true",
-        help="Use mixed precision quantization scheme to quantize LLMs.",
-    )
-    parser.add_argument(
-        "--outlier_pct",
-        type=float,
+        "--qconfig",
         default=None,
-        help="Percentage of outliers to filter when quantizing activations.",
+        choices=sorted(QUANTIZATION_CONFIGS),
+        help=(
+            "Named per-operand qconfig table for LLMs (from "
+            "examples/language_modeling/quantization_configs.py); also puts "
+            "softmax and layer_norm outputs in fp8."
+        ),
     )
     parser.add_argument(
         "--use_maxpool_2x2",
@@ -382,197 +350,15 @@ def main():
             bert.evaluate_gm(gm, preprocessed_dataset)
 
     elif args.model == "llm_prefill" or args.model == "llm_decode":
-        from transformers import AutoModelForCausalLM
+        model, tokenizer = llama.load_model(args)
 
-        if args.model_name_or_path is None:
-            args.model_name_or_path = "meta-llama/Llama-3.1-8B"
-
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-            attn_implementation=args.attn_implementation,
+        gm, old_output, new_output = llama.quantize_and_dump_model(
+            model=model,
+            tokenizer=tokenizer,
+            quantizer=quantizer,
+            vector_stages=VECTOR_PIPELINE,
+            args=args,
         )
-
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-
-        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
-
-        input_ids = encodings.input_ids[:, : args.context_length]
-
-        past_key_values = None
-
-        block = config.vector_lanes
-        raw = args.context_length + 128
-        max_cache_len = -(-raw // block) * block
-
-        if args.model == "llm_decode":
-            transform_args["context_len"] = args.context_length
-            transform_args["max_new_tokens"] = 128
-
-            past_key_values = StaticCache(
-                config=model.config,
-                max_batch_size=1,
-                max_cache_len=max_cache_len,
-                dtype=model.dtype,
-            )
-
-            with torch.no_grad():
-                outputs = model(
-                    input_ids, past_key_values=past_key_values, use_cache=True
-                )
-
-            input_ids = torch.argmax(
-                outputs.logits[:, -1, :], dim=-1, keepdim=True
-            )
-            past_key_values = outputs.past_key_values
-
-        inputs_embeds = model.model.embed_tokens(input_ids)
-
-        past_seen_tokens = (
-            past_key_values.get_seq_length().item()
-            if past_key_values is not None
-            else 0
-        )
-        cache_position = torch.arange(
-            past_seen_tokens,
-            past_seen_tokens + inputs_embeds.shape[1],
-            device=inputs_embeds.device,
-        )
-
-        position_ids = cache_position.unsqueeze(0)
-
-        causal_mask = TorchExportableModuleWithStaticCache._prepare_4d_causal_attention_mask_with_cache_position(
-            None,
-            sequence_length=inputs_embeds.shape[1],
-            target_length=max_cache_len,
-            dtype=inputs_embeds.dtype,
-            device=inputs_embeds.device,
-            cache_position=cache_position,
-            batch_size=inputs_embeds.shape[0],
-        )
-
-        if args.model == "llm_prefill":
-            causal_mask = causal_mask[:, :, :, : args.context_length]
-
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = model.model.rotary_emb(
-            inputs_embeds, position_ids
-        )
-
-        example_args = (
-            inputs_embeds,
-            causal_mask,
-            position_embeddings,
-            cache_position,
-        )
-
-        class LlamaWrapper(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.model = model.model
-                self.lm_head = model.lm_head
-
-                self.static_cache = past_key_values
-
-                if self.static_cache is not None:
-                    for i in range(len(self.static_cache.layers)):
-                        self.register_buffer(
-                            f"key_cache_{i}",
-                            self.static_cache.layers[i].keys,
-                            persistent=False,
-                        )
-                        self.register_buffer(
-                            f"value_cache_{i}",
-                            self.static_cache.layers[i].values,
-                            persistent=False,
-                        )
-
-            def forward(
-                self,
-                hidden_states,
-                attention_mask,
-                position_embeddings,
-                cache_position=None,
-            ):
-                for decoder_layer in self.model.layers:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        position_embeddings=position_embeddings,
-                        past_key_values=self.static_cache,
-                        cache_position=cache_position,
-                    )
-                    hidden_states = layer_outputs[0]
-
-                    if args.compile_single_layer:
-                        break
-
-                logits = self.lm_head(hidden_states)
-                return logits
-
-        gm = export_model(LlamaWrapper(), example_args)
-
-        remove_softmax_dtype_cast(gm)
-
-        hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
-        example_input = torch.randn(1, 128, hidden_size, dtype=model.dtype)
-        replace_rmsnorm_with_layer_norm(
-            gm, model.model.layers[0].input_layernorm, (example_input,)
-        )
-
-        if args.enable_mixed_precision:
-            qconfig = get_llama_qconfig(args.pe_array_size[1], args.outlier_pct)
-
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            target_path = os.path.join(
-                script_dir, "../examples/language_modeling"
-            )
-            sys.path.append(os.path.abspath(target_path))
-
-            from quantization_configs import set_qconfig
-
-            set_qconfig(quantizer, qconfig)
-
-            fp8_qspec = QuantizationSpec.from_str(
-                "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
-            )
-            qconfig = QuantizationConfig(fp8_qspec, None, None, None)
-            quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-            quantizer.set_object_type(
-                torch.ops.aten.layer_norm.default, qconfig
-            )
-
-        if args.quantize_attention_mask:
-            qspec = QuantizationSpec.from_str(
-                "int1,qs=per_tensor_symmetric,qmax=1"
-            )
-            attention_mask = next(
-                iter(n for n in gm.graph.nodes if n.target == "attention_mask")
-            )
-            _annotate_output_qspec(attention_mask, qspec)
-
-        gm = prepare_pt2e(gm, quantizer, example_args)
-
-        for _ in range(2):
-            gm(*example_args)
-
-        convert_pt2e(gm, args.bias)
-
-        flatten_args, _ = tree_flatten(example_args)
-        old_output = ShapeProp(gm).propagate(*flatten_args)
-
-        if args.quantize_attention_mask:
-            gm, mask_preprocess_fn = extract_input_preprocessor(
-                gm, "attention_mask"
-            )
-            h, mask, pos, cache = example_args
-            example_args = (h, mask_preprocess_fn(mask), pos, cache)
-
-        transform(gm, example_args, **transform_args)
-        compile(gm, example_args, **compile_args)
-        gm.graph.print_tabular()
-        new_output = gm(*example_args) if args.debug else None
     elif args.model == "llm_kivi":
         from transformers import AutoModelForCausalLM
 
@@ -786,6 +572,8 @@ def main():
         print(f"WARNING: output verification failed: {e}")
         print(old_output)
         print(new_output)
+        if args.model.startswith("medusa_"):
+            raise
 
 
 if __name__ == "__main__":

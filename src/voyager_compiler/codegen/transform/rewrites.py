@@ -469,17 +469,18 @@ def fold_constant_generators(model: GraphModule):
             inp not in constants for inp in node.all_input_nodes
         ):
             continue
-        # Folding a dequantize offsets the benefit of quantizing the params;
-        # folding an expand materializes the replication it stands for.
-        if node.target in [
-            torch.ops.quantized_ops.dequantize.default,
-            torch.ops.aten.expand.default,
-        ]:
-            continue
-        # Bufferization pass can absorb expand into indexing to avoid copying.
-        if any(u.target is torch.ops.aten.expand.default for u in node.users):
+        # Folding a dequantize offsets the benefit of quantizing the params.
+        if node.target is torch.ops.quantized_ops.dequantize.default:
             continue
         if not isinstance(getattr(node, "value", None), torch.Tensor):
+            continue
+        # Folding a real expand materializes the replication it stands for,
+        # which bufferization would otherwise absorb into indexing; one that
+        # only fills in ``-1`` dims is a view of its input and folds through.
+        if (
+            node.target is torch.ops.aten.expand.default
+            and node.value.shape != node.args[0].value.shape
+        ):
             continue
         const = node.target(
             *map_arg(node.args, resolve), **map_arg(node.kwargs, resolve)
