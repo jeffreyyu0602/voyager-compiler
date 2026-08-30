@@ -1153,16 +1153,7 @@ def build_sparse_gemm(
     with _lenient_verifier():
         gm = export_model(pattern, plan.inputs)
     gm = _finalize_exported_gm(gm)
-    # The scheduler's allocs take the same bank groups a dense GEMM's would;
-    # ``forward``'s hand allocs precede them in allocation order.  Every
-    # buffer that addresses the CSR joins the ``"csr"`` bank the search
-    # charged: the gather staging pair, the pointer tile (a scheduler slot,
-    # grouped by role) and the base-table tile whose scalars place the
-    # gather's copies -- all of them this nest's own, and all read on the
-    # same serialized fetch chain.  The CSR this nest *emits* gets a bank of
-    # its own (``"csr_out"``): its staging is compute-written and DMA-read
-    # while the gather's is the reverse, and a nest that both consumes and
-    # produces has both live in one step.
+
     roles = plan.anchor.meta.get("tiling", {}).get("bank_groups")
     if roles is not None:
 
@@ -1177,11 +1168,11 @@ def build_sparse_gemm(
         hand_groups = []
         if geom is not None:
             # gather_data, gather_indices, base_table
-            hand_groups += [group_of("csr")] * 3
+            hand_groups += [group_of("input")] * 3
         if out_geom is not None:
             # slice_nnz, stream_pos, out_base_table and the five
             # store-staging tiles
-            hand_groups += [group_of("csr_out")] * 8
+            hand_groups += [group_of("output")] * 8
         _stamp_bank_groups(
             gm,
             hand_groups

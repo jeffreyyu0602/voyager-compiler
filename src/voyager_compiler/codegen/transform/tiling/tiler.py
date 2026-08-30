@@ -376,8 +376,13 @@ def make_size_fn(
 
     Operands are grouped one per bank ideally:
 
-        input | input_scale | weight+weight_scale+bias | output+output_scale
-              | each fused operand
+        input+csr | input_scale | weight+weight_scale+bias
+                  | output+output_scale+csr staging | each fused operand
+
+    An outlier CSR the GEMM consumes rides the input's bank -- both are
+    DMA-written and compute-read at the same depth -- and the CSR a fused
+    tail emits stages in the output's, beside the dense pair it stores by
+    the same route.
 
     Each such source is ping-ponged, so it costs ``num_slots`` whole banks --
     the two halves live in *separate* banks, which is what the planner does and
@@ -472,7 +477,7 @@ def make_size_fn(
         """The bank partition of one candidate tile: the merged ``(bytes,
         kind, slots, roles)`` groups plus the scratch region's bytes, or
         ``(None, 0.0)`` for a vetoed tile.  ``roles`` is the set of operand
-        roles sharing the bank (``"input"``, ``"input_scale"``, ``"csr"``,
+        roles sharing the bank (``"input"``/``"csr"``, ``"input_scale"``,
         ``"weight"``/``"weight_scale"``/``"bias"``, ``"output"``,
         ``("fused", i)``); a merge unions the two sets.  ``size_fn`` sums
         exactly these groups, so the stamped partition and the fit check can
@@ -500,6 +505,18 @@ def make_size_fn(
         out_bits = PSUM_BITS if is_psum else of_bits
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
         bias = _alloc_bytes(extent(le.OC), bias_bits)
+        # A CSR the tail emits stages in the output's bank before its packed
+        # stores: a block's (value, index) pairs and its row pointers.  The
+        # quantize sees the output tile, so the budget follows it.
+        staged_csr = 0.0
+        if out_csr_data_bits:
+            rows = of_count / max(1.0, extent(le.OC))
+            staged = of_count * out_outlier_pct
+            staged_csr = (
+                _alloc_bytes(staged, out_csr_data_bits)
+                + _alloc_bytes(staged, out_csr_index_bits)
+                + _alloc_bytes(rows + 1, 32)
+            )
 
         def slots(dims, distinct):
             """Banks an operand spanning ``dims`` needs: a second holds the
@@ -515,26 +532,23 @@ def make_size_fn(
                 tiles *= point.loop_blocking(d)[3]
             return num_slots if tiles > 1 else 1
 
+        # The gathered CSR shares the input's bank: a block's (value, index)
+        # pairs, at the fraction of the activation the stream is sized for.
         gathered = if_count * outlier_pct
         groups = [
             (
-                _alloc_bytes(if_count, if_bits),
+                _alloc_bytes(if_count, if_bits)
+                + _alloc_bytes(gathered, csr_data_bits)
+                + _alloc_bytes(gathered, csr_index_bits),
                 _IF,
                 slots(_IF_DIMS, batch),
-                {"input"},
+                {"input", "csr"},
             ),
             (
                 _scale_bytes(if_count, if_scale_bits),
                 _IF,
                 slots(_IF_DIMS, batch),
                 {"input_scale"},
-            ),
-            (
-                _alloc_bytes(gathered, csr_data_bits)
-                + _alloc_bytes(gathered, csr_index_bits),
-                _IF,
-                slots(_IF_DIMS, batch),
-                {"csr"},
             ),
             (
                 _alloc_bytes(fl_count, fl_bits)
@@ -545,7 +559,7 @@ def make_size_fn(
                 {"weight", "weight_scale", "bias"},
             ),
             (
-                _alloc_bytes(of_count, out_bits) + of_scale,
+                _alloc_bytes(of_count, out_bits) + of_scale + staged_csr,
                 _OF,
                 slots(_OF_DIMS, batch),
                 {"output"},
@@ -562,24 +576,6 @@ def make_size_fn(
                     _OF,
                     slots(dims, distinct),
                     {("fused", i)},
-                )
-            )
-
-        # A CSR the tail emits stages before its packed stores: one region
-        # (refilled within a round, so not ``num_slots``) for a block's
-        # (value, index) pairs, row pointers and stream bookkeeping.  The
-        # quantize sees the output tile, so the budget follows it.
-        if out_csr_data_bits:
-            rows = of_count / max(1.0, extent(le.OC))
-            staged = of_count * out_outlier_pct
-            groups.append(
-                (
-                    _alloc_bytes(staged, out_csr_data_bits)
-                    + _alloc_bytes(staged, out_csr_index_bits)
-                    + _alloc_bytes(rows + 1, 32),
-                    _OF,
-                    1,
-                    {"csr_out"},
                 )
             )
 
