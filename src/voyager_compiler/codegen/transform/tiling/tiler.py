@@ -60,6 +60,14 @@ le = interstellar.le
 # ``accumulate_fp32`` is never enabled today; wire it through if that changes.
 PSUM_BITS = 16
 
+# Finished output vectors the matrix -> vector path holds before a
+# single-buffered accumulator's array feels the tail's drain rate: the
+# matrix processor's output FIFO (8), the vector pipeline's input FIFO (9)
+# and the stages between.  Measured on the E4M3x16x16 SoC as 20 (MobileBERT
+# GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
+# per L3 step.
+OUTPUT_SLACK = 24
+
 # The non-reduction L3 loops a builder's grid may permute, outermost to
 # innermost, in the order it emits when nothing says otherwise.  The reduction
 # is always innermost (the kernels accumulate in place) and the gemm batch dims
@@ -636,25 +644,26 @@ class RuntimeCalculator:
     The model follows the trends that set a mapping's runtime -- the operand
     bytes fetched and stored through the scratchpad banks, the systolic
     passes, the DRAM transfers -- not the cycle-exact datapath.  Known
-    simplifications: the accumulator drain is taken as pipelined with the
-    next block whatever ``DOUBLE_BUFFERED_ACCUM_BUFFER`` the hardware was
-    built with (a single-buffered array back-pressures on a multi-beat
-    store); per-operation costs -- parameter load, deserialisation, the
-    start/done handshake, the pipeline drain between uncommitted ops -- are
-    left out; the systolic fill/skew is a constant of the array dims; a
-    stream-breaking ``quantize_mx`` tail is charged as a staged region, not
-    as a drained pass; a conv input tile is sized without its halo; and the
-    bank port width is one number for every operand, ``sram_bandwidth``,
-    which the SoC is assumed to present as a single bus.
+    simplifications: a single-buffered accumulator's back-pressure on a
+    multi-beat tail is priced per output burst against a fixed
+    ``OUTPUT_SLACK`` of buffering; per-operation costs -- parameter load,
+    deserialisation, the start/done handshake, the pipeline drain between
+    uncommitted ops -- are left out; the systolic fill/skew is a constant of
+    the array dims; a stream-breaking ``quantize_mx`` tail is charged as a
+    staged region, not as a drained pass; a conv input tile is sized without
+    its halo; and the bank port width is one number for every operand,
+    ``sram_bandwidth``, which the SoC is assumed to present as a single bus.
 
     Args:
         input_dtype_width: Input element width, bits.
         weight_dtype_width: Weight element width, bits.
         output_dtype_width: Output element width, bits.
         accum_dtype_width: Partial-sum width, bits, while K accumulates.
-        double_buffered_accum_buffer: Charge the once-per-step accumulator
-            drain as a whole vector pass rather than as its beats past the
-            first.
+        double_buffered_accum_buffer: A finished tile that needs more than
+            one beat per vector parks in a bank the vector unit drains while
+            the next block computes (the hardware's ``should_use_direct_path``
+            rule), so only the sweep's last drain is charged; without it the
+            array back-pressures on every burst (``OUTPUT_SLACK``).
         sram_bandwidth: Width of a scratchpad bank's port, bits per cycle
             -- one bus word; every operand a bank holds queues on it.
         dram_bandwidth: DRAM bandwidth, bytes per cycle (sizes are bytes).
@@ -823,14 +832,16 @@ class RuntimeCalculator:
 
     def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
-        each costing the busier of the matrix unit and the scratchpad bank
-        with the most to move for it -- the every-round operands of its L1
-        sub-tiles, the accumulator read back and rewritten while the
-        reduction is split, the finished tile and the tail's operands when
-        it is not, each summed with whatever shares its bank -- plus the
-        once-per-sweep overhead (buffer fill, systolic skew, accumulator
-        drain) spread over the steps a double-buffered L2 overlaps it with.
-        Also the reporting model's per-tile utilization denominator.
+        each costing the busier of the matrix unit -- its systolic passes,
+        plus the back-pressure a single-buffered accumulator takes while the
+        tail drains each finished tile -- and the scratchpad bank with the
+        most to move for it -- the every-round operands of its L1 sub-tiles,
+        the accumulator read back and rewritten while the reduction is
+        split, the finished tile and the tail's operands when it is not,
+        each summed with whatever shares its bank -- plus the once-per-sweep
+        overhead (buffer fill, systolic skew, the last parked tile's drain)
+        spread over the steps a double-buffered L2 overlaps it with.  Also
+        the reporting model's per-tile utilization denominator.
 
         Args:
             mapping: The interstellar mapping to price.
@@ -866,9 +877,52 @@ class RuntimeCalculator:
         num_remaining_l1_tiles *= blockings[le.IC][2]
         computation_l1_time = weight_reuse_tile_time * num_remaining_l1_tiles
 
+        # --- the finished L1 output tile: its vectors, and the bus beats the
+        # tail spends on each -- storing it, and reading a fused operand
+        # alongside when one is wider than the port ---
+        num_k = blockings[le.IC][3]
+        output_size = 1
+        for loop in [le.OC, le.OY, le.OX]:
+            output_size *= blockings[loop][1]
+        oc_dim = partitionings[le.OC][0]
+        output_width = (
+            self.accum_dtype_width if num_k > 1 else self.output_dtype_width
+        )
+        store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
+        vector_beats = store_cycles
+        if num_k == 1:
+            for dims, bits in self.tail_specs:
+                vector_beats = max(
+                    vector_beats,
+                    math.ceil(
+                        bits
+                        * (oc_dim if le.OC in dims else 1)
+                        / self.sram_bandwidth
+                    ),
+                )
+
+        # Without a bank to park the finished tile in, its vectors leave the
+        # array one per step during the last reduction pass of each weight
+        # tile -- as one burst of the whole tile when the OC passes are
+        # adjacent (no filter loops at L1), else as OC1 bursts of one spatial
+        # tile -- and the tail drains them at ``vector_beats`` apiece.  The
+        # path absorbs ``OUTPUT_SLACK`` of them; past that the array runs at
+        # the tail's pace for the rest of the burst.  A double-buffered
+        # accumulator parks any tile that would need this, so it never pays.
+        if not self.double_buffered_accum_buffer:
+            burst_vectors = weight_reuse_tile_size
+            burst_cycles = weight_reuse_tile_time
+            bursts = blockings[le.OC][1]
+            if blockings[le.FX][1] * blockings[le.FY][1] == 1:
+                burst_vectors *= bursts
+                burst_cycles *= bursts
+                bursts = 1
+            computation_l1_time += bursts * max(
+                0, burst_vectors * vector_beats - burst_cycles - OUTPUT_SLACK
+            )
+
         # --- bus traffic of one L2 output block: the loads of its L1
         # sub-tiles, then what the vector unit moves for the block itself ---
-        num_k = blockings[le.IC][3]
         loads = self._load_words(mapping)
         words = {
             role: count * blockings[le.IC][2] for role, count in loads.items()
@@ -913,22 +967,16 @@ class RuntimeCalculator:
             if i != le.IC:
                 l2_blocks *= blockings[i][2]
 
-        # The first tile's loads overlap nothing; the last tile's drain is a
-        # whole vector pass, or only its beats past the first.
+        # The first tile's loads overlap nothing; the last parked tile's drain
+        # is a whole vector pass, while a single-buffered accumulator's drain
+        # is already in its blocks' own time.
         buffer_fill = self._bank_cycles(loads, bank_groups)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
-        output_size = 1
-        for loop in [le.OC, le.OY, le.OX]:
-            output_size *= blockings[loop][1]
-        oc_dim = partitionings[le.OC][0]
-        output_width = (
-            self.accum_dtype_width if num_k > 1 else self.output_dtype_width
+        drain = (
+            output_size * vector_beats
+            if self.double_buffered_accum_buffer
+            else 0
         )
-        store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
-        if self.double_buffered_accum_buffer:
-            drain = output_size * store_cycles
-        else:
-            drain = output_size * (store_cycles - 1)
         overhead = buffer_fill + skew + drain
         steady = l2_blocks * block_time
 
