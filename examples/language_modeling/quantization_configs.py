@@ -98,10 +98,15 @@ QUANTIZATION_CONFIGS["mxnf4_outlier_scale_bf16"] = {
 }
 QUANTIZATION_CONFIGS["mxnf4_outlier"] = {
     torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [
+    ("self_attn", torch.ops.aten.matmul.default, 0): [
         INT6_SPEC,
-        f"{MXNF4_VALUE_SPEC},othr=6.0",
+        f"{MXNF4_VALUE_SPEC},opct=0.01",
     ],
+    ("self_attn", torch.ops.aten.matmul.default, 1): [
+        INT6_SPEC,
+        f"{MXNF4_VALUE_SPEC},opct=0.01",
+    ],
+    ("lm_head", torch.ops.aten.linear.default, 0): [MXNF4_SPEC, MXNF4_SPEC],
 }
 
 
