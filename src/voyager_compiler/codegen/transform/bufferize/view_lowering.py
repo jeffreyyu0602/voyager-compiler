@@ -51,7 +51,8 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 
 def lower_views(model: GraphModule) -> GraphModule:
     """Rewrite foldable ``select`` / ``slice`` / ``cat`` / ``stack`` nodes
-    into subview windows."""
+    into subview windows.  A window carries the logical (quantized) dtype of
+    the buffer it views, so its bytes are sized like the buffer's."""
     for node in list(model.graph.nodes):
         if node.op != "call_function":
             continue
@@ -97,6 +98,7 @@ def _fold_select(model: GraphModule, node: Node) -> None:
             {"squeeze_dim": [dim]},
         )
     set_node_value(subview, node.value)
+    subview.meta["dtype"] = source.meta.get("dtype")
     node.replace_all_uses_with(subview)
     graph.erase_node(node)
 
@@ -138,6 +140,7 @@ def _fold_unbind(model: GraphModule, node: Node) -> None:
                 {"squeeze_dim": [dim]},
             )
         set_node_value(subview, user.value)
+        subview.meta["dtype"] = source.meta.get("dtype")
         user.replace_all_uses_with(subview)
         graph.erase_node(user)
     graph.erase_node(node)
@@ -178,6 +181,7 @@ def _fold_slice(model: GraphModule, node: Node) -> None:
             _SUBVIEW, (source, offsets, sizes, [1] * len(shape))
         )
     set_node_value(subview, node.value)
+    subview.meta["dtype"] = source.meta.get("dtype")
     node.replace_all_uses_with(subview)
     graph.erase_node(node)
 
@@ -228,6 +232,10 @@ def _fold_join(model: GraphModule, node: Node) -> None:
         for v in values
     ):
         return
+    dtypes = {s.meta.get("dtype") for s in sources}
+    if len(dtypes) != 1:
+        return
+    dtype = dtypes.pop()
     # A shared producer cannot land in two windows at once.
     targets = [_storage_of(s) for s in sources]
     redirected = [t for t in targets if t is not None]
@@ -247,6 +255,7 @@ def _fold_join(model: GraphModule, node: Node) -> None:
             _ALLOC, (out_shape, value.dtype, int(MemoryLevel.DRAM), 0)
         )
     set_node_value(buf, value)
+    buf.meta["dtype"] = dtype
     if (scope := first.meta.get("scope")) is not None:
         buf.meta["scope"] = scope
 
@@ -269,6 +278,7 @@ def _fold_join(model: GraphModule, node: Node) -> None:
                 _SUBVIEW, (buf, offsets, sizes, [1] * rank), squeeze
             )
         set_node_value(window, v)
+        window.meta["dtype"] = dtype
         last = window
         if t is not None:
             dest = window
@@ -278,6 +288,7 @@ def _fold_join(model: GraphModule, node: Node) -> None:
                         _RESHAPE, (window, list(t.value.shape))
                     )
                 set_node_value(dest, t.value)
+                dest.meta["dtype"] = dtype
                 last = dest
             t.replace_all_uses_with(dest)
             graph.erase_node(t)
@@ -286,6 +297,7 @@ def _fold_join(model: GraphModule, node: Node) -> None:
                 clone = graph.call_function(_CLONE, (s,))
                 graph.call_function(_INSERT, (clone, window))
             set_node_value(clone, v)
+            clone.meta["dtype"] = dtype
 
     node.replace_all_uses_with(buf)
     graph.erase_node(node)
