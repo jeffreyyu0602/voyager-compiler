@@ -44,40 +44,15 @@ QUANTIZATION_CONFIGS["w16a4"] = {
     torch.ops.aten.matmul.default: [MXNF4_SPEC, MXNF4_VALUE_SPEC],
 }
 
-# The softmax output left unquantized, which measures what that tensor's
-# quantization costs at all.
-QUANTIZATION_CONFIGS["mxnf4_p_bf16"] = {
-    **QUANTIZATION_CONFIGS["mxnf4"],
-    ("self_attn", torch.ops.aten.matmul.default, 1): [None, MXNF4_VALUE_SPEC],
-}
-
 # Attention operands at int6 rather than NormalFloat.  The linears here keep
 # NormalFloat's float levels (`nf4`), not the int6 projection every other
 # config deploys.
-QUANTIZATION_CONFIGS["mxnf4_attn_int6_scale_bf16"] = {
-    torch.nn.Linear: [f"nf4,{BLOCKING},ax=-1", f"nf4,{BLOCKING},ax=-1"],
-    torch.ops.aten.matmul.default: [
-        f"int6,{BLOCKING},ax=-1",
-        f"int6,{BLOCKING},ax=-2",
-    ],
-}
 QUANTIZATION_CONFIGS["mxnf4_attn_int6"] = {
     torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
     torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
 }
 
 # ... and with `lm_head` reading an int6 activation as well.
-QUANTIZATION_CONFIGS["mxnf4_attn_head_int6_scale_bf16"] = {
-    torch.nn.Linear: [f"nf4_6,{BLOCKING},ax=-1", f"nf4_6,{BLOCKING},ax=-1"],
-    torch.ops.aten.matmul.default: [
-        f"int6,{BLOCKING},ax=-1",
-        f"int6,{BLOCKING},ax=-2",
-    ],
-    ("lm_head", torch.ops.aten.linear.default, 0): [
-        f"int6,{BLOCKING},ax=-1",
-        f"nf4_6,{BLOCKING},ax=-1",
-    ],
-}
 QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = {
     torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
     torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
@@ -86,16 +61,6 @@ QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = {
 
 # Outlier filtering: a linear's activation sets aside its largest 1% before
 # quantizing, and the attention value operand anything past 6.0.
-QUANTIZATION_CONFIGS["mxnf4_outlier_scale_bf16"] = {
-    torch.nn.Linear: [
-        f"nf4_6,{BLOCKING},ax=-1,opct=0.01",
-        f"nf4_6,{BLOCKING},ax=-1",
-    ],
-    torch.ops.aten.matmul.default: [
-        f"int6,{BLOCKING},ax=-1",
-        f"nf4_6,{BLOCKING},ax=-2,othr=6.0",
-    ],
-}
 QUANTIZATION_CONFIGS["mxnf4_outlier"] = {
     torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
     ("self_attn", torch.ops.aten.matmul.default, 0): [
