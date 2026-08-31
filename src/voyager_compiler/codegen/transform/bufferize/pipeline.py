@@ -1595,9 +1595,11 @@ def _split_leading_dequantize(fused_gm):
         ``None`` when the tail does not scale the accumulated value with a
         dequantize, else ``(dequantize, rest_gm)``: a call scaling one
         partial, and the tail's remaining ops on the accumulated value, both
-        taking the same operand list as ``fused_gm``.  The scale is a direct
-        op call rather than a graph module because it runs inside the
-        reduction's ``torch.cond`` branches, which capture no submodules.
+        taking the same operand list as ``fused_gm`` -- ``None`` when the
+        dequantize was the whole tail, so the caller sees no tail at all.
+        The scale is a direct op call rather than a graph module because it
+        runs inside the reduction's ``torch.cond`` branches, which capture
+        no submodules.
     """
     if not isinstance(fused_gm, torch.fx.GraphModule):
         return None
@@ -1621,8 +1623,10 @@ def _split_leading_dequantize(fused_gm):
             *[a if i is None else operands[i] for i, a in scale_args],
         )
 
-    out = next(n for n in graph.nodes if n.op == "output").args[0]
     rest = [n for n in ops if n is not node]
+    if not rest:
+        return dequantize, None
+    out = next(n for n in graph.nodes if n.op == "output").args[0]
     rest_gm = _split_part(fused_gm, rest, node, "acc", out)
     # The tail mutated the scale's own result in place; rooted on the
     # accumulator it would mutate the buffer it reads, which a region cannot do.
