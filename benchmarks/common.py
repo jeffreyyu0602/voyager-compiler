@@ -64,7 +64,6 @@ import voyager_compiler  # noqa: F401  registers voyager.*
 from voyager_compiler import (
     OpMatcher,
     QuantizationSpec,
-    convert_and_export_with_split_cache,
     convert_pt2e,
     export_model,
     gen_compute_graph,
@@ -72,7 +71,6 @@ from voyager_compiler import (
     prepare_pt2e,
     remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
-    swap_llama_attention,
     transform,
 )
 from voyager_compiler.codegen.aten_classifier import is_compute_op
@@ -358,7 +356,7 @@ def dtype_spec(bits: int, group: int) -> Optional[str]:
 
 
 def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
-    """The dtype string for a *main* KV-cache tensor at ``bits``.  KIVI
+    """The dtype string for a KV-cache tensor at ``bits``.  KIVI
     quantizes keys per-channel (``ax=-2``) and values per-token (``ax=-1``) of
     the ``(N, H, S, D)`` cache.  Returns ``None`` for 16-bit (full precision).
     """
@@ -417,9 +415,8 @@ def build_quantizer(cfg: SweepConfig):
     """A quantizer for ``cfg``'s weight / activation precision (microscaling for
     8/4-bit, unquantized bf16 for 16-bit).  The rotary embedding's matmul is
     exempted by the scope ``cfg.mode``'s export records for it.  KV-cache
-    precision is *not* set here -- it is applied by annotating the main cache
-    tensors in ``_annotate_kv_cache`` (KIVI keeps the full-precision residual
-    untouched).
+    precision is *not* set here -- it is applied by annotating the cache
+    writes in ``_annotate_kv_cache``.
     """
     group = cfg.group
     quantizer = get_default_quantizer(
@@ -488,25 +485,12 @@ def build_prefill(cfg: SweepConfig):
 
 
 def build_decode(cfg: SweepConfig):
-    """Export a single decode step over a KV cache of length ``kv_len``.
-
-    A **BF16 (16-bit) cache** does not need the KIVI split cache, so it takes
-    the simpler HF export (``_build_decode_bf16``).  A **quantized cache** needs
-    the split cache -- a quantizable main cache plus a full-precision residual,
-    exported via ``_build_decode_split``.  KV quant is off for now (kv_bits is
-    always 16), but the split path is kept for when the bufferizer can lower an
-    in-place cache write.
-
-    Returns ``(gm, model, example_args, example_kwargs)``."""
-    if cfg.kv_bits == 16:
-        return _build_decode_bf16(cfg)
-    return _build_decode_split(cfg)
-
-
-def _build_decode_bf16(cfg: SweepConfig):
-    """Simple full-model decode export for a BF16 cache, via HF's
-    ``convert_and_export_with_cache`` (whole model -- embeddings, every layer,
-    final norm, lm_head -- no residual / KIVI swap).  The cache holds the
+    """Export a single decode step over a KV cache of length ``kv_len``: the
+    whole model -- embeddings, every layer, final norm, lm_head -- via HF's
+    ``convert_and_export_with_cache``.  A quantized cache needs no special
+    export: ``_annotate_kv_cache`` puts the KIVI spec on the cache writes and
+    ``transform`` splits each cache into a baked prefix and a full-precision
+    residual window (``quant_folding``).  The cache holds the
     ``kv_len`` context plus ``DECODE_MAX_GEN`` generation slots, rounded up to
     the MX ``block_size`` (= ``cfg.group``) so the KV tensors stay block-aligned
     and need no attention padding.  The decode token is at ``cache_position =
@@ -541,61 +525,17 @@ def _build_decode_bf16(cfg: SweepConfig):
     return gm, model, (), example_kwargs
 
 
-def _build_decode_split(cfg: SweepConfig):
-    """KIVI split-cache decode export (for a *quantized* KV cache).
-
-    ``convert_and_export_with_split_cache`` (llm_utils) exports the whole model
-    with a quantizable **main** cache of length ``kv_len`` plus a full-precision
-    **residual** cache of length ``DECODE_MAX_GEN`` (the recent-token
-    window KIVI keeps full precision).  Attention is swapped to
-    ``LlamaAttentionKIVI`` and the causal mask is passed in precomputed, so no
-    in-graph mask control flow is traced.  One step at ``cache_position =
-    [kv_len]``; contents don't affect the estimate, only shapes."""
-    model = _load_model(cfg)
-    swap_llama_attention(model)
-
-    max_len = cfg.kv_len
-    max_new = DECODE_MAX_GEN
-    max_cache_len = max_len + max_new
-
-    input_ids = torch.ones((cfg.batch, 1), dtype=torch.long)
-    cache_position = torch.tensor([cfg.kv_len], dtype=torch.long)
-    cache_position_residual = torch.tensor([0], dtype=torch.long)
-    attention_mask = torch.ones((cfg.batch, max_cache_len), dtype=model.dtype)[
-        None, None, :, :
-    ]
-
-    with _disable_aten_to_metadata_assertions():
-        ep = convert_and_export_with_split_cache(
-            model,
-            max_len=max_len,
-            max_new_tokens=max_new,
-            example_input_ids=input_ids,
-            example_cache_position=cache_position,
-            example_cache_position_residual=cache_position_residual,
-            example_attention_mask=attention_mask,
-        )
-    gm = ep.module()
-
-    example_kwargs = {
-        "input_ids": input_ids,
-        "cache_position": cache_position,
-        "cache_position_residual": cache_position_residual,
-        "attention_mask": attention_mask,
-    }
-    return gm, model, (), example_kwargs
-
-
-# Main KV-cache buffers only (``key_cache_0`` ...); the ``key_cache_residual_*``
-# tensors are deliberately excluded -- KIVI keeps the residual full precision.
-_MAIN_KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
+# The exported KV-cache buffers (``key_cache_0`` ...); their writes carry the
+# KIVI spec.
+_KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
 
 
 def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
-    """Annotate the *main* KV-cache tensors with ``cfg.kv_bits``' KIVI spec
-    (keys per-channel, values per-token), leaving the full-precision residual
-    cache untouched.  A no-op for 16-bit KV.  Raises if the graph names the
-    cache tensors unexpectedly so a mismatch surfaces loudly."""
+    """Annotate the KV-cache writes (``index_copy_`` into a cache buffer)
+    with ``cfg.kv_bits``' KIVI spec (keys per-channel, values per-token), so
+    ``quant_folding`` bakes each cache's prefix and keeps a full-precision
+    residual window.  A no-op for 16-bit KV.  Raises if the graph names the
+    cache buffers unexpectedly so a mismatch surfaces loudly."""
     if cfg.kv_bits == 16:
         return 0
     if _annotate_output_qspec is None:
@@ -608,17 +548,20 @@ def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
     )
     n = 0
     for node in gm.graph.nodes:
-        m = _MAIN_KV_CACHE.match(str(node.target))
-        if node.op == "get_attr" and m is not None:
-            _annotate_output_qspec(
-                node, key_qspec if m.group(1) == "key" else value_qspec
-            )
-            n += 1
+        if node.target is not torch.ops.aten.index_copy_.default:
+            continue
+        m = _KV_CACHE.match(str(node.args[0].target))
+        if m is None:
+            continue
+        _annotate_output_qspec(
+            node, key_qspec if m.group(1) == "key" else value_qspec
+        )
+        n += 1
     if n == 0:
         raise RuntimeError(
-            "KV quant: no main key/value cache get_attrs matched -- the "
-            "exported decode graph names them differently; inspect the graph "
-            "and update _MAIN_KV_CACHE"
+            "KV quant: no key/value cache write matched -- the exported "
+            "decode graph names the caches differently; inspect the graph "
+            "and update _KV_CACHE"
         )
     return n
 
@@ -692,7 +635,7 @@ def _frontend(cfg: SweepConfig):
     whole-graph and the per-module paths can share this."""
     is_decode = cfg.mode == "decode"
     # The builders return an already-exported graph (prefill via export_model,
-    # decode via convert_and_export_with_split_cache).
+    # decode via convert_and_export_with_cache).
     if is_decode:
         gm, model, example_args, example_kwargs = build_decode(cfg)
     else:
@@ -707,8 +650,8 @@ def _frontend(cfg: SweepConfig):
         gm, model.model.layers[0].input_layernorm, (example_input,)
     )
 
-    # KV-cache precision is applied by annotating the main cache tensors (KIVI);
-    # it only exists in decode.  Prefill has no persistent cache, so kv_bits is
+    # KV-cache precision is applied by annotating the cache writes (KIVI); it
+    # only exists in decode.  Prefill has no persistent cache, so kv_bits is
     # not applicable there.
     if is_decode:
         _annotate_kv_cache(gm, cfg)

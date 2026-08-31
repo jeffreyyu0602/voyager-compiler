@@ -35,6 +35,25 @@ AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.dequantize.default: 3,
     torch.ops.quantized_ops.quantize.default: 3,
     torch.ops.quantized_ops.quantize_mx.default: 2,
+    torch.ops.quantized_ops.quantize_affine.default: 2,
+}
+
+# The dynamic quantizes: each computes its qparams in the kernel and returns
+# a tuple -- qparams first, value last -- read through one ``getitem`` per
+# output.
+DYNAMIC_QUANTIZE_OPS = frozenset(
+    {
+        torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.quantized_ops.quantize_mx_outlier.default,
+        torch.ops.quantized_ops.quantize_affine.default,
+    }
+)
+
+# The whole quantize family: ops that re-encode a tensor -- change its dtype
+# and qparams -- rather than combine it with another.
+QUANTIZE_FAMILY_OPS = DYNAMIC_QUANTIZE_OPS | {
+    torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.dequantize.default,
 }
 
 
@@ -693,7 +712,10 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
         return compute_tiled_shape(override_shapes or node.shape, tiling)
     elif isinstance(node.value, (tuple, list)):
         shapes = []
-        has_sparse_outputs = len(node.value) > 2
+        # A ``quantize_mx_outlier`` -- bare or fused -- leads with the CSR
+        # triple, whose tile shapes count rows; every other tuple is plain
+        # dense outputs.
+        has_sparse_outputs = csr_quantize_node(node) is not None
 
         for i, tensor in enumerate(node.value):
             old_shape = override_shapes[i] if override_shapes else tensor.shape

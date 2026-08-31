@@ -637,6 +637,68 @@ def quantize_mx(
 
 
 quantized_ops_lib.define(
+    "quantize_affine(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
+    "float quant_min, float quant_max, Tensor scale_qmap=None) "
+    "-> (Tensor, Tensor, Tensor)"
+)
+
+
+@impl(quantized_ops_lib, "quantize_affine", "CompositeExplicitAutograd")
+def quantize_affine(
+    input: torch.Tensor,
+    qmap: torch.Tensor,
+    axes: Tuple[int],
+    block_size: int,
+    quant_min: float,
+    quant_max: float,
+    scale_qmap: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor]:
+    """Group-wise affine quantization with the qparams computed on the fly.
+
+    Each block of ``block_size`` elements along the one axis in ``axes`` maps
+    its own ``[min, max]`` onto ``[quant_min, quant_max]``, so the result
+    carries a scale *and* a zero point per block.  The runtime twin of the
+    calibrated ``quantize``, the way ``quantize_mx`` is for microscaling.
+
+    Args:
+        input: The tensor to quantize.
+        qmap: Quantization map turning the scaled values into codes.
+        axes: The single axis the blocks lie along, as a one-element list
+            (the same argument shape as ``quantize_mx``).
+        block_size: Elements per block along the axis.
+        quant_min: Smallest code of the target dtype.
+        quant_max: Largest code of the target dtype.
+        scale_qmap: Quantization map for the scale and zero point, or
+            ``None`` to keep them in the input's dtype.
+
+    Returns:
+        ``(scale, zero_point, value)``.
+    """
+    # Deferred to break a real cycle: ``quantization`` imports this module for
+    # the ops, so it cannot be imported here at module scope.
+    from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
+
+    assert block_size > 0
+
+    (axis,) = axes
+    axes = [axis % input.ndim]
+    blocked, block_axes, _, _ = _reshape_to_blocks(input, axes, block_size)
+    reduce_axes = [x + 1 for x in block_axes]
+
+    low = torch.amin(blocked, dim=reduce_axes)
+    high = torch.amax(blocked, dim=reduce_axes)
+    scale = (high - low) / (quant_max - quant_min)
+    scale = torch.where(scale > 0.0, scale, 1.0)
+    zero_point = -low / scale + quant_min
+    if scale_qmap is not None:
+        scale = vmap(scale, scale_qmap)
+        zero_point = vmap(zero_point, scale_qmap)
+
+    value = quantize(input, scale, zero_point, axes, block_size, qmap)
+    return scale, zero_point, value
+
+
+quantized_ops_lib.define(
     "filter_outlier(Tensor input, float threshold, float max_pct=0.01) "
     "-> (Tensor, Tensor, Tensor, Tensor)"
 )

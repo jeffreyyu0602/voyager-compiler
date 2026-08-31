@@ -687,7 +687,10 @@ def pad_vector_op_dimensions(
             _pad_layer_norm(model, node, K_unroll)
         elif node.target == torch.ops.aten.softmax.int:
             _pad_softmax(model, node, K_unroll)
-        elif node.target == torch.ops.quantized_ops.quantize_mx.default:
+        elif node.target in (
+            torch.ops.quantized_ops.quantize_mx.default,
+            torch.ops.quantized_ops.quantize_affine.default,
+        ):
             _pad_quantize_mx(model, node, K_unroll, fold_cache)
 
     for node in list(model.graph.nodes):

@@ -24,6 +24,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
+    QUANTIZE_FAMILY_OPS,
     get_arg_value,
     is_compute_op,
     is_nop,
@@ -157,24 +158,12 @@ def _is_cache_attr(node) -> bool:
     return "cache" in low and ("key" in low or "value" in low or "kv" in low)
 
 
-# Compute ops a source trace still walks through: they re-encode a tensor
-# rather than combine it with another.
-_QUANTIZE_OPS = frozenset(
-    {
-        torch.ops.quantized_ops.quantize.default,
-        torch.ops.quantized_ops.dequantize.default,
-        torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.quantize_mx_outlier.default,
-    }
-)
-
-
 def _trace_source(node, bind: Dict[Node, Node]) -> Node:
     """Recurse *upward* from a buffer to the ``get_attr`` or placeholder it
     originates from, stopping at the first op that computes on its input.
     Everything in between only moves data (``repeat_kv``'s expand / stack /
     permute / reshape, the ``index_copy_`` cache write) or re-encodes it
-    (``_QUANTIZE_OPS``)."""
+    (``QUANTIZE_FAMILY_OPS``)."""
     seen = set()
     while isinstance(node, Node) and node not in seen:
         seen.add(node)
@@ -183,7 +172,7 @@ def _trace_source(node, bind: Dict[Node, Node]) -> Node:
             continue
         if node.op != "call_function" or not node.all_input_nodes:
             return node
-        if is_compute_op(node) and node.target not in _QUANTIZE_OPS:
+        if is_compute_op(node) and node.target not in QUANTIZE_FAMILY_OPS:
             return node
         node = node.all_input_nodes[0]
     return node

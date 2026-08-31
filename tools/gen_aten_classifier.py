@@ -1120,6 +1120,7 @@ _QUANTIZED_COMPUTE_OPS = (
     "matmul_mx",
     "max_pool2d",
     "quantize",
+    "quantize_affine",
     "quantize_mx",
     "quantize_mx_outlier",
     "spmm_csr",

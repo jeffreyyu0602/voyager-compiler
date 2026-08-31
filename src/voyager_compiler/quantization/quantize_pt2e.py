@@ -767,7 +767,38 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
                 model, graph, input_node.name + "_zero_point", zero_point
             )
     else:
-        raise NotImplementedError
+        # An activation's blocks change every step, so the qparams are
+        # computed in the graph and come out of the quantize beside the value.
+        with graph.inserting_before(node):
+            qmap_node = create_getattr_from_value(
+                model, graph, "qmap", activation_post_process.qmap
+            )
+            scale_qmap_node = None
+            if activation_post_process.scale_qmap is not None:
+                scale_qmap_node = create_getattr_from_value(
+                    model, graph, "qmap", activation_post_process.scale_qmap
+                )
+            quantize_node = graph.call_function(
+                torch.ops.quantized_ops.quantize_affine.default,
+                (
+                    input_node,
+                    qmap_node,
+                    activation_post_process.ch_axis,
+                    activation_post_process.block_size,
+                    float(activation_post_process.quant_min),
+                    float(activation_post_process.quant_max),
+                    scale_qmap_node,
+                ),
+            )
+            scale_node, zero_point_node, quantized_node = [
+                graph.call_function(operator.getitem, (quantize_node, i))
+                for i in range(3)
+            ]
+        quantize_node.meta["dtype"] = (
+            activation_post_process.scale_dtype,
+            activation_post_process.scale_dtype,
+            activation_post_process.dtype,
+        )
 
     quantized_node.meta["dtype"] = activation_post_process.dtype
 
@@ -801,8 +832,9 @@ def _eliminate_dequantize_with_no_effect(model: GraphModule):
             continue
 
         scale_node = node.args[1]
-        scale = model.get_buffer(scale_node.target)
-        if scale_node.op != "get_attr" or torch.any(scale != 1):
+        if scale_node.op != "get_attr":
+            continue
+        if torch.any(model.get_buffer(scale_node.target) != 1):
             continue
 
         # During integer quantization, the dequantize node also perform a

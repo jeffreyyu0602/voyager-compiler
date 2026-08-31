@@ -23,6 +23,7 @@ import torch.fx as fx
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
+    DYNAMIC_QUANTIZE_OPS,
     bound_operands,
     csr_quantize_node,
     gemm_produces_csr,
@@ -1129,11 +1130,7 @@ def _dedup_regions(gm: GraphModule) -> None:
                 _dedup_regions(sub)
 
 
-_MULTI_OUTPUT_POINTWISE = {
-    torch.ops.quantized_ops.quantize_mx.default,
-    torch.ops.quantized_ops.quantize_mx_outlier.default,
-}
-_REDUCTION_POINTWISE_OPS = _MULTI_OUTPUT_POINTWISE | {
+_REDUCTION_POINTWISE_OPS = DYNAMIC_QUANTIZE_OPS | {
     torch.ops.quantized_ops.quantize.default,
     torch.ops.quantized_ops.layer_norm.default,
     torch.ops.aten.layer_norm.default,

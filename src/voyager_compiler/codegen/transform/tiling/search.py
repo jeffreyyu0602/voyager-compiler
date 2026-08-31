@@ -7,6 +7,7 @@ import torch
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
+    DYNAMIC_QUANTIZE_OPS,
     _pair,
     bound_operands,
     compute_output_tiled_shapes,
@@ -653,15 +654,18 @@ def _vector_op_tiling_limits(node, vector_unit_width):
         node: The vector op whose dimensions are being constrained.
         vector_unit_width: Lanes the last dim has to fill.
     """
-    if not is_elementwise_op(node) and node.target not in [
-        torch.ops.aten.softmax.int,
-        torch.ops.aten.layer_norm.default,
-        torch.ops.aten.permute.default,
-        torch.ops.aten.transpose.int,
-        torch.ops.quantized_ops.layer_norm.default,
-        torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.quantize_mx_outlier.default,
-    ]:
+    if (
+        not is_elementwise_op(node)
+        and node.target not in DYNAMIC_QUANTIZE_OPS
+        and node.target
+        not in [
+            torch.ops.aten.softmax.int,
+            torch.ops.aten.layer_norm.default,
+            torch.ops.aten.permute.default,
+            torch.ops.aten.transpose.int,
+            torch.ops.quantized_ops.layer_norm.default,
+        ]
+    ):
         return None
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
@@ -677,10 +681,7 @@ def _vector_op_tiling_limits(node, vector_unit_width):
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
         )
-    elif node.target in [
-        torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.quantize_mx_outlier.default,
-    ]:
+    elif node.target in DYNAMIC_QUANTIZE_OPS:
         axes = get_arg_value(node, 2, "axes", None)
         block_size = get_arg_value(node, 3, "block_size", None)
         ndim = len(node.args[0].shape)

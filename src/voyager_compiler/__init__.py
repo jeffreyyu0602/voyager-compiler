@@ -59,8 +59,6 @@ from voyager_compiler.codegen.transform.tiling import (
     build_interstellar_tiler,
 )
 from voyager_compiler.export_utils import (
-    TorchExportableModuleWithStaticCache,
-    convert_and_export_with_split_cache,
     export_model,
     get_aten_graph_module,
     get_node_name_to_scope,
@@ -102,7 +100,6 @@ from voyager_compiler.quantization.dtypes import (
     quantize_to_nf,
     quantize_to_posit,
 )
-from voyager_compiler.quantization.modules import swap_llama_attention
 from voyager_compiler.shape_prop import ShapeProp, fetch_attr, propagate_shape
 from voyager_compiler.utils import with_execution_context
 
@@ -116,13 +113,11 @@ __all__ = [
     "QuantizationConfig",
     "QuantizationSpec",
     "ShapeProp",
-    "TorchExportableModuleWithStaticCache",
     "add_compile_args",
     "add_experiment_args",
     "add_quantization_args",
     "compile",
     "convert",
-    "convert_and_export_with_split_cache",
     "convert_pt2e",
     "deduplicate_nodes",
     "derive_bias_qparams_fn",
@@ -156,7 +151,6 @@ __all__ = [
     "replace_rmsnorm_with_layer_norm",
     "replace_softmax",
     "sink_obs_or_fq",
-    "swap_llama_attention",
     "transform",
     "with_execution_context",
 ]

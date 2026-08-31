@@ -10,6 +10,7 @@ static KV cache captured by ``convert_and_export_with_cache``.
 
 import logging
 import os
+import re
 import sys
 
 import torch
@@ -17,7 +18,12 @@ from datasets import load_dataset
 from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.utils._pytree import tree_flatten
 from torchao.quantization.pt2e.quantizer.utils import annotate_output_qspec
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    StaticCache,
+)
 from transformers.integrations.executorch import convert_and_export_with_cache
 
 from voyager_compiler import (
@@ -56,6 +62,20 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 
 # Generation slots the decode KV cache holds beyond the prefilled context.
 DECODE_MAX_GEN = 128
+
+# KIVI's 2-bit KV cache: keys grouped along the sequence (per channel), values
+# along the head dim (per token).  The compiler splits each cache into a
+# baked prefix and a re-quantized residual window (``quant_folding``).
+KIVI_KEY_SPEC = "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
+KIVI_VALUE_SPEC = "uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
+# The attention matmuls under KIVI re-encode the cache as int6 microscaling
+# for the MXU.  Each baked prefix is decoded and re-encoded in one fused
+# dequantize, which needs the int6 scale constant across each affine block:
+# 64x64 blocks cover both the key's 64-token and the value's 64-channel
+# groups.
+KIVI_QUERY_SPEC = "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3"
+KIVI_CACHE_MX_SPEC = "int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3"
+_KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
 
 # The rotary embedding's ``inv_freq @ position`` matmul is not an MXU op and
 # stays unquantized.  A regex, so it matches both the prefill scope
@@ -112,7 +132,9 @@ def build_prefill(model, tokenizer, args):
 def build_decode(model, tokenizer, args, config):
     """Export one decode step at ``cache_position = [context_length]`` over a
     static BF16 KV cache of ``max_cache_len`` slots, via Hugging Face's
-    ``convert_and_export_with_cache``.  Returns ``(gm, (), example_kwargs)``.
+    ``convert_and_export_with_cache``, then prefill the exported cache with
+    the ``context_length`` prompt tokens so calibration and the baked cache
+    see real contents.  Returns ``(gm, (), example_kwargs)``.
     """
     model.generation_config = GenerationConfig(
         use_cache=True,
@@ -134,13 +156,27 @@ def build_decode(model, tokenizer, args, config):
             example_input_ids=input_ids,
             example_cache_position=cache_position,
         )
+    gm = ep.module()
+
+    prompt = _prompt_ids(tokenizer, args.context_length)
+    cache = StaticCache(
+        config=model.config,
+        max_batch_size=1,
+        max_cache_len=max_cache_len(args, config),
+        dtype=model.dtype,
+    )
+    model(prompt, past_key_values=cache, use_cache=True)
+    for i, layer in enumerate(cache.layers):
+        getattr(gm, f"key_cache_{i}").copy_(layer.keys)
+        getattr(gm, f"value_cache_{i}").copy_(layer.values)
+
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
-    return ep.module(), (), example_kwargs
+    return gm, (), example_kwargs
 
 
 def quantize_model(model, tokenizer, quantizer, vector_stages, args):
-    """Export and quantize the stage ``args.model`` names (``llm_prefill`` /
-    ``llm_decode``), stopping short of ``transform``.  Returns ``(gm,
+    """Export and quantize the stage ``args.model`` names (``llama_prefill`` /
+    ``llama_decode``), stopping short of ``transform``.  Returns ``(gm,
     example_args, example_kwargs, old_output, transform_args,
     compile_args)`` -- the converted graph with shapes propagated, its example
     inputs and reference output, and the keyword sets ``transform`` and
@@ -149,7 +185,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     compile_args = get_compile_args(args)
     config = transform_args["config"]
 
-    is_decode = args.model == "llm_decode"
+    is_decode = args.model in ("llama_decode", "llama_decode_kivi")
     if is_decode:
         transform_args["context_len"] = args.context_length
         transform_args["max_new_tokens"] = DECODE_MAX_GEN
@@ -175,6 +211,32 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     if args.qconfig is not None:
         set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.qconfig])
 
+    if args.model == "llama_decode_kivi":
+        query = QuantizationSpec.from_str(KIVI_QUERY_SPEC)
+        cache_mx = QuantizationSpec.from_str(KIVI_CACHE_MX_SPEC)
+        for order in (0, 1):
+            quantizer.set_module_name_object_type_order(
+                "self_attn",
+                torch.ops.aten.matmul.default,
+                order,
+                QuantizationConfig(query, None, cache_mx, None),
+            )
+        # The cache is quantized where it is written -- the observer sits on
+        # the index_copy_ -- so quant_folding can bake the buffer and move
+        # the quantize onto the token.
+        key_qspec = QuantizationSpec.from_str(KIVI_KEY_SPEC)
+        value_qspec = QuantizationSpec.from_str(KIVI_VALUE_SPEC)
+        for n in gm.graph.nodes:
+            if n.target is not torch.ops.aten.index_copy_.default:
+                continue
+            match = _KV_CACHE.match(str(n.args[0].target))
+            if match is None:
+                continue
+            annotate_output_qspec(
+                n, key_qspec if match.group(1) == "key" else value_qspec
+            )
+
+    if args.qconfig is not None or args.model == "llama_decode_kivi":
         fp8_qspec = QuantizationSpec.from_str(
             "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
         )
@@ -183,10 +245,12 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
         quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
 
     # The HF export builds the causal mask in-graph: a ``where`` over the
-    # boolean mask that the attention scores' ``add`` reads.  Annotating its
-    # output makes convert_pt2e emit quantize -> dequantize on it; the
-    # constant fold then leaves an int1 constant plus the dequantize.
-    if args.quantize_attention_mask:
+    # boolean mask that the attention scores' ``add`` reads.  In prefill the
+    # mask is a constant, so annotating the ``where`` makes convert_pt2e emit
+    # quantize -> dequantize on it and the constant fold leaves an int1
+    # constant plus the dequantize.  Decode rebuilds the mask from
+    # ``cache_position`` every step and keeps it in bf16.
+    if args.quantize_attention_mask and not is_decode:
         qspec = QuantizationSpec.from_str("int1,qs=per_tensor_symmetric,qmax=1")
         masks = [
             n
@@ -220,7 +284,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
 
 def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
     """Export, quantize, transform and compile the stage ``args.model`` names
-    (``llm_prefill`` / ``llm_decode``).  Returns ``(gm, old_output,
+    (``llama_prefill`` / ``llama_decode``).  Returns ``(gm, old_output,
     new_output)``; ``new_output`` is ``None`` unless ``--debug`` re-runs the
     lowered graph."""
     (

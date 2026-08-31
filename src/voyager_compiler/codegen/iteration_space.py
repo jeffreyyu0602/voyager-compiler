@@ -1009,6 +1009,7 @@ class IterationSpaceNormalizer:
             in {
                 torch.ops.quantized_ops.quantize_mx.default,
                 torch.ops.quantized_ops.quantize_mx_outlier.default,
+                torch.ops.quantized_ops.quantize_affine.default,
             }
         )
 

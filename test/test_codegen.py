@@ -1,44 +1,19 @@
 import argparse
 import logging
-import re
 
 import torch
-import torch.nn as nn
-from datasets import load_dataset
 from torch.testing import assert_close
 from torch.utils._pytree import tree_flatten
-from torchao.quantization.pt2e.quantizer.utils import (
-    annotate_output_qspec as _annotate_output_qspec,
-)
 from torchvision import models
-from transformers import AutoTokenizer
 from utils.dataset import glue, imagenet
 from utils.models import bert, llama, mobilebert, torchvision_models, vit
 from utils.models.llama import QUANTIZATION_CONFIGS
-from utils.models.utils import get_compile_args, get_transform_args
 
 from voyager_compiler import (
     OpMatcher,
-    QuantizationConfig,
-    QuantizationSpec,
-    ShapeProp,
-    TorchExportableModuleWithStaticCache,
     add_compile_args,
     add_quantization_args,
-    compile,
-    convert_and_export_with_split_cache,
-    convert_pt2e,
-    extract_input_preprocessor,
-    fuse_dequantize_quantize,
     get_default_quantizer,
-    prepare_pt2e,
-    sink_obs_or_fq,
-    swap_llama_attention,
-    transform,
-)
-from voyager_compiler.codegen import (
-    remove_softmax_dtype_cast,
-    replace_rmsnorm_with_layer_norm,
 )
 from voyager_compiler.codegen.node_info import is_fully_connected
 
@@ -79,7 +54,12 @@ def model_input_name(gm):
 
 
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
+QUANT_OPS = [
+    "quantize",
+    "quantize_mx",
+    "quantize_mx_outlier",
+    "quantize_affine",
+]
 
 # Tolerance for comparing the lowered graph's output against the original's.
 # Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
@@ -262,10 +242,6 @@ def main():
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
 
-    transform_args = get_transform_args(args, VECTOR_PIPELINE)
-    compile_args = get_compile_args(args)
-    config = transform_args["config"]
-
     if args.model in models.__dict__:
         model = torchvision_models.load_model(args)
 
@@ -349,7 +325,7 @@ def main():
         if args.evaluate:
             bert.evaluate_gm(gm, preprocessed_dataset)
 
-    elif args.model == "llm_prefill" or args.model == "llm_decode":
+    elif args.model in ("llama_prefill", "llama_decode", "llama_decode_kivi"):
         model, tokenizer = llama.load_model(args)
 
         gm, old_output, new_output = llama.quantize_and_dump_model(
@@ -359,158 +335,6 @@ def main():
             vector_stages=VECTOR_PIPELINE,
             args=args,
         )
-    elif args.model == "llm_kivi":
-        from transformers import AutoModelForCausalLM
-
-        if args.model_name_or_path is None:
-            args.model_name_or_path = "meta-llama/Llama-3.1-8B"
-
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name_or_path,
-            torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
-            attn_implementation=args.attn_implementation,
-        ).eval()
-
-        if args.compile_single_layer:
-            layers_to_keep = model.model.layers[:1]
-            model.model.layers = nn.ModuleList(layers_to_keep)
-
-            if hasattr(model, "config"):
-                model.config.num_hidden_layers = len(model.model.layers)
-
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-
-        test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-        encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
-
-        input_ids = encodings.input_ids[:, : args.context_length]
-
-        block = config.vector_lanes
-        # context + generation budget, rounded up to a block_size multiple.
-        raw = args.context_length + 128
-        max_cache_len = -(-raw // block) * block
-
-        max_length = args.context_length
-        max_gen = max_cache_len - max_length
-
-        swap_llama_attention(model)
-
-        from torch._export.utils import _disable_aten_to_metadata_assertions
-
-        with _disable_aten_to_metadata_assertions():
-            gm = convert_and_export_with_split_cache(
-                model, max_len=max_length, max_new_tokens=max_gen
-            ).module()
-
-        # Run decode once to fill in the KV caches
-        output = TorchExportableModuleWithStaticCache.generate(
-            model,
-            prompt_token_ids=input_ids,
-            max_new_tokens=max_gen,
-            min_length=max_length + 1,
-            eos_token_id=[
-                tokenizer.eos_token_id,
-                tokenizer.encode("\n", add_special_tokens=False)[-1],
-            ],
-            model_decode=gm,
-        )[0]
-
-        remove_softmax_dtype_cast(gm)
-
-        hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
-        example_input = torch.randn(1, 1, hidden_size, dtype=model.dtype)
-        replace_rmsnorm_with_layer_norm(
-            gm, model.model.layers[0].input_layernorm, (example_input,)
-        )
-
-        quantizer.set_object_type(torch.ops.aten.matmul.default, None)
-
-        act0 = QuantizationSpec.from_str(
-            "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3"
-        )
-        act1 = QuantizationSpec.from_str(
-            "int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3"
-        )
-        qconfig = QuantizationConfig(act0, None, act1, None)
-
-        for layer_idx in range(model.config.num_hidden_layers):
-            module_name = f"model.model.layers.{layer_idx}.self_attn"
-            quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 0, qconfig
-            )
-            quantizer.set_module_name_object_type_order(
-                module_name, torch.ops.aten.matmul.default, 2, qconfig
-            )
-
-        fp8_qspec = QuantizationSpec.from_str(
-            "fp8_e4m3,qs=per_tensor_symmetric,qmax=240"
-        )
-        qconfig = QuantizationConfig(fp8_qspec, None, None, None)
-        quantizer.set_object_type(torch.ops.aten.softmax.int, qconfig)
-        quantizer.set_object_type(torch.ops.aten.layer_norm.default, qconfig)
-
-        if args.quantize_attention_mask:
-            qspec = QuantizationSpec.from_str(
-                "int1,qs=per_tensor_symmetric,qmax=1"
-            )
-            attention_mask = next(
-                iter(n for n in gm.graph.nodes if n.target == "attention_mask")
-            )
-            _annotate_output_qspec(attention_mask, qspec)
-
-        key_qspec = QuantizationSpec.from_str(
-            "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
-        )
-        value_qspec = QuantizationSpec.from_str(
-            "uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
-        )
-
-        for node in gm.graph.nodes:
-            match = re.match(r"^(key|value)_cache_(\d+)$", str(node.target))
-            if node.op == "get_attr" and match is not None:
-                _annotate_output_qspec(
-                    node, key_qspec if match.group(1) == "key" else value_qspec
-                )
-
-        example_input_ids = torch.tensor([[1]], dtype=torch.long)
-        example_cache_position = torch.tensor([0], dtype=torch.long)
-        example_cache_position_residual = torch.tensor([0], dtype=torch.long)
-        example_attention_mask = torch.ones(
-            (1, max_cache_len), dtype=torch_dtype
-        )[None, None, :, :]
-        example_kwargs = {
-            "input_ids": example_input_ids,
-            "cache_position": example_cache_position,
-            "cache_position_residual": example_cache_position_residual,
-            "attention_mask": example_attention_mask,
-        }
-
-        gm = prepare_pt2e(gm, quantizer)
-
-        for _ in range(2):
-            gm(**example_kwargs)
-
-        sink_obs_or_fq(gm)
-        convert_pt2e(gm, eliminate_no_effect=False)
-
-        flatten_args, _ = tree_flatten(example_kwargs)
-        old_output = ShapeProp(gm).propagate(*flatten_args)
-
-        if args.quantize_attention_mask:
-            gm, mask_preprocess_fn = extract_input_preprocessor(
-                gm, "attention_mask"
-            )
-            example_kwargs["attention_mask"] = mask_preprocess_fn(
-                example_kwargs["attention_mask"]
-            )
-
-        fuse_dequantize_quantize(gm)
-
-        transform(gm, (), example_kwargs, **transform_args)
-        compile(gm, (), example_kwargs, **compile_args)
-
-        gm.graph.print_tabular()
-        new_output = gm(**example_kwargs) if args.debug else None
     elif args.model == "vit":
         model = vit.load_model(args)
 

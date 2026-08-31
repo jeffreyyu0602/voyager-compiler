@@ -94,8 +94,8 @@ assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 # Reused per-command extra-flag groups.
 _SINGLE = "--compile_single_layer"
 _LLM = "--context_length 1024 --compile_single_layer --quantize_attention_mask"
-_LLM_MP = _LLM + " --enable_mixed_precision"
-_LLM_SPMM = _LLM_MP + " --outlier_pct 0.01"
+_LLM_MP = _LLM + " --qconfig mxnf4_attn_head_int6"
+_LLM_SPMM = _LLM + " --qconfig mxnf4_outlier"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
 _LLM_SPMM_DB = _LLM_SPMM + " " + _DB
@@ -131,11 +131,11 @@ COMMANDS = [
     Command("mobilebert", "MXINT8", "16,16", "mobilebert_encoder", _SINGLE),
     Command("mobilenet_v2", "MXINT8", "16,16"),
     # -- MXNF4 (llama) --
-    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill", _LLM),
-    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
-    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
-    Command("llm_decode", "MXNF4", "64,64", "llama_decode", _LLM),
-    Command("llm_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
+    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill", _LLM),
+    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
+    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
+    Command("llama_decode", "MXNF4", "64,64", "llama_decode", _LLM),
+    Command("llama_decode_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
     # -- MXNF4 (vision / bert) --
     Command("resnet18", "MXNF4", "64,64"),
     Command("resnet50", "MXNF4", "64,64"),
@@ -144,10 +144,10 @@ COMMANDS = [
     # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
     # pipeline apart) --
     Command("resnet18", "MXNF4", "64,64", "resnet18_db", _DB),
-    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
-    Command("llm_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
+    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
+    Command("llama_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
     Command(
-        "llm_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
+        "llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
     ),
 ]
 
