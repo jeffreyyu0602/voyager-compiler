@@ -11,7 +11,6 @@ interstellar directly.  A reduction factor greater than 1 is what drives the
 to each builder; per-node element widths are read from the nodes themselves.
 """
 
-import copy
 import gc
 import itertools
 import logging
@@ -1968,27 +1967,6 @@ def prefetch_tilings(nodes, tiler):
             len(searches) - cached,
             PREFETCH_TIMEOUT_S,
         )
-
-
-def recost_k_split(tiling_meta, k_tiles):
-    """Rewrite a stamped mapping and its access counts for a builder-imposed
-    K split.
-
-    Args:
-        tiling_meta: The anchor's ``meta["tiling"]`` dict, edited in place.
-        k_tiles: Reduction-tile count of the nest the builder emits.
-    """
-    mapping, _ = tiling_meta["interstellar_tiling"]
-    corrected = copy.deepcopy(mapping)
-    corrected.loop_blockings = [list(b) for b in corrected.loop_blockings]
-    b = corrected.loop_blockings[le.IC]
-    b[1], b[2], b[3] = 1, b[1] * b[2] * b[3] // k_tiles, k_tiles
-    _, _, access_list = interstellar.cost_model.get_cost(
-        tiling_meta["interstellar_architecture"],
-        corrected,
-        tiling_meta["layer"],
-    )
-    tiling_meta["interstellar_tiling"] = (corrected, access_list)
 
 
 def _l3_order_from_mapping(mapping, canonical, loop_of):

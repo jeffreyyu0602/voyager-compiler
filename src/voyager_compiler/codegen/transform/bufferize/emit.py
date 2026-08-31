@@ -249,7 +249,13 @@ _TILING_NUM_LEVELS = 3
 def _build_tiling(node) -> Tiling:
     """The interstellar mapping of a tiled matrix op (stamped on the node by its
     builder), as a ``Tiling``.  ``LoopIndex`` is numbered like the interstellar
-    loop ids, so they map across directly."""
+    loop ids, so they map across directly.  A level's loops are written in
+    order rank; a loop blocked at a level that gives it no rank could not be
+    placed and would be dropped, so that mapping is rejected.
+
+    Raises:
+        ValueError: A level blocks a loop it assigns no order to.
+    """
     mapping, access_list = node.meta["interstellar_tiling"]
     tiling = Tiling(name=node.name)
 
@@ -271,6 +277,17 @@ def _build_tiling(node) -> Tiling:
                     break
             if not matched:
                 break
+        for loop in range(interstellar.le.NUM):
+            if (
+                mapping.loop_blockings[loop][level] > 1
+                and mapping.loop_orders[loop][level] >= loop_index
+            ):
+                raise ValueError(
+                    f"{node.name}: level {level} blocks loop {loop} by "
+                    f"{mapping.loop_blockings[loop][level]} but ranks it "
+                    f"{mapping.loop_orders[loop][level]}, past the "
+                    f"{loop_index} loops placed; the Tiling would drop it"
+                )
         tiling.level_tilings.append(lt)
         tiling.level_access_counts.append(
             LevelAccessCount(
