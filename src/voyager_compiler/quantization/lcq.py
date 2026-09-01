@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops.quantized import HEAD_AXIS, QMAP_SIZE, vmap
+from voyager_compiler.ops.quantized import QMAP_SIZE, vmap
 from voyager_compiler.quantization.dtypes import create_normal_map
 
 logger = logging.getLogger(__name__)
@@ -776,13 +776,37 @@ def _grid_cells(tensor, counts):
     return cells
 
 
+def _padded_counts(counts, rank, head_axis):
+    """Widen an older dump's table counts to one per operand axis.
+
+    Args:
+        counts: Counts as the dump spells them -- the head count alone,
+            or a grid over the trailing axes.
+        rank: The operand's rank, or None when the graph does not say.
+        head_axis: The counts name the attention head axis, which leads
+            from the front, rather than trailing axes.
+
+    Returns:
+        One count per axis, 1 where the dump splits nothing.
+    """
+    if rank is None or rank <= len(counts):
+        return list(counts)
+    if head_axis:
+        padded = [1] * rank
+        # Attention operands all enter their matmul as ``[batch, head,
+        # ...]``, which is the axis those dumps indexed.
+        padded[1] = counts[0]
+        return padded
+    return [1] * (rank - len(counts)) + list(counts)
+
+
 def leading_split(counts):
     """Return the leading axis a granularity splits, or None.
 
-    Counts align to the trailing axes, so the last two entries are the
-    grid a 3-D ``qmap`` dispatches by position and anything earlier is an
-    axis a 2-D one dispatches by index.  Which it is settles from the
-    tuple alone, without the operand's rank.
+    Counts align to the trailing axes, so anything split before the last
+    two is a leading axis, along which a partner's energy has to be
+    sliced to match.  Which it is settles from the tuple alone, without
+    the operand's rank.
 
     Args:
         counts: A granularity tuple, as the caller wrote it.
@@ -1318,7 +1342,7 @@ def fit_codebooks(
                 spread.max(),
             )
 
-    tables, unsigned, undeployable = {}, [], []
+    tables, unsigned = {}, []
     for name, (module, _, _) in operands.items():
         group = histograms.get(name)
         if group is None or group[0].weight is None:
@@ -1342,50 +1366,21 @@ def fit_codebooks(
             optimal_codebook(histogram, k=k, pin_zero=pin_zero)
             for histogram in group
         ]
-        # The decoder indexes a codebook either by one leading axis or by
-        # position in the last two, so those are the granularities a fit
-        # can be written back through.  Anything else is still fitted and
-        # still dumped -- which is what measuring its headroom needs --
-        # but nothing is installed for it.
+        # A codebook carries one axis per tensor axis, so the grid the
+        # fit asked for is the shape the decoder dispatches on and every
+        # granularity has a layout.
         counts = settled_counts[name]
-        axis = indexed.get(name)
-        blocks = module.ch_axis
-        blocks = blocks[0] if isinstance(blocks, (tuple, list)) else blocks
-        splits_last_two = any(count != 1 for count in counts[-2:])
         if all(count == 1 for count in counts):
             tables[name] = fitted[0]
             install_codebook(module, tables[name])
-        elif axis is None and blocks == -1:
-            # A 3-D qmap: one row per region, dispatched inside
-            # ``encode``/``decode`` by position, the same way a 2-D qmap
-            # dispatches per head.
-            rows, cols = counts[-2], counts[-1]
+        else:
             module.qmap = torch.tensor(
                 fitted, dtype=torch.float32, device=module.qmap.device
-            ).reshape(rows, cols, k)
-            tables[name] = {"regions": [rows, cols], "levels": fitted}
-        elif (
-            axis is not None
-            and not splits_last_two
-            and axis + len(counts) == HEAD_AXIS
-        ):
-            tables[name] = fitted
-            install_codebook(module, tables[name])
-        else:
+            ).reshape(*counts, k)
             tables[name] = {"granularity": list(counts), "levels": fitted}
-            undeployable.append(name)
         logger.debug("%s: %s", name, tables[name])
 
     logger.info("fitted %d of %d tensors", len(tables), len(operands))
-    if undeployable:
-        logger.warning(
-            "%d granularities have no qmap layout, so their tables are "
-            "dumped but not installed -- a codebook is indexed by one "
-            "leading axis or by position in the last two, not both: %s%s",
-            len(undeployable),
-            ", ".join(undeployable[:3]),
-            " ..." if len(undeployable) > 3 else "",
-        )
     if unsigned:
         logger.info(
             "%d never went negative, so their levels span [0, quant_max]: "
@@ -1407,12 +1402,13 @@ def load_codebooks(model, tables, skip=()):
     Args:
         model: Graph module from ``prepare_pt2e``.
         tables: ``name -> levels``, or the path of a JSON file holding it,
-            as ``fit_codebooks`` writes with ``dump``.  An entry that is a
-            list of tables rather than one is a codebook per attention
-            head (or head group); a ``{"regions": [R, C], "levels": ...}``
-            entry installs a grid of tables over the last two axes
-            instead (``{"channel_groups": G, ...}`` is the older spelling
-            of ``[1, G]``).
+            as ``fit_codebooks`` writes with ``dump``.  One table is a
+            list of levels; a grid of them is
+            ``{"granularity": counts, "levels": ...}``, one count per
+            operand axis.  Older dumps spell a grid over the trailing
+            axes ``{"regions": [R, C], ...}`` or ``{"channel_groups": G}``,
+            and a bare list of tables means one per attention head; both
+            are padded out to the operand's rank.
         skip: Substrings of operand names to leave alone.
 
     Returns:
@@ -1434,23 +1430,31 @@ def load_codebooks(model, tables, skip=()):
             f"quantizes, starting with {unknown[0]}"
         )
     for name, entry in tables.items():
-        module = operands[name][0]
-        if isinstance(entry, dict) and "granularity" in entry:
-            raise ValueError(
-                f"{name}: these tables were fitted at granularity "
-                f"{tuple(entry['granularity'])}, which no qmap layout "
-                f"holds, so they cannot be installed"
+        module, operand = operands[name][0], operands[name][1]
+        value = operand.meta.get("val", getattr(operand, "value", None))
+        rank = value.dim() if value is not None else None
+        if not isinstance(entry, dict):
+            if not isinstance(entry[0], (list, tuple)):
+                install_codebook(module, entry)
+                continue
+            # A dump from before a codebook carried one axis per operand
+            # axis: its rows indexed the attention head axis.
+            counts = _padded_counts([len(entry)], rank, head_axis=True)
+        elif "granularity" in entry:
+            counts = list(entry["granularity"])
+        else:
+            counts = list(
+                entry.get(
+                    "regions", (1, entry.get("channel_groups", len(entry)))
+                )
             )
-        if isinstance(entry, dict):
-            levels = torch.tensor(
-                entry["levels"], dtype=torch.float32, device=module.qmap.device
-            )
-            rows, cols = entry.get(
-                "regions", (1, entry.get("channel_groups", len(levels)))
-            )
-            module.qmap = levels.reshape(rows, cols, levels.shape[-1])
-            continue
-        install_codebook(module, entry)
+            counts = _padded_counts(counts, rank, head_axis=False)
+        levels = torch.tensor(
+            entry["levels"] if isinstance(entry, dict) else entry,
+            dtype=torch.float32,
+            device=module.qmap.device,
+        )
+        module.qmap = levels.reshape(*counts, levels.shape[-1])
     logger.info("installed %d codebooks", len(tables))
 
     unfitted = sorted(set(operands) - set(tables))

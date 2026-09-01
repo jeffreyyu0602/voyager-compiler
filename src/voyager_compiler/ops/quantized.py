@@ -126,43 +126,44 @@ def vmap(
 #: codebook itself, and is searched rather than indexed.
 QMAP_SIZE = 2**16
 
-#: Axis an attention operand carries its heads on: Q, K, P and V all enter
-#: their matmul as ``[batch, head, ...]``.  A microscaling block never
-#: straddles two heads, so a head owns whole blocks and can carry its own
-#: codebook.
-HEAD_AXIS = 1
-
 
 def _region_view(input: torch.Tensor, codebook: torch.Tensor):
     """Reshape a tensor so its region grid leads, ready to gather.
 
     Args:
-        input: Tensor whose last two axes the grid tiles.
-        codebook: The ``[R, C, k]`` region codebook.
+        input: Tensor the grid tiles, one codebook axis per input axis.
+        codebook: ``[*counts, k]``; ``counts[i]`` regions along axis ``i``,
+            1 leaving that axis whole.
 
     Returns:
-        ``(shaped, moved)`` -- the tensor split into regions, and the same
-        with the two region axes moved to the front.
+        ``(moved, inverse)`` -- the tensor split into regions with the
+        region axes moved to the front, and the permutation putting them
+        back.
 
     Raises:
-        ValueError: The grid does not divide the tensor's last two axes.
+        ValueError: The grid's rank or its extents do not fit the tensor.
     """
-    rows, cols = codebook.shape[0], codebook.shape[1]
-    if input.dim() < 2:
+    counts = tuple(codebook.shape[:-1])
+    if len(counts) != input.dim():
         raise ValueError(
-            f"a {rows}x{cols} region codebook needs two axes to tile, but "
-            f"the tensor reaching it has {input.dim()}"
+            f"a {list(counts)} region codebook tiles {len(counts)} axes, "
+            f"but the tensor reaching it has {input.dim()}"
         )
-    outer, inner = input.shape[-2], input.shape[-1]
-    if outer % rows or inner % cols:
+    if any(extent % count for extent, count in zip(input.shape, counts)):
         raise ValueError(
-            f"a {rows}x{cols} region codebook does not divide the "
-            f"{outer}x{inner} tensor reaching it"
+            f"a {list(counts)} region codebook does not divide the "
+            f"{list(input.shape)} tensor reaching it"
         )
-    shaped = input.reshape(
-        *input.shape[:-2], rows, outer // rows, cols, inner // cols
-    )
-    return shaped, shaped.movedim(-4, 0).movedim(-2, 1)
+    split = []
+    for extent, count in zip(input.shape, counts):
+        split += [count, extent // count]
+    # Region axes land on the even positions, their tiles on the odd ones.
+    order = list(range(0, 2 * len(counts), 2))
+    order += list(range(1, 2 * len(counts), 2))
+    inverse = [0] * len(order)
+    for position, axis in enumerate(order):
+        inverse[axis] = position
+    return input.reshape(split).permute(order), inverse
 
 
 def encode(
@@ -180,15 +181,12 @@ def encode(
 
     Args:
         input: Tensor to quantize, already divided by its block scale.
-        codebook: Entries in ascending order.  A 2-D codebook holds one
-            row per attention head -- or per group of consecutive heads,
-            when its row count divides the head count -- and is indexed
-            by ``input``'s ``HEAD_AXIS``.  A 3-D codebook ``[R, C, k]``
-            tiles the last two axes into ``R`` by ``C`` regions, each
-            decoding through its own entries: the grid a consumer's tiles
-            impose on a stored tensor.  ``R == 1`` leaves the second-last
-            axis whole, which is how an activation splits by channel
-            group alone.
+        codebook: Entries in ascending order.  A 1-D codebook is one
+            table for the whole tensor.  Otherwise it carries one axis per
+            input axis plus the entries, ``[*counts, k]``: ``counts[i]``
+            splits axis ``i`` into that many regions, each decoding
+            through its own entries, and 1 leaves the axis whole.  One
+            table per attention head is ``[1, heads, 1, 1, k]``.
         bounds: The midpoints between entries, passed when the caller
             wants the index each element falls to rather than the entry
             itself -- what a compiled graph stores, to be decoded where
@@ -199,8 +197,7 @@ def encode(
         element rounded to or that entry's index.
 
     Raises:
-        ValueError: A per-head codebook's rows neither match nor divide
-            the tensor's head count.
+        ValueError: The codebook's grid does not fit the tensor.
     """
     edges = bounds
     if edges is None:
@@ -213,37 +210,18 @@ def encode(
         picked = index if bounds is not None else codebook[index]
         return picked.to(input.dtype)
 
-    # A region grid over the last two axes: an element's position picks
-    # its table, the way a consumer's tiles pick one.
-    if codebook.dim() == 3:
-        shaped, moved = _region_view(input, codebook)
-        rows, cols = codebook.shape[0], codebook.shape[1]
-        flat = moved.reshape(rows * cols, -1).bfloat16().float()
-        table = codebook.reshape(rows * cols, -1)
-        edge = edges.reshape(rows * cols, -1)
-        index = torch.searchsorted(edge.contiguous(), flat.contiguous())
-        picked = index if bounds is not None else table.gather(1, index)
-        picked = picked.view(moved.shape).movedim(1, -2).movedim(0, -4)
-        return picked.reshape(input.shape).to(input.dtype)
-
-    # One row per head, which ``searchsorted`` reaches only when the head
-    # leads both operands: the rest of the tensor flattens behind it.
-    heads = input.shape[HEAD_AXIS]
-    rows = codebook.shape[0]
-    if rows != heads:
-        if rows == 0 or heads % rows:
-            raise ValueError(
-                f"the codebook holds {rows} rows, but the tensor reaching "
-                f"it has {heads} heads"
-            )
-        # A grouped codebook: consecutive heads share a row.
-        codebook = codebook.repeat_interleave(heads // rows, 0)
-        edges = edges.repeat_interleave(heads // rows, 0)
-    moved = input.movedim(HEAD_AXIS, 0)
-    flat = moved.reshape(heads, -1).bfloat16().float()
-    index = torch.searchsorted(edges.contiguous(), flat.contiguous())
-    picked = index if bounds is not None else codebook.gather(1, index)
-    return picked.view(moved.shape).movedim(0, HEAD_AXIS).to(input.dtype)
+    # A region grid: an element's position picks its table, the way a
+    # consumer's tiles pick one.  ``searchsorted`` reaches the tables only
+    # when they lead, so the regions flatten to rows and the rest behind.
+    moved, inverse = _region_view(input, codebook)
+    regions = codebook.numel() // codebook.shape[-1]
+    flat = moved.reshape(regions, -1).bfloat16().float()
+    table = codebook.reshape(regions, -1)
+    edge = edges.reshape(regions, -1)
+    index = torch.searchsorted(edge.contiguous(), flat.contiguous())
+    picked = index if bounds is not None else table.gather(1, index)
+    picked = picked.view(moved.shape).permute(inverse)
+    return picked.reshape(input.shape).to(input.dtype)
 
 
 def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
@@ -251,43 +229,27 @@ def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
 
     Args:
         input: Tensor of indices, as ``encode`` emitted them.
-        codebook: The entries.  A 2-D codebook holds one row per attention
-            head -- or per group of consecutive heads, when its row count
-            divides the head count -- and is indexed by ``input``'s
-            ``HEAD_AXIS``.  A 3-D codebook ``[R, C, k]`` tiles the last
-            two axes into ``R`` by ``C`` regions.
+        codebook: The entries.  A 1-D codebook is one table for the whole
+            tensor; otherwise it carries one axis per input axis plus the
+            entries, ``[*counts, k]``, and ``counts[i]`` regions split
+            axis ``i``.
 
     Returns:
         Tensor shaped like ``input``, holding the entry each index names.
 
     Raises:
-        ValueError: A per-head codebook's rows neither match nor divide
-            the tensor's head count.
+        ValueError: The codebook's grid does not fit the tensor.
     """
     index = input.to(torch.long)
     if codebook.dim() == 1:
         return codebook[index].to(input.dtype)
 
-    if codebook.dim() == 3:
-        rows, cols = codebook.shape[0], codebook.shape[1]
-        _, moved = _region_view(index, codebook)
-        table = codebook.reshape(rows * cols, -1)
-        picked = table.gather(1, moved.reshape(rows * cols, -1))
-        picked = picked.view(moved.shape).movedim(1, -2).movedim(0, -4)
-        return picked.reshape(index.shape).to(input.dtype)
-
-    heads = input.shape[HEAD_AXIS]
-    rows = codebook.shape[0]
-    if rows != heads:
-        if rows == 0 or heads % rows:
-            raise ValueError(
-                f"the codebook holds {rows} rows, but the tensor reaching "
-                f"it has {heads} heads"
-            )
-        codebook = codebook.repeat_interleave(heads // rows, 0)
-    moved = index.movedim(HEAD_AXIS, 0)
-    picked = codebook.gather(1, moved.reshape(heads, -1)).view(moved.shape)
-    return picked.movedim(0, HEAD_AXIS).to(input.dtype)
+    moved, inverse = _region_view(index, codebook)
+    regions = codebook.numel() // codebook.shape[-1]
+    table = codebook.reshape(regions, -1)
+    picked = table.gather(1, moved.reshape(regions, -1))
+    picked = picked.view(moved.shape).permute(inverse)
+    return picked.reshape(index.shape).to(input.dtype)
 
 
 quantized_ops_lib.define(

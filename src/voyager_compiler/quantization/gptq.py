@@ -22,7 +22,7 @@ import torch
 from torch.fx import Interpreter
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops import calculate_mx_qparam, vmap
+from voyager_compiler.ops import calculate_mx_qparam, quantize, vmap
 from voyager_compiler.quantization.lcq import EPS
 from voyager_compiler.shape_prop import fetch_attr
 
@@ -76,21 +76,6 @@ def hessian_inverse_chol(hessian, tokens, damping):
 SHRINK_GRID = (1.0, 0.93, 0.86, 0.79, 0.72)
 
 
-def quantize_rows(values, scale, fake_quant):
-    """Quantize one column (or block) through the deployed codebook.
-
-    Args:
-        values: ``[out]`` column, or ``[out, 64]`` block.
-        scale: One scale per output row, shaped to broadcast over
-            ``values``.
-        fake_quant: The fake-quant, for its lookup table.
-
-    Returns:
-        The dequantized values, shaped like ``values``.
-    """
-    return vmap((values / scale).bfloat16(), fake_quant.qmap).float() * scale
-
-
 def block_scale(block, weights, fake_quant, shrink):
     """Choose each row's scale for one microscaling block.
 
@@ -138,7 +123,10 @@ def block_scale(block, weights, fake_quant, shrink):
             .float()
             .clamp_min(EPS)
         )
-        quantized = quantize_rows(block, scale[:, None], fake_quant)
+        quantized = (
+            quantize(block, scale[:, None], qmap=fake_quant.qmap).float()
+            * scale[:, None]
+        )
         error = ((block - quantized).pow(2) * weights).sum(dim=1)
         if lowest is None:
             chosen, lowest = scale, error
@@ -223,8 +211,7 @@ def compensate_weight(
 
     Raises:
         ValueError: The weight's blocks do not run along its input
-            channels, which is the axis this walks, or its codebook is not
-            the single lookup table the walk quantizes through.
+            channels, which is the axis this walks.
     """
     block_size = fake_quant.block_size
     axis = fake_quant.ch_axis
@@ -233,14 +220,6 @@ def compensate_weight(
         raise ValueError(
             f"weight blocks run along axis {axis}, but the compensation "
             f"walks the input channels of a {tuple(weight.shape)} weight"
-        )
-    if fake_quant.qmap.dim() != 1:
-        # One table per weight, so a block's columns all decode the same
-        # way.  A codebook that varies within the weight would have to be
-        # resolved per column here, and per element where it deploys.
-        raise ValueError(
-            f"the compensation quantizes through one lookup table, but "
-            f"this weight carries a {tuple(fake_quant.qmap.shape)} codebook"
         )
     perm = (
         salience_order(hessian, weight.shape[1], within_block, block_size)
@@ -271,7 +250,14 @@ def compensate_weight(
         deltas = torch.zeros(weight.shape[0], end - start, device=weight.device)
         for offset, column in enumerate(range(start, end)):
             values = work[:, column]
-            quantized = quantize_rows(values, scale, fake_quant)
+            # The codebook names every axis of the weight, so a column
+            # enters as the column it is rather than a bare vector.
+            quantized = (
+                quantize(
+                    values[:, None], scale[:, None], qmap=fake_quant.qmap
+                ).float()[:, 0]
+                * scale
+            )
             out[:, column] = quantized
             delta = (values - quantized) / hinv_chol[column, column].clamp_min(
                 EPS
