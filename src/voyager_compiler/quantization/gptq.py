@@ -76,6 +76,21 @@ def hessian_inverse_chol(hessian, tokens, damping):
 SHRINK_GRID = (1.0, 0.93, 0.86, 0.79, 0.72)
 
 
+def quantize_rows(values, scale, fake_quant):
+    """Quantize one column (or block) through the deployed codebook.
+
+    Args:
+        values: ``[out]`` column, or ``[out, 64]`` block.
+        scale: One scale per output row, shaped to broadcast over
+            ``values``.
+        fake_quant: The fake-quant, for its lookup table.
+
+    Returns:
+        The dequantized values, shaped like ``values``.
+    """
+    return vmap((values / scale).bfloat16(), fake_quant.qmap).float() * scale
+
+
 def block_scale(block, weights, fake_quant, shrink):
     """Choose each row's scale for one microscaling block.
 
@@ -99,7 +114,7 @@ def block_scale(block, weights, fake_quant, shrink):
     Returns:
         One scale per output row.
     """
-    qmap, scale_qmap = fake_quant.qmap, fake_quant.scale_qmap
+    scale_qmap = fake_quant.scale_qmap
     base = (
         calculate_mx_qparam(
             block,
@@ -123,10 +138,7 @@ def block_scale(block, weights, fake_quant, shrink):
             .float()
             .clamp_min(EPS)
         )
-        quantized = (
-            vmap((block / scale[:, None]).bfloat16(), qmap).float()
-            * scale[:, None]
-        )
+        quantized = quantize_rows(block, scale[:, None], fake_quant)
         error = ((block - quantized).pow(2) * weights).sum(dim=1)
         if lowest is None:
             chosen, lowest = scale, error
@@ -211,7 +223,8 @@ def compensate_weight(
 
     Raises:
         ValueError: The weight's blocks do not run along its input
-            channels, which is the axis this walks.
+            channels, which is the axis this walks, or its codebook is not
+            the single lookup table the walk quantizes through.
     """
     block_size = fake_quant.block_size
     axis = fake_quant.ch_axis
@@ -220,6 +233,14 @@ def compensate_weight(
         raise ValueError(
             f"weight blocks run along axis {axis}, but the compensation "
             f"walks the input channels of a {tuple(weight.shape)} weight"
+        )
+    if fake_quant.qmap.dim() != 1:
+        # One table per weight, so a block's columns all decode the same
+        # way.  A codebook that varies within the weight would have to be
+        # resolved per column here, and per element where it deploys.
+        raise ValueError(
+            f"the compensation quantizes through one lookup table, but "
+            f"this weight carries a {tuple(fake_quant.qmap.shape)} codebook"
         )
     perm = (
         salience_order(hessian, weight.shape[1], within_block, block_size)
@@ -241,18 +262,16 @@ def compensate_weight(
 
     work = weight.float().clone()
     out = torch.zeros_like(work)
-    for start in range(0, weight.shape[1], block_size):
-        end = min(start + block_size, weight.shape[1])
+    columns = weight.shape[1]
+    for start in range(0, columns, block_size):
+        end = min(start + block_size, columns)
         scale = block_scale(
             work[:, start:end], salience[start:end], fake_quant, shrink
         )
         deltas = torch.zeros(weight.shape[0], end - start, device=weight.device)
         for offset, column in enumerate(range(start, end)):
             values = work[:, column]
-            quantized = (
-                vmap((values / scale).bfloat16(), fake_quant.qmap).float()
-                * scale
-            )
+            quantized = quantize_rows(values, scale, fake_quant)
             out[:, column] = quantized
             delta = (values - quantized) / hinv_chol[column, column].clamp_min(
                 EPS
@@ -413,6 +432,7 @@ def _cache_budget(device, reserve):
     return max(0, torch.cuda.mem_get_info(device)[0] - reserve)
 
 
+@torch.no_grad()
 def gptq(
     model,
     calibration,

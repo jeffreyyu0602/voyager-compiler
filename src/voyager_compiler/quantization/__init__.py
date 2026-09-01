@@ -16,12 +16,14 @@ from voyager_compiler.quantization.gptq import (
 )
 from voyager_compiler.quantization.lcq import (
     CodebookGrid,
+    Weighting,
     Histogram,
     codebook_qmap,
     fit_codebooks,
     load_codebooks,
     normal_float_levels,
     optimal_codebook,
+    to_integer_codebook,
     unit_scale,
     weighted_lloyd,
 )
@@ -54,6 +56,7 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 __all__ = [
     "CACHE_RESERVE",
     "CodebookGrid",
+    "Weighting",
     "Histogram",
     "DerivedQuantizationSpec",
     "FusedAmaxObsFakeQuantize",
@@ -82,6 +85,7 @@ __all__ = [
     "replace_softmax",
     "sink_obs_or_fq",
     "swap_matmul_inputs",
+    "to_integer_codebook",
     "unit_scale",
     "weighted_lloyd",
 ]
