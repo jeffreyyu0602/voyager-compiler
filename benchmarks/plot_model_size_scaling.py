@@ -14,6 +14,7 @@ compares it against the ``num_params`` the sweep recorded, and they must agree.
 """
 
 import argparse
+import functools
 import os
 
 import numpy as np
@@ -32,6 +33,8 @@ MODEL_IDS = {
 }
 
 BILLION = 1e9
+# Marker diameter in points; a label above a marker starts past its radius.
+MARKER_PT = 9
 
 
 def _dims(cfg):
@@ -105,14 +108,34 @@ def verify(table):
     return ok
 
 
+def _annotate(ax, point, text, rise, color):
+    """``text`` centered ``rise`` points above ``point`` (below, when
+    negative), in the series' color with a white halo."""
+    ax.annotate(
+        text,
+        point,
+        textcoords="offset points",
+        xytext=(0, rise),
+        ha="center",
+        va="bottom" if rise >= 0 else "top",
+        fontsize=style.VALUE_PT,
+        fontweight="bold",
+        color=color,
+        path_effects=style.HALO,
+    )
+
+
 def _draw_axis(fig, ax, points, xlabel, title, logx):
     """Draw a dual-axis line chart onto ``ax`` (latency left, DRAM right) over
-    numeric ``points`` -- ``(x, latency_s, dram_gb, label)``, each marker named.
+    numeric ``points`` -- ``(x, latency_s, dram_gb, label)``.  Every marker is
+    labeled with its value, and each latency marker named for its model.
     Returns ``(handles, names)`` for a shared legend; the caller owns the
-    figure, so this neither legends nor saves."""
+    figure, so this neither legends nor saves.  ``fig`` is unused: it is the
+    ``draw_pair`` callback signature."""
     x = np.array([p[0] for p in points], dtype=float)
     seconds = np.array([p[1] for p in points], dtype=float)
     gigabytes = np.array([p[2] for p in points], dtype=float)
+    names = [p[3] for p in points]
 
     style._grid(ax)
     lat = ax.plot(
@@ -121,13 +144,13 @@ def _draw_axis(fig, ax, points, xlabel, title, logx):
         color=style.COLORS[0],
         linewidth=2.5,
         marker="o",
-        markersize=9,
+        markersize=MARKER_PT,
         markeredgecolor="black",
         markeredgewidth=0.8,
         zorder=3,
     )[0]
-    ax.set_ylabel("Latency (s)", fontsize=style.LABEL_PT, fontweight="bold")
-    ax.set_xlabel(xlabel, fontsize=style.LABEL_PT, fontweight="bold")
+    ax.set_ylabel("Latency (s)", fontsize=style.HEADER_PT, fontweight="bold")
+    ax.set_xlabel(xlabel, fontsize=style.HEADER_PT, fontweight="bold")
     if logx:
         ax.set_xscale("log")
     style._limits(ax, list(seconds), False, headroom=style.LATENCY_HEADROOM)
@@ -140,60 +163,38 @@ def _draw_axis(fig, ax, points, xlabel, title, logx):
         linewidth=2.5,
         linestyle="--",
         marker="s",
-        markersize=9,
+        markersize=MARKER_PT,
         markeredgecolor="black",
         markeredgewidth=0.8,
         zorder=4,
     )[0]
-    right.set_ylabel("DRAM (GB)", fontsize=style.LABEL_PT, fontweight="bold")
+    right.set_ylabel("DRAM (GB)", fontsize=style.HEADER_PT, fontweight="bold")
     style._limits(right, list(gigabytes), False, headroom=style.DRAM_HEADROOM)
 
     for axis in (ax, right):
-        axis.tick_params(axis="both", labelsize=style.TICK_PT)
+        axis.tick_params(axis="both", labelsize=style.HEADER_PT)
         for lbl in axis.get_yticklabels() + axis.get_xticklabels():
             lbl.set_fontweight("bold")
 
-    # Name each design point next to its latency marker: the axis carries the
-    # size, but which model sits at that size is the reason to read the chart.
-    for xi, sec, (_, _, _, label) in zip(x, seconds, points):
-        ax.annotate(
-            label,
+    # Value labels sit outside the pair of lines -- latency below its marker,
+    # DRAM above -- so neither series' markers run through the other's digits
+    # (the DRAM line runs above the latency line by the two axes' headroom).
+    # Under each latency value goes the model's name: the axis gives the
+    # size, but which model sits there is the reason to read the chart.
+    clear = style.LABEL_PAD + MARKER_PT / 2
+    for xi, sec, gb, name in zip(x, seconds, gigabytes, names):
+        _annotate(ax, (xi, sec), style._fmt(sec), -clear, style.COLORS[0])
+        _annotate(
+            ax,
             (xi, sec),
-            textcoords="offset points",
-            xytext=(0, -style.LINE_HEIGHT * style.VALUE_PT),
-            ha="center",
-            va="top",
-            fontsize=style.VALUE_PT,
-            fontweight="bold",
-            color=style.COLORS[0],
-            path_effects=style.HALO,
+            name,
+            -(clear + style.LINE_HEIGHT * style.VALUE_PT),
+            style.COLORS[0],
         )
+        _annotate(right, (xi, gb), style._fmt(gb), clear, style.COLORS[1])
 
-    ax.set_title(title, fontsize=style.TITLE_PT, fontweight="bold")
+    ax.set_title(title, fontsize=style.HEADER_PT, fontweight="bold")
     return [lat, dram], ["Latency", "DRAM Traffic"]
-
-
-def draw_stacked(panels, xlabel, suptitle, logx, out_dir, stem):
-    """Stack the ``panels`` -- ``(points, mode_title)`` top to bottom, prefill
-    above decode -- under one ``suptitle``.  Both plot the same x (parameters),
-    so they share one x-axis, labeled once at the bottom."""
-    w, h = style.FIGSIZE
-    fig, axes = style.plt.subplots(
-        len(panels),
-        1,
-        figsize=(w, h * len(panels)),
-        layout="constrained",
-        sharex=True,
-    )
-    fig.get_layout_engine().set(hspace=style.PAIR_HSPACE)
-    handles = names = None
-    for ax, (points, mode) in zip(axes, panels):
-        handles, names = _draw_axis(fig, ax, points, xlabel, mode, logx)
-        ax.title.set_fontsize(style.PAIR_TITLE_PT)
-        ax.label_outer()  # keep only the bottom panel's shared x labels
-    fig.suptitle(suptitle, fontsize=style.TITLE_PT, fontweight="bold")
-    style._legend(fig, handles, names, ncol=len(names))
-    return style._save(fig, out_dir, stem)
 
 
 def parse_args():
@@ -236,15 +237,21 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
 
-    # Parameter scaling: prefill over decode, both vs #params, stacked.
-    written = draw_stacked(
+    # Parameter scaling: prefill over decode, both vs #params, one shared
+    # x-axis.
+    written = style.draw_pair(
         [
-            (_points(rows, table, "prefill"), "Prefill"),
-            (_points(rows, table, "decode"), "Decode"),
+            functools.partial(
+                _draw_axis,
+                points=_points(rows, table, mode),
+                xlabel="Parameters (B)",
+                title=mode.capitalize(),
+                logx=args.logx,
+            )
+            for mode in style.MODES
         ],
-        "Parameters (B)",
-        "Latency and DRAM Traffic v.s. Parameters",
-        args.logx,
+        "Latency and DRAM Traffic vs. Parameters",
+        style.FIGSIZE,
         args.out,
         "params_scaling",
     )

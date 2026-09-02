@@ -511,12 +511,12 @@ def _write_metric_sheet(ws, sheet):
     # DRAM Weight/Activation/KV breakdown (right).
     for g, is_pre, start, end, head, axis in blocks:
         lat = build_chart(
-            ws, f"{head} Latency and DRAM Traffic v.s. {axis}", start, end
+            ws, f"{head} Latency and DRAM Traffic vs. {axis}", start, end
         )
         lat.anchor = _anchor(g, is_pre, base_col=14)
         ws.add_chart(lat)
         brk = build_dram_breakdown(
-            ws, f"{head} DRAM Traffic Breakdown v.s. {axis}", start, end
+            ws, f"{head} DRAM Traffic Breakdown vs. {axis}", start, end
         )
         brk.anchor = _anchor(g, is_pre, base_col=28)
         ws.add_chart(brk)

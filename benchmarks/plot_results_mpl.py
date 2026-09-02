@@ -446,11 +446,14 @@ def _rows(ws):
 
 
 def _chart_titles(ws):
-    """The sheet's chart titles, in the order the charts were added."""
+    """The sheet's chart titles, in the order the charts were added.  A
+    workbook written before the titles spelled ``vs.`` carries ``v.s.``; it
+    is read as ``vs.``."""
     titles = []
     for chart in ws._charts:
         rich = chart.title.tx.rich
-        titles.append("".join(r.t or "" for p in rich.p for r in (p.r or [])))
+        text = "".join(r.t or "" for p in rich.p for r in (p.r or []))
+        titles.append(text.replace("v.s.", "vs."))
     return titles
 
 
