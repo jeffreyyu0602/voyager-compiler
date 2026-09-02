@@ -24,8 +24,6 @@ from voyager_compiler.quantization.lcq import (
     normal_float_levels,
     optimal_codebook,
     to_integer_codebook,
-    unit_scale,
-    weighted_lloyd,
 )
 from voyager_compiler.quantization.qconfig import QConfig, get_qconfig
 from voyager_compiler.quantization.qspec import QScheme
@@ -86,6 +84,4 @@ __all__ = [
     "sink_obs_or_fq",
     "swap_matmul_inputs",
     "to_integer_codebook",
-    "unit_scale",
-    "weighted_lloyd",
 ]

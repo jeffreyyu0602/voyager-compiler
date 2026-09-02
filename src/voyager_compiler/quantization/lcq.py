@@ -7,16 +7,15 @@ levels it decodes to change.  It applies not to a tensor's raw values but to
 normalized space.  How many levels there are, and what range they span, is
 the caller's to say -- nothing here assumes a size or a grid.
 
-Two solvers fit the levels to measured samples: ``weighted_lloyd`` refines
-from a seed, and ``optimal_codebook`` returns the exact weighted-MSE minimum
-by dynamic programming.  Weighting each sample by its channel's downstream
-energy is what makes either minimize layer-output error rather than tensor
-MSE.  Squared error alone is blind to zero and will spend that level
-elsewhere, which under block scaling forces a block's many small values to
-at least one step off zero -- pass ``pin_zero`` to forbid it.
+``optimal_codebook`` fits the levels to measured samples: the exact
+weighted-MSE minimum over an accumulated ``Histogram``, by dynamic
+programming.  Weighting each sample by its channel's downstream energy is
+what makes it minimize layer-output error rather than tensor MSE.  Squared
+error alone is blind to zero and will spend that level elsewhere, which
+under block scaling forces a block's many small values to at least one step
+off zero -- pass ``pin_zero`` to forbid it.
 """
 
-import dataclasses
 import enum
 import json
 import logging
@@ -27,7 +26,8 @@ import numpy as np
 import torch
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops.quantized import QMAP_SIZE, vmap
+from voyager_compiler.ops import calculate_mx_qparam, expand
+from voyager_compiler.ops.quantized import QMAP_SIZE
 from voyager_compiler.quantization.dtypes import create_normal_map
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,6 @@ HISTOGRAM_BINS = 4001
 ACCUMULATE_CHUNK = 1 << 25
 
 
-@dataclasses.dataclass
 class Histogram:
     """Weighted moments of one tensor's normalized values, per bin.
 
@@ -68,11 +67,10 @@ class Histogram:
         bins: Resolution the range is divided into.
     """
 
-    quant_min: float
-    quant_max: float
-    bins: int = HISTOGRAM_BINS
-
-    def __post_init__(self):
+    def __init__(self, quant_min, quant_max, bins=HISTOGRAM_BINS):
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        self.bins = bins
         self.weight = None
         self.total = None
         self.square = None
@@ -155,54 +153,11 @@ class CodebookGrid(enum.Enum):
     FLOAT = "float"
 
 
-def block_scales(x, block_size, quant_max, scale_qmap=None):
-    """Return the scale each microscaling block is divided by.
-
-    Args:
-        x: Tensor whose last axis is the contraction axis.
-        block_size: Elements sharing one scale.
-        quant_max: Largest magnitude the codebook can represent.
-        scale_qmap: Codebook the scale is itself quantized into, as
-            deployment quantizes it.  None returns the exact
-            ``amax / quant_max``, which is not the number the decoder
-            divides by: it can only store a scale its own codebook holds.
-
-    Returns:
-        One scale per block, shaped ``[blocks, 1]``.
-    """
-    amax = x.float().reshape(-1, block_size).abs().amax(-1, keepdim=True)
-    if scale_qmap is None:
-        return amax.clamp_min(EPS) / quant_max
-    # Matching ``calculate_mx_qparam``, down to what it does with a scale
-    # that underflows its codebook: replace it with one, not with a floor.
-    scale = vmap(amax / quant_max, scale_qmap)
-    return torch.where(scale > 0.0, scale, 1.0)
-
-
-def unit_scale(x, block_size, quant_max, scale_qmap=None):
-    """Return ``x / blockscale`` under block-amax microscaling.
-
-    Args:
-        x: Tensor whose last axis is the contraction axis.
-        block_size: Elements sharing one scale.
-        quant_max: Largest magnitude the codebook can represent.
-        scale_qmap: Codebook the block scale is quantized into; see
-            ``block_scales``.
-
-    Returns:
-        Tensor shaped like ``x``.  Its per-block maximum is ``quant_max``
-        under an exact scale, and near it under a quantized one.
-    """
-    x = x.float()
-    scale = block_scales(x, block_size, quant_max, scale_qmap)
-    return (x.reshape(-1, block_size) / scale).reshape(x.shape)
-
-
 def to_integer_codebook(values, quant_max, quant_min=None):
     """Project float levels onto distinct integers, endpoints pinned.
 
     The block maximum always lands on the outermost level, so both endpoints
-    are forced to the range ends; letting them float measured worse.
+    are forced to the range ends.
 
     Args:
         values: Candidate levels, any order.
@@ -256,65 +211,6 @@ def normal_float_levels(k, quant_max, grid=CodebookGrid.INTEGER):
     return to_integer_codebook(levels, quant_max, -quant_max)
 
 
-def weighted_lloyd(
-    u,
-    weights,
-    k,
-    quant_max,
-    quant_min=None,
-    iters=15,
-    init=None,
-    grid=CodebookGrid.INTEGER,
-):
-    """Fit a codebook by weighted Lloyd-Max on normalized samples.
-
-    Weighting each sample by its input channel's downstream energy makes the
-    fit minimize layer-output error rather than tensor MSE, which is where
-    most of the accuracy comes from.
-
-    Args:
-        u: Flat tensor of ``x / blockscale`` samples.
-        weights: Per-sample weights, same shape as ``u``.
-        iters: Alternating assign/update rounds.
-        k: Number of levels, used only when ``init`` is not given.
-        init: Starting levels; defaults to NormalFloat, or to a uniform
-            ladder when the range is not symmetric, which NF4 cannot seed.
-        quant_max: Largest representable magnitude.
-        quant_min: Smallest representable value; see ``to_integer_codebook``.
-        grid: Whether the levels are snapped to integers or left at full
-            precision.
-
-    Returns:
-        The fitted codebook, ascending and distinct: integers on the
-        integer grid, floats on the float grid.
-    """
-    quant_min = -quant_max if quant_min is None else quant_min
-    if init is None:
-        init = (
-            normal_float_levels(k, quant_max)
-            if quant_min == -quant_max
-            else torch.linspace(quant_min, quant_max, k).tolist()
-        )
-    codebook = torch.tensor(init, dtype=torch.float32, device=u.device)
-    weights = (weights / weights.mean().clamp_min(EPS)).clamp(0, 100)
-    for _ in range(iters):
-        assignment = (u.unsqueeze(-1) - codebook).abs().argmin(-1)
-        for level in range(codebook.numel()):
-            member = assignment == level
-            if member.any():
-                codebook[level] = (u[member] * weights[member]).sum() / weights[
-                    member
-                ].sum().clamp_min(EPS)
-        codebook = codebook.sort().values
-    levels = codebook.tolist()
-    if grid is CodebookGrid.INTEGER:
-        return to_integer_codebook(levels, quant_max, quant_min)
-    # The block maximum lands on the outermost level either way, so both
-    # ends are pinned on the float grid too.
-    levels[0], levels[-1] = float(quant_min), float(quant_max)
-    return levels
-
-
 def codebook_qmap(entries, device=None):
     """Build the 65536-entry bf16 lookup table a fake-quant consumes.
 
@@ -350,12 +246,11 @@ def optimal_codebook(
 
     Levels are ``k`` distinct candidates in ``[quant_min, quant_max]`` --
     every integer, or ``resolution`` points across the range -- and
-    nearest-neighbour
-    assignment puts the boundary between two chosen levels at their midpoint.
-    Cluster membership is therefore an interval, which makes the exact
-    minimizer of the weighted squared error a shortest path over
-    ``(previous level, current level)`` states -- no initialization, no local
-    minima.  Lloyd-Max lands 2-7% above this.
+    nearest-neighbour assignment puts the boundary between two chosen levels
+    at their midpoint.  Cluster membership is therefore an interval, which
+    makes the exact minimizer of the weighted squared error a shortest path
+    over ``(previous level, current level)`` states -- no initialization, no
+    local minima.
 
     Args:
         histogram: Accumulated weighted moments of the tensor's
@@ -528,18 +423,30 @@ def _channel_energy(tensor, ch_axis):
     return flat.reshape(-1, flat.shape[-1]).pow(2).mean(0)
 
 
-#: Ops that contract their first two arguments against each other.  Only
-#: there is a codebook's job defined: the block runs along the contraction
-#: axis, and the error a level makes reaches the output scaled by the other
-#: operand.  The quantizer also annotates elementwise ops -- a residual add,
-#: a softmax -- whose operands have neither.  Any remaining argument is a
-#: bias or a stride, not an operand.
-CONTRACTED_OPS = (
-    torch.ops.aten.linear.default,
-    torch.ops.aten.matmul.default,
-    torch.ops.aten.conv1d.default,
-    torch.ops.aten.conv2d.default,
-)
+def _constant(node):
+    """Whether a node yields the same tensor on every calibration entry.
+
+    A parameter is, and so is a fake-quant reading one directly.
+    """
+    return node.op == "get_attr" or (
+        node.op == "call_module"
+        and getattr(node.args[0], "op", None) == "get_attr"
+    )
+
+
+#: Ops that contract their first two arguments against each other, mapped
+#: to the axis each of the two positions contracts along.  Only there is a
+#: codebook's job defined: the block runs along the contraction axis, and
+#: the error a level makes reaches the output scaled by the other operand
+#: on the shared axis.  The quantizer also annotates elementwise ops -- a
+#: residual add, a softmax -- whose operands have neither.  Any remaining
+#: argument is a bias or a stride, not an operand.
+CONTRACTED_OPS = {
+    torch.ops.aten.linear.default: (-1, -1),
+    torch.ops.aten.matmul.default: (-1, -2),
+    torch.ops.aten.conv1d.default: (1, 1),
+    torch.ops.aten.conv2d.default: (1, 1),
+}
 
 
 def _quantized_operands(model, skip):
@@ -674,9 +581,10 @@ def _accumulate(
             scale squared.  Without it every block votes equally on where
             the levels sit, however large its values are.
         quantized_scale: Normalize by the scale deployment can store --
-            the block maximum pushed through the scale codebook -- rather
-            than the exact ``amax / quant_max``.  The decoder divides by
-            the former, so the latter places the levels against values it
+            the block maximum pushed through the scale codebook, and its
+            power-of-two floor when the module forces one -- rather than
+            the exact ``amax / quant_max``.  The decoder divides by the
+            former, so the latter places the levels against values it
             never sees.
     """
     ordered = _contraction_last(tensor.detach(), module.ch_axis)
@@ -689,16 +597,27 @@ def _accumulate(
     if threshold is not None:
         kept = ordered.abs() < threshold
         ordered = ordered * kept
+    ordered = ordered.float()
     # One scale serves both the normalization and the squared-scale weight,
-    # so the two halves of the objective refer to the same number.
-    scale = block_scales(
+    # so the two halves of the objective refer to the same number -- the
+    # one deployment computes: its blocks pad out along the contraction
+    # axis rather than running past it.
+    scale = calculate_mx_qparam(
         ordered,
-        module.block_size,
-        module.quant_max,
-        getattr(module, "scale_qmap", None) if quantized_scale else None,
+        axes=-1,
+        block_size=module.block_size,
+        quant_max=module.quant_max,
+        force_scale_power_of_two=(
+            getattr(module, "force_scale_power_of_two", False)
+            if quantized_scale
+            else False
+        ),
+        scale_qmap=(
+            getattr(module, "scale_qmap", None) if quantized_scale else None
+        ),
     )
-    flat = ordered.float().reshape(-1, module.block_size)
-    normalized = (flat / scale).reshape(-1)
+    scale = expand(scale, ordered.shape, module.block_size)
+    normalized = (ordered / scale).reshape(-1)
     if energy is None:
         weights = torch.ones_like(normalized)
     else:
@@ -709,7 +628,7 @@ def _accumulate(
     if kept is not None:
         weights = weights * kept.reshape(-1)
     if scale_weighted:
-        weights = weights * (scale**2).expand_as(flat).reshape(-1)
+        weights = weights * (scale**2).reshape(-1)
     histogram.add(normalized, weights)
 
 
@@ -776,30 +695,6 @@ def _grid_cells(tensor, counts):
     return cells
 
 
-def _padded_counts(counts, rank, head_axis):
-    """Widen an older dump's table counts to one per operand axis.
-
-    Args:
-        counts: Counts as the dump spells them -- the head count alone,
-            or a grid over the trailing axes.
-        rank: The operand's rank, or None when the graph does not say.
-        head_axis: The counts name the attention head axis, which leads
-            from the front, rather than trailing axes.
-
-    Returns:
-        One count per axis, 1 where the dump splits nothing.
-    """
-    if rank is None or rank <= len(counts):
-        return list(counts)
-    if head_axis:
-        padded = [1] * rank
-        # Attention operands all enter their matmul as ``[batch, head,
-        # ...]``, which is the axis those dumps indexed.
-        padded[1] = counts[0]
-        return padded
-    return [1] * (rank - len(counts)) + list(counts)
-
-
 def leading_split(counts):
     """Return the leading axis a granularity splits, or None.
 
@@ -835,25 +730,31 @@ def leading_split(counts):
     return lead[0]
 
 
-def install_codebook(module, levels):
+def install_codebook(module, levels, counts=None):
     """Write fitted levels into a fake-quant, in place.
 
     The levels replace the fake-quant's quantization map outright, since
     that map is what ``quantize`` reads and what ``convert_pt2e`` hands to
     the graph.  One table per tensor stays a lookup table, so nothing
-    downstream sees a change; one table per head cannot be a lookup table
+    downstream sees a change.  A grid of tables cannot be a lookup table
     -- an entry per bfloat16 bit pattern has no room for a second index --
-    and is installed as the codebook itself, which ``quantize`` searches.
+    and is installed as a ``[*counts, k]`` codebook, which ``quantize``
+    searches with each element's position picking its table.
 
     Args:
         module: The fake-quant the levels belong to.
-        levels: One table of integers, or one table per attention head.
+        levels: One table of integers, or one table per grid cell in
+            row-major order when ``counts`` is given.
+        counts: How many tables along each operand axis, for a grid of
+            them.  None installs ``levels`` as the tensor's one table.
     """
     device = module.qmap.device
-    if isinstance(levels[0], (list, tuple)):
-        module.qmap = torch.tensor(levels, dtype=torch.float32, device=device)
-    else:
+    if counts is None:
         module.qmap = codebook_qmap(levels, device)
+    else:
+        module.qmap = torch.tensor(
+            levels, dtype=torch.float32, device=device
+        ).reshape(*counts, -1)
 
 
 #: The op a weight's tap wraps.  A conv's weight contracts over its
@@ -885,6 +786,29 @@ def _tap_output(call, note):
         if output.requires_grad:
             output.register_hook(lambda grad: note(args[0], grad))
         return output
+
+    return tapped
+
+
+def _tap_operands(call, note):
+    """Wrap an op so ``note`` sees its arguments, per call.
+
+    A partner with no fake-quant has no module to hook, but it is always
+    an argument of the contracted op reading it, so that node is pointed
+    at a wrapper the way ``_tap_output``'s is.
+
+    Args:
+        call: What the node calls today.
+        note: Called as ``note(args)`` with the op's positional arguments
+            before it runs.
+
+    Returns:
+        A stand-in with the same signature, for the node to point at.
+    """
+
+    def tapped(*args, **kwargs):
+        note(args)
+        return call(*args, **kwargs)
 
     return tapped
 
@@ -926,11 +850,10 @@ def _accumulate_fisher(
         fisher: Dict filled with each operand's per-channel Fisher
             weight.  Operands absent from it fall back to their partner.
         tap_weights: Also weight the parameters, by the taps described
-            above.  Off because it measured *worse* than leaving them on
-            the partner energy (7.130313 against 7.112759): the exact
-            diagonal carries a per-token ``||g_t||^2`` factor that a few
-            high-loss calibration tokens dominate, and that concentration
-            is a property of the calibration set rather than the weight.
+            above.  A parameter's exact diagonal carries a per-token
+            ``||g_t||^2`` factor that a few high-loss calibration tokens
+            dominate -- a property of the calibration set rather than the
+            weight -- so the default leaves parameters on partner energy.
     """
 
     def per_channel(grad, ch_axis):
@@ -956,8 +879,24 @@ def _accumulate_fisher(
 
     def note_weight(name, activation, grad):
         rows = activation.detach().reshape(-1, activation.shape[-1]).float()
-        norms = grad.detach().reshape(-1, grad.shape[-1]).float().pow(2).sum(-1)
-        per = (rows.pow(2) * norms.unsqueeze(1)).sum(0)
+        grads = grad.detach().reshape(-1, grad.shape[-1]).float().pow(2)
+        if name in grid:
+            # The weight is ``[out, in]`` -- one axis from each factor --
+            # so a cell's diagonal pairs its output band's norms with its
+            # input band's columns, in the same row-major cell order the
+            # collection indexes.
+            counts = _resolve_counts(
+                grid[name], (grad.shape[-1], activation.shape[-1])
+            )
+            per = torch.stack(
+                [
+                    (band.pow(2) * norm.sum(-1, keepdim=True)).sum(0)
+                    for norm in grads.chunk(counts[0], -1)
+                    for band in rows.chunk(counts[1], -1)
+                ]
+            )
+        else:
+            per = (rows.pow(2) * grads.sum(-1, keepdim=True)).sum(0)
         fisher[name] = per if name not in fisher else fisher[name] + per
 
     handles, tapped = [], {}
@@ -1023,9 +962,10 @@ class Weighting(enum.Enum):
     the fit minimizes the whole model's output error rather than the
     immediate layer's -- an operand no per-token gradient reaches falls
     back to ``PARTNER``.  ``FISHER_ALL`` extends the diagonal to the
-    parameters by tapping each linear's output gradient, which measured
-    worse than leaving them on partner energy.  ``NONE`` weights nothing,
-    and recovers less than half as much.
+    parameters by tapping each linear's output gradient; a parameter's
+    exact diagonal is dominated by a few high-loss calibration tokens, so
+    the default leaves parameters on partner energy.  ``NONE`` weights
+    nothing and fits plain tensor MSE.
     """
 
     NONE = "none"
@@ -1050,11 +990,14 @@ def fit_codebooks(
 ):
     """Fit a codebook to every tensor a prepared model quantizes, in place.
 
-    Runs the calibration set twice: once to measure every operand's channel
-    energy and sign, and once to bin every element of each operand weighted
-    by its *partner's* energy, so the fit minimizes layer-output error
-    rather than tensor MSE.  Nothing is sampled, so a fit is reproducible
-    and sees the whole tensor.  Block size, contraction axis and range come
+    Runs the calibration set twice: once to measure channel energies and
+    signs -- a partner needs no codebook of its own to be measured: one
+    with any fake-quant is hooked there, and a bare tensor is read at the
+    contracted op that consumes it -- and once to
+    bin every element of each operand weighted by its *partner's* energy,
+    so the fit minimizes layer-output error rather than tensor MSE.
+    Nothing is sampled, so a fit is reproducible and sees the whole
+    tensor.  Block size, contraction axis and range come
     from the fake-quant the quantizer already attached to each tensor, and
     the fitted levels are written back into that module's lookup table.
 
@@ -1068,7 +1011,8 @@ def fit_codebooks(
             the two Fisher modes the operand's own loss-gradient diagonal,
             ``NONE`` no weighting at all.
         weight_by: Substrings picking which partners weight a tensor read
-            by several ops; empty adds every partner's energy.
+            by several ops; empty adds every partner's energy.  Only a
+            partner that is itself quantized has a name to be picked by.
         granularity: ``name substring -> counts``, how many codebooks a
             tensor is fitted along each axis.  The tuple aligns to the
             trailing axes: ``-1`` gives one table per item of that axis,
@@ -1085,7 +1029,9 @@ def fit_codebooks(
             one per table the tensor is fitted.  Fresh by default.
 
     Returns:
-        ``name -> the fitted levels``, for every tensor fitted.
+        ``name -> the fitted levels`` for every tensor fitted: one table
+        as a list of levels, a grid of them as
+        ``{"granularity": counts, "levels": tables}``.
     """
     operands = _quantized_operands(model, skip)
     logger.info(
@@ -1112,12 +1058,12 @@ def fit_codebooks(
     named = {node: name for name, (_, node, _) in operands.items()}
     partners = {
         name: [
-            found
+            named.get(partner, partner.name)
             for partner in group
-            if (found := named.get(partner)) is not None
-            and (not weight_by or any(pick in found for pick in weight_by))
+            if not weight_by
+            or any(pick in named.get(partner, "") for pick in weight_by)
         ]
-        or [named.get(partner) for partner in group]
+        or [named.get(partner, partner.name) for partner in group]
         for name, (_, _, group) in operands.items()
     }
     grid = {}
@@ -1137,7 +1083,6 @@ def fit_codebooks(
             other: axis
             for name, axis in list(leading.items())
             for other in partners[name]
-            if other
         }
     )
     if grid:
@@ -1160,19 +1105,22 @@ def fit_codebooks(
         for module in live:
             module.fake_quant_enabled.zero_()
 
-    def measure(name, module, tensor):
-        axis = leading.get(name)
+    def note_energy(key, ch_axis, tensor):
+        axis = leading.get(key)
         if axis is not None:
             share = torch.stack(
                 [
-                    _channel_energy(piece, module.ch_axis)
+                    _channel_energy(piece, ch_axis)
                     for piece in tensor.unbind(axis)
                 ]
             )
         else:
-            share = _channel_energy(tensor, module.ch_axis)
-        held = energies.get(name)
-        energies[name] = share if held is None else held + share
+            share = _channel_energy(tensor, ch_axis)
+        held = energies.get(key)
+        energies[key] = share if held is None else held + share
+
+    def measure(name, module, tensor):
+        note_energy(name, module.ch_axis, tensor)
         lowest = tensor.detach().min()
         held = floors.get(name)
         floors[name] = lowest if held is None else torch.minimum(held, lowest)
@@ -1187,6 +1135,11 @@ def fit_codebooks(
             )
             settled_counts[name] = counts
         axis = leading.get(name)
+        channel = (
+            module.ch_axis[0]
+            if isinstance(module.ch_axis, (tuple, list))
+            else module.ch_axis
+        )
         cells = _grid_cells(tensor, counts)
         if name not in histograms:
             # A tensor that never went negative -- a softmax output -- would
@@ -1217,25 +1170,18 @@ def fit_codebooks(
             share = energy
             if share is not None and share.dim() == 2:
                 if from_fisher:
-                    # Already one row per cell, in this same order.
                     share = share[cell]
                 elif axis is None:
-                    # Measured per slice for a partner's sake, but this
-                    # tensor is not split along that axis, so it pools
-                    # every slice.
                     share = share.mean(0)
                 else:
-                    # Pooling a per-slice energy is averaging it: every
-                    # slice contributes the same count to the mean, so a
-                    # grouped split averages its group's rows.
-                    per = share.shape[0] // counts[axis]
-                    start = index[axis] * per
-                    share = share[start : start + per].mean(0)
-            if share is not None and counts[-1] > 1 and not from_fisher:
-                # The energy indexes the contraction axis, so a cell is
-                # weighted by the columns it holds -- the same slice for
-                # every row band, which is what the column index picks out.
-                share = share.chunk(counts[-1])[index[-1]]
+                    start = index[axis] * share.shape[0] // counts[axis]
+                    stop = (index[axis] + 1) * share.shape[0] // counts[axis]
+                    share = share[start : max(stop, start + 1)].mean(0)
+            if share is not None and not from_fisher and counts[channel] > 1:
+                # The energy indexes the contraction axis, so only a cell
+                # split along it holds a slice of the channels; any other
+                # split leaves every cell the whole vector.
+                share = share.chunk(counts[channel])[index[channel]]
             _accumulate(
                 slab,
                 module,
@@ -1251,10 +1197,37 @@ def fit_codebooks(
     # minimum where it was.  Visiting one anyway is most of the work, since
     # a model's parameters outweigh one input's activations many times over.
     static = {
-        name
-        for name, (_, node, _) in operands.items()
-        if getattr(node.args[0], "op", None) == "get_attr"
+        name for name, (_, node, _) in operands.items() if _constant(node)
     }
+
+    outside, hooked, covered = {}, [], set()
+    for _, node, group in operands.values():
+        for partner in group:
+            if partner in named or partner in covered:
+                continue
+            covered.add(partner)
+            consumer = next(
+                user
+                for user in node.users
+                if user.target in CONTRACTED_OPS
+                and node in user.args[:2]
+                and partner in user.args[:2]
+            )
+            spot = consumer.args[:2].index(partner)
+            axis = CONTRACTED_OPS[consumer.target][spot]
+            if partner.op == "call_module":
+                hooked.append(
+                    (
+                        model.get_submodule(partner.target),
+                        partner.name,
+                        axis,
+                        _constant(partner),
+                    )
+                )
+            else:
+                outside.setdefault(consumer, []).append(
+                    (spot, partner.name, axis, _constant(partner))
+                )
 
     if weighting in (Weighting.FISHER_ACTIVATIONS, Weighting.FISHER_ALL):
         _accumulate_fisher(
@@ -1300,6 +1273,34 @@ def fit_codebooks(
                 )
                 for name, (module, _, _) in operands.items()
             ]
+            tapped = {}
+            if visit is measure:
+
+                def once_energy(key, axis, fixed, tensor, settled=settled):
+                    if fixed:
+                        if key in settled:
+                            return
+                        settled.add(key)
+                    note_energy(key, axis, tensor)
+
+                handles += [
+                    module.register_forward_pre_hook(
+                        lambda _, inputs, key=key, axis=axis, fixed=fixed: (
+                            once_energy(key, axis, fixed, inputs[0])
+                        )
+                    )
+                    for module, key, axis, fixed in hooked
+                ]
+                for consumer, jobs in outside.items():
+
+                    def note(args, jobs=jobs):
+                        for spot, key, axis, fixed in jobs:
+                            once_energy(key, axis, fixed, args[spot])
+
+                    tapped[consumer] = consumer.target
+                    consumer.target = _tap_operands(consumer.target, note)
+                if tapped:
+                    model.recompile()
             step = max(1, len(calibration) // 10)
             for index, entry in enumerate(calibration):
                 model(*entry)
@@ -1312,6 +1313,10 @@ def fit_codebooks(
                     )
             for handle in handles:
                 handle.remove()
+            for consumer, target in tapped.items():
+                consumer.target = target
+            if tapped:
+                model.recompile()
 
     for module, enabled in live.items():
         module.fake_quant_enabled.copy_(enabled)
@@ -1333,8 +1338,8 @@ def fit_codebooks(
         if spread:
             spread = torch.tensor(spread)
             logger.info(
-                "%s concentration over %d operands (max/median per "
-                "operand): median %.3g, p90 %.3g, worst %.3g",
+                "%s concentration over %d tensors (max/median per "
+                "tensor): median %.3g, p90 %.3g, worst %.3g",
                 label,
                 len(spread),
                 spread.median(),
@@ -1358,9 +1363,9 @@ def fit_codebooks(
         # module already carries says it: a lookup table by how many
         # distinct entries it holds, a codebook by its width.
         k = (
-            module.qmap.shape[-1]
-            if module.qmap.numel() < QMAP_SIZE
-            else int(torch.unique(module.qmap).numel())
+            int(torch.unique(module.qmap).numel())
+            if module.qmap.numel() == QMAP_SIZE and module.qmap.dim() == 1
+            else module.qmap.shape[-1]
         )
         fitted = [
             optimal_codebook(histogram, k=k, pin_zero=pin_zero)
@@ -1374,9 +1379,7 @@ def fit_codebooks(
             tables[name] = fitted[0]
             install_codebook(module, tables[name])
         else:
-            module.qmap = torch.tensor(
-                fitted, dtype=torch.float32, device=module.qmap.device
-            ).reshape(*counts, k)
+            install_codebook(module, fitted, counts)
             tables[name] = {"granularity": list(counts), "levels": fitted}
         logger.debug("%s: %s", name, tables[name])
 
@@ -1405,10 +1408,7 @@ def load_codebooks(model, tables, skip=()):
             as ``fit_codebooks`` writes with ``dump``.  One table is a
             list of levels; a grid of them is
             ``{"granularity": counts, "levels": ...}``, one count per
-            operand axis.  Older dumps spell a grid over the trailing
-            axes ``{"regions": [R, C], ...}`` or ``{"channel_groups": G}``,
-            and a bare list of tables means one per attention head; both
-            are padded out to the operand's rank.
+            operand axis.
         skip: Substrings of operand names to leave alone.
 
     Returns:
@@ -1421,6 +1421,11 @@ def load_codebooks(model, tables, skip=()):
     if isinstance(tables, (str, os.PathLike)):
         with open(tables) as handle:
             tables = json.load(handle)
+    tables = {
+        name: entry
+        for name, entry in tables.items()
+        if not any(excluded in name for excluded in skip)
+    }
 
     operands = _quantized_operands(model, skip)
     unknown = sorted(set(tables) - set(operands))
@@ -1430,31 +1435,11 @@ def load_codebooks(model, tables, skip=()):
             f"quantizes, starting with {unknown[0]}"
         )
     for name, entry in tables.items():
-        module, operand = operands[name][0], operands[name][1]
-        value = operand.meta.get("val", getattr(operand, "value", None))
-        rank = value.dim() if value is not None else None
-        if not isinstance(entry, dict):
-            if not isinstance(entry[0], (list, tuple)):
-                install_codebook(module, entry)
-                continue
-            # A dump from before a codebook carried one axis per operand
-            # axis: its rows indexed the attention head axis.
-            counts = _padded_counts([len(entry)], rank, head_axis=True)
-        elif "granularity" in entry:
-            counts = list(entry["granularity"])
+        module = operands[name][0]
+        if isinstance(entry, dict):
+            install_codebook(module, entry["levels"], entry["granularity"])
         else:
-            counts = list(
-                entry.get(
-                    "regions", (1, entry.get("channel_groups", len(entry)))
-                )
-            )
-            counts = _padded_counts(counts, rank, head_axis=False)
-        levels = torch.tensor(
-            entry["levels"] if isinstance(entry, dict) else entry,
-            dtype=torch.float32,
-            device=module.qmap.device,
-        )
-        module.qmap = levels.reshape(*counts, levels.shape[-1])
+            install_codebook(module, entry)
     logger.info("installed %d codebooks", len(tables))
 
     unfitted = sorted(set(operands) - set(tables))
