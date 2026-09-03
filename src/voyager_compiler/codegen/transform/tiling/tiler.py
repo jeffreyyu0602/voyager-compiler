@@ -711,8 +711,9 @@ class RuntimeCalculator:
         dram_access_latency_cycles: Fixed latency, once per transfer.
         double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
             costs ``max(dram, compute)`` and not their sum.
-        has_sparse_op: A gathered (outlier) weight streams at half the
-            bank's bandwidth.
+        outlier_rate: Fraction of the input's elements that are outliers.
+            Each one gathers a full weight row on top of the dense weight
+            stream, so an L1 round's weight words grow by that many rows.
         batch: Grid steps the builder loops *outside* the mapping -- a bmm's
             leading dims, which share no operand.
         weight_batch: Distinct weight tiles over those ``batch`` steps, fewer
@@ -749,7 +750,7 @@ class RuntimeCalculator:
         dram_bandwidth: int,
         dram_access_latency_cycles: float,
         double_buffered_l2: bool = False,
-        has_sparse_op: bool = False,
+        outlier_rate: float = 0.0,
         batch: int = 1,
         weight_batch: Optional[int] = None,
         has_tail: bool = False,
@@ -771,7 +772,7 @@ class RuntimeCalculator:
         self.dram_bandwidth = dram_bandwidth
         self.dram_access_latency_cycles = dram_access_latency_cycles
         self.double_buffered_l2 = double_buffered_l2
-        self.has_sparse_op = has_sparse_op
+        self.outlier_rate = outlier_rate
         self.batch = batch
         self.weight_batch = batch if weight_batch is None else weight_batch
         self.has_tail = has_tail
@@ -835,21 +836,19 @@ class RuntimeCalculator:
     def _load_words(self, mapping):
         """Bus words one L1 tile's every-round operands take, per role: the
         input and its block scales, the weight and its scales.  An input
-        scale is delivered one per bus word however narrow it is; a gathered
-        (sparse) weight streams at half the bank's bandwidth."""
+        scale is delivered one per bus word however narrow it is; every
+        outlier in the input tile gathers one more weight row on top of the
+        dense weight tile."""
         ext = lambda loop: self._extent(mapping, loop, 1)
         rows = ext(le.OX) * ext(le.OY) * ext(le.ON)
         depth = ext(le.IC)
         taps = ext(le.FX) * ext(le.FY)
-        weight_bandwidth = self.sram_bandwidth / 8
-        if self.has_sparse_op:
-            weight_bandwidth /= 2
+        gathered_rows = rows * depth * self.outlier_rate
         words = {
             "input": self._bus_words(rows * depth, self.input_dtype_width),
             "weight": self._bus_words(
-                ext(le.OC) * depth * taps,
+                ext(le.OC) * (depth * taps + gathered_rows),
                 self.weight_dtype_width,
-                weight_bandwidth,
             ),
             "weight_scale": self._bus_words(
                 ext(le.OC) * depth * taps / self.scale_block_size,
@@ -1541,13 +1540,23 @@ def _prepare_search(node, tiler, constraint=None):
             constraint = head.merged(constraint)
 
     # An outlier GEMM's CSR: what fraction of the activation the packed stream
-    # is sized to hold.  Read off the operand rather than the producer's
-    # geometry, so tiling stays independent of the bufferize builders.
+    # is sized to hold (the staging window), and what fraction the example
+    # input actually filled (the weight rows the engine gathers).  Read off
+    # the operands rather than the producer's geometry, so tiling stays
+    # independent of the bufferize builders.
     outlier_pct = 0.0
+    outlier_rate = 0.0
     a_data = anchor.kwargs.get("A_data")
     if a_data is not None and getattr(a_data, "value", None) is not None:
-        rows, cols = anchor.args[0].value.shape[-2:]
-        outlier_pct = a_data.value.shape[-1] / (rows * cols)
+        act = anchor.args[0].value
+        elements = act.shape[-2] * act.shape[-1]
+        outlier_pct = a_data.value.shape[-1] / elements
+        outlier_rate = outlier_pct
+        indptr = getattr(anchor.kwargs.get("A_indptr"), "value", None)
+        if indptr is not None and not indptr.is_meta:
+            # Each slice's pointer array ends at that slice's count.
+            nnz = float(indptr[..., -1].sum())
+            outlier_rate = nnz / (math.prod(act.shape[:-2]) * elements)
 
     # A CSR producer's stream is unquantized, so ``meta["dtype"]`` leaves its
     # entries empty; resolve them against the traced values (the rule
@@ -1574,6 +1583,7 @@ def _prepare_search(node, tiler, constraint=None):
         constraint,
         outlier_pct,
         out_outlier_pct,
+        outlier_rate,
     )
 
     layer = _extract_layer_from_node(anchor)
@@ -1629,7 +1639,7 @@ def _prepare_search(node, tiler, constraint=None):
         weight_scale_width=fl_scale_bits,
         output_scale_width=of_scale_bits,
         scale_block_size=anchor.kwargs.get("block_size") or 1,
-        has_sparse_op=outlier_pct > 0,
+        outlier_rate=outlier_rate,
         bias_width=_node_dtype_bits(get_arg_value(anchor, 2, "bias", None), 0),
         stride=(layer.hstd, layer.wstd),
         bank_size=tiler.config.bank_size,

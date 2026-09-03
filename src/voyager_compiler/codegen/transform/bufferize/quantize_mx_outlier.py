@@ -8,12 +8,16 @@ own anchor cannot give it: when the quantize is fused onto a ``layer_norm``,
 ``_vector_op_tiling_limits`` pins the tile to whole rows, and a full-K tile
 emits columns spanning ``0..K-1``.
 
-Hence two loops sharing one row sweep. The outer loop is an ordinary
-``PipelinedKernel`` over row blocks, so whatever was fused ahead of the
-quantize keeps its natural ``[rows, K]`` tile and its double-buffered input
-fetch; its result lands in a named scratchpad intermediate. The inner loop
-re-dices that intermediate along K and runs the op once per slice, so the
-activation is read from DRAM exactly once.
+Hence one sweep over ``(row block, K slice)`` pairs: a ``PipelinedKernel``
+whose grid carries both, running the op once per step. What a step holds on
+chip is the one thing the two kinds of producer decide differently. A bare
+quantize loads just the ``[rows, tk]`` slice it quantizes, so its row block
+is bounded by one double-buffered window and the staging tiles. A quantize
+fused onto a reduction (a ``layer_norm``) needs the whole row: its activation
+is loaded ``[rows, K]`` and advanced only with the row block, the prefix runs
+on the block's first slice step into a resident scratchpad intermediate, and
+every slice step windows that. Either way the activation is read from DRAM
+exactly once.
 
 Three DRAM outputs are ordinary tiled stores (``inliers``, ``scale``, and the
 row pointers). ``data`` / ``indices`` are not: outliers concentrate in a few
@@ -44,8 +48,6 @@ from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 import torch
-from torch._higher_order_ops.while_loop import while_loop
-
 from torch.fx import Node
 
 from voyager_compiler.codegen.node_info import (
@@ -88,7 +90,7 @@ logger = logging.getLogger(__name__)
 _SRAM = int(MemoryLevel.SRAM)
 _QUANTIZE_MX_OUTLIER = torch.ops.quantized_ops.quantize_mx_outlier.default
 
-# Stores ``_OutlierProducer._slice_loop`` issues per K slice (inliers, scale,
+# Stores ``_OutlierProducer._slice`` issues per K slice (inliers, scale,
 # indptr, packed data, packed indices), all posting ``store_sem`` — the posts
 # one drain must consume.
 _SLICE_STORES = 5
@@ -136,7 +138,7 @@ class _Geometry:
 
     Attributes:
         batch: Leading batch dims of the activation, ``()`` when it is 2-D.
-        rows: Rows the outer loop handles per step.
+        rows: Rows one block spans.
         tk: Columns one K slice spans — the consuming GEMM's own k tile, so
             each block's columns land inside the weight tile.
         block_size: Microscaling block size, which ``tk`` must be a multiple of.
@@ -267,9 +269,9 @@ class _Bufs:
 
 
 class _OutlierProducer(torch.nn.Module):
-    """Row-block sweep over a fused prefix, each row block re-diced along K.
+    """Sweep over ``(row block, K slice)``, quantizing one slice per step.
 
-    The outer loop is a ``PipelinedKernel`` with no scheduler-managed outputs:
+    The sweep is a ``PipelinedKernel`` with no scheduler-managed outputs:
     every buffer is allocated here and closed over, because the packed stores
     are addressed by loop state rather than by the grid. ``base``, ``run`` and
     the shared table use ``voyager.alloc`` in Scratchpad rather than a
@@ -309,7 +311,7 @@ class _OutlierProducer(torch.nn.Module):
         self.num_inputs = len(in_specs)
         self.inner = PipelinedKernel(
             self._kernel,
-            grid=geom.batch + (geom.n_rb,),
+            grid=geom.batch + (geom.n_rb, geom.n_k),
             in_specs=in_specs,
             out_specs=[],
             scratch_specs=scratch_specs,
@@ -342,177 +344,172 @@ class _OutlierProducer(torch.nn.Module):
         i = self.kw_idx.get(name)
         return None if i is None else slots[i]
 
-    # --- the two loops ------------------------------------------------------
-
     def _kernel(self, idx, *slots):
-        """One row block: run whatever was fused, then sweep its K slices.
+        """One K slice of one row block.
 
         The scheduler hands the loaded tiles first and the reduction scratch
-        after them; only the prefix sees the scratch.
+        after them; only the prefix sees the scratch.  A bare quantize is
+        handed the slice itself.  A fused prefix is handed the whole row
+        block, runs on the block's first slice step into the resident
+        intermediate, and every step of the block windows that.
         """
+        g = self.geom
         tiles, scratch = slots[: self.num_inputs], slots[self.num_inputs :]
+        k = idx[g.nb + 1]
         if self.prefix_gm is None:
-            # No fused prefix: the loaded tile itself is the intermediate
-            # the slices window (a K-slice subview composes with the slot's
-            # own window into one reference).
-            mid = tiles[self.act_idx]
+            tile = tiles[self.act_idx]
         else:
             mid = self._bufs.row_block
-            voyager.insert(self.prefix_gm(*tiles, *scratch), mid)
-        self._slice_loop(idx, mid, tiles)
-
-    def _slice_loop(self, idx, mid, slots):
-        g, bufs = self.geom, self._bufs
-        nb, ones = g.nb, g.ones
-        bidx = [idx[i] for i in range(nb)]
-        m = idx[nb]
-
-        def cond_fn(k):
-            return k < g.n_k
-
-        def body_fn(k):
+            effect_cond(
+                k == 0,
+                lambda: voyager.insert(self.prefix_gm(*tiles, *scratch), mid),
+            )
             # A K slice of the resident intermediate is a window, not a
             # transfer: it is already on chip, which is the whole point of
             # splitting here rather than round-tripping through DRAM.
             tile = voyager.subview(
                 mid,
-                [0] * nb + [0, k * g.tk],
-                ones + (g.rows, g.tk),
-                (1,) * (nb + 2),
+                [0] * g.nb + [0, k * g.tk],
+                g.ones + (g.rows, g.tk),
+                (1,) * (g.nb + 2),
                 [],
             )
+        self._slice(idx, tile, tiles)
 
-            # This slice's running count, so the block emits pointers already
-            # in slice coordinates rather than starting at 0.
-            base_ref = voyager.subview(
-                bufs.stream_pos, bidx + [0], ones + (1,), (1,) * (nb + 1), []
-            )
-            run_ref = voyager.subview(
-                bufs.slice_nnz, bidx + [k], ones + (1,), (1,) * (nb + 1), []
-            )
-            offset = _scalar(run_ref)
-            torch._check(offset >= 0)
+    def _slice(self, idx, tile, slots):
+        """Quantize one ``[rows, tk]`` slice and store it: the tiled outputs
+        by grid position, the packed data and indices at the stream position,
+        then the bookkeeping the next block and the consumers read."""
+        g, bufs = self.geom, self._bufs
+        nb, ones = g.nb, g.ones
+        bidx = [idx[i] for i in range(nb)]
+        m, k = idx[nb], idx[nb + 1]
 
-            d, i, p, s, q = self._quantize(tile, slots, offset)
+        # This slice's running count, so the block emits pointers already
+        # in slice coordinates rather than starting at 0.
+        base_ref = voyager.subview(
+            bufs.stream_pos, bidx + [0], ones + (1,), (1,) * (nb + 1), []
+        )
+        run_ref = voyager.subview(
+            bufs.slice_nnz, bidx + [k], ones + (1,), (1,) * (nb + 1), []
+        )
+        offset = _scalar(run_ref)
+        torch._check(offset >= 0)
 
-            # The previous slice's stores are drained only here: their DMAs
-            # ran under this slice's quantize, so the waits cost nothing, and
-            # the staging tiles are not reused before this point. The sweep's
-            # first slice has nothing in flight; ``forward`` drains the last
-            # slice's stores after the loop.
-            pending = (m != 0) | (k != 0)
-            for b in bidx:
-                pending |= b != 0
+        d, i, p, s, q = self._quantize(tile, slots, offset)
 
-            def drain():
-                for _ in range(_SLICE_STORES):
-                    voyager.async_wait(bufs.store_sem)
+        # The previous step's stores are drained only here: their DMAs ran
+        # under this step's quantize, so the waits cost nothing, and the
+        # staging tiles are not reused before this point. The sweep's first
+        # step has nothing in flight; ``forward`` drains the last step's
+        # stores after the sweep.  Built with ``|`` rather than ``|=``: a
+        # one-step sweep makes every index a constant, and an in-place op on
+        # a constant is not valid source for the loop body dynamo emits.
+        pending = (m != 0) | (k != 0)
+        for b in bidx:
+            pending = pending | (b != 0)
 
-            effect_cond(pending, drain)
+        def drain():
+            for _ in range(_SLICE_STORES):
+                voyager.async_wait(bufs.store_sem)
 
-            # A compute result reaches DRAM through a scratchpad tile: the
-            # memory model has the datapath write on chip (``insert``) and the
-            # DMA move it out, never straight from the op.
-            voyager.insert(d, bufs.store_data_tile)
-            voyager.insert(i, bufs.store_index_tile)
-            voyager.insert(p, bufs.store_indptr_tile)
-            voyager.insert(s, bufs.store_scale_tile)
-            voyager.insert(q, bufs.store_inlier_tile)
-            d, i, p, s, q = (
-                bufs.store_data_tile,
-                bufs.store_index_tile,
-                bufs.store_indptr_tile,
-                bufs.store_scale_tile,
-                bufs.store_inlier_tile,
-            )
+        effect_cond(pending, drain)
 
-            # Grid-addressed stores.
-            voyager.async_copy(
-                q,
-                bufs.inliers,
-                bidx + [m, k],
-                ones + (g.rows, g.tk),
-                bufs.store_sem,
-            )
-            voyager.async_copy(
-                s,
-                bufs.scale,
-                bidx + [m, k],
-                ones + (g.rows, g.tk // g.block_size),
-                bufs.store_sem,
-            )
-            # Slice k, rows [m*rows, m*rows+rows] inclusive: rows+1 entries at
-            # stride rows, so consecutive blocks share a boundary element. Both
-            # writes carry the same value there, so the overlap is idempotent
-            # and the array's last entry falls out of the last block's write.
-            voyager.async_copy(
-                p.reshape(ones + (1, g.rows + 1)),
-                bufs.csr_indptr,
+        # A compute result reaches DRAM through a scratchpad tile: the
+        # memory model has the datapath write on chip (``insert``) and the
+        # DMA move it out, never straight from the op.
+        voyager.insert(d, bufs.store_data_tile)
+        voyager.insert(i, bufs.store_index_tile)
+        voyager.insert(p, bufs.store_indptr_tile)
+        voyager.insert(s, bufs.store_scale_tile)
+        voyager.insert(q, bufs.store_inlier_tile)
+        d, i, p, s, q = (
+            bufs.store_data_tile,
+            bufs.store_index_tile,
+            bufs.store_indptr_tile,
+            bufs.store_scale_tile,
+            bufs.store_inlier_tile,
+        )
+
+        # Grid-addressed stores.
+        voyager.async_copy(
+            q,
+            bufs.inliers,
+            bidx + [m, k],
+            ones + (g.rows, g.tk),
+            bufs.store_sem,
+        )
+        voyager.async_copy(
+            s,
+            bufs.scale,
+            bidx + [m, k],
+            ones + (g.rows, g.tk // g.block_size),
+            bufs.store_sem,
+        )
+        # Slice k, rows [m*rows, m*rows+rows] inclusive: rows+1 entries at
+        # stride rows, so consecutive blocks share a boundary element. Both
+        # writes carry the same value there, so the overlap is idempotent
+        # and the array's last entry falls out of the last block's write.
+        voyager.async_copy(
+            p.reshape(ones + (1, g.rows + 1)),
+            bufs.csr_indptr,
+            bidx + [k, m],
+            ones + (1, g.rows + 1),
+            bufs.store_sem,
+            None,
+            [1] * nb + [1, g.rows],
+        )
+
+        # The block's real length is the span its pointers cover, not the
+        # last one: they are offset by ``run``.
+        last = _entry(p, g.rows, nb, ones)
+        nnz = _scalar(last) - _scalar(_entry(p, 0, nb, ones))
+        torch._check(nnz >= 0)
+        at = _scalar(base_ref)
+        torch._check(at >= 0)
+
+        # Packed stores. ``strides`` of 1 collapses the block-index
+        # multiply so ``base`` is a raw element offset; ``sizes`` stays the
+        # whole budget because it also picks the store branch, and
+        # ``count`` moves only the real entries. ``dims`` must be None —
+        # an empty one would drop the offset and land every block at 0.
+        voyager.async_copy(
+            d,
+            bufs.csr_data,
+            bidx + [at],
+            ones + (g.budget,),
+            bufs.store_sem,
+            None,
+            [1] * (nb + 1),
+            count=[1] * nb + [nnz],
+        )
+        voyager.async_copy(
+            i,
+            bufs.csr_indices,
+            bidx + [at],
+            ones + (g.budget,),
+            bufs.store_sem,
+            None,
+            [1] * (nb + 1),
+            count=[1] * nb + [nnz],
+        )
+
+        # Bookkeeping, both scratchpad writes: where this block sits in the
+        # stream (for the consumer), and where the slice now stands.
+        voyager.insert(
+            base_ref.reshape(ones + (1, 1)).clone(),
+            voyager.subview(
+                bufs.base_table,
                 bidx + [k, m],
-                ones + (1, g.rows + 1),
-                bufs.store_sem,
-                None,
-                [1] * nb + [1, g.rows],
-            )
-
-            # The block's real length is the span its pointers cover, not the
-            # last one: they are offset by ``run``.
-            last = _entry(p, g.rows, nb, ones)
-            nnz = _scalar(last) - _scalar(_entry(p, 0, nb, ones))
-            torch._check(nnz >= 0)
-            at = _scalar(base_ref)
-            torch._check(at >= 0)
-
-            # Packed stores. ``strides`` of 1 collapses the block-index
-            # multiply so ``base`` is a raw element offset; ``sizes`` stays the
-            # whole budget because it also picks the store branch, and
-            # ``count`` moves only the real entries. ``dims`` must be None —
-            # an empty one would drop the offset and land every block at 0.
-            voyager.async_copy(
-                d,
-                bufs.csr_data,
-                bidx + [at],
-                ones + (g.budget,),
-                bufs.store_sem,
-                None,
-                [1] * (nb + 1),
-                count=[1] * nb + [nnz],
-            )
-            voyager.async_copy(
-                i,
-                bufs.csr_indices,
-                bidx + [at],
-                ones + (g.budget,),
-                bufs.store_sem,
-                None,
-                [1] * (nb + 1),
-                count=[1] * nb + [nnz],
-            )
-
-            # Bookkeeping, both scratchpad writes: where this block sits in the
-            # stream (for the consumer), and where the slice now stands.
-            voyager.insert(
-                base_ref.reshape(ones + (1, 1)).clone(),
-                voyager.subview(
-                    bufs.base_table,
-                    bidx + [k, m],
-                    ones + (1, 1),
-                    (1,) * (nb + 2),
-                    [],
-                ),
-            )
-            voyager.insert(last.clone(), run_ref)
-            # Advance the packed-stream position for the next block: an op
-            # result, so it has a destination of its own.
-            voyager.insert(base_ref + nnz, base_ref)
-            return (k + 1,)
-
-        # The loop's result must be consumed: an unused ``while_loop`` is
-        # pruned, taking the body's buffer stores with it.
-        (k_end,) = while_loop(cond_fn, body_fn, (0,))
-        torch._check(k_end >= 0)
-
-    # --- entry --------------------------------------------------------------
+                ones + (1, 1),
+                (1,) * (nb + 2),
+                [],
+            ),
+        )
+        voyager.insert(last.clone(), run_ref)
+        # Advance the packed-stream position for the next block: an op
+        # result, so it has a destination of its own.
+        voyager.insert(base_ref + nnz, base_ref)
 
     def forward(self, *inputs):
         g = self.geom
@@ -551,7 +548,7 @@ class _OutlierProducer(torch.nn.Module):
         )
         bufs.store_sem = voyager.zeros([], torch.int64)
         bufs.table_sem = voyager.zeros([], torch.int64)
-        # Per-block staging tiles for ``_slice_loop``'s stores.
+        # Per-block staging tiles for ``_slice``'s stores.
         bufs.store_data_tile = voyager.alloc(
             list(g.ones) + [g.budget], self.data_dtype, _SRAM
         )
@@ -730,48 +727,38 @@ def consumer_row_tile(node, tiler) -> Optional[int]:
     return min(rows) if rows else None
 
 
-# What one row of the nest costs, in units of the ``[rows, K]`` intermediate.
-# The tile search cannot size this nest: the intermediate is allocated inside
-# it and is invisible to the search, which sees only the operands crossing the
-# boundary.  Three buffers scale with the row block -- the intermediate, the
-# input tile it is produced from (the same rows at the same width), and the
-# per-slice staging tiles, which together span one K slice and so cannot
-# exceed the intermediate either.  A fused reduction's scratch scales with it
-# too, and is charged on top from its own shapes.
+# What one row of a fused prefix's nest costs, in units of its ``[rows, K]``
+# intermediate.  The tile search cannot size this nest: the intermediate is
+# allocated inside it and is invisible to the search, which sees only the
+# operands crossing the boundary.  Three buffers scale with the row block --
+# the intermediate, the input tile it is produced from (the same rows at the
+# same width), and the per-slice staging tiles, which together span one K
+# slice and so cannot exceed the intermediate either.  A fused reduction's
+# scratch scales with it too, and is charged on top from its own shapes.
 _NEST_ROW_BLOCK_COPIES = 3
 
 
-def _row_block(
-    node, tiler, geom_shape, mid_bytes_per_row, scratch_bytes_per_row, cap=None
-) -> int:
-    """Rows the outer loop handles per step.
+def _row_block(start, bytes_per_row, capacity, M, cap=None) -> int:
+    """Rows one block spans.
 
-    Starts from the vector-op tile search (which sizes the operands the fused
-    group loads) and shrinks until everything in the nest that scales with the
-    row block fits the scratchpad -- not the intermediate alone, which is only
-    a third of it (``_NEST_ROW_BLOCK_COPIES``), plus whatever a fused
-    reduction keeps beside it.
+    ``start`` rows, no more than ``cap``, halved until the block's share of
+    the scratchpad fits ``capacity``, then trimmed to divide ``M`` and
+    ``cap``.
 
     Args:
-        node: The producer being lowered.
-        tiler: The interstellar ``TilerContext``.
-        geom_shape: Rows the activation has in all (``M``).
-        mid_bytes_per_row: Bytes one row of the ``[rows, K]`` intermediate
-            occupies.
-        scratch_bytes_per_row: Bytes one row of the fused reduction's scratch
-            regions occupies, 0 when the prefix keeps none.
+        start: Rows to begin from: the vector-op tile search's row count for
+            a fused prefix, whose ``[rows, K]`` tile that search sized, or
+            every row for a bare quantize, which loads one slice at a time.
+        bytes_per_row: Bytes one row of everything that scales with the
+            block occupies.
+        capacity: Scratchpad bytes those buffers may take.
+        M: Rows the activation has in all.
         cap: The smallest row tile any sparse consumer uses. A consumer
             gathers a whole number of blocks, so the block must divide its row
             tile -- which makes a block no larger than one.
     """
-    M = geom_shape
-    tiling = vector_op_tiling(node, tiler.config)
-    rows = M if tiling is None else max(1, M // max(1, tiling[-2]))
-    if cap is not None:
-        rows = min(rows, cap)
-    per_row = _NEST_ROW_BLOCK_COPIES * mid_bytes_per_row + scratch_bytes_per_row
-    slot_size = tiler.config.usable_scratchpad_size // tiler.config.num_slots
-    while rows > 1 and rows * per_row > slot_size:
+    rows = start if cap is None else min(start, cap)
+    while rows > 1 and rows * bytes_per_row > capacity:
         rows //= 2
     while rows > 1 and (M % rows or (cap is not None and cap % rows)):
         rows -= 1
@@ -782,14 +769,14 @@ def build_quantize_mx_outlier(
     node, *, tiler, num_slots: int = _DEFAULT_NUM_SLOTS
 ) -> Optional[torch.fx.GraphModule]:
     """Bufferize a row-swept ``quantize_mx_outlier`` — bare or fused, 2-D or
-    batched — as a row-block loop whose body re-dices each block along K.
+    batched — as one sweep over ``(row block, K slice)``.
 
     Args:
         node: The producer: a bare ``quantize_mx_outlier`` call, or a fused
             ``call_module`` whose submodule ends in one.
         tiler: The interstellar ``TilerContext``; supplies both the consumer's
             k tile and the row-block search.
-        num_slots: Software-pipeline depth for the outer loop's inputs.
+        num_slots: Software-pipeline depth for the sweep's inputs.
 
     Returns:
         The bufferized gm, or ``None`` when ``node`` is not one this builds.
@@ -824,29 +811,46 @@ def build_quantize_mx_outlier(
         else None
     )
 
-    # The prefix's reduction keeps regions on chip beside the intermediate it
-    # produces (a layer_norm's mean, variance and normalized tile).  Every one
-    # scales linearly with the row block, so a one-row tile prices a row of
-    # them -- which is what the row-block search needs before it knows how
-    # many rows there are.
-    lanes = tiler.config.vector_lanes
+    # Everything that scales with the row block, per row, and the scratchpad
+    # it may take.  A fused prefix keeps its whole-row intermediate, the tile
+    # it is produced from and the staging tiles in one pipeline slot
+    # (``_NEST_ROW_BLOCK_COPIES``), plus its reduction's regions (a
+    # layer_norm's mean, variance and normalized tile), which a one-row tile
+    # prices before the block is known; its block starts from the vector-op
+    # search, which sized that ``[rows, K]`` tile.  A bare quantize keeps only
+    # the double-buffered ``[rows, tk]`` window and the staging tiles, so it
+    # starts from the whole activation and lets the consumers' row tile cap
+    # it.  The search runs either way: it stamps the operands' bank groups.
+    config = tiler.config
+    tiling = vector_op_tiling(node, config)
+    lanes = config.vector_lanes
     ones = [1] * len(batch)
-    scratch_per_row = (
-        sum(
+    act_bytes = act.element_size()
+    vals = node.value
+    if prefix_gm is not None:
+        scratch_per_row = sum(
             math.prod(shape) * dtype.itemsize
             for _, shape, dtype in reduction_scratch(node, ones + [1, K], lanes)
         )
-        if prefix_gm is not None
-        else 0
-    )
-    rows = _row_block(
-        node,
-        tiler,
-        M,
-        K * act.element_size(),
-        scratch_per_row,
-        cap=tm_consumer,
-    )
+        start = M if tiling is None else max(1, M // max(1, tiling[-2]))
+        per_row = _NEST_ROW_BLOCK_COPIES * K * act_bytes + scratch_per_row
+        capacity = config.usable_scratchpad_size // config.num_slots
+    else:
+        data_bytes, scale_bytes, inlier_bytes = (
+            vals[i].dtype.itemsize for i in (0, 3, 4)
+        )
+        # Per row of one slice: the inlier and scale tiles, the packed data
+        # and int32 indices at the declared rate, and one int32 row pointer.
+        staging = (
+            tk * inlier_bytes
+            + tk // bs * scale_bytes
+            + tk * max_pct * (data_bytes + 4)
+            + 4
+        )
+        start = M
+        per_row = num_slots * tk * act_bytes + staging
+        capacity = config.usable_scratchpad_size
+    rows = _row_block(start, per_row, capacity, M, cap=tm_consumer)
     if M % rows:
         raise ValueError(f"{node.name}: row block {rows} does not divide M={M}")
     geom = _Geometry(
@@ -874,8 +878,7 @@ def build_quantize_mx_outlier(
     if prefix_gm is not None:
         prefix_gm = _naming_scratch(prefix_gm, [name for name, _, _ in scratch])
 
-    # Operand roles. The activation tiles along the row-block grid dim and
-    # keeps K whole (the inner loop dices it); codebooks load whole.
+    # Operand roles: the activation is tiled, codebooks load whole.
     in_nodes = list(node.all_input_nodes)
     order = {n: i for i, n in enumerate(in_nodes)}
     codebooks = quant_param_arg_nodes(qnode)
@@ -892,10 +895,16 @@ def build_quantize_mx_outlier(
         codebooks = set(codebooks)
 
     # Tile *counts*: every batch dim is diced to the element (one grid step per
-    # batch element, since each carries its own CSR), rows to the row block,
-    # and K left whole for the inner loop to slice.
-    out_tiling = tuple(batch) + (geom.n_rb, 1)
-    grid_map = tuple(range(len(batch))) + (len(batch), None)
+    # batch element, since each carries its own CSR) and rows to the row block.
+    # K is diced to the slice for a bare quantize, which needs nothing wider,
+    # and left whole for a fused prefix, which needs the row -- the scheduler
+    # then advances the activation only with the row block.
+    if prefix_gm is None:
+        out_tiling = tuple(batch) + (geom.n_rb, geom.n_k)
+        grid_map = tuple(range(len(batch))) + (len(batch), len(batch) + 1)
+    else:
+        out_tiling = tuple(batch) + (geom.n_rb, 1)
+        grid_map = tuple(range(len(batch))) + (len(batch), None)
     in_specs = []
     for n in in_nodes:
         if n in codebooks or n.value.numel() == 1:
@@ -925,7 +934,6 @@ def build_quantize_mx_outlier(
             f"{node.name}: nothing is fused ahead of the quantize and its "
             f"activation is not one of the group's operands"
         )
-    vals = node.value
     producer = _OutlierProducer(
         geom=geom,
         in_specs=in_specs,
@@ -969,7 +977,7 @@ def build_quantize_mx_outlier(
             gm,
             hand_groups + _bank_group_list(node, in_specs, [], scratch_specs),
         )
-    _tag_loop_extents(gm, [[(0, producer.num_steps, 1)], [(0, geom.n_k, 1)]])
+    _tag_loop_extents(gm, [[(0, producer.num_steps, 1)]])
     tag_base_table(gm, node.name, base_table_shape(geom))
     # The consumer has to know how the stream was diced -- how many blocks span
     # one of its row tiles, and how big each may be -- and cannot derive it

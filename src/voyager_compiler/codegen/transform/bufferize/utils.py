@@ -529,27 +529,37 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     return gm
 
 
-def _tag_loop_extents(gm, extents_per_level, depth=0):
-    """
-    Tag the nested ``while_loop`` chain with the per-dimension tile-grid
+def _tag_loop_extents(gm, extents_per_level, depth=0) -> bool:
+    """Tag the nested ``while_loop`` chain with the per-dimension tile-grid
     extents.
 
     ``extents_per_level[d]`` is the list of extents (each a bare ``end`` count
     or an ``(start, end, step)`` tuple) for the while_loop at nesting depth
     ``d``.  The builders flatten an N-D grid into one ``while_loop``, so a level
     with N extents is later emitted as N nested ``Loop`` protos.  Assumes one
-    loop per nesting level (a linear chain), which holds for these builders.
+    loop per nesting level (a linear chain), which holds for these builders;
+    a level's loop may sit inside a ``cond`` branch, as a guarded gather does.
+
+    Returns:
+        Whether a loop at depth ``depth`` was found in ``gm``.
     """
     if depth >= len(extents_per_level):
-        return
+        return False
     named = dict(gm.named_modules())
     for n in gm.graph.nodes:
-        if (
-            n.op == "call_function"
-            and n.target is torch.ops.higher_order.while_loop
-        ):
+        if n.op != "call_function":
+            continue
+        if n.target is torch.ops.higher_order.while_loop:
             n.meta["loop_extents"] = extents_per_level[depth]
             body = named.get(str(n.args[1].target))
             if isinstance(body, torch.fx.GraphModule):
                 _tag_loop_extents(body, extents_per_level, depth + 1)
-            return
+            return True
+        if n.target is torch.ops.higher_order.cond:
+            for branch in n.args[1:3]:
+                sub = named.get(str(branch.target))
+                if not isinstance(sub, torch.fx.GraphModule):
+                    continue
+                if _tag_loop_extents(sub, extents_per_level, depth):
+                    return True
+    return False

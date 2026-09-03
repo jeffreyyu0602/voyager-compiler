@@ -59,19 +59,47 @@ QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = {
     ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
 }
 
-# Outlier filtering: a linear's activation sets aside its largest 1% before
-# quantizing, and the attention value operand anything past 6.0.
+QUANTIZATION_CONFIGS["mxint6"] = {
+    torch.nn.Linear: [INT6_SPEC, MXNF4_SPEC],
+    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
+    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+}
+
+# Outlier filtering on the linears only: each activation sets aside its
+# largest 1% before quantizing.  Attention and the `lm_head` activation stay
+# dense at int6, as in `mxnf4_attn_head_int6`, which is this config's dense
+# twin.
 QUANTIZATION_CONFIGS["mxnf4_outlier"] = {
     torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
-    ("self_attn", torch.ops.aten.matmul.default, 0): [
-        INT6_SPEC,
+    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
+    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+}
+
+# The same linears, plus the attention key and value: the matmuls' second
+# operand sets aside its largest 1% too, with the attention operands kept at
+# NormalFloat.  A side-stream on the column operand makes the lowering swap
+# each matmul so the CSR lands on the row side, transposing the scores.
+QUANTIZATION_CONFIGS["mxnf4_outlier_kv"] = {
+    torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
+    torch.ops.aten.matmul.default: [
+        MXNF4_SPEC,
         f"{MXNF4_VALUE_SPEC},opct=0.01",
+    ],
+    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+}
+
+# The attention side-stream on the row operand instead: Q carries it on the
+# first matmul and P @ V has none, so no matmul is swapped.
+QUANTIZATION_CONFIGS["mxnf4_outlier_q"] = {
+    **QUANTIZATION_CONFIGS["mxnf4_outlier_kv"],
+    ("self_attn", torch.ops.aten.matmul.default, 0): [
+        f"{MXNF4_SPEC},opct=0.01",
+        MXNF4_VALUE_SPEC,
     ],
     ("self_attn", torch.ops.aten.matmul.default, 1): [
-        INT6_SPEC,
-        f"{MXNF4_VALUE_SPEC},opct=0.01",
+        MXNF4_SPEC,
+        MXNF4_VALUE_SPEC,
     ],
-    ("lm_head", torch.ops.aten.linear.default, 0): [MXNF4_SPEC, MXNF4_SPEC],
 }
 
 

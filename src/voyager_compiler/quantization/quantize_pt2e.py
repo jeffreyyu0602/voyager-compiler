@@ -445,12 +445,13 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
     if activation_post_process.outlier_threshold is not None:
-        max_outlier_pct = (
-            math.ceil(activation_post_process.max_outlier_pct * 100) / 100.0
+        observed = activation_post_process.max_outlier_pct
+        activation_post_process.max_outlier_pct = (
+            math.ceil((observed + 0.01) * 100) / 100
         )
-        activation_post_process.max_outlier_pct = max(max_outlier_pct, 0.05)
         logger.info(
-            f"{node.target} has maximum outlier percentage {max_outlier_pct:.2%}"
+            f"{node.target}: {observed:.2%} outliers observed, stream "
+            f"declared at {activation_post_process.max_outlier_pct:.0%}"
         )
 
     dequant_code, quant_code = None, None

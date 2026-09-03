@@ -60,6 +60,12 @@ QUANT_OPS = [
     "quantize_mx_outlier",
     "quantize_affine",
 ]
+# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
+# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
+# own column tile, which pins every consumer's reduction tile to it.  The
+# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
+# op, and its slice width follows the consumers.
+GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 
 # Tolerance for comparing the lowered graph's output against the original's.
 # Tiling reassociates a reduction, so a bfloat16 accumulation lands a few
@@ -77,13 +83,13 @@ VECTOR_PIPELINE = [
         OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*QUANT_OPS, "mul", "div"),
+        OpMatcher(*GEMM_QUANT_OPS, "mul", "div"),
     ],
     [
         OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*QUANT_OPS, "mul", "div"),
+        OpMatcher(*GEMM_QUANT_OPS, "mul", "div"),
     ],
     # Fused SpMM operation will use the first stage in the pipeline
     [
@@ -91,7 +97,7 @@ VECTOR_PIPELINE = [
         OpMatcher("dequantize"),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div"),
-        OpMatcher(*QUANT_OPS),
+        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher("layer_norm", "softmax"),

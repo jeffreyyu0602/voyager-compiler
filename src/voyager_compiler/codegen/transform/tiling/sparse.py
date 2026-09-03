@@ -153,6 +153,8 @@ def _search_costs(searches, tiler):
                 found[1] if found is not None else math.inf
             )
             prepared[node, constraint] = (key, search, found)
+    for (node, constraint), cost in costs.items():
+        logger.debug("[csr] %s under %s: %.0f", node.name, constraint, cost)
     return costs, prepared
 
 
@@ -227,6 +229,13 @@ def plan_csr_slices(nodes, tiler, min_slice=DEFAULT_MIN_CSR_SLICE):
             total = op_cost(node, _constraint(s_in, s_out))
             for child in consumers_of.get(node, ()):
                 total += subtree(child, s_out)
+            logger.debug(
+                "[csr] %s handed %s emitting %s: subtree %.0f",
+                node.name,
+                s_in,
+                s_out,
+                total,
+            )
             if total < choice[0]:
                 choice = (total, s_out)
         best[node, s_in] = choice
