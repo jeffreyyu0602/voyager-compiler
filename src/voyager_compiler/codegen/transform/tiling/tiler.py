@@ -390,6 +390,7 @@ def make_size_fn(
     constraint=None,
     has_tail=False,
     staged_tail=False,
+    scratch_regions=1,
     num_slots=1,
     batch=1,
     weight_batch=1,
@@ -425,7 +426,11 @@ def make_size_fn(
     bank-aligned region on top.  So is the finished tile a stream-breaking
     tail (``staged_tail``) stages even for a single round.  Leaving either
     out is what let the tiler return tilings ``plan_memory`` could not
-    place.
+    place.  A split reduction whose tail reads that tile back from scratch
+    may take ``scratch_regions`` of them: a second region lets the read-back
+    pass ride the finalize commit instead of running bare, so it is charged
+    whenever it fits beside the sources, and the tile falls back to one
+    region -- priced as the bare pass -- when it does not.
 
     A bank cannot be split between groups, so each group rounds up to a whole
     bank -- which puts a floor of ``num_slots * len(groups) * bank_size`` on the
@@ -508,8 +513,9 @@ def make_size_fn(
         counts, point, level, partitioning_accum, bank_size, num_banks
     ):
         """The bank partition of one candidate tile: the merged ``(bytes,
-        kind, slots, roles)`` groups plus the scratch region's bytes, or
-        ``(None, 0.0)`` for a vetoed tile.  ``roles`` is the set of operand
+        kind, slots, roles)`` groups, the scratch region's bytes and the
+        regions it takes, or ``(None, 0.0, 1)`` for a vetoed tile.
+        ``roles`` is the set of operand
         roles sharing the bank (``"input"``/``"csr"``, ``"input_scale"``,
         ``"weight"``/``"weight_scale"``/``"bias"``, ``"output"``,
         ``("fused", i)``); a merge unions the two sets.  ``size_fn`` sums
@@ -532,7 +538,7 @@ def make_size_fn(
         # attention head (the MHA relayout must store whole heads), a CSR
         # slice width the coupled ops agreed on.
         if constraint is not None and not constraint.allows(extent):
-            return None, 0.0
+            return None, 0.0, 1
 
         # The output is a wide partial sum until IC is fully reduced; only the
         # final value carries an output scale.
@@ -627,31 +633,50 @@ def make_size_fn(
             scratch = _alloc_bytes(of_count, stage_bits)
         else:
             scratch = 0.0
+        # Only a split reduction's read-back tail has a second region to
+        # gain; a single staged round keeps one.
+        regions = 1
+        if scratch and point.loop_blocking(le.IC)[3] > 1:
+            regions = scratch_regions
 
         if not bank_size:
-            return groups, scratch
+            return groups, scratch, regions
 
         scratch_banks = math.ceil(scratch / bank_size) if scratch else 0
-        # Banks left for the ping-ponged sources.  Without a bank count the
-        # partition is one source per bank, so nothing merges.
-        budget = (num_banks or math.inf) - scratch_banks
 
-        while (
-            len(groups) > 1
-            and sum(n * math.ceil(size / bank_size) for size, _, n, _ in groups)
-            > budget
-        ):
-            groups.sort(key=lambda g: g[0])
-            (s0, k0, n0, r0), (s1, k1, n1, r1) = groups[0], groups[1]
-            # Charge the shared bank to the larger member's operand, and to the
-            # deeper pipeline: one buffer holding both has to ping-pong if
-            # either of them does.
-            merged = (s0 + s1, k0 if s0 >= s1 else k1, max(n0, n1), r0 | r1)
-            groups = [merged] + groups[2:]
-        return groups, scratch
+        def banks(groups):
+            return sum(
+                n * math.ceil(size / bank_size) for size, _, n, _ in groups
+            )
+
+        def merge_to_fit(budget):
+            """The groups with their two smallest merged until their banks
+            fit ``budget``, and whether they do -- one group may still not."""
+            merged = list(groups)
+            while len(merged) > 1 and banks(merged) > budget:
+                merged.sort(key=lambda g: g[0])
+                (s0, k0, n0, r0), (s1, k1, n1, r1) = merged[0], merged[1]
+                # Charge the shared bank to the larger member's operand, and
+                # to the deeper pipeline: one buffer holding both has to
+                # ping-pong if either of them does.
+                merged = [
+                    (s0 + s1, k0 if s0 >= s1 else k1, max(n0, n1), r0 | r1)
+                ] + merged[2:]
+            return merged, banks(merged) <= budget
+
+        # Banks left for the ping-ponged sources, after the scratch regions.
+        # Without a bank count the partition is one source per bank, so
+        # nothing merges.  A second scratch region is kept only when the
+        # sources still fit beside it.
+        while True:
+            budget = (num_banks or math.inf) - regions * scratch_banks
+            merged, fits = merge_to_fit(budget)
+            if fits or regions == 1:
+                return merged, scratch, regions
+            regions -= 1
 
     def size_fn(counts, point, level, partitioning_accum, bank_size, num_banks):
-        groups, scratch = compute_groups(
+        groups, scratch, regions = compute_groups(
             counts, point, level, partitioning_accum, bank_size, num_banks
         )
         if groups is None:
@@ -661,13 +686,13 @@ def make_size_fn(
         if not bank_size:
             for size, kind, n, _ in groups:
                 out[kind] += n * size
-            out[_OF] += scratch
+            out[_OF] += regions * scratch
             return tuple(out)
 
         for size, kind, n, _ in groups:
             out[kind] += n * math.ceil(size / bank_size) * bank_size
         if scratch:
-            out[_OF] += math.ceil(scratch / bank_size) * bank_size
+            out[_OF] += regions * math.ceil(scratch / bank_size) * bank_size
         return tuple(out)
 
     size_fn.compute_groups = compute_groups
@@ -729,6 +754,10 @@ class RuntimeCalculator:
             the vector unit; a bare GEMM reduces in place and does not.
         staged_tail: The tail runs over the staged tile even in a single
             round, so the finished tile is read back from scratch.
+        bare_tail: A split reduction's tail reads the finished tile back
+            from scratch; with one scratch region that pass runs bare on
+            the control stream, which then issues the next tile's loads
+            only after the matrix and vector passes both finish.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
             pairs, from ``_fused_operand_specs``, in the order the bank
             partition's ``("fused", i)`` roles name them; ``vector_cycles``
@@ -763,6 +792,7 @@ class RuntimeCalculator:
         weight_batch: Optional[int] = None,
         has_tail: bool = False,
         staged_tail: bool = False,
+        bare_tail: bool = False,
         tail_specs=(),
         input_scale_width: int = 0,
         weight_scale_width: int = 0,
@@ -786,6 +816,7 @@ class RuntimeCalculator:
         self.weight_batch = batch if weight_batch is None else weight_batch
         self.has_tail = has_tail
         self.staged_tail = staged_tail
+        self.bare_tail = bare_tail
         self.tail_specs = tuple(tail_specs)
         self.input_scale_width = input_scale_width
         self.weight_scale_width = weight_scale_width
@@ -1334,7 +1365,7 @@ class RuntimeCalculator:
             for (dims, _), size in zip(self.tail_specs, tail_sizes)
         ]
 
-        bank_groups = bank_partition(
+        bank_groups, scratch_slots = bank_partition(
             architecture, layer.size_fn, layer, mapping
         )
         matrix_cycles = self.matrix_cycles(mapping, bank_groups)
@@ -1404,6 +1435,14 @@ class RuntimeCalculator:
         # window to the next -- hence one price per class.
         for tail, count in classes:
             prefetch = load + tail
+            if self.bare_tail and scratch_slots == 1:
+                # The bare pass holds the control stream through both the
+                # matrix and the vector pass, so the window's loads are
+                # issued only then and nothing hides them.
+                total_time += count * (
+                    matrix_cycles + vector_cycles + prefetch + matrix_cycles
+                )
+                continue
             compute = max(matrix_cycles, prefetch) + matrix_cycles
             dma = max(matrix_cycles + vector_cycles, prefetch) + store + load
             total_time += count * max(compute, dma)
@@ -1551,6 +1590,17 @@ def _prepare_search(node, tiler, constraint=None):
             isinstance(out_quant.args[0], torch.fx.Node)
             and out_quant.args[0].target is not anchor.target
         )
+    # A split reduction's tail reads the finished tile back from scratch
+    # when the accumulate cannot chain it, or a quantize breaks the stream
+    # (``_gemm_scratch_and_kernel``'s sync path).  A second scratch region
+    # lets that pass ride the finalize commit -- except in a CSR-producing
+    # nest, whose stores run bare after the commit and pin one region
+    # (``_SparseGemm``).
+    bare_tail = has_tail and (
+        stream_breaking_quantize(sub_gm) is not None
+        or not node.meta.get("accumulate_fusible", False)
+    )
+    scratch_regions = 2 if bare_tail and out_quant is None else 1
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
     # else _detect_mha_relayout can't store the tile: that joins whatever
@@ -1607,6 +1657,8 @@ def _prepare_search(node, tiler, constraint=None):
         tuple(fused_specs),
         has_tail,
         staged_tail,
+        bare_tail,
+        scratch_regions,
         constraint,
         outlier_pct,
         out_outlier_pct,
@@ -1662,6 +1714,7 @@ def _prepare_search(node, tiler, constraint=None):
         weight_batch=batch // weight_repeat,
         has_tail=has_tail,
         staged_tail=staged_tail,
+        bare_tail=bare_tail,
         tail_specs=fused_specs,
         input_scale_width=if_scale_bits,
         weight_scale_width=fl_scale_bits,
@@ -1683,6 +1736,7 @@ def _prepare_search(node, tiler, constraint=None):
         constraint=constraint,
         has_tail=has_tail,
         staged_tail=staged_tail,
+        scratch_regions=scratch_regions,
         num_slots=tiler.config.num_slots,
         batch=batch,
         weight_batch=batch // weight_repeat,
@@ -1739,18 +1793,21 @@ def bank_partition(architecture, size_fn, layer, mapping):
     stamped for the memory planner and the reporting model.
 
     Returns:
-        A list of role sets, one per bank group -- plus a ``{"scratch"}``
-        entry when the search charged the reduction scratch its own region --
-        or ``None`` when the architecture has no banked level or there is no
-        ``size_fn`` (nothing checked the fit, so nothing shares a bank).
+        ``(partition, scratch_slots)``: a list of role sets, one per bank
+        group -- plus a ``{"scratch"}`` entry when the search charged the
+        reduction scratch its own regions -- and how many regions it
+        charged, the slot count the scratch is allocated with.  The
+        partition is ``None`` when the architecture has no banked level or
+        there is no ``size_fn`` (nothing checked the fit, so nothing shares
+        a bank).
     """
     if size_fn is None:
-        return None
+        return None, 1
     level = 2
     buf = architecture.buffer(level)
     bank_size = buf.bank_size
     if not bank_size:
-        return None
+        return None, 1
     capacity = buf.capacity
     if isinstance(capacity, list):
         capacity = capacity[0]
@@ -1777,15 +1834,15 @@ def bank_partition(architecture, size_fn, layer, mapping):
             blocking_accum, partitioning_accum, partitioning
         ),
     )
-    groups, scratch = size_fn.compute_groups(
+    groups, scratch, regions = size_fn.compute_groups(
         counts, mapping, level, partitioning_accum, bank_size, num_banks
     )
     if groups is None:
-        return None
+        return None, 1
     partition = [roles for _, _, _, roles in groups]
     if scratch:
         partition.append({"scratch"})
-    return partition
+    return partition, regions
 
 
 def _finish_search(search, found):
@@ -1795,10 +1852,11 @@ def _finish_search(search, found):
     layer first -- a forked search set it only on the worker's copy.
 
     Returns:
-        ``(mapping, access_list, bank_groups)`` -- the best MappingPoint (its
-        ``loop_blockings`` give the per-level tile factors), the per-level
-        ``(input, output, weight)`` access counts the ``Tiling`` proto
-        reports, and the winning bank partition (``bank_partition``).
+        ``(mapping, access_list, bank_groups, scratch_slots)`` -- the best
+        MappingPoint (its ``loop_blockings`` give the per-level tile
+        factors), the per-level ``(input, output, weight)`` access counts
+        the ``Tiling`` proto reports, and the winning bank partition with
+        its scratch slot count (``bank_partition``).
     """
     runtime, mapping = found
     search.layer.size_fn = search.size_fn
@@ -1825,10 +1883,10 @@ def _finish_search(search, found):
     _, _, access_list = interstellar.cost_model.get_cost(
         search.tiler.arch, mapping, search.layer
     )
-    bank_groups = bank_partition(
+    bank_groups, scratch_slots = bank_partition(
         search.tiler.arch, search.size_fn, search.layer, mapping
     )
-    return mapping, access_list, bank_groups
+    return mapping, access_list, bank_groups, scratch_slots
 
 
 # Prepared in the parent before forking; a worker reads its job by index so
@@ -2078,7 +2136,7 @@ def get_tiling(node, tiler=None):
 
     key, search = _prepare_search(node, tiler, constraint)
     if key in tiler.cache:
-        mapping, access_list, bank_groups = tiler.cache[key]
+        mapping, access_list, bank_groups, scratch_slots = tiler.cache[key]
         logger.debug(
             "[tiling] %s: mapping cache hit (%d entries)",
             anchor.name,
@@ -2089,8 +2147,9 @@ def get_tiling(node, tiler=None):
         t0 = time.perf_counter()
         if search is None:
             mapping = access_list = bank_groups = None
+            scratch_slots = 1
         else:
-            mapping, access_list, bank_groups = _finish_search(
+            mapping, access_list, bank_groups, scratch_slots = _finish_search(
                 search, _run_search(search)
             )
         logger.info(
@@ -2098,19 +2157,21 @@ def get_tiling(node, tiler=None):
             anchor.name,
             time.perf_counter() - t0,
         )
-        tiler.cache[key] = (mapping, access_list, bank_groups)
+        tiler.cache[key] = (mapping, access_list, bank_groups, scratch_slots)
 
     if mapping is None:
         return None, None
 
     # The builders copy these onto the nest they build (the anchor is erased
     # on splice): the mapping / architecture for the proto's ``Tiling``,
-    # ``bank_groups`` for the memory planner, and the calculator / layer so
-    # the reporting model prices the mapping actually emitted.
+    # ``bank_groups`` for the memory planner, ``scratch_slots`` for the
+    # reduction kernel, and the calculator / layer so the reporting model
+    # prices the mapping actually emitted.
     anchor.meta["tiling"] = {
         "interstellar_tiling": (mapping, access_list),
         "interstellar_architecture": tiler.arch,
         "bank_groups": bank_groups,
+        "scratch_slots": scratch_slots,
         "runtime_calculator": search.rc,
         "layer": search.layer,
     }
