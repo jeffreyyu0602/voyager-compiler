@@ -311,7 +311,10 @@ class _SparseGemm(torch.nn.Module):
         )
         racing = async_pipeline and same_slice_gap < _STORE_LAG
         self.chain_epilogue = (
-            out_geom is not None and self.n_sub == 1 and not racing
+            out_geom is not None
+            and self.n_sub == 1
+            and not racing
+            and (accumulate_fusible or plan.num_k == 1)
         )
         self.chain_fused_tail = accumulate_fusible and out_geom is None
         if geom is not None:
@@ -434,14 +437,8 @@ class _SparseGemm(torch.nn.Module):
             fused_idx=fused_idx,
             anchor=plan.anchor,
             accumulate_fp32=self.accumulate_fp32,
-            # A multi-slice epilogue re-reads the staged accumulator — its
-            # interleaved stores cannot ride the pass; a single-slice tail
-            # is pure compute and chains, its stores running bare in
-            # ``_kernel`` / ``_async_kernel``.  A consumer's fusible tail
-            # chains like a dense GEMM's.
             chain_tail=self.chain_epilogue or self.chain_fused_tail,
             async_pipeline=self.async_pipeline,
-            # An ``_EpilogueTail`` stages its own stores and is never split.
             split=self.tail_split if tail is plan.fused_gm else None,
             staged=self.stage_tile,
         )
