@@ -71,6 +71,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _tag_loop_extents,
     effect_cond,
     outline_dps_ops,
+    stamp_csr_fill,
     voyager,
 )
 from voyager_compiler.export_utils import export_model
@@ -1234,6 +1235,11 @@ def build_sparse_gemm(
     _tag_loop_extents(gm, extents)
     if geom is not None:
         tag_base_table(gm, ptr.meta[PRODUCER_META], base_table_shape(geom))
+    # A gather moves a block's own count, at the occupancy its producer
+    # measured.  A nest that also stores a CSR (the epilogue producer) is
+    # left at the budget.
+    if geom is not None and out_geom is None:
+        stamp_csr_fill(gm, geom.fill)
     if out_geom is not None:
         tag_base_table(gm, node.name, base_table_shape(out_geom))
         gm.meta[GEOMETRY_META] = out_geom

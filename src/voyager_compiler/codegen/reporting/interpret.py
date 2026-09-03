@@ -36,6 +36,7 @@ from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _produces_tensor,
     _viewed_buffer,
 )
+from voyager_compiler.codegen.transform.bufferize.utils import CSR_FILL_META
 from voyager_compiler.codegen.transform.bufferize.emit import (
     COMMIT,
     COND,
@@ -340,6 +341,9 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
         elif t is _ASYNC_COPY:
             buf, sizes, is_load = _dma_dir(node, ctx.bind)
             n_bytes = tile_bytes(buf, sizes)
+            fill = node.meta.get(CSR_FILL_META)
+            if fill is not None:
+                n_bytes = math.ceil(n_bytes * fill)
             key = _sem_key(node.args[4], env, ctx.bind)
             post_count = _resolve(get_arg_value(node, 10, "post_count", 1), env)
             ctx.rs.async_copy(

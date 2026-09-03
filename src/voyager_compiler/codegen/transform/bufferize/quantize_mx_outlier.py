@@ -78,6 +78,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _tag_loop_extents,
     effect_cond,
     outline_dps_ops,
+    stamp_csr_fill,
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling.search import vector_op_tiling
@@ -148,6 +149,9 @@ class _Geometry:
             activation's worst block.
         max_pct: Fraction of the whole matrix the declared stream holds; the
             graph-level op's own bound.
+        fill: Mean occupancy of a block's ``budget`` over the calibration
+            activation -- what a block's copy moves at run time, which the
+            reporting model prices it at.  1.0 until the producer measures it.
         dropped: Leading batch dims a reshape removed between the producer and
             this consumer; 0 on a producer's own geometry.
     """
@@ -160,6 +164,7 @@ class _Geometry:
     block_size: int
     budget: int
     max_pct: float
+    fill: float = 1.0
     # Leading batch dims a reshape dropped between the producer and this
     # consumer. They are all extent 1, so the table keeps the producer's rank
     # and the consumer pins them to 0; the packed stream is addressed at the
@@ -979,6 +984,11 @@ def build_quantize_mx_outlier(
         )
     _tag_loop_extents(gm, [[(0, producer.num_steps, 1)]])
     tag_base_table(gm, node.name, base_table_shape(geom))
+    # Each slice's pointer array ends at that slice's count.
+    nnz = float(vals[2][..., -1].sum())
+    blocks = math.prod(geom.batch) * geom.n_rb * geom.n_k
+    geom = replace(geom, fill=nnz / (blocks * geom.budget))
+    stamp_csr_fill(gm, geom.fill)
     # The consumer has to know how the stream was diced -- how many blocks span
     # one of its row tiles, and how big each may be -- and cannot derive it
     # from the CSR's shapes alone. ``bufferize_graph`` copies this onto the

@@ -5,8 +5,10 @@ Shared helpers for the bufferization builders (``gemm`` / ``pointwise`` /
 Tile DMA goes through ``voyager.async_copy`` (the guarded prefetch / store) and
 ``voyager.insert`` (the in-kernel whole-slot writes); the helpers here are
 the remaining shared pieces: the fused pointwise tail, the lenient export
-verifier, exported-graph cleanup, and tagging each ``while_loop`` with its
-per-dimension tile-grid extents (consumed by the loop-aware code generator).
+verifier, exported-graph cleanup, tagging each ``while_loop`` with its
+per-dimension tile-grid extents (consumed by the loop-aware code generator),
+and stamping a CSR block copy with the occupancy the reporting model prices
+it at.
 """
 
 import contextlib
@@ -20,6 +22,7 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     compute_tiled_shape,
+    get_arg_value,
     is_nop,
     quant_param_arg_nodes,
 )
@@ -29,6 +32,10 @@ voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
+# Stamped on a CSR block's ``async_copy`` -- sized at the block's budget but
+# moving ``count`` entries at run time -- as the budget's mean occupancy over
+# the example input, so the reporting model prices the bytes actually moved.
+CSR_FILL_META = "csr_fill"
 
 
 def effect_cond(
@@ -563,3 +570,17 @@ def _tag_loop_extents(gm, extents_per_level, depth=0) -> bool:
                 if _tag_loop_extents(sub, extents_per_level, depth):
                     return True
     return False
+
+
+def stamp_csr_fill(gm, fill: float) -> None:
+    """Stamp ``CSR_FILL_META`` on every counted ``async_copy`` in ``gm``."""
+    for m in gm.modules():
+        if not isinstance(m, torch.fx.GraphModule):
+            continue
+        for n in m.graph.nodes:
+            if (
+                n.op == "call_function"
+                and n.target is voyager.async_copy.default
+                and get_arg_value(n, 11, "count", None) is not None
+            ):
+                n.meta[CSR_FILL_META] = fill
