@@ -20,6 +20,7 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_prunable_op,
     is_reshape_op,
+    is_spmm,
     repeat_of,
     swaps_last_two_dims,
 )
@@ -671,41 +672,38 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     return nodes
 
 
-def _accumulate_fusible(
-    anchor: Node, group: List[Node], patterns: List[List[Any]]
+def _tail_fits(
+    anchor: Node, tail: List[Node], patterns: List[List[Any]], adds: int
 ) -> bool:
-    """Whether the vector pipeline can absorb a cross-tile reduction's
-    accumulator add into ``anchor``'s fused chain.
+    """Whether one pass of the vector pipeline holds ``adds`` accumulator
+    adds and then ``tail``, in that order, after ``anchor``.
 
-    A ``num_k > 1`` reduction's last step runs ``anchor -> add(accumulator) ->
-    tail`` as one pass only if the add gets a pipeline stage of its own,
-    between the anchor and the stages the tail occupies.  The check embeds
-    ``[add, *tail]`` into each pattern's post-anchor stages in order, each
-    stage claimed at most once.  The tail is the group's post-anchor ops minus
-    relayout / nop members, which consume no stage; the add is virtual (no FX
-    node) and matches a stage by target alone.
+    The pipeline runs a fused chain in one pass only if every op gets a
+    stage of its own, in chain order.  The check embeds the adds and then
+    the tail's ops into each pattern's post-anchor stages, each stage
+    claimed at most once.  The adds are virtual (no FX node) and match a
+    stage by target alone: an SpMM's sparse correction takes one, and a
+    ``num_k > 1`` reduction's accumulate another, both ahead of the tail.
 
     Args:
         anchor: The group's GEMM / conv node.
-        group: The fused group's nodes, in graph order.
+        tail: The group's post-anchor ops minus relayout / nop members,
+            which consume no stage.
         patterns: The pipeline patterns handed to :func:`fuse_operator`.
+        adds: Add stages to claim ahead of the tail.
 
     Returns:
-        True if some pattern admits the chain with the add inserted.
+        True if some pattern admits the chain.
     """
-    tail = [
-        n
-        for n in group[group.index(anchor) + 1 :]
-        if not (is_nop(n) or is_reshape_op(n))
-    ]
     add = torch.ops.aten.add.Tensor
     for pattern in patterns:
         if not pattern[0].matches(anchor):
             continue
         stages = iter(pattern[1:])
-        if any(add in m.targets for m in stages) and all(
-            any(m.matches(n) for m in stages) for n in tail
-        ):
+        claimed = all(
+            any(add in m.targets for m in stages) for _ in range(adds)
+        )
+        if claimed and all(any(m.matches(n) for m in stages) for n in tail):
             return True
     return False
 
@@ -763,11 +761,21 @@ def fuse_operator(
 
     for fused_nodes in fused_nodes_list:
         anchor = next((n for n in fused_nodes if is_gemm_op(n)), None)
-        fusible = (
-            anchor is not None
-            and operations is not None
-            and _accumulate_fusible(anchor, fused_nodes, operations)
-        )
+        drain_fusible = accumulate_fusible = False
+        if anchor is not None and operations is not None:
+            tail = [
+                n
+                for n in fused_nodes[fused_nodes.index(anchor) + 1 :]
+                if not (is_nop(n) or is_reshape_op(n))
+            ]
+            # The sparse correction takes an add stage ahead of the tail;
+            # a split reduction's accumulate takes one more.  A tail the
+            # drain cannot hold runs as a second pass over the staged tile.
+            reserved = 1 if is_spmm(anchor) else 0
+            drain_fusible = _tail_fits(anchor, tail, operations, reserved)
+            accumulate_fusible = _tail_fits(
+                anchor, tail, operations, reserved + 1
+            )
         node = create_and_insert_subgraph(
             fused_nodes, model, normalize_iteration_space=True
         )
@@ -775,7 +783,8 @@ def fuse_operator(
             continue
         propagate_shape(node, model)
         if anchor is not None:
-            node.meta["accumulate_fusible"] = fusible
+            node.meta["drain_fusible"] = drain_fusible
+            node.meta["accumulate_fusible"] = accumulate_fusible
 
     graph.lint()
     graph.eliminate_dead_code()

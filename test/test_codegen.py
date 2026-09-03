@@ -20,20 +20,12 @@ from voyager_compiler.codegen.node_info import is_fully_connected
 logger = logging.getLogger()
 
 
-def _is_bf16_fc(node):
-    # BF16 FC are ran on vector unit and thus cannot be fused
+def _can_fuse(node):
+    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
     if hasattr(node, "value") and is_fully_connected(node):
         input_node = node.args[0]
-        return input_node.meta.get("dtype") is None
-    return False
-
-
-def _is_spmm(node):
-    return node.kwargs.get("A_data") is not None
-
-
-def _can_fuse(node):
-    return not _is_spmm(node) and not _is_bf16_fc(node)
+        return input_node.meta.get("dtype") is not None
+    return True
 
 
 def _is_constant_div(node):
@@ -90,14 +82,6 @@ VECTOR_PIPELINE = [
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
         OpMatcher(*GEMM_QUANT_OPS, "mul", "div"),
-    ],
-    # Fused SpMM operation will use the first stage in the pipeline
-    [
-        OpMatcher(*MXU_OPS, predicate=_is_spmm),
-        OpMatcher("dequantize"),
-        OpMatcher("exp", "abs", "relu"),
-        OpMatcher("add", "mul", "div"),
-        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher("layer_norm", "softmax"),

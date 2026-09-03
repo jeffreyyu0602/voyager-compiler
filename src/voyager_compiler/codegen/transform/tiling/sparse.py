@@ -150,7 +150,7 @@ def _search_costs(searches, tiler):
                 found = None
         for node, constraint in users:
             costs[node, constraint] = (
-                found[1] if found is not None else math.inf
+                found[0] if found is not None else math.inf
             )
             prepared[node, constraint] = (key, search, found)
     for (node, constraint), cost in costs.items():

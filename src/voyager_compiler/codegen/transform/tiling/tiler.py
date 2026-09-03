@@ -387,7 +387,6 @@ def make_size_fn(
     node,
     out_dtype=None,
     fused_specs=(),
-    extra_sharing=0,
     constraint=None,
     has_tail=False,
     staged_tail=False,
@@ -430,11 +429,11 @@ def make_size_fn(
 
     A bank cannot be split between groups, so each group rounds up to a whole
     bank -- which puts a floor of ``num_slots * len(groups) * bank_size`` on the
-    tile, however small it is.  With more groups than banks the two *smallest*
-    are merged until they fit (a tiny scale tensor would otherwise waste a
-    whole bank).  Only whole sources merge, never a source's own two slots --
-    each slot must keep its own bank.  ``extra_sharing`` forces further merges;
-    ``_run_search`` raises it when nothing maps even at the minimum.
+    tile, however small it is.  While the groups' banks exceed the budget the
+    two *smallest* are merged (a tiny scale tensor would otherwise waste a
+    whole bank), so a tile is admitted with the least sharing that fits it
+    and the cost model prices that sharing.  Only whole sources merge, never
+    a source's own two slots -- each slot must keep its own bank.
 
     Every operand is sized the way ``tensor_alloc_bytes`` sizes it for the
     planner -- payload, the slack a final store beat overshoots by, aligned to
@@ -569,6 +568,8 @@ def make_size_fn(
 
         # The gathered CSR shares the input's bank: a block's (value, index)
         # pairs, at the fraction of the activation the stream is sized for.
+        # Its staging ping-pongs exactly when the input does -- a sweep that
+        # gathers once keeps one slot (``_SparseGemm.forward``).
         gathered = if_count * outlier_pct
         groups = [
             (
@@ -631,10 +632,15 @@ def make_size_fn(
             return groups, scratch
 
         scratch_banks = math.ceil(scratch / bank_size) if scratch else 0
-        # Banks left for the ping-ponged sources, in whole sources.
-        budget = (num_banks or num_slots * len(groups)) - scratch_banks
-        target = max(1, budget // num_slots - extra_sharing)
-        for _ in range(max(0, len(groups) - target)):
+        # Banks left for the ping-ponged sources.  Without a bank count the
+        # partition is one source per bank, so nothing merges.
+        budget = (num_banks or math.inf) - scratch_banks
+
+        while (
+            len(groups) > 1
+            and sum(n * math.ceil(size / bank_size) for size, _, n, _ in groups)
+            > budget
+        ):
             groups.sort(key=lambda g: g[0])
             (s0, k0, n0, r0), (s1, k1, n1, r1) = groups[0], groups[1]
             # Charge the shared bank to the larger member's operand, and to the
@@ -721,6 +727,8 @@ class RuntimeCalculator:
             matmul as thirty-two.  ``None`` = one apiece.
         has_tail: The node has a fused post-op, so a reduction drains through
             the vector unit; a bare GEMM reduces in place and does not.
+        staged_tail: The tail runs over the staged tile even in a single
+            round, so the finished tile is read back from scratch.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
             pairs, from ``_fused_operand_specs``, in the order the bank
             partition's ``("fused", i)`` roles name them; ``vector_cycles``
@@ -754,6 +762,7 @@ class RuntimeCalculator:
         batch: int = 1,
         weight_batch: Optional[int] = None,
         has_tail: bool = False,
+        staged_tail: bool = False,
         tail_specs=(),
         input_scale_width: int = 0,
         weight_scale_width: int = 0,
@@ -776,6 +785,7 @@ class RuntimeCalculator:
         self.batch = batch
         self.weight_batch = batch if weight_batch is None else weight_batch
         self.has_tail = has_tail
+        self.staged_tail = staged_tail
         self.tail_specs = tuple(tail_specs)
         self.input_scale_width = input_scale_width
         self.weight_scale_width = weight_scale_width
@@ -1066,7 +1076,7 @@ class RuntimeCalculator:
         )
         store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
         vector_beats = store_cycles
-        if num_k == 1:
+        if num_k == 1 and not self.staged_tail:
             for dims, bits in self.tail_specs:
                 vector_beats = max(
                     vector_beats,
@@ -1134,6 +1144,12 @@ class RuntimeCalculator:
             words["scratch"] = 2 * self._bus_words(
                 output_elems, self.accum_dtype_width
             )
+        elif self.staged_tail:
+            # A staged single round parks the finished tile in scratch for
+            # the tail's own pass (``vector_cycles``) to read back.
+            words["scratch"] = self._bus_words(
+                output_elems, self.output_dtype_width
+            )
         else:
             words.update(self._tail_words(mapping, 1))
         # A stream that changes bank idles its port for a round trip each
@@ -1188,7 +1204,7 @@ class RuntimeCalculator:
         lane_bytes = max(widths) / 8 * oc_dim
         lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
         words = self._tail_words(mapping, 2)
-        if blockings[le.IC][3] > 1:
+        if blockings[le.IC][3] > 1 or self.staged_tail:
             words["scratch"] = self._bus_words(
                 output_size * oc_dim, self.accum_dtype_width
             )
@@ -1355,13 +1371,18 @@ class RuntimeCalculator:
 
         if not self.double_buffered_l2:
             total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
-            if num_k > 1:
+            if num_k > 1 or self.staged_tail:
                 total_time += output_tiles * vector_cycles
             return total_time
 
         if num_k == 1:
-            # Every step finishes a tile: one schedule covers the sweep.
-            return _sweep_cycles(dmas, l3_blocks, matrix_cycles)
+            # Every step finishes a tile: one schedule covers the sweep.  A
+            # riding tail drains inside the matrix pass; a staged one is a
+            # pass of its own, serial on the single scratch region.
+            step = matrix_cycles
+            if self.staged_tail:
+                step += vector_cycles
+            return _sweep_cycles(dmas, l3_blocks, step)
 
         load = input_load + weight_load
         # The sweep's last step has no tile after it to prefetch, so it costs
@@ -1448,15 +1469,14 @@ class _Search:
         tiler: The shared ``TilerContext``.
         layer: The interstellar ``Layer`` to map.
         rc: The ``RuntimeCalculator`` scoring each candidate mapping.
-        size_fns: Successive bank-sharing relaxations, least-shared first;
-            the first that maps wins.
+        size_fn: The ``Layer.size_fn`` the fit check runs.
     """
 
     name: str
     tiler: TilerContext
     layer: object
     rc: RuntimeCalculator
-    size_fns: list
+    size_fn: object
 
 
 def _prepare_search(node, tiler, constraint=None):
@@ -1505,10 +1525,13 @@ def _prepare_search(node, tiler, constraint=None):
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
-    # A tail whose quantize breaks the compute stream stages the finished
-    # tile even for a single-round reduction (``_gemm_scratch_and_kernel``);
-    # the footprint model must charge that region for unsplit mappings too.
-    staged_tail = stream_breaking_quantize(sub_gm) is not None
+    # A tail whose quantize breaks the compute stream, or that the drain
+    # cannot hold in one pass, stages the finished tile even for a
+    # single-round reduction (``_gemm_scratch_and_kernel``); the footprint
+    # model must charge that region for unsplit mappings too.
+    staged_tail = stream_breaking_quantize(sub_gm) is not None or not (
+        node.meta.get("drain_fusible", True)
+    )
     # The tail's own ``quantize_mx_outlier``, if it has one: this group is
     # then a CSR producer as well as (possibly) a consumer.
     out_quant = None
@@ -1543,20 +1566,24 @@ def _prepare_search(node, tiler, constraint=None):
     # is sized to hold (the staging window), and what fraction the example
     # input actually filled (the weight rows the engine gathers).  Read off
     # the operands rather than the producer's geometry, so tiling stays
-    # independent of the bufferize builders.
+    # independent of the bufferize builders.  The filled fraction is measured
+    # once and kept on the anchor: once the producer is lowered, its outputs
+    # carry the values of its buffers, not the example CSR.
     outlier_pct = 0.0
-    outlier_rate = 0.0
+    outlier_rate = anchor.meta.get("outlier_rate", 0.0)
     a_data = anchor.kwargs.get("A_data")
     if a_data is not None and getattr(a_data, "value", None) is not None:
         act = anchor.args[0].value
         elements = act.shape[-2] * act.shape[-1]
         outlier_pct = a_data.value.shape[-1] / elements
-        outlier_rate = outlier_pct
         indptr = getattr(anchor.kwargs.get("A_indptr"), "value", None)
-        if indptr is not None and not indptr.is_meta:
-            # Each slice's pointer array ends at that slice's count.
-            nnz = float(indptr[..., -1].sum())
-            outlier_rate = nnz / (math.prod(act.shape[:-2]) * elements)
+        if "outlier_rate" not in anchor.meta:
+            outlier_rate = outlier_pct
+            if indptr is not None and not indptr.is_meta:
+                # Each slice's pointer array ends at that slice's count.
+                nnz = float(indptr[..., -1].sum())
+                outlier_rate = nnz / (math.prod(act.shape[:-2]) * elements)
+            anchor.meta["outlier_rate"] = outlier_rate
 
     # A CSR producer's stream is unquantized, so ``meta["dtype"]`` leaves its
     # entries empty; resolve them against the traced values (the rule
@@ -1634,6 +1661,7 @@ def _prepare_search(node, tiler, constraint=None):
         batch=batch,
         weight_batch=batch // weight_repeat,
         has_tail=has_tail,
+        staged_tail=staged_tail,
         tail_specs=fused_specs,
         input_scale_width=if_scale_bits,
         weight_scale_width=fl_scale_bits,
@@ -1648,74 +1676,55 @@ def _prepare_search(node, tiler, constraint=None):
     # Built up front rather than per attempt: each one reads the node, which
     # only the parent may do.  They close over it, so they cannot be pickled --
     # hence a forked worker rather than a spawned one.
-    size_fns = [
-        make_size_fn(
-            anchor,
-            out_dtype,
-            fused_specs,
-            extra_sharing,
-            constraint=constraint,
-            has_tail=has_tail,
-            staged_tail=staged_tail,
-            num_slots=tiler.config.num_slots,
-            batch=batch,
-            weight_batch=batch // weight_repeat,
-            outlier_pct=outlier_pct,
-            out_outlier_pct=out_outlier_pct,
-            bank_width=tiler.config.bank_width,
-            vector_lanes=tiler.config.vector_lanes,
-        )
-        for extra_sharing in range(4 + len(fused_specs))
-    ]
-    return key, _Search(anchor.name, tiler, layer, rc, size_fns)
+    size_fn = make_size_fn(
+        anchor,
+        out_dtype,
+        fused_specs,
+        constraint=constraint,
+        has_tail=has_tail,
+        staged_tail=staged_tail,
+        num_slots=tiler.config.num_slots,
+        batch=batch,
+        weight_batch=batch // weight_repeat,
+        outlier_pct=outlier_pct,
+        out_outlier_pct=out_outlier_pct,
+        bank_width=tiler.config.bank_width,
+        vector_lanes=tiler.config.vector_lanes,
+    )
+    return key, _Search(anchor.name, tiler, layer, rc, size_fn)
 
 
 def _run_search(search):
-    """Map ``search``'s layer, relaxing bank sharing until one fits.
-
-    Each operand ideally gets a bank of its own, but a bank cannot be split, so
-    a layer with more operands than banks has no tiling at any size.  Retry
-    with progressively more bank sharing and keep the first (least-shared)
-    mapping.
+    """Map ``search``'s layer.
 
     Dispatches no torch op, so it is safe in a forked worker (:class:`_Search`).
 
     Returns:
-        ``(index, runtime, mapping)`` -- which ``size_fns`` entry mapped, its
-        estimated runtime, and the ``MappingPoint`` itself.
+        ``(runtime, mapping)`` -- the estimated runtime and the
+        ``MappingPoint`` itself.
 
     Raises:
-        RuntimeError: No tiling fits even at maximum sharing.
+        RuntimeError: No tiling fits on chip.
     """
-    for index, size_fn in enumerate(search.size_fns):
-        search.layer.size_fn = size_fn
-        try:
-            result = interstellar.optimizer.opt_optimizer(
-                search.tiler.arch,
-                search.layer,
-                search.tiler.schedule,
-                search.rc.calculate_runtime,
-                verbose=False,
-                runtime_tolerance=search.tiler.runtime_tolerance,
-            )
-        except AssertionError as e:
-            # The optimizer reports "nothing fits" with a bare assert, so match
-            # it narrowly: every other AssertionError in interstellar is a real
-            # invariant break.
-            if "No valid mapping point found" not in str(e):
-                raise
-            continue
-        if index:
-            logger.info(
-                f"[interstellar] {search.name}: no tiling fits one bank "
-                f"per operand; sharing {index} more"
-            )
-        _, runtime, mapping, _ = result
-        return index, runtime, mapping
-    raise RuntimeError(
-        f"{search.name}: no tiling fits on chip even with every operand "
-        f"sharing one bank"
-    )
+    search.layer.size_fn = search.size_fn
+    try:
+        result = interstellar.optimizer.opt_optimizer(
+            search.tiler.arch,
+            search.layer,
+            search.tiler.schedule,
+            search.rc.calculate_runtime,
+            verbose=False,
+            runtime_tolerance=search.tiler.runtime_tolerance,
+        )
+    except AssertionError as e:
+        # The optimizer reports "nothing fits" with a bare assert, so match
+        # it narrowly: every other AssertionError in interstellar is a real
+        # invariant break.
+        if "No valid mapping point found" not in str(e):
+            raise
+        raise RuntimeError(f"{search.name}: no tiling fits on chip") from e
+    _, runtime, mapping, _ = result
+    return runtime, mapping
 
 
 def bank_partition(architecture, size_fn, layer, mapping):
@@ -1782,9 +1791,8 @@ def bank_partition(architecture, size_fn, layer, mapping):
 def _finish_search(search, found):
     """Log ``found``'s tile sizes and price it, in the parent.
 
-    ``get_cost`` sizes tiles through ``layer.size_fn``, so the winning
-    relaxation is set on the layer first -- a forked search set it only on the
-    worker's copy.
+    ``get_cost`` sizes tiles through ``layer.size_fn``, which is set on the
+    layer first -- a forked search set it only on the worker's copy.
 
     Returns:
         ``(mapping, access_list, bank_groups)`` -- the best MappingPoint (its
@@ -1792,8 +1800,8 @@ def _finish_search(search, found):
         ``(input, output, weight)`` access counts the ``Tiling`` proto
         reports, and the winning bank partition (``bank_partition``).
     """
-    index, runtime, mapping = found
-    search.layer.size_fn = search.size_fns[index]
+    runtime, mapping = found
+    search.layer.size_fn = search.size_fn
 
     b = mapping.loop_blockings
     logger.info(
@@ -1818,7 +1826,7 @@ def _finish_search(search, found):
         search.tiler.arch, mapping, search.layer
     )
     bank_groups = bank_partition(
-        search.tiler.arch, search.size_fns[index], search.layer, mapping
+        search.tiler.arch, search.size_fn, search.layer, mapping
     )
     return mapping, access_list, bank_groups
 

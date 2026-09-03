@@ -985,6 +985,12 @@ def csr_quantize_node(node):
     )
 
 
+def is_spmm(node: Node) -> bool:
+    """Whether a GEMM's activation carries an outlier CSR (``A_data``), so
+    the engine adds the sparse correction on the vector pipeline."""
+    return node.kwargs.get("A_data") is not None
+
+
 def gemm_produces_csr(node) -> bool:
     """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
 

@@ -1905,9 +1905,7 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
     assigned = [None] * len(ordered)
     scratch_group = None
 
-    node_specs = {
-        n: spec for n, spec in zip(node.all_input_nodes, in_specs)
-    }
+    node_specs = {n: spec for n, spec in zip(node.all_input_nodes, in_specs)}
 
     def tag(spec, group):
         if spec is not None and id(spec) in index_of:
@@ -2019,8 +2017,9 @@ def _gemm_scratch_and_kernel(
             sentinel classifies here.
         staged: Force the staged path even for an unsplit single round —
             the tail re-reads its tile from scratch (a CSR-producing
-            epilogue staging its prefix result), so the ``num_k == 1``
-            map shortcut must not apply.
+            epilogue staging its prefix result, or a tail the drain cannot
+            hold in one pass, ``meta['drain_fusible']``), so the
+            ``num_k == 1`` map shortcut must not apply.
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -2339,6 +2338,7 @@ def build_conv2d(
         chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
+        staged=not node.meta.get("drain_fusible", True),
     )
     gm = build_pipelined_buffers(
         kernel,
@@ -2744,6 +2744,7 @@ def build_gemm(
         chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
+        staged=not node.meta.get("drain_fusible", True),
     )
     gm = build_pipelined_buffers(
         kernel,

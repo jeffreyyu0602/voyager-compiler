@@ -223,11 +223,11 @@ class _SparseGemm(torch.nn.Module):
     index is in hand, and the kernel below only substitutes the filled scratch
     for the raw operands.
 
-    A row tile's blocks are the same for every column tile it meets, so a
-    whole-K sweep gathers them once, on the row tile's first column step,
-    and reads them from the staging slot for the rest of the sweep
-    (``reuse_gathers``).  A split reduction changes block with every step
-    and gathers per step.
+    A row tile's blocks are the same for every step the sweep nests inside
+    its row dim, so a whole-K sweep gathers them once, on the row tile's
+    first such step, and reads them from the staging slot for the rest
+    (``reuse_gathers``).  A split reduction, or a sweep with nothing inside
+    the row dim, changes block with every step and gathers per step.
 
     Two scheduling modes.  The synchronous nest waits every operand inline.
     The async nest (``async_pipeline``) dispatches each step's compute as a
@@ -246,6 +246,7 @@ class _SparseGemm(torch.nn.Module):
         *,
         out_geom=None,
         accumulate_fusible: bool,
+        drain_fusible: bool = True,
         num_slots: int = _DEFAULT_NUM_SLOTS,
         accumulate_fp32: bool = False,
         async_pipeline: bool = False,
@@ -259,7 +260,25 @@ class _SparseGemm(torch.nn.Module):
         self.R = plan.tile_m // geom.rows if geom is not None else 1
         self.span = self.R * geom.budget if geom is not None else 0
         self.grid_m, self.grid_n, self.grid_k = plan.grid_dims
-        self.reuse_gathers = geom is not None and plan.num_k == 1
+        # Grid dims the sweep nests inside the row dim, ahead of the
+        # reduction, and the steps they span: how long a row tile lasts.
+        self.inner_dims = [d for d in range(self.grid_k) if d > self.grid_m]
+        self.row_steps = math.prod(plan.grid[d] for d in self.inner_dims)
+        self.reuse_gathers = (
+            geom is not None and plan.num_k == 1 and self.row_steps > 1
+        )
+        # Gathers the sweep issues: one per row tile when reused, one per
+        # step otherwise.  A single gather never ping-pongs, so its staging
+        # keeps one slot -- the depth the tile search charges the CSR at.
+        gathers = (
+            math.prod(plan.grid[: self.grid_m + 1])
+            if self.reuse_gathers
+            else math.prod(plan.grid)
+        )
+        if not async_pipeline:
+            self.gather_slots = UNPIPELINED
+        else:
+            self.gather_slots = _DONE_DEPTH if gathers > 1 else 1
         if out_geom is not None:
             # Every output is stored by hand, the dense pair by the same
             # route as the CSR, so the output grid dices none of them.
@@ -307,15 +326,13 @@ class _SparseGemm(torch.nn.Module):
         # next finalize of the same K slice -- the same batch and column
         # coordinates, another row tile -- reads the running nonzero count
         # that store updates, so the two must be at least that far apart.
-        # They are ``num_k`` finalizes times the extent of every grid dim
-        # nested inside the row dim apart, and a nest with a single row tile
-        # never revisits a slice.  A nest whose gap is shorter stores inline
-        # instead.
-        inner = math.prod(
-            plan.grid[dim] for dim in range(self.grid_k) if dim > self.grid_m
-        )
+        # They are ``num_k`` finalizes times the steps inside the row dim
+        # apart, and a nest with a single row tile never revisits a slice.
+        # A nest whose gap is shorter stores inline instead.
         same_slice_gap = (
-            plan.num_k * inner if plan.grid[self.grid_m] > 1 else math.inf
+            plan.num_k * self.row_steps
+            if plan.grid[self.grid_m] > 1
+            else math.inf
         )
         racing = async_pipeline and same_slice_gap < _STORE_LAG
         self.chain_epilogue = (
@@ -337,15 +354,14 @@ class _SparseGemm(torch.nn.Module):
         # Classified once: the traced per-step kernel rebuild cannot walk
         # a graph.
         self.tail_split = _split_stream_break(plan.fused_gm, plan.acc_shape)
-        # A multi-sub-slice epilogue reads windows of its tile at an index
-        # the rolled loop supplies at runtime, and only a buffer can be
-        # addressed that way; an unchained single-slice one runs its stores
-        # bare after the commit and needs the tile staged the same way.
-        # ``staged`` is what puts the tile in one: its sole effect is to
-        # disqualify ``_map_kernel``, which allocates no scratch, leaving
-        # the reduction scratch to read windows out of.
-        self.stage_tile = out_geom is not None and (
-            self.n_sub > 1 or not self.chain_epilogue
+        # A tail the drain cannot hold in one pass runs over the staged
+        # tile.  So does a multi-sub-slice epilogue, which reads windows of
+        # its tile at an index the rolled loop supplies at runtime, and an
+        # unchained single-slice one, which runs its stores bare after the
+        # commit.  ``staged`` is what puts the tile in scratch: its sole
+        # effect is to disqualify ``_map_kernel``, which allocates none.
+        self.stage_tile = not drain_fusible or (
+            out_geom is not None and (self.n_sub > 1 or not self.chain_epilogue)
         )
         # A finalize writes the five staging tiles, and the store that
         # empties them runs ``_STORE_LAG`` steps later; in between, no other
@@ -572,7 +588,7 @@ class _SparseGemm(torch.nn.Module):
     def _ordinal(self, idx, dims):
         """``idx``'s position in the sweep, counted over its first ``dims``
         grid dims: the whole grid counts steps, ``grid_k`` (the reduction,
-        last) output tiles, ``grid_n`` (the column dim) row tiles."""
+        last) output tiles, ``grid_m + 1`` row tiles."""
         ordinal = 0
         for d in range(dims):
             ordinal = ordinal * self.plan.grid[d] + idx[d]
@@ -688,10 +704,19 @@ class _SparseGemm(torch.nn.Module):
             ),
         )
 
+    def _row_tile_start(self, idx):
+        """Whether ``idx`` is the first step of its row tile: every dim
+        inside the row dim at zero."""
+        first = idx[self.inner_dims[0]] == 0
+        for d in self.inner_dims[1:]:
+            first = first & (idx[d] == 0)
+        return first
+
     def _kernel(self, idx, *slots):
         if self.reuse_gathers:
             effect_cond(
-                idx[self.grid_n] == 0, lambda: self._gather_rolled(idx, slots)
+                self._row_tile_start(idx),
+                lambda: self._gather_rolled(idx, slots),
             )
         elif self.geom is not None:
             self._gather_rolled(idx, slots)
@@ -730,8 +755,8 @@ class _SparseGemm(torch.nn.Module):
         the gather DMAs' addresses at issue time — so its load semaphore is
         waited here and withheld from the commit, which instead depends on
         the dense loads plus the gather copies.  A reused gather posts one
-        credit per column step, so every commit of the sweep lists the same
-        views and consumes one.  The gather-slot views ride the
+        credit per step of its row tile, so every commit of the sweep lists
+        the same views and consumes one.  The gather-slot views ride the
         dependency-carrying operand list into the commit (see
         ``_scratch_and_kernel``).
         """
@@ -753,20 +778,19 @@ class _SparseGemm(torch.nn.Module):
         if self.geom is not None:
             voyager.async_wait(deps.pop(self.ptr_sem_index))
             # The gather slot ping-pongs with whatever the blocks change
-            # with -- the row tile when they are reused across its column
-            # steps, the step otherwise -- since the previous one's last
+            # with -- the row tile when they are reused across the steps
+            # inside it, the step otherwise -- since the previous one's last
             # commit may still be reading the other slot.
             if self.reuse_gathers:
-                slot = self._ordinal(idx, self.grid_n) % _DONE_DEPTH
+                slot = self._ordinal(idx, self.grid_m + 1) % _DONE_DEPTH
             else:
                 slot = step % _DONE_DEPTH
             row = get_slot(self._bufs.gather_sem, slot)
             if self.reuse_gathers:
-                columns = self.plan.grid[self.grid_n]
                 effect_cond(
-                    idx[self.grid_n] == 0,
+                    self._row_tile_start(idx),
                     lambda: self._gather_rolled(
-                        idx, in_slots, slot, row, columns
+                        idx, in_slots, slot, row, self.row_steps
                     ),
                 )
             else:
@@ -818,7 +842,7 @@ class _SparseGemm(torch.nn.Module):
         bufs = _Bufs()
         g = self.geom
         if g is not None:
-            num_slots = _DONE_DEPTH if self.async_pipeline else UNPIPELINED
+            num_slots = self.gather_slots
             # Names the producer's table rather than adding one:
             # ``merge_base_tables`` collapses the group onto its alloc.
             bufs.base_table_dram = voyager.alloc(
@@ -1165,6 +1189,7 @@ def build_sparse_gemm(
         data_dtype,
         out_geom=out_geom,
         accumulate_fusible=node.meta.get("accumulate_fusible", False),
+        drain_fusible=node.meta.get("drain_fusible", True),
         num_slots=num_slots,
         accumulate_fp32=accumulate_fp32,
         async_pipeline=async_pipeline,
