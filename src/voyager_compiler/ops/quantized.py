@@ -1061,13 +1061,17 @@ def spmm_csr(
 
         # The row pointers may name a range lifted out of a longer array,
         # in which case they do not start at 0 and data/indices hold only
-        # the span they cover.  Rebase both onto that span's start.
-        base = indptr[i][0].item()
-        end_index = indptr[i][-1].item() - base
+        # the span they cover.  Rebase both onto that span's start, and
+        # keep the pointers and columns in range: shape propagation runs a
+        # nest over buffers no step has written (see ``_pad_csr``), and
+        # the sparse mm does not check its input.
+        crow = (indptr[i] - indptr[i][0]).clamp_(0, data.shape[-1])
+        crow = torch.cummax(crow, 0).values
+        end_index = int(crow[-1])
 
         csr = torch.sparse_csr_tensor(
-            indptr[i] - base,
-            indices[i, :end_index],
+            crow,
+            indices[i, :end_index].clamp(0, B_batch.shape[0] - 1),
             data[i, :end_index],
             dtype=torch.float32,
             size=input_size,
