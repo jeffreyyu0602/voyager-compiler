@@ -23,10 +23,38 @@ __all__ = [
     "fetch_attr",
     "propagate_shape",
     "set_node_value",
+    "written_buffers",
 ]
 
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
+_HOPS = (_WHILE_LOOP, _COND)
+
+
+def written_buffers(graph) -> set:
+    """Targets of the ``get_attr`` buffers the graph writes in place: the
+    destination of an in-place ATen op (a KV-cache ``index_copy_``), or an
+    operand of a ``cond`` / ``while_loop`` region, whose body may write it.
+    Such a buffer must not be replaced by a compile-time copy."""
+    written = set()
+    for node in graph.nodes:
+        if node.op != "call_function":
+            continue
+        target = node.target
+        if target in _HOPS or target is _commit_op():
+            operands = node.all_input_nodes
+        elif (
+            isinstance(target, torch._ops.OpOverload)
+            and target._schema.name.endswith("_")
+            and node.args
+        ):
+            operands = [node.args[0]]
+        else:
+            continue
+        for operand in operands:
+            if isinstance(operand, Node) and operand.op == "get_attr":
+                written.add(operand.target)
+    return written
 
 
 def fetch_attr(module, target):
@@ -102,6 +130,10 @@ class ShapeProp:
     single iteration with the carried *initial* values, each ``cond`` branch
     once — so their inner nodes are stamped too, in one pass.  The default runs
     them as opaque callables (what other callers rely on).
+
+    The module's own state is left as found: a buffer the graph writes in
+    place (a KV cache) is run on a copy, and a ``get_attr`` is stamped with
+    the value it holds when the graph starts, before any write of the step.
     """
 
     def __init__(
@@ -152,11 +184,16 @@ class ShapeProp:
             map_arg(node.args, lambda n: register_last_uses(n, node))
             map_arg(node.kwargs, lambda n: register_last_uses(n, node))
 
+        written = written_buffers(self.graph)
+
         for node in self.graph.nodes:
             if node.op == "placeholder":
                 result = next(args_iter)
             elif node.op == "get_attr":
                 result = fetch_attr(self.mod, node.target)
+                if node.target in written and isinstance(result, torch.Tensor):
+                    result = result.clone()
+                set_node_value(node, result)
             elif node.op == "output":
                 result = load_arg(node.args[0])
             elif self._recurse and node.target is _WHILE_LOOP:
@@ -198,11 +235,14 @@ class ShapeProp:
             env[node.name] = result
 
             # A node nothing consumes is never retired below, so snapshot it now
-            if node not in node_to_last_use:
+            if node not in node_to_last_use and node.op != "get_attr":
                 set_node_value(node, result)
 
-            # Retire any nodes whose last use is this node
+            # Retire any nodes whose last use is this node.  A ``get_attr``
+            # was stamped at its definition, with the step's input state.
             for n in user_to_last_uses.get(node, []):
-                set_node_value(n, env.pop(n.name))
+                value = env.pop(n.name)
+                if n.op != "get_attr":
+                    set_node_value(n, value)
 
         return load_arg(list(self.graph.nodes)[-1])

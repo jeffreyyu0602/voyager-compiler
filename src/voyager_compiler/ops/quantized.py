@@ -722,9 +722,14 @@ def quantize_affine(
     high = torch.amax(blocked, dim=reduce_axes)
     scale = (high - low) / (quant_max - quant_min)
     scale = torch.where(scale > 0.0, scale, 1.0)
-    zero_point = -low / scale + quant_min
+    # A scale below the format's range rounds to zero: the block is one
+    # level, as with no range.  The zero point is taken against the scale
+    # as stored.
     if scale_qmap is not None:
         scale = vmap(scale, scale_qmap)
+        scale = torch.where(scale > 0.0, scale, 1.0)
+    zero_point = -low / scale + quant_min
+    if scale_qmap is not None:
         zero_point = vmap(zero_point, scale_qmap)
 
     value = quantize(input, scale, zero_point, axes, block_size, qmap)

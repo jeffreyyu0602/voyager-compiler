@@ -71,6 +71,7 @@ from voyager_compiler import (
     prepare_pt2e,
     remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
+    split_kv_cache,
     transform,
 )
 from voyager_compiler.codegen.aten_classifier import is_compute_op
@@ -121,8 +122,7 @@ BASELINE_PROMPT_LEN = 1024
 
 # Max generation length added to the decode KV cache: the cache must hold the
 # ``kv_len`` context plus room for generation, so ``max_cache_len = kv_len +
-# DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).  For the KIVI
-# split cache this is also the residual window (``max_new_tokens``).
+# DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).
 DECODE_MAX_GEN = 128
 
 
@@ -430,6 +430,13 @@ def build_quantizer(cfg: SweepConfig):
         0,
         None,
     )
+    if cfg.mode == "decode":
+        # The split caches' residual halves of the attention (matmul orders
+        # 1 and 3 within a layer) stay unquantized.
+        for order in (1, 3):
+            quantizer.set_module_name_object_type_order(
+                "self_attn", torch.ops.aten.matmul.default, order, None
+            )
     return quantizer
 
 
@@ -487,13 +494,15 @@ def build_prefill(cfg: SweepConfig):
 def build_decode(cfg: SweepConfig):
     """Export a single decode step over a KV cache of length ``kv_len``: the
     whole model -- embeddings, every layer, final norm, lm_head -- via HF's
-    ``convert_and_export_with_cache``.  A quantized cache needs no special
-    export: ``_annotate_kv_cache`` puts the KIVI spec on the cache writes and
-    ``transform`` splits each cache into a baked prefix and a full-precision
-    residual window (``quant_folding``).  The cache holds the
-    ``kv_len`` context plus ``DECODE_MAX_GEN`` generation slots, rounded up to
-    the MX ``block_size`` (= ``cfg.group``) so the KV tensors stay block-aligned
-    and need no attention padding.  The decode token is at ``cache_position =
+    ``convert_and_export_with_cache``.  ``split_kv_cache`` keeps the chunk
+    being filled in a full-precision residual of one ``cfg.group`` block;
+    the main cache is quantized on its read -- by the attention matmuls'
+    activation spec, or by the KIVI spec ``_annotate_kv_cache`` puts there
+    -- and ``transform`` bakes it quantized and quantizes each chunk as it
+    completes (``quant_folding``).  The cache holds the ``kv_len`` context plus
+    ``DECODE_MAX_GEN`` generation slots, rounded up to the MX ``block_size``
+    (= ``cfg.group``) so the KV tensors stay block-aligned and need no
+    attention padding.  The decode token is at ``cache_position =
     [kv_len]``.  Contents don't affect the estimate, only shapes."""
     model = _load_model(cfg)
     block = cfg.group
@@ -521,6 +530,7 @@ def build_decode(cfg: SweepConfig):
             example_cache_position=cache_position,
         )
     gm = ep.module()
+    split_kv_cache(gm, block, cfg.kv_len)
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, model, (), example_kwargs
 
@@ -531,10 +541,11 @@ _KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
 
 
 def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
-    """Annotate the KV-cache writes (``index_copy_`` into a cache buffer)
-    with ``cfg.kv_bits``' KIVI spec (keys per-channel, values per-token), so
-    ``quant_folding`` bakes each cache's prefix and keeps a full-precision
-    residual window.  A no-op for 16-bit KV.  Raises if the graph names the
+    """Annotate each main KV cache's read into the attention with
+    ``cfg.kv_bits``' KIVI spec (keys per-channel, values per-token), so
+    ``quant_folding`` bakes the cache quantized and quantizes each chunk on
+    its fold.  The residual buffers, and the fold's own handle on the cache,
+    are left alone.  A no-op for 16-bit KV.  Raises if the graph names the
     cache buffers unexpectedly so a mismatch surfaces loudly."""
     if cfg.kv_bits == 16:
         return 0
@@ -548,10 +559,12 @@ def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
     )
     n = 0
     for node in gm.graph.nodes:
-        if node.target is not torch.ops.aten.index_copy_.default:
+        if node.op != "get_attr":
             continue
-        m = _KV_CACHE.match(str(node.args[0].target))
-        if m is None:
+        m = _KV_CACHE.match(str(node.target))
+        if m is None or any(
+            u.target is torch.ops.aten.index_copy_.default for u in node.users
+        ):
             continue
         _annotate_output_qspec(
             node, key_qspec if m.group(1) == "key" else value_qspec
@@ -670,8 +683,6 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
-        context_len=cfg.kv_len if is_decode else None,
-        max_new_tokens=DECODE_MAX_GEN if is_decode else None,
     )
 
     if cfg.dump_dir is not None:

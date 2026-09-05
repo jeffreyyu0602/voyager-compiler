@@ -13,20 +13,27 @@ Example:
 
 import argparse
 import json
+import math
+import logging
 import os
 import re
 import string
 import zipfile
 from collections import Counter
 
+import torch
 from fuzzywuzzy import fuzz
 from huggingface_hub import hf_hub_download
 from rouge import Rouge
 from tqdm import tqdm
 
 from common import (
+    BF16_CONFIG,
+    SEQ_BLOCK,
     add_inference_args,
     add_model_args,
+    add_quantization_args,
+    build_generator,
     generate_answer,
     load_model_and_tokenizer,
 )
@@ -201,10 +208,8 @@ DATASET2MAXGEN = {
 }
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="LongBench evaluation.")
-    add_model_args(parser)
-    add_inference_args(parser)
+def add_longbench_args(parser):
+    """Add the task selection options to ``parser``."""
     parser.add_argument(
         "--datasets",
         nargs="+",
@@ -216,7 +221,18 @@ def parse_args():
         action="store_true",
         help="Evaluate on LongBench-E and report scores per length bucket",
     )
-    return parser.parse_args()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="LongBench evaluation.")
+    add_model_args(parser)
+    add_inference_args(parser)
+    add_longbench_args(parser)
+    add_quantization_args(parser)
+    args = parser.parse_args()
+    if (args.qconfig or args.kivi) and args.max_length is None:
+        parser.error("--max_length sizes the quantized graphs' KV cache")
+    return args
 
 
 def load_longbench(dataset, longbench_e):
@@ -239,7 +255,14 @@ def load_longbench(dataset, longbench_e):
 
 
 def predict(
-    model, tokenizer, samples, dataset, max_length, max_gen, chat_template
+    model,
+    tokenizer,
+    samples,
+    dataset,
+    max_length,
+    max_gen,
+    chat_template,
+    out=None,
 ):
     """Greedily generate an answer for every sample of one task.
 
@@ -255,6 +278,8 @@ def predict(
         max_length: Prompt token budget.
         max_gen: Maximum number of generated tokens.
         chat_template: Chat-template the prompts of non-few-shot tasks.
+        out: File each record is appended to as it is produced, so an
+            interrupted run resumes where it stopped.
 
     Returns:
         One record per sample with ``pred``, ``answers``, ``all_classes``
@@ -278,14 +303,16 @@ def predict(
             chat_template,
             **generate_kwargs,
         )
-        records.append(
-            {
-                "pred": pred,
-                "answers": sample["answers"],
-                "all_classes": sample["all_classes"],
-                "length": sample["length"],
-            }
-        )
+        record = {
+            "pred": pred,
+            "answers": sample["answers"],
+            "all_classes": sample["all_classes"],
+            "length": sample["length"],
+        }
+        records.append(record)
+        if out is not None:
+            out.write(json.dumps(record, ensure_ascii=False) + "\n")
+            out.flush()
     return records
 
 
@@ -419,24 +446,29 @@ def score(dataset, records, longbench_e):
     return means if longbench_e else means["all"]
 
 
-def main(args):
-    if args.gpu is None:
-        model, tokenizer = load_model_and_tokenizer(
-            args.model_id, args.torch_dtype, device_map="auto"
-        )
-    else:
-        model, tokenizer = load_model_and_tokenizer(
-            args.model_id, args.torch_dtype
-        )
-        model.to(f"cuda:{args.gpu}")
+def evaluate(model, tokenizer, args, output_dir):
+    """Run and score every selected task, writing predictions and scores.
+
+    Existing predictions in ``output_dir`` are reused unless
+    ``args.overwrite`` is set, so an interrupted run resumes after the last
+    sample it wrote.
+
+    Args:
+        model: Anything with ``generate`` and ``device``: an HF causal LM,
+            or the quantized generator ``common.build_generator`` returns.
+            Without ``args.max_length`` its ``config`` supplies the prompt
+            budget.
+        tokenizer: Its tokenizer.
+        args: Parsed options carrying the inference and task settings.
+        output_dir: Where ``<task>.jsonl`` and ``result.json`` go.
+
+    Returns:
+        ``{task: score}``, as written to ``result.json``.
+    """
     chat_template = (
         not args.no_chat_template and tokenizer.chat_template is not None
     )
-
     datasets = args.datasets or (DATASETS_E if args.e else DATASETS)
-    output_dir = args.output_dir or os.path.join(
-        "pred_e" if args.e else "pred", args.model_id.split("/")[-1]
-    )
     os.makedirs(output_dir, exist_ok=True)
 
     scores = {}
@@ -446,30 +478,89 @@ def main(args):
         if max_length is None:
             max_length = model.config.max_position_embeddings - max_gen
         pred_path = os.path.join(output_dir, f"{dataset}.jsonl")
+        records = []
         if os.path.exists(pred_path) and not args.overwrite:
-            print(f"{dataset}: reusing predictions in {pred_path}")
             with open(pred_path, encoding="utf-8") as f:
                 records = [json.loads(line) for line in f]
+        samples = load_longbench(dataset, args.e)[: args.num_samples]
+        if len(records) >= len(samples):
+            print(f"{dataset}: reusing predictions in {pred_path}")
         else:
-            samples = load_longbench(dataset, args.e)[: args.num_samples]
-            records = predict(
-                model,
-                tokenizer,
-                samples,
-                dataset,
-                max_length,
-                max_gen,
-                chat_template,
-            )
-            with open(pred_path, "w", encoding="utf-8") as f:
-                for record in records:
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            if records:
+                print(f"{dataset}: resuming after {len(records)} predictions")
+            with open(
+                pred_path, "a" if records else "w", encoding="utf-8"
+            ) as f:
+                records += predict(
+                    model,
+                    tokenizer,
+                    samples[len(records) :],
+                    dataset,
+                    max_length,
+                    max_gen,
+                    chat_template,
+                    f,
+                )
         scores[dataset] = score(dataset, records, args.e)
         print(f"{dataset}: {scores[dataset]}")
 
     with open(os.path.join(output_dir, "result.json"), "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
+    return scores
+
+
+def main(args):
+    quantized = args.qconfig is not None or args.kivi
+    if quantized:
+        # The compiler's graphs run on one device; without --gpu, the CPU.
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        device = (
+            torch.device(f"cuda:{args.gpu}")
+            if args.gpu is not None
+            else torch.device("cpu")
+        )
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+        datasets = args.datasets or (DATASETS_E if args.e else DATASETS)
+        longest_generation = max(DATASET2MAXGEN[name] for name in datasets)
+        # Whole prefill blocks and whole residual chunks.
+        block = math.lcm(SEQ_BLOCK, args.residual_length)
+        cache_len = args.max_length + SEQ_BLOCK + longest_generation
+        cache_len = -(-cache_len // block) * block
+        model, tokenizer = build_generator(
+            args.model_id,
+            args.torch_dtype,
+            args.qconfig or BF16_CONFIG,
+            args.decode_qconfig,
+            args.kivi,
+            args.residual_length,
+            args.bake,
+            args.codebooks,
+            cache_len,
+            device,
+        )
+    elif args.gpu is None:
+        model, tokenizer = load_model_and_tokenizer(
+            args.model_id, args.torch_dtype, device_map="auto"
+        )
+    else:
+        model, tokenizer = load_model_and_tokenizer(
+            args.model_id, args.torch_dtype
+        )
+        model.to(f"cuda:{args.gpu}")
+
+    tag = [args.qconfig] if args.qconfig else []
+    tag += [f"decode-{args.decode_qconfig}"] if args.decode_qconfig else []
+    tag += ["kivi"] if args.kivi else []
+    tag += ["baked"] if args.bake else []
+    output_dir = args.output_dir or os.path.join(
+        "pred_e" if args.e else "pred",
+        "-".join([args.model_id.rstrip("/").split("/")[-1], *tag]),
+    )
+    evaluate(model, tokenizer, args, output_dir)
     print(f"model:      {args.model_id}")
+    if quantized:
+        print(f"scheme:     {'-'.join(tag)}")
     print(f"max length: {args.max_length or 'model context'}")
     print(f"results:    {os.path.join(output_dir, 'result.json')}")
 

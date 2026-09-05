@@ -45,6 +45,8 @@ from voyager_compiler.codegen import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
+    scalarize_index_arithmetic,
+    split_kv_cache,
 )
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
@@ -150,7 +152,9 @@ __all__ = [
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
     "replace_softmax",
+    "scalarize_index_arithmetic",
     "sink_obs_or_fq",
+    "split_kv_cache",
     "transform",
     "with_execution_context",
 ]
@@ -211,8 +215,6 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
-    context_len=None,
-    max_new_tokens=None,
 ):
     if example_kwargs is None:
         example_kwargs = {}
@@ -227,7 +229,8 @@ def transform(
     fold_constant_generators(model)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
-    fuse_quantize_dequantize_with_producer(model, context_len, max_new_tokens)
+    scalarize_index_arithmetic(model)
+    fuse_quantize_dequantize_with_producer(model)
 
     if config.pe_array_size is not None:
         pad_matrix_op_dimensions(model, *config.pe_array_size)

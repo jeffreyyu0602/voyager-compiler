@@ -9,6 +9,7 @@ static KV cache captured by ``convert_and_export_with_cache``.
 """
 
 import logging
+import math
 import os
 import re
 import sys
@@ -34,6 +35,7 @@ from voyager_compiler import (
     convert_pt2e,
     export_model,
     prepare_pt2e,
+    split_kv_cache,
     transform,
 )
 from voyager_compiler.codegen import (
@@ -52,8 +54,12 @@ sys.path.append(
     )
 )
 from quantization_configs import (  # noqa: E402
+    KIVI_BLOCK_SIZE,
+    KIVI_RESIDUAL_LENGTH,
     QUANTIZATION_CONFIGS,
+    set_kivi_attention_qconfig,
     set_qconfig,
+    set_residual_attention_qconfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,24 +69,26 @@ DEFAULT_MODEL = "meta-llama/Llama-3.1-8B"
 # Generation slots the decode KV cache holds beyond the prefilled context.
 DECODE_MAX_GEN = 128
 
-# KIVI's 2-bit KV cache: keys grouped along the sequence (per channel), values
-# along the head dim (per token).  The compiler splits each cache into a
-# baked prefix and a re-quantized residual window (``quant_folding``).
-KIVI_KEY_SPEC = "uint2,bs=64,qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
-KIVI_VALUE_SPEC = "uint2,bs=64,qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
-# The attention matmuls under KIVI re-encode the cache as int6 microscaling
-# for the MXU.  Each baked prefix is decoded and re-encoded in one fused
-# dequantize, which needs the int6 scale constant across each affine block:
-# 64x64 blocks cover both the key's 64-token and the value's 64-channel
-# groups.
-KIVI_QUERY_SPEC = "int6,qs=microscaling,bs=64,ax=-1,scale=fp8_e5m3"
-KIVI_CACHE_MX_SPEC = "int6,qs=microscaling,bs=64,ax=(-2,-1),scale=fp8_e5m3"
-_KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
+# The KV-cache buffers of a split decode graph: the main caches and the
+# residuals ``split_kv_cache`` puts beside them.
+_KV_BUFFER = re.compile(r"^(key|value)_cache_\d+(_residual)?$")
 
 # The rotary embedding's ``inv_freq @ position`` matmul is not an MXU op and
 # stays unquantized.  A regex, so it matches both the prefill scope
 # (``model.rotary_emb``) and the executorch wrapper's (``model.model...``).
 _ROTARY_SCOPE = r"model\.rotary_emb"
+
+# The 2-bit KV cache the compiler lowers: KIVI's groups (keys along the
+# sequence per channel, values along the head dim per token), with the
+# group scale and zero point in fp8_e5m3, the format of the block scale
+# the fused dequantize reads them beside.
+_KIVI_KEY_SPEC = (
+    f"uint2,bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,ax=-2,scale=fp8_e5m3"
+)
+_KIVI_VALUE_SPEC = (
+    f"uint2,bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,ax=-1,scale=fp8_e5m3"
+)
+_KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
 
 
 def load_model(args):
@@ -106,10 +114,24 @@ def _prompt_ids(tokenizer, length):
     return encodings.input_ids[:, :length]
 
 
+def residual_length(args):
+    """Positions of a decode KV cache kept in full precision while their
+    chunk fills: ``--residual_length``, or ``KIVI_RESIDUAL_LENGTH``; a
+    multiple of the 2-bit group (which the int6 block matches)."""
+    length = args.residual_length or KIVI_RESIDUAL_LENGTH
+    if length % KIVI_BLOCK_SIZE:
+        raise ValueError(
+            f"--residual_length {length} is not a multiple of the "
+            f"{KIVI_BLOCK_SIZE}-token KIVI group"
+        )
+    return length
+
+
 def max_cache_len(args, config):
     """Context plus generation budget, rounded up to a vector-lane multiple
-    so the KV tensors stay block-aligned."""
-    block = config.vector_lanes
+    so the KV tensors stay block-aligned, and to a whole number of residual
+    chunks."""
+    block = math.lcm(config.vector_lanes, residual_length(args))
     raw = args.context_length + DECODE_MAX_GEN
     return -(-raw // block) * block
 
@@ -134,7 +156,9 @@ def build_decode(model, tokenizer, args, config):
     static BF16 KV cache of ``max_cache_len`` slots, via Hugging Face's
     ``convert_and_export_with_cache``, then prefill the exported cache with
     the ``context_length`` prompt tokens so calibration and the baked cache
-    see real contents.  Returns ``(gm, (), example_kwargs)``.
+    see real contents.  The caches are then split into completed chunks and
+    a full-precision residual of ``residual_length(args)`` positions.
+    Returns ``(gm, (), example_kwargs)``.
     """
     model.generation_config = GenerationConfig(
         use_cache=True,
@@ -170,30 +194,95 @@ def build_decode(model, tokenizer, args, config):
         getattr(gm, f"key_cache_{i}").copy_(layer.keys)
         getattr(gm, f"value_cache_{i}").copy_(layer.values)
 
+    split_kv_cache(gm, residual_length(args), args.context_length)
+
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, (), example_kwargs
+
+
+def annotate_kivi_cache(gm):
+    """Quantize the main KV caches of a split decode graph to the 2-bit
+    layout the compiler lowers (``_KIVI_KEY_SPEC`` / ``_KIVI_VALUE_SPEC``).
+
+    The observer sits on the main cache's read into the attention, so the
+    whole buffer -- completed chunks and the zeros above them -- is
+    quantized on the way in, and ``quant_folding`` bakes it and moves the
+    quantize onto each chunk's fold.  The fold's own handle on the buffer,
+    whose ``index_copy_`` writes a ``where``, is not a read; the residual
+    buffers are not annotated.
+
+    Args:
+        gm: Decode graph after ``split_kv_cache``; annotated in place.
+
+    Raises:
+        RuntimeError: A cache is written directly, i.e. the graph was not
+            split.
+    """
+    key_qspec = QuantizationSpec.from_str(_KIVI_KEY_SPEC)
+    value_qspec = QuantizationSpec.from_str(_KIVI_VALUE_SPEC)
+    for node in gm.graph.nodes:
+        if node.op != "get_attr":
+            continue
+        match = _KV_CACHE.match(str(node.target))
+        if match is None:
+            continue
+        writes = [
+            u
+            for u in node.users
+            if u.target is torch.ops.aten.index_copy_.default
+        ]
+        if writes:
+            if writes[0].args[3].target is not torch.ops.aten.where.self:
+                raise RuntimeError(
+                    f"{node.target} is written directly: split the graph "
+                    "with split_kv_cache before annotating the caches"
+                )
+            continue
+        annotate_output_qspec(
+            node, key_qspec if match.group(1) == "key" else value_qspec
+        )
+
+
+def kv_cache_state(gm):
+    """A copy of every KV-cache buffer, to put back with
+    ``restore_kv_cache`` before the graph is run again.
+
+    The decode step is not idempotent: the step that completes a chunk folds
+    the residual into the main cache, and a second run of it would then read
+    the chunk from both.
+    """
+    return {
+        name: buffer.clone()
+        for name, buffer in gm.named_buffers()
+        if _KV_BUFFER.match(name)
+    }
+
+
+def restore_kv_cache(gm, state):
+    for name, saved in state.items():
+        getattr(gm, name).copy_(saved)
 
 
 def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     """Export and quantize the stage ``args.model`` names (``llama_prefill`` /
     ``llama_decode``), stopping short of ``transform``.  Returns ``(gm,
     example_args, example_kwargs, old_output, transform_args,
-    compile_args)`` -- the converted graph with shapes propagated, its example
-    inputs and reference output, and the keyword sets ``transform`` and
-    ``compile`` take."""
+    compile_args, kv_state)`` -- the converted graph with shapes propagated,
+    its example inputs and reference output, the keyword sets ``transform``
+    and ``compile`` take, and the KV-cache state to restore before running
+    the graph again (``restore_kv_cache``)."""
     transform_args = get_transform_args(args, vector_stages)
     compile_args = get_compile_args(args)
     config = transform_args["config"]
 
     is_decode = args.model in ("llama_decode", "llama_decode_kivi")
     if is_decode:
-        transform_args["context_len"] = args.context_length
-        transform_args["max_new_tokens"] = DECODE_MAX_GEN
         gm, example_args, example_kwargs = build_decode(
             model, tokenizer, args, config
         )
     else:
         gm, example_args, example_kwargs = build_prefill(model, tokenizer, args)
+    kv_state = kv_cache_state(gm)
 
     remove_softmax_dtype_cast(gm)
 
@@ -212,29 +301,10 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
         set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.qconfig])
 
     if args.model == "llama_decode_kivi":
-        query = QuantizationSpec.from_str(KIVI_QUERY_SPEC)
-        cache_mx = QuantizationSpec.from_str(KIVI_CACHE_MX_SPEC)
-        for order in (0, 1):
-            quantizer.set_module_name_object_type_order(
-                "self_attn",
-                torch.ops.aten.matmul.default,
-                order,
-                QuantizationConfig(query, None, cache_mx, None),
-            )
-        # The cache is quantized where it is written -- the observer sits on
-        # the index_copy_ -- so quant_folding can bake the buffer and move
-        # the quantize onto the token.
-        key_qspec = QuantizationSpec.from_str(KIVI_KEY_SPEC)
-        value_qspec = QuantizationSpec.from_str(KIVI_VALUE_SPEC)
-        for n in gm.graph.nodes:
-            if n.target is not torch.ops.aten.index_copy_.default:
-                continue
-            match = _KV_CACHE.match(str(n.args[0].target))
-            if match is None:
-                continue
-            annotate_output_qspec(
-                n, key_qspec if match.group(1) == "key" else value_qspec
-            )
+        set_kivi_attention_qconfig(quantizer)
+        annotate_kivi_cache(gm)
+    elif is_decode:
+        set_residual_attention_qconfig(quantizer)
 
     if args.qconfig is not None or args.model == "llama_decode_kivi":
         fp8_qspec = QuantizationSpec.from_str(
@@ -266,7 +336,9 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
 
     for _ in range(2):
+        restore_kv_cache(gm, kv_state)
         gm(*example_args, **example_kwargs)
+    restore_kv_cache(gm, kv_state)
 
     convert_pt2e(gm, args.bias)
 
@@ -279,6 +351,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
         old_output,
         transform_args,
         compile_args,
+        kv_state,
     )
 
 
@@ -294,6 +367,7 @@ def quantize_and_dump_model(model, tokenizer, quantizer, vector_stages, args):
         old_output,
         transform_args,
         compile_args,
+        _,
     ) = quantize_model(model, tokenizer, quantizer, vector_stages, args)
 
     transform(gm, example_args, example_kwargs, **transform_args)

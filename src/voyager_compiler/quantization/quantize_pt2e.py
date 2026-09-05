@@ -724,6 +724,24 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 add_node.replace_input_with(add_node, mx_op_node)
 
 
+def _is_written_buffer(model: GraphModule, node: Node) -> bool:
+    """Whether the buffer ``get_attr`` ``node`` names is written in the
+    graph -- the destination of an in-place op (a KV cache and its fold).
+    Such a buffer changes at run time, so it is quantized dynamically, in
+    the graph, not baked once from the observer's statistics."""
+    written = (
+        torch.ops.aten.index_copy_.default,
+        torch.ops.aten.copy_.default,
+    )
+    for n in model.graph.nodes:
+        if n.op != "call_function" or n.target not in written:
+            continue
+        for operand in n.all_input_nodes:
+            if operand.op == "get_attr" and operand.target == node.target:
+                return True
+    return False
+
+
 def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
     model: torch.fx.GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
 ):
@@ -738,7 +756,9 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
 
     input_node = node.args[0]
 
-    if input_node.op == "get_attr":
+    if input_node.op == "get_attr" and not _is_written_buffer(
+        model, input_node
+    ):
         param = fetch_attr(model, input_node.target)
         activation_post_process(param.data)
         scale, zero_point = activation_post_process.calculate_qparams()
@@ -1002,8 +1022,14 @@ def convert_pt2e(
         _eliminate_dequantize_with_no_effect(model)
 
     model.graph.lint()
+    # A KV-cache fold writes a buffer in place and yields nothing; it is the
+    # one side effect kept.
     model.graph.eliminate_dead_code(
         is_impure_node=lambda n: n.op in {"placeholder", "output"}
+        or (
+            n.target is torch.ops.aten.index_copy_.default
+            and n.args[0].op == "get_attr"
+        )
     )
     model.recompile()
     model.delete_all_unused_submodules()

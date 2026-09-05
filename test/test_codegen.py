@@ -152,6 +152,16 @@ def main():
         help="Context length for the LLM decoding.",
     )
     parser.add_argument(
+        "--residual_length",
+        type=int,
+        default=None,
+        help=(
+            "Positions of a KIVI KV cache kept in full precision while their "
+            "chunk fills; a multiple of the 64-token KIVI group, 128 by "
+            "default."
+        ),
+    )
+    parser.add_argument(
         "--compile_single_layer",
         action="store_true",
         help=(
@@ -200,7 +210,13 @@ def main():
     parser.add_argument(
         "--attn_implementation",
         default="eager",
-        choices=["eager", "sdpa", "flash_attention_2", "flash_attention_3"],
+        choices=["eager", "sdpa"],
+        help=(
+            "HuggingFace attention module the graph is built from. Only sdpa "
+            "emits a scaled_dot_product_attention node, the one the flash-"
+            "attention builders lower; eager decomposes it into "
+            "matmul/softmax/matmul."
+        ),
     )
     parser.add_argument(
         "--log_level",

@@ -15,6 +15,11 @@ the tables. The fit takes the first N windows by default (which reproduces
 the committed table dumps); ``--spread`` diversifies a small budget by
 drawing them across the whole corpus. The GPTQ Hessian is contiguous.
 
+A config that sets aside outliers (``opct=`` on an operand) first runs the
+fit windows through the graph so each filtered operand's threshold settles
+by EMA, then freezes observation, so the fit, GPTQ and the score all see
+one fixed threshold and the filtered distribution behind it.
+
 Examples:
     # fit + compensate + score in one process (loss-aware, per-head Q/K/V)
     python codebook_eval.py --gpu 1 --config mxnf4 --fit \\
@@ -29,6 +34,13 @@ Examples:
     # install dumped tables, compensate, and score
     python codebook_eval.py --gpu 1 --config mxnf4 --codebooks \\
         codebooks/fitted.json --gptq --shrink --gptq_windows 480
+    # the ppl_2048 recipe: per-head attention tables fitted on a seeded
+    # spread of 512 windows (after the thresholds freeze, for an outlier
+    # config), GPTQ + shrink, scored at 2048/2048
+    python codebook_eval.py --gpu 1 --config mxnf4_outlier --fit --spread \\
+        --seed 0 --fit_windows 512 --granularity '|q:-1,1,1' '|k:-1,1,1' \\
+        '|v:-1,1,1' --weight_by v_proj --gptq --shrink --gptq_windows 480 \\
+        --c4_docs 4000 --max_length 2048 --stride 2048 --dump tables.json
 """
 
 import argparse
@@ -52,6 +64,7 @@ from voyager_compiler.quantization import (
     gptq,
     load_codebooks,
 )
+from voyager_compiler.quantization.lcq import _quantized_operands
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +241,15 @@ def parse_args(parser=None):
             "writes. Fit them under the same --config. Excludes --fit."
         ),
     )
+    parser.add_argument(
+        "--save_model",
+        default=None,
+        help=(
+            "Directory to save the model and tokenizer to after GPTQ: a "
+            "checkpoint carrying the compensated weights, which the graph "
+            "shares with the model."
+        ),
+    )
 
     parser.add_argument(
         "--gptq",
@@ -281,6 +303,18 @@ def parse_args(parser=None):
         help="Quantize blocks left to right, not most-salient-first.",
     )
 
+    parser.add_argument(
+        "--max_length",
+        type=int,
+        default=2048,
+        help="Tokens per wikitext-2 scoring window.",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=2048,
+        help="Tokens the wikitext-2 scoring window advances by.",
+    )
     parser.add_argument(
         "--no_eval",
         action="store_true",
@@ -352,7 +386,9 @@ def main(args):
     example = torch.randint(
         0, model.config.vocab_size, (1, WINDOW), device=device
     )
-    chunk = torch.export.Dim("chunk_dim", min=2, max=16)
+    chunk = torch.export.Dim(
+        "chunk_dim", min=2, max=max(WINDOW, args.max_length) // 64
+    )
     with torch.no_grad():
         graph = prepare_pt2e(
             model,
@@ -367,10 +403,51 @@ def main(args):
         )
     sink_obs_or_fq(graph)
 
+    # An outlier config: settle each filtered operand's threshold on the fit
+    # windows, then freeze observation so nothing downstream moves it.
+    filtered = [
+        (name, module)
+        for name, (module, _, _) in _quantized_operands(graph, ()).items()
+        if getattr(module, "outlier_pct", None) is not None
+    ]
+    # The fit's windows, drawn once: they calibrate the thresholds too.
+    windows = fit_windows() if args.fit or filtered else []
+    if filtered:
+        logger.info(
+            "calibrating %d outlier thresholds on %d windows",
+            len(filtered),
+            len(windows),
+        )
+        with torch.no_grad():
+            for entry in windows:
+                graph(*entry)
+        empty = [
+            name
+            for name, module in filtered
+            if module.outlier_threshold.numel() == 0
+        ]
+        if empty:
+            raise RuntimeError(f"never calibrated: {empty[:5]}")
+        thresholds = torch.tensor(
+            [module.outlier_threshold.item() for _, module in filtered]
+        )
+        logger.info(
+            "thresholds: min %.4g, median %.4g, max %.4g",
+            thresholds.min(),
+            thresholds.median(),
+            thresholds.max(),
+        )
+        frozen = 0
+        for module in graph.modules():
+            if hasattr(module, "observer_enabled"):
+                module.observer_enabled[0] = 0
+                frozen += 1
+        logger.info("observation disabled on %d fake-quants", frozen)
+
     if args.fit:
         fit_codebooks(
             graph,
-            fit_windows(),
+            windows,
             skip=args.skip,
             weighting=Weighting(args.weighting),
             weight_by=args.weight_by,
@@ -406,6 +483,11 @@ def main(args):
             reserve=int(args.cache_reserve * 2**30),
         )
 
+    if args.save_model:
+        model.save_pretrained(args.save_model)
+        tokenizer.save_pretrained(args.save_model)
+        logger.info("saved the compensated model to %s", args.save_model)
+
     if args.no_eval:
         return
 
@@ -415,7 +497,15 @@ def main(args):
         ),
         return_tensors="pt",
     )
-    ppl = evaluate_perplexity(graph, test, WINDOW, 512, device).item()
+    ppl = evaluate_perplexity(
+        graph, test, args.max_length, args.stride, device
+    ).item()
+    worst = sorted(
+        ((module.max_outlier_pct, name) for name, module in filtered),
+        reverse=True,
+    )[:5]
+    for pct, name in worst:
+        logger.info("max outlier fraction %.4f at %s", pct, name)
     source = (
         args.weighting if args.fit else ("json" if args.codebooks else "seed")
     )

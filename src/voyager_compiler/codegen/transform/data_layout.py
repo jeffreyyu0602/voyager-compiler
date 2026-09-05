@@ -32,7 +32,11 @@ from voyager_compiler.ops.layout import (
     NHWC_TO_NCHW,
     OIHW_TO_HWIO,
 )
-from voyager_compiler.shape_prop import fetch_attr, propagate_shape
+from voyager_compiler.shape_prop import (
+    fetch_attr,
+    propagate_shape,
+    written_buffers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -385,8 +389,16 @@ def find_upstream_transpose_or_param(
 
 
 def _insert_transposed_input(arg: Node, model: GraphModule):
+    """``arg`` transposed: a transpose of the last two dims is undone, a
+    constant is transposed once, into a buffer of its own, and a computed
+    tensor, or a buffer the graph writes (a KV cache, whose transposed copy
+    would go stale), goes through a transpose op."""
+    if swaps_last_two_dims(arg):
+        return arg.args[0]
     with model.graph.inserting_after(arg):
-        if arg.op == "get_attr":
+        if arg.op == "get_attr" and arg.target not in written_buffers(
+            model.graph
+        ):
             value = fetch_attr(model, arg.target)
             transposed = create_getattr_from_value(
                 model, model.graph, arg.name + "_T", value.mT
@@ -485,7 +497,7 @@ def fold_transpose_into_constant(
 
     attr_node = chain[0]
     down_t = chain[-1]
-    if attr_node.op != "get_attr":
+    if attr_node.op != "get_attr" or attr_node.target in written_buffers(graph):
         return False
 
     # Ensure selects are on first dimension only

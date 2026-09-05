@@ -20,6 +20,8 @@ from voyager_compiler.codegen.transform.padding import (
 from voyager_compiler.codegen.transform.quant_folding import (
     fuse_dequantize_quantize,
     fuse_quantize_dequantize_with_producer,
+    sink_cache_folds,
+    split_kv_cache,
 )
 from voyager_compiler.codegen.transform.rewrites import (
     deduplicate_nodes,
@@ -32,6 +34,9 @@ from voyager_compiler.codegen.transform.rewrites import (
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
+)
+from voyager_compiler.codegen.transform.scalarize import (
+    scalarize_index_arithmetic,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     gemv_op_tiling,
@@ -61,6 +66,9 @@ __all__ = [
     "replace_conv2d_with_im2col",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
+    "scalarize_index_arithmetic",
+    "sink_cache_folds",
+    "split_kv_cache",
     "gemv_op_tiling",
     "vector_op_tiling",
     "pool_op_tiling",

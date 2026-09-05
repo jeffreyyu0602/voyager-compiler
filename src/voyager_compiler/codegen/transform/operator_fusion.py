@@ -25,6 +25,7 @@ from voyager_compiler.codegen.node_info import (
     swaps_last_two_dims,
 )
 from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
+from voyager_compiler.codegen.transform.quant_folding import sink_cache_folds
 from voyager_compiler.shape_prop import propagate_shape
 
 logger = logging.getLogger(__name__)
@@ -786,6 +787,9 @@ def fuse_operator(
             node.meta["drain_fusible"] = drain_fusible
             node.meta["accumulate_fusible"] = accumulate_fusible
 
+    # A fused group lands at its last op, which can carry a KV cache read
+    # below the cache's fold: put every fold back after its last reader.
+    sink_cache_folds(model)
     graph.lint()
     graph.eliminate_dead_code()
     model.recompile()

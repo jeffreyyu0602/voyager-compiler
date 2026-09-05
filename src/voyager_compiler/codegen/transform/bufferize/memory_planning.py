@@ -290,6 +290,21 @@ def _plan_dram(model: GraphModule, buffer_of, config) -> int:
         ):
             if n.meta.get("space") != "Scratchpad":
                 reusable.append(n)
+        elif n.op == "call_function" and n.target is _COND:
+            # A split cache's fold computes the chunk's quantized outputs
+            # into buffers of its own inside a branch, born and dead within
+            # the cond: they take the cond's place in the schedule.
+            for handle in n.args[1:3]:
+                for inner in getattr(model, handle.target).graph.nodes:
+                    if (
+                        inner.op == "call_function"
+                        and (
+                            inner.target is _ALLOC or _materializes_dram(inner)
+                        )
+                        and inner.meta.get("space") != "Scratchpad"
+                    ):
+                        reusable.append(inner)
+                        pos[inner] = pos[n]
 
     # Lifetime of each buffer: from its def to the last top-level node reading it
     # — through ``buffer_of``, so a read through a *name* of the buffer (a

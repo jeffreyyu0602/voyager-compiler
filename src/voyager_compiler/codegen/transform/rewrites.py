@@ -31,6 +31,7 @@ from voyager_compiler.shape_prop import (
     fetch_attr,
     propagate_shape,
     set_node_value,
+    written_buffers,
 )
 
 logger = logging.getLogger(__name__)
@@ -454,12 +455,18 @@ def fold_constant_generators(model: GraphModule):
     ``get_attr`` buffer and is not lowered or scheduled as a compute op.
 
     Walking in program order, a node is constant iff every FX-Node input is a
-    ``get_attr`` (an initial buffer or one this pass just created); it is then
-    evaluated with the real buffer values and replaced by a ``get_attr`` to the
-    result.  Orphaned constant ancestors are dropped by dead-code elimination.
+    ``get_attr`` (an initial buffer or one this pass just created) that the
+    graph never writes; it is then evaluated with the real buffer values and
+    replaced by a ``get_attr`` to the result.  Orphaned constant ancestors
+    are dropped by dead-code elimination.
     """
     graph = model.graph
-    constants = {n for n in graph.nodes if n.op == "get_attr"}
+    # A buffer the graph writes -- a KV cache, or a ``cond`` operand -- is
+    # not a constant: what reads it must run every step.
+    written = written_buffers(graph)
+    constants = {
+        n for n in graph.nodes if n.op == "get_attr" and n.target not in written
+    }
 
     def resolve(n: Node):
         return fetch_attr(model, n.target)

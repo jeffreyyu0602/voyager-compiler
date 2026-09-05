@@ -792,6 +792,24 @@ def rename_nest_nodes(model: GraphModule) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _sites(model: GraphModule):
+    """Every node the bufferizer visits, as ``(graph module, node, scope)``:
+    the top-level nodes, scoped by their own name, and, for a ``cond``
+    among them, both branches' nodes ahead of it, scoped under the cond's
+    scope so a nest in a branch never shares a name with one outside.  A
+    split KV cache's fold quantizes the completing chunk in its ``true``
+    branch, so the nests for that live in the branch and take its
+    placeholders -- the cache buffers -- as their operands."""
+    for node in list(model.graph.nodes):
+        if node.op == "call_function" and node.target is _COND:
+            prefix = node.meta["scope"][0]
+            for handle in node.args[1:3]:
+                branch = getattr(model, handle.target)
+                for inner in list(branch.graph.nodes):
+                    yield branch, inner, f"{prefix}_{inner.name}"
+        yield model, node, node.name
+
+
 def bufferize_graph(
     model: GraphModule,
     pipelined: bool = False,
@@ -828,7 +846,10 @@ def bufferize_graph(
             tiler,
         )
 
-    for node in list(graph.nodes):
+    modules = {model}
+    for gm, node, scope in _sites(model):
+        modules.add(gm)
+        graph = gm.graph
         if node.op not in ("call_module", "call_function"):
             continue
 
@@ -963,14 +984,13 @@ def bufferize_graph(
         value_remap = {}
         with oracle_disabled():
             results = replace_node_with_graph_module(
-                model, node, sub_gm, propagate=False, value_remap=value_remap
+                gm, node, sub_gm, propagate=False, value_remap=value_remap
             )
         logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
 
         # Scope the nest by the name of the op it replaces, and record which
         # build it came from — the scope says which layer a node belongs to,
         # the group says which other layers were built the same way.
-        scope = node.name
         # ``node_copy`` carries the cached build's base-table tags; retag
         # them to this splice's own producers so ``merge_base_tables``
         # groups every nest with its own layer's tables.
@@ -1031,8 +1051,9 @@ def bufferize_graph(
         graph.erase_node(node)
 
     merge_base_tables(model)
-    graph.lint()
-    model.recompile()
+    for gm in modules:
+        gm.graph.lint()
+        gm.recompile()
     lower_views(model)
     _dedup_regions(model)
     annotate_tensor_spaces(model)

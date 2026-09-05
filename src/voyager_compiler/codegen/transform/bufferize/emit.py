@@ -1303,7 +1303,9 @@ def _node_label(node, named) -> Optional[str]:
             parts.append(str(dtype))
         elif val.dtype not in (torch.float, torch.bfloat16):
             parts.append(str(val.dtype))
-    elif isinstance(val, (tuple, list)):
+    elif isinstance(val, (tuple, list)) and all(
+        isinstance(t, torch.Tensor) for t in val
+    ):
         parts.append(", ".join(str(tuple(t.shape)) for t in val))
         dtypes = [t.dtype for t in val]
         if isinstance(dtype, (list, tuple)):

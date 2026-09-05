@@ -194,11 +194,13 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
 
         sf = (max - min) / (quant_max - quant_min)
         sf = torch.where(sf > 0.0, sf, 1.0)
-        zp = -min / sf + quant_min
-
-        # Quantize the scale using the codebook
+        # Quantize the scale using the codebook; a scale below its range
+        # rounds to zero and the block is one level, as with no range.
         if scale_qmap is not None:
             sf = vmap(sf, scale_qmap)
+            sf = torch.where(sf > 0.0, sf, 1.0)
+        zp = -min / sf + quant_min
+        if scale_qmap is not None:
             zp = vmap(zp, scale_qmap)
 
         scale.resize_(sf.shape).copy_(sf)
@@ -262,12 +264,12 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.force_scale_power_of_two = force_scale_power_of_two
         self.record_histogram = record_histogram
         self.outlier_pct = outlier_pct
-        assert outlier_pct is None or outlier_threshold is None, (
-            "Only one of outlier_pct and outlier_threshold can be set."
-        )
+        assert (
+            outlier_pct is None or outlier_threshold is None
+        ), "Only one of outlier_pct and outlier_threshold can be set."
         self.max_outlier_pct = 0.0
 
-        factory_kwargs = {'device': device, 'dtype': torch.float}
+        factory_kwargs = {"device": device, "dtype": torch.float}
 
         # Generate quantization map buffers
         quant_map = get_quantization_map(dtype, device)
@@ -279,19 +281,24 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
 
         scale_map = (
             get_quantization_map(self.scale_dtype, device)
-            if self.scale_dtype is not None else None
+            if self.scale_dtype is not None
+            else None
         )
         self.register_buffer("scale_qmap", scale_map, persistent=False)
 
         # Create amax history and scale buffers
         self.register_buffer("amax_history", torch.tensor([], **factory_kwargs))
-        self.register_buffer('scale', torch.tensor([1.0], **factory_kwargs))
-        self.register_buffer('zero_point', torch.tensor([1.0], **factory_kwargs))
+        self.register_buffer("scale", torch.tensor([1.0], **factory_kwargs))
+        self.register_buffer(
+            "zero_point", torch.tensor([1.0], **factory_kwargs)
+        )
 
         # Create histogram buffer
         if self.record_histogram:
             self.register_buffer(
-                "histogram", torch.zeros(254, **factory_kwargs), persistent=False
+                "histogram",
+                torch.zeros(254, **factory_kwargs),
+                persistent=False,
             )
 
         self.observer_enabled[0] = self.qscheme is not None
@@ -431,11 +438,19 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
 
         return x
 
-    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
-                              missing_keys, unexpected_keys, error_msgs):
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
         # Removing this function throws an error that the size of the loaded tensor does not match the original size
         # i.e., These buffers start out with numel 0 and become numel 1 once they have their first forward pass.
-        local_state = ['scale', 'amax_history']
+        local_state = ["scale", "amax_history"]
         for name in local_state:
             key = prefix + name
             if key in state_dict:
@@ -444,23 +459,30 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
                 # of size N into uninitialized buffers of size 0. The
                 # buffers are resized here, and the values are copied in
                 # the default state_dict loading code of the parent.
-                if name == 'scale':
+                if name == "scale":
                     self.scale.resize_(val.shape)
                 else:
-                    assert name == 'amax_history'
+                    assert name == "amax_history"
                     self.amax_history.resize_(val.shape)
                 # For torchscript module we need to update the attributes here since we do not
                 # call the `_load_from_state_dict` function defined module.py
                 if torch.jit.is_scripting():
-                    if name == 'scale':
+                    if name == "scale":
                         self.scale.copy_(val)
                     else:
-                        assert name == 'amax_history'
+                        assert name == "amax_history"
                         self.amax_history.copy_(val)
             elif strict:
                 missing_keys.append(key)
-        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
-                                      missing_keys, unexpected_keys, error_msgs)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 
 class _DerivedObserverOrFakeQuantize(FakeQuantizeBase):
@@ -472,12 +494,16 @@ class _DerivedObserverOrFakeQuantize(FakeQuantizeBase):
         self,
         dtype: torch.dtype,
         obs_or_fqs: List[ObserverOrFakeQuantize],
-        derive_qparams_fn: Callable[[List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]],
+        derive_qparams_fn: Callable[
+            [List[ObserverOrFakeQuantize]], Tuple[Tensor, Tensor]
+        ],
     ):
         super().__init__()
         self.obs_or_fqs = obs_or_fqs
         self.derive_qparams_fn = derive_qparams_fn
-        self.register_buffer("qmap", get_quantization_map(dtype), persistent=False)
+        self.register_buffer(
+            "qmap", get_quantization_map(dtype), persistent=False
+        )
         self.observer_enabled[0] = 0
         self.dtype = dtype
         self.qscheme = obs_or_fqs[1].qscheme

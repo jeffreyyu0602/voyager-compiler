@@ -21,7 +21,11 @@ from voyager_compiler.export_utils import (
     create_getattr_from_value,
     get_aten_graph_module,
 )
-from voyager_compiler.shape_prop import fetch_attr, propagate_shape
+from voyager_compiler.shape_prop import (
+    fetch_attr,
+    propagate_shape,
+    written_buffers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -234,9 +238,12 @@ def _insert_pad(model, node, pad, pad_value, fold_cache=False):
 
     Every pad goes in through here, so each way of not paying for one is tried
     in turn: a slice above that already left room, then a cache write that can
-    take the pad into its buffer, then a buffer that is simply padded as it
-    stands.  The round-trip sweep would reach the same graph on its own, but
-    only after L2 tiling and the layout pass have read a pad that was never
+    take the pad into its buffer (only when the pad's requester is the write's
+    sole reader -- widening the write would change what its other readers
+    see), then a buffer that is simply padded as it stands.  A buffer the
+    graph writes is not padded in place: its padded copy would go stale.
+    The round-trip sweep would reach the same graph on its own, but only
+    after L2 tiling and the layout pass have read a pad that was never
     needed, and tiling is what it would mislead.
     """
     cancel, chain, dims = _find_cancelling_slice(node, pad)
@@ -250,11 +257,14 @@ def _insert_pad(model, node, pad, pad_value, fold_cache=False):
     if (
         fold_cache
         and node.target is _INDEX_COPY
+        and len(node.users) == 1
         and _fold_pad_into_cache(model, node, pad, pad_value, fold_cache)
     ):
         return node
 
-    if node.op == "get_attr":
+    if node.op == "get_attr" and node.target not in written_buffers(
+        model.graph
+    ):
         # Nothing writes it, so its padded form is known now: widen the buffer
         # once here rather than the tensor it holds on every step.
         baked = F.pad(
