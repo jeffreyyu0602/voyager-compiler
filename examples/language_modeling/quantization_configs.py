@@ -106,7 +106,6 @@ QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = {
 QUANTIZATION_CONFIGS["mxnf4_int6"] = {
     torch.nn.Linear: [INT6_SPEC, MXNF4_SPEC],
     torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
-    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
 }
 
 # Outlier filtering on the linears only: each activation sets aside its

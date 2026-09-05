@@ -1649,6 +1649,11 @@ def store_qparam_unrepeated(
 
 
 def run_qparam_through_nodes(model, input, nodes, axes, block_size):
+    axes = tuple(a + input.ndim if a < 0 else a for a in axes)
+    if not nodes:
+        # Nothing between the dequantize and the quantize (multi-head
+        # attention's values): the qparams reach it as stored.
+        return input, axes
     env = {nodes[0].args[0]: input}
 
     def map_node(n):
@@ -1658,8 +1663,6 @@ def run_qparam_through_nodes(model, input, nodes, axes, block_size):
 
     def load_arg(a):
         return torch.fx.graph.map_arg(a, map_node)
-
-    axes = tuple(a + input.ndim if a < 0 else a for a in axes)
 
     for n in nodes:
         if n.target in LAYOUT_OPS:

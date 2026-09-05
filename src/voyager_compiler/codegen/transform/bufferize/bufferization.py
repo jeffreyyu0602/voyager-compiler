@@ -715,11 +715,16 @@ def rename_nest_nodes(model: GraphModule) -> None:
     used = {n.name for n in model.graph.nodes}
 
     def rename(node: Node, candidate: str) -> None:
+        """Name ``node`` ``candidate``, or the first numbered variant of it
+        that is unused model-wide.  A graph's namespace may hand back a
+        different name than asked (a suffix it counts up past names of
+        erased nodes), so it is the name assigned, not the one requested,
+        that has to be unique."""
         base, i = candidate, 1
-        while candidate in used:
-            candidate = f"{base}_{i}"
-            i += 1
         node._rename(candidate)  # registers the name in the graph's namespace
+        while node.name in used:
+            node._rename(f"{base}_{i}")
+            i += 1
         used.add(node.name)
 
     def rename_node(
