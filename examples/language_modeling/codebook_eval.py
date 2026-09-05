@@ -38,7 +38,7 @@ import torch
 from datasets import load_dataset
 from quantization_configs import QUANTIZATION_CONFIGS, set_qconfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from wikitext import evaluate_perplexity
+from common import evaluate_perplexity
 
 from voyager_compiler import (
     get_default_quantizer,
