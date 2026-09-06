@@ -64,6 +64,12 @@ def _dtype(node):
     return _val(node).dtype
 
 
+def _dtypes(out_node, *in_nodes) -> str:
+    """``in,...->out`` logical dtypes, for the op's calibration signature."""
+    ins = ",".join(str(_dtype(n)) for n in in_nodes if isinstance(n, Node))
+    return f"{ins}->{_dtype(out_node)}"
+
+
 # --------------------------------------------------------------------------
 # DRAM traffic
 # --------------------------------------------------------------------------
@@ -164,6 +170,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "input": _shape(anchor.args[0]),
                 "weight": w,
                 "output": out,
+                "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
             },
             units=matrix_units,
             utilization=op_utilization(node, matrix_units, ideal, cost),
@@ -189,6 +196,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "input": inp,
                 "weight": _shape(anchor.args[1]),
                 "output": out,
+                "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
             },
             units=units,
             utilization=op_utilization(node, units, ideal, cost),
@@ -206,7 +214,12 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         node.name,
         "vector",
         ideal,
-        {"ops": ops, "input": in_shape, "output": out},
+        {
+            "ops": ops,
+            "input": in_shape,
+            "output": out,
+            "dtypes": _dtypes(anchor, *in_nodes[:1]),
+        },
         units=("vector",),
         utilization=op_utilization(node, ("vector",), ideal, cost),
     )

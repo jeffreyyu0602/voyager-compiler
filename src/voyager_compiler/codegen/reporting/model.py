@@ -1,14 +1,14 @@
 """Data structures shared across the reporting stages.
 
-The estimator runs three separate stages over a bufferized FX graph:
-scheduling (``interpret`` + ``scheduler``), repeated-pattern compression
-(``compress``), and reporting (``excel`` / ``perfetto``).  These dataclasses are
-the contract between them.
+The estimator walks a bufferized FX graph once (``interpret`` +
+``scheduler``), folding each loop's steady state as it goes, and the
+reporting stage (``excel`` / ``perfetto`` / ``calibration``) reads the
+result.  These dataclasses are the contract between them.
 """
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from voyager_compiler.hardware_config import AcceleratorConfig
 
@@ -18,36 +18,28 @@ class TimingRecord:
     """One scheduled execution of one FX node (a loop body node runs many
     times, so one node yields many records, tagged by ``iteration_path``).
 
-    ``resource`` is the tuple of lanes the event occupies — each advances
-    that lane's clock and draws its own Gantt bar.  A compute pass holds
-    ``("mma",)`` (matrix unit), ``("vector",)`` (vector unit), or both
-    ``("mma", "vector")`` (a fused GEMM / conv, whose tail runs on the VU);
-    a DMA holds ``("dram",)``; an ``async_wait`` holds ``("control",)`` —
-    a synchronization that uses no bandwidth (it can stall the program
-    clock but draws no visible bar).  ``start_deps`` lists the ``eid``s
-    whose ``end`` fed this event's ``start = max(...)`` — recorded so the
-    workbook can wire ``Start = MAX(End_of_dep...)`` and recalculate live
-    (the dependency wiring is structural, hence invariant to edits).
+    ``resource`` is the tuple of lanes the event occupies.  A compute pass
+    holds ``("mma",)`` (matrix unit), ``("vector",)`` (vector unit), or
+    both ``("mma", "vector")`` (a fused GEMM / conv, whose tail runs on the
+    VU); a DMA holds ``("dram",)``; an ``async_wait`` holds
+    ``("control",)`` -- a synchronization that uses no bandwidth.
+    ``kernel`` names the bufferized nest the event belongs to, ``op_key``
+    the ``OpInfo`` a compute event was priced by.
     """
 
     eid: int
     node_name: str
-    kind: str  # compute | load | store | async_wait
+    kind: str  # compute | load | store | async_wait | launch
     resource: Tuple[str, ...]  # subset of {mma, vector, dram, control}
     start: int
     end: int
     iteration_path: Tuple[int, ...] = ()
     loop_uid: int = -1  # id() of the enclosing while_loop (-1 = top level)
+    kernel: str = ""
     bytes: int = 0  # DRAM ops only
     is_read: bool = False  # DRAM loads (vs stores)
     category: str = ""
-    start_deps: Tuple[int, ...] = ()
-    # How the workbook recomputes this event's latency.  ("compute", op_key)
-    # links to the Operations sheet; ("dram", n_bytes) is the bandwidth
-    # formula; ("const", cycles) is a fixed latency (e.g. a wait = 0).
-    latency_kind: str = "const"
-    latency_ref: object = None
-    detail: dict = field(default_factory=dict)
+    op_key: str = ""
 
 
 @dataclass
@@ -56,9 +48,13 @@ class OpInfo:
     ``TimingRecord``s with the same ``key`` reference one ``OpInfo``.
 
     ``utilization`` is the fraction of peak the op sustains, so it costs
-    ``ceil(ideal_cycles / utilization)`` cycles.  It is compute-only (DRAM is
-    modeled separately, as ``async_copy`` events), pre-computed by ``cost.py``,
-    and stays editable in the workbook."""
+    ``ceil(ideal_cycles / utilization)`` cycles.  It is compute-only (DRAM
+    is modeled separately, as ``async_copy`` events) and pre-computed by
+    ``cost.py``.  A calibrated op carries the RTL-derived ``measured_cycles``
+    instead, with ``calibration`` saying how it was derived (``exact`` for
+    a one-op period, ``shared`` when the period's ops split one
+    measurement pro rata).
+    """
 
     key: str
     op_type: str  # gemm | conv | vector
@@ -66,46 +62,82 @@ class OpInfo:
     detail: dict = field(default_factory=dict)
     units: Tuple[str, ...] = ("vector",)
     utilization: float = 1.0
+    kernel: str = ""
+    measured_cycles: Optional[int] = None
+    calibration: str = ""
+
+    @property
+    def analytic_cycles(self) -> int:
+        """The cost model's price: ideal cycles stretched by utilization."""
+        return math.ceil(self.ideal_cycles / self.utilization)
 
     @property
     def effective_cycles(self) -> int:
-        """The op's real cost: its ideal cycles stretched by its utilization."""
-        return math.ceil(self.ideal_cycles / self.utilization)
+        """The op's charged cost: the measurement when calibrated, else the
+        analytic price."""
+        if self.measured_cycles is not None:
+            return self.measured_cycles
+        return self.analytic_cycles
 
 
 @dataclass
-class LoopSummary:
-    """A compressed ``while_loop`` region: a steady-state period that repeats
-    ``repeat_count`` times, framed by a non-repeating prefix / suffix.
-
-    ``written_periods`` are the ``K = carry_distance + 2`` representative
-    periods the live-formula sheet emits (see ``excel.py``); ``period_eids``
-    aliases the first.  ``uncompressed`` loops (too few repeats) are written
-    event-by-event.
+class LoopSkip:
+    """A run of loop iterations the walk did not execute: ``repeats``
+    periods of ``period`` iterations, each a time-shift by ``shift`` cycles
+    of the ``template`` records (the last walked period), starting at
+    iteration ``first_step`` and cycle ``start``.  ``bytes`` is one
+    period's DRAM traffic by counter (``read`` / ``write`` / a category).
     """
 
-    loop_name: str
+    loop_uid: int
+    kernel: str
+    after_eid: int  # last walked record before the skip (-1 = none)
+    first_step: int
+    period: int
+    repeats: int
+    template: Tuple[int, ...]  # eids of the template period's records
+    shift: int
+    start: int
+    bytes: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def iterations(self) -> int:
+        return self.period * self.repeats
+
+    @property
+    def end(self) -> int:
+        return self.start + self.repeats * self.shift
+
+
+@dataclass
+class LoopStats:
+    """What the walk did with one ``while_loop``: how many iterations it
+    walked and skipped, the period it found and how long a period takes.
+    A nested loop is entered once per walked outer iteration; the counts
+    accumulate over every entry."""
+
+    loop_uid: int
+    name: str
+    kernel: str
     trip_count: int
-    prefix_eids: List[int]
-    period_eids: List[int]  # one representative period (template)
-    suffix_eids: List[int]
-    repeat_count: int
-    period_duration: int
-    loop_uid: int = -1
-    carry_distance: int = 0
-    written_periods: List[List[int]] = field(default_factory=list)
-    ii_anchor_eids: Tuple[int, int] = (-1, -1)
-    uncompressed: bool = False
+    entries: int = 0
+    walked: int = 0
+    skipped: int = 0
+    period: int = 0  # 0 = no period found
+    shift: int = 0  # cycles per period
+    start: int = 0  # clock at the first entry
+    end: int = 0  # clock at the last exit
 
 
 @dataclass
 class ScheduleResult:
     """Everything the reporting stage needs.
 
-    ``records`` is the full, uncompressed event stream (one per dynamic node
-    execution) — feeds Perfetto.  ``ops`` is the static compute table.
-    ``loops`` (filled by ``compress``) collapses steady-state iterations for
-    the compact Excel views.
+    ``records`` holds the walked events; ``skips`` the folded steady-state
+    runs between them, so the two together describe the whole schedule.
+    ``busy_*`` are exact union lengths of the compute, DRAM and either
+    lanes' busy intervals over the whole makespan.  ``kernel_signatures``
+    maps each kernel to its ``calibration.KernelSignature``.
     """
 
     records: List[TimingRecord]
@@ -117,12 +149,9 @@ class ScheduleResult:
     dram_weight_bytes: int = 0
     dram_activation_bytes: int = 0
     dram_kv_bytes: int = 0
-    loops: List[LoopSummary] = field(default_factory=list)
-    loop_names: dict = field(default_factory=dict)  # id(loop) -> node name
-    dep_remap: dict = field(default_factory=dict)
-
-    def record_by_eid(self, eid: int) -> Optional[TimingRecord]:
-        # records are appended in eid order, so index directly when aligned.
-        if 0 <= eid < len(self.records) and self.records[eid].eid == eid:
-            return self.records[eid]
-        return next((r for r in self.records if r.eid == eid), None)
+    skips: List[LoopSkip] = field(default_factory=list)
+    loops: List[LoopStats] = field(default_factory=list)
+    busy_compute: int = 0
+    busy_dram: int = 0
+    busy_any: int = 0
+    kernel_signatures: Dict[str, object] = field(default_factory=dict)

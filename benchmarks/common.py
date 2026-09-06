@@ -28,6 +28,8 @@ until the bufferizer can lower an in-place cache-write cone.
 """
 
 import argparse
+import json
+import functools
 import multiprocessing
 import operator
 import os
@@ -37,7 +39,7 @@ import subprocess
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from typing import (
     Optional,
     Tuple,
@@ -77,8 +79,9 @@ from voyager_compiler import (
 from voyager_compiler.codegen.aten_classifier import is_compute_op
 from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
-    compress_schedule,
     estimate_schedule,
+    kernel_rows,
+    load_calibration,
     write_excel_report,
     write_perfetto,
 )
@@ -197,7 +200,12 @@ class SweepConfig:
     ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
     dequant / activation / requantize tail becomes separate kernels and the
     GQA KV repeat is materialised in memory instead of folding into the
-    block index."""
+    block index.
+
+    ``calibration`` names a filled-in RTL calibration form (see
+    ``write_calibration_form``) whose measured kernel cycles price the
+    compute ops; ``calibration_rows_dir`` makes each point dump its kernel
+    rows there, the input for writing such a form."""
 
     model_id: str = DEFAULT_MODEL
     mode: str = "prefill"  # "prefill" | "decode"
@@ -225,6 +233,8 @@ class SweepConfig:
 
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     dump_dir: Optional[str] = None
+    calibration: Optional[str] = None
+    calibration_rows_dir: Optional[str] = None
 
     @property
     def acc_config(self) -> AcceleratorConfig:
@@ -372,7 +382,7 @@ def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
     raise ValueError(f"unsupported kv bits: {bits}")
 
 
-NON_DESIGN_FIELDS = ("dump_dir",)
+NON_DESIGN_FIELDS = ("dump_dir", "calibration_rows_dir")
 _UNUSED_BY_MODE = {"prefill": "kv_len", "decode": "prompt_len"}
 # The scope each export records for LlamaRotaryEmbedding.  The decode wrapper
 # nests the model one level deeper than the prefill export, the same way it
@@ -733,10 +743,42 @@ def _num_params(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
+@functools.lru_cache(maxsize=None)
+def _calibration(path):
+    """The RTL calibration at ``path``, loaded once per process."""
+    return load_calibration(path) if path else None
+
+
+def point_label(cfg: SweepConfig) -> str:
+    """The design point a config describes, without its layer count, so a
+    ``--fast`` run's two probes name the same point."""
+    length = cfg.prompt_len if cfg.mode == "prefill" else cfg.kv_len
+    return f"{cfg.mode} {length}"
+
+
+def _dump_kernel_rows(cfg: SweepConfig, result) -> None:
+    """Write the point's kernel rows (the calibration form's input) as JSON
+    under ``cfg.calibration_rows_dir``."""
+    os.makedirs(cfg.calibration_rows_dir, exist_ok=True)
+    label = point_label(cfg)
+    stem = re.sub(r"[^\w.-]+", "_", label) + f"_L{cfg.num_layers_override}"
+    path = os.path.join(cfg.calibration_rows_dir, f"{stem}.json")
+    with open(path, "w") as f:
+        json.dump(
+            {"point": label, "rows": [asdict(r) for r in kernel_rows(result)]},
+            f,
+        )
+
+
 def run_design_point(cfg: SweepConfig) -> Metrics:
-    """Compile ``cfg`` and return its ideal latency + DRAM traffic."""
+    """Compile ``cfg`` and return its ideal latency + DRAM traffic, priced by
+    ``cfg.calibration`` when one is given."""
     gm, model, plan = _compile(cfg)
-    r = estimate_schedule(gm, cfg.acc_config)
+    r = estimate_schedule(
+        gm, cfg.acc_config, calibration=_calibration(cfg.calibration)
+    )
+    if cfg.calibration_rows_dir is not None:
+        _dump_kernel_rows(cfg, r)
     return Metrics(
         total_latency=r.total_latency,
         dram_read_bytes=r.dram_read_bytes,
@@ -983,37 +1025,12 @@ def _extract_standalone(gm, node):
     return sub
 
 
-def _union_len(intervals):
-    """Wall-clock covered by ``[start, end)`` intervals (their union)."""
-    total = cur_end = 0
-    started = False
-    for s, e in sorted(intervals):
-        if not started or s > cur_end:
-            total += e - s
-            cur_end = e
-            started = True
-        elif e > cur_end:
-            total += e - cur_end
-            cur_end = e
-    return total
-
-
 def _time_split(result):
     """Split a schedule's makespan into ``(compute, memory, overlap, stall)``
-    cycles.  Must be called on the *uncompressed* estimate."""
-    comp = [
-        (r.start, r.end)
-        for r in result.records
-        if r.latency_kind == "compute" and r.end > r.start
-    ]
-    dram = [
-        (r.start, r.end)
-        for r in result.records
-        if r.latency_kind == "dram" and r.end > r.start
-    ]
-    c, m = _union_len(comp), _union_len(dram)
-    overlap = c + m - _union_len(comp + dram)
-    stall = max(0, result.total_latency - (c + m - overlap))
+    cycles, from the exact busy-lane unions the walk keeps."""
+    c, m = result.busy_compute, result.busy_dram
+    overlap = c + m - result.busy_any
+    stall = max(0, result.total_latency - result.busy_any)
     return c - overlap, m - overlap, overlap, stall
 
 
@@ -1045,12 +1062,10 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         single_buffer_tail=cfg.single_buffer_tail,
     )
     plan = plan_memory(sub, acc_config)
-    # Split off the *uncompressed* estimate, then compress + dump.
     r = estimate_schedule(sub, acc_config)
     compute, memory, overlap, stall = _time_split(r)
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
-        compress_schedule(r)
         write_excel_report(r, os.path.join(dump_dir, f"{node.name}.xlsx"))
         write_perfetto(r, os.path.join(dump_dir, f"{node.name}.perfetto.json"))
     return Metrics(

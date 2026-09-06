@@ -1,11 +1,13 @@
 """Chrome / Perfetto trace export (``chrome://tracing`` JSON).
 
-Emits the full, uncompressed event stream so the exact schedule can be
-inspected: compute split onto a Matrix (systolic array) and a Vector
-(vector unit) track, the DRAM interface on another, control (waits) on a
-third.  A fused pass that runs vector ops alongside its matrix anchor (a
-GEMM + elementwise epilogue) draws on BOTH compute tracks.  Time is in
-cycles (the trace ``ts``/``dur`` unit is arbitrary).
+Emits every walked event: compute split onto a Matrix (systolic array) and
+a Vector (vector unit) track, the DRAM interface on another, control
+(waits) on a third.  A fused pass that runs vector ops alongside its
+matrix anchor (a GEMM + elementwise epilogue) draws on BOTH compute
+tracks.  A folded steady state -- iterations the walk skipped as repeats
+of the period before them -- appears as one bar on the Control track
+spanning the skipped time, so the trace stays readable at any trip count.
+Time is in cycles (the trace ``ts``/``dur`` unit is arbitrary).
 """
 
 import json
@@ -43,12 +45,33 @@ def perfetto_dict(result: ScheduleResult) -> Dict:
                     "args": {
                         "eid": r.eid,
                         "kind": r.kind,
+                        "kernel": r.kernel,
                         "bytes": r.bytes,
                         "is_read": r.is_read,
                         "iteration": list(r.iteration_path),
                     },
                 }
             )
+    for s in result.skips:
+        events.append(
+            {
+                "name": f"{s.kernel} x{s.repeats} periods folded",
+                "cat": "fold",
+                "ph": "X",
+                "ts": s.start,
+                "dur": s.end - s.start,
+                "pid": 0,
+                "tid": _TID["control"],
+                "args": {
+                    "kernel": s.kernel,
+                    "first_step": s.first_step,
+                    "iterations": s.iterations,
+                    "period": s.period,
+                    "repeats": s.repeats,
+                    "cycles_per_period": s.shift,
+                },
+            }
+        )
     return {"traceEvents": events, "displayTimeUnit": "ns"}
 
 

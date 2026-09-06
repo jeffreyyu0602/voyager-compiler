@@ -1,455 +1,259 @@
-"""Live Excel workbook (xlsxwriter) with a linked Gantt chart.
+"""The schedule workbook (xlsxwriter), values only.
 
-The schedule *structure* — event order, resource lanes, and each event's
-``start_deps`` — is fixed by the scheduler and written once.  Only the
-*durations* are formulas, so editing the ``Architecture`` inputs (frequency,
-bandwidth, latency, unroll) or a node's ``Utilization`` recomputes every event's
-``Start``/``End`` and the Gantt bars **inside Excel**, no Python re-run needed.
-This is sound because the dependency wiring is structural and therefore
-invariant to duration edits.
-
-Sheets: ``Architecture`` (editable knobs), ``Operations`` (per-node cycles),
-``Events`` (every scheduled event, fully live), ``Gantt`` (stacked-bar
-timeline), and ``Summary`` (totals + per-loop view + a representative period).
+Sheets: ``Summary`` (totals, the busy split, calibration coverage),
+``Kernels`` (one row per bufferized nest: span, traffic, how much of its
+loop was walked or folded, what a steady-state period runs and costs, its
+calibration), ``Operations`` (per static compute node: shapes, dtypes,
+ideal / analytic / effective cycles), ``Events`` (every walked event, with
+a ``fold`` row where a steady state was skipped), and ``Architecture``
+(the config the estimate used).  Nothing recomputes in Excel: changing a
+knob or entering a measurement means re-running the estimator.
 """
 
-from typing import Dict, List
+from typing import List
 
-from voyager_compiler.codegen.reporting.model import (
-    ScheduleResult,
-    TimingRecord,
+from voyager_compiler.codegen.reporting.model import ScheduleResult
+from voyager_compiler.codegen.reporting.summary import (
+    KernelRow,
+    coverage,
+    kernel_rows,
 )
-
-# ``xlsxwriter`` is imported lazily in ``write_excel_report`` so that importing
-# voyager_compiler never hard-requires it; only generating a workbook does.
-xl_rowcol_to_cell = None  # bound in write_excel_report
-
-# Events sheet column layout.
-C_EID = 0
-C_NODE = 1
-C_KIND = 2
-C_RES = 3
-C_ITER = 4
-C_BYTES = 5
-C_START = 6
-C_LAT = 7
-C_END = 8
-C_COMPUTE = 9
-C_DRAM = 10
-C_READ = 11
-C_WRITE = 12
-
-# Operations sheet column layout (shapes precede the derived Work scalar).
-O_NODE = 0
-O_TYPE = 1
-O_IN = 2
-O_WEIGHT = 3
-O_OUT = 4
-O_WORK = 5
-O_IDEAL = 6
-O_UTIL = 7
-O_EFF = 8
-
-_HEADERS = [
-    "EID",
-    "Node",
-    "Kind",
-    "Resource",
-    "Iter",
-    "Bytes",
-    "Start",
-    "Latency",
-    "End",
-    "Compute",
-    "DRAM",
-    "Read B",
-    "Write B",
-]
-_MAX_GANTT_ROWS = 400  # keep the chart legible; large graphs are truncated
-
-
-def _architecture(wb, result: ScheduleResult):
-    ws = wb.add_worksheet("Architecture")
-    bold = wb.add_format({"bold": True})
-    edit = wb.add_format({"bg_color": "#FFF2CC", "border": 1})
-    ws.write(0, 0, "Architecture (editable)", bold)
-    ws.set_column(0, 0, 22)
-    ws.set_column(1, 1, 14)
-    rows = [
-        ("frequency", float(result.cost.frequency)),  # GHz
-        ("dram_bandwidth", float(result.cost.dram_bandwidth)),  # GB/s
-        ("dram_access_latency", float(result.cost.dram_access_latency)),  # ns
-        ("ic_unroll", int(result.cost.pe_array_size[0])),
-        ("oc_unroll", int(result.cost.pe_array_size[1])),
-    ]
-    for i, (name, val) in enumerate(rows):
-        r = i + 1
-        ws.write(r, 0, name)
-        ws.write_number(r, 1, val, edit)
-        wb.define_name(name, f"=Architecture!${'B'}${r + 1}")
-    ws.write(7, 0, "bytes/cycle", bold)
-    ws.write_formula(
-        7,
-        1,
-        "=dram_bandwidth/frequency",
-        None,
-        result.cost.dram_bandwidth / result.cost.frequency,
-    )
-
-
-def _operations(wb, result: ScheduleResult) -> Dict[str, int]:
-    """Write the per-node compute table; return ``op.key -> Effective-cell
-    row`` so ``Events`` can link each compute latency to it."""
-    ws = wb.add_worksheet("Operations")
-    bold = wb.add_format({"bold": True})
-    edit = wb.add_format({"bg_color": "#FFF2CC", "border": 1})
-    headers = [
-        "Node",
-        "Op type",
-        "Input",
-        "Weight",
-        "Output",
-        "Macs / Ops",
-        "Ideal cycles",
-        "Utilization",
-        "Effective cycles",
-    ]
-    for c, h in enumerate(headers):
-        ws.write(0, c, h, bold)
-    ws.set_column(O_NODE, O_NODE, 18)
-    ws.set_column(O_IN, O_OUT, 18)
-    ws.set_column(O_IDEAL, O_EFF, 14)
-
-    op_row: Dict[str, int] = {}
-    for i, op in enumerate(result.ops):
-        r = i + 1
-        work = op.detail.get("macs", op.detail.get("ops", 0))
-        ws.write(r, O_NODE, op.key)
-        ws.write(r, O_TYPE, op.op_type)
-        # Operand shapes (the ``Work`` scalar's provenance).
-        for col, dim in (
-            (O_IN, "input"),
-            (O_WEIGHT, "weight"),
-            (O_OUT, "output"),
-        ):
-            shape = op.detail.get(dim)
-            if shape is not None:
-                ws.write(r, col, "x".join(str(int(d)) for d in shape))
-        ws.write_number(r, O_WORK, work)
-        work_cell = xl_rowcol_to_cell(r, O_WORK)
-        if "mma" in op.units:
-            ideal = f"=CEILING({work_cell}/(ic_unroll*oc_unroll),1)"
-        else:
-            ideal = f"=CEILING({work_cell}/oc_unroll,1)"
-        ws.write_formula(r, O_IDEAL, ideal, None, op.ideal_cycles)
-        # Pre-computed (from the interstellar RuntimeCalculator for a tiled
-        # matrix op, else the per-op-type rules) but still editable.
-        ws.write_number(r, O_UTIL, op.utilization, edit)
-        ideal_cell = xl_rowcol_to_cell(r, O_IDEAL)
-        util_cell = xl_rowcol_to_cell(r, O_UTIL)
-        ws.write_formula(
-            r,
-            O_EFF,
-            f"=CEILING({ideal_cell}/{util_cell},1)",
-            None,
-            op.effective_cycles,
-        )
-        op_row[op.key] = r
-    return op_row
-
-
-def _latency_formula(
-    rec: TimingRecord, row: int, op_row: Dict[str, int]
-) -> str:
-    if rec.latency_kind == "compute":
-        cell = xl_rowcol_to_cell(op_row[rec.latency_ref], O_EFF)
-        return f"='Operations'!{cell}"
-    if rec.latency_kind == "dram":
-        b = xl_rowcol_to_cell(row, C_BYTES)
-        return (
-            f"=CEILING((dram_access_latency+{b}/dram_bandwidth)"
-            f"*frequency,1)"
-        )
-    return "=0"
-
-
-def _start_term(dep, result, eid_to_row, ii_names):
-    """The ``Start`` MAX-term for one dependency: its ``End`` cell when written,
-    else the congruent last-written event's ``End`` shifted by ``skip`` live
-    initiation intervals.  A truncated-away dep falls back to a cached literal.
-    """
-    if dep in eid_to_row:
-        return xl_rowcol_to_cell(eid_to_row[dep], C_END)
-    remap = result.dep_remap
-    if dep in remap:
-        written, skip, uid = remap[dep]
-        if written in eid_to_row:
-            end = xl_rowcol_to_cell(eid_to_row[written], C_END)
-            return f"({end}+{skip}*{ii_names[uid]})"
-    rec = result.record_by_eid(dep)
-    return str(rec.end if rec else 0)
-
-
-def _events(
-    wb,
-    result: ScheduleResult,
-    op_row: Dict[str, int],
-    written_recs: List[TimingRecord],
-    eid_to_row: Dict[int, int],
-    ii_names: Dict[int, str],
-):
-    ws = wb.add_worksheet("Events")
-    bold = wb.add_format({"bold": True})
-    for c, h in enumerate(_HEADERS):
-        ws.write(0, c, h, bold)
-    ws.set_column(C_NODE, C_NODE, 16)
-    ws.set_column(C_START, C_END, 10)
-
-    for rec in written_recs:
-        r = eid_to_row[rec.eid]
-        ws.write_number(r, C_EID, rec.eid)
-        ws.write(r, C_NODE, rec.node_name)
-        ws.write(r, C_KIND, rec.kind)
-        ws.write(r, C_RES, "/".join(rec.resource))
-        ws.write(r, C_ITER, str(rec.iteration_path))
-        ws.write_number(r, C_BYTES, rec.bytes)
-
-        lat = xl_rowcol_to_cell(r, C_LAT)
-        start = xl_rowcol_to_cell(r, C_START)
-        res = xl_rowcol_to_cell(r, C_RES)
-        if rec.start_deps:
-            terms = ",".join(
-                _start_term(d, result, eid_to_row, ii_names)
-                for d in rec.start_deps
-            )
-            start_f = f"=MAX({terms})"
-        else:
-            start_f = "=0"
-        ws.write_formula(r, C_START, start_f, None, rec.start)
-        ws.write_formula(
-            r,
-            C_LAT,
-            _latency_formula(rec, r, op_row),
-            None,
-            rec.end - rec.start,
-        )
-        ws.write_formula(r, C_END, f"={start}+{lat}", None, rec.end)
-        ws.write_formula(
-            r,
-            C_COMPUTE,
-            f'=IF(AND({res}<>"dram",{res}<>"control"),{lat},0)',
-            None,
-            (
-                rec.end - rec.start
-                if rec.resource[0] not in ("dram", "control")
-                else 0
-            ),
-        )
-        ws.write_formula(
-            r,
-            C_DRAM,
-            f'=IF({res}="dram",{lat},0)',
-            None,
-            rec.end - rec.start if rec.resource[0] == "dram" else 0,
-        )
-        ws.write_number(r, C_READ, rec.bytes if rec.is_read else 0)
-        ws.write_number(r, C_WRITE, 0 if rec.is_read else rec.bytes)
-    return ws
-
-
-def _gantt(wb, first: int, last: int, title: str, name: str):
-    """A stacked-bar Gantt over Events data rows ``[first, last]`` (1-based, a
-    transparent Start offset + visible Compute / DRAM bars), linked so it
-    recalculates live."""
-    ws = wb.add_worksheet(name)
-    chart = wb.add_chart({"type": "bar", "subtype": "stacked"})
-    n = last - first + 1
-
-    def col(c):
-        return [
-            "Events",
-            first,
-            c,
-            last,
-            c,
-        ]
-
-    cats = col(C_NODE)
-    chart.add_series(
-        {
-            "name": "Start",
-            "categories": cats,
-            "values": col(C_START),
-            "fill": {"none": True},
-            "border": {"none": True},
-        }
-    )
-    chart.add_series(
-        {
-            "name": "Compute",
-            "categories": cats,
-            "values": col(C_COMPUTE),
-            "fill": {"color": "#4472C4"},
-        }
-    )
-    chart.add_series(
-        {
-            "name": "DRAM",
-            "categories": cats,
-            "values": col(C_DRAM),
-            "fill": {"color": "#ED7D31"},
-        }
-    )
-    chart.set_title({"name": title})
-    chart.set_x_axis({"name": "cycles", "reverse": False})
-    chart.set_y_axis({"reverse": True})  # first event at the top
-    chart.set_legend({"position": "bottom"})
-    chart.set_size({"x_scale": 2.0, "y_scale": max(1.0, n / 18.0)})
-    ws.insert_chart(1, 1, chart)
-
-
-def _summary(wb, result: ScheduleResult, last: int, compressed: bool):
-    ws = wb.add_worksheet("Summary")
-    bold = wb.add_format({"bold": True})
-    ws.set_column(0, 0, 20)
-    ws.set_column(1, 5, 14)
-    ws.write(0, 0, "Totals", bold)
-    ws.write(1, 0, "total_latency")
-    ws.write_formula(
-        1,
-        1,
-        f"=MAX(Events!{xl_rowcol_to_cell(1, C_END)}:"
-        f"{xl_rowcol_to_cell(last, C_END)})",
-        None,
-        result.total_latency,
-    )
-
-    # Bytes depend on no editable knob; when compressed a live SUM would also
-    # miss the elided rows, so write the exact totals as constants.
-    def _bytes(row, name, col, total):
-        ws.write(row, 0, name)
-        if compressed:
-            ws.write_number(row, 1, total)
-        else:
-            ws.write_formula(
-                row,
-                1,
-                f"=SUM(Events!{xl_rowcol_to_cell(1, col)}:"
-                f"{xl_rowcol_to_cell(last, col)})",
-                None,
-                total,
-            )
-
-    _bytes(2, "dram_read_bytes", C_READ, result.dram_read_bytes)
-    _bytes(3, "dram_write_bytes", C_WRITE, result.dram_write_bytes)
-
-    ws.write(5, 0, "Loops (compressed)", bold)
-    head = [
-        "Loop",
-        "Trip",
-        "Period iters events",
-        "Repeat",
-        "Period cyc",
-        "Compact",
-    ]
-    for c, h in enumerate(head):
-        ws.write(6, c, h, bold)
-    for i, L in enumerate(result.loops):
-        r = 7 + i
-        ws.write(r, 0, L.loop_name)
-        ws.write_number(r, 1, L.trip_count)
-        ws.write_number(r, 2, len(L.period_eids))
-        ws.write_number(r, 3, L.repeat_count)
-        ws.write_number(r, 4, L.period_duration)
-        ws.write(r, 5, f"prefix + period x {L.repeat_count} + suffix")
-
 
 _XLS_ROW_MAX = 1_048_576  # Excel's hard row limit (row 0 holds the header)
 
 
-def _written_records(result: ScheduleResult) -> List[TimingRecord]:
-    """The records the compressed Events sheet emits, in eid order: every
-    top-level record, plus each loop's prefix, written periods and suffix (or
-    every record of an uncompressed loop)."""
-    unc = {L.loop_uid for L in result.loops if L.uncompressed}
-    keep = set()
-    for L in result.loops:
-        if L.uncompressed:
-            continue
-        keep.update(L.prefix_eids)
-        keep.update(L.suffix_eids)
-        for period in L.written_periods:
-            keep.update(period)
-    return [
-        r
-        for r in result.records
-        if r.loop_uid == -1 or r.loop_uid in unc or r.eid in keep
+def _table(wb, name: str, headers: List[str], rows, widths=None):
+    ws = wb.add_worksheet(name)
+    bold = wb.add_format({"bold": True})
+    for c, h in enumerate(headers):
+        ws.write(0, c, h, bold)
+    for c, w in (widths or {}).items():
+        ws.set_column(c, c, w)
+    for r, row in enumerate(rows, start=1):
+        for c, v in enumerate(row):
+            if isinstance(v, bool):
+                ws.write(r, c, str(v))
+            elif isinstance(v, (int, float)):
+                ws.write_number(r, c, v)
+            elif v is None:
+                pass
+            else:
+                ws.write(r, c, str(v))
+    return ws
+
+
+def _shape(op, key) -> str:
+    dims = op.detail.get(key)
+    if dims is None:
+        return ""
+    return "x".join(str(int(d)) for d in dims)
+
+
+def _summary(wb, result: ScheduleResult, rows: List[KernelRow]):
+    overlap = result.busy_compute + result.busy_dram - result.busy_any
+    walked = sum(s.walked for s in result.loops)
+    skipped = sum(s.skipped for s in result.loops)
+    calibrated = [r for r in rows if r.calibration]
+    lines = [
+        ("total_latency", result.total_latency),
+        ("compute_only_cycles", result.busy_compute - overlap),
+        ("dram_only_cycles", result.busy_dram - overlap),
+        ("overlap_cycles", overlap),
+        ("stall_cycles", result.total_latency - result.busy_any),
+        ("dram_read_bytes", result.dram_read_bytes),
+        ("dram_write_bytes", result.dram_write_bytes),
+        ("dram_weight_bytes", result.dram_weight_bytes),
+        ("dram_activation_bytes", result.dram_activation_bytes),
+        ("dram_kv_bytes", result.dram_kv_bytes),
+        ("iterations_walked", walked),
+        ("iterations_folded", skipped),
+        ("events_walked", len(result.records)),
+        ("kernels", len(rows)),
+        ("kernels_calibrated", len(calibrated)),
+        ("calibration_coverage", coverage(rows, result.total_latency)),
     ]
+    _table(wb, "Summary", ["Metric", "Value"], lines, {0: 24, 1: 16})
+
+
+def _kernels(wb, rows: List[KernelRow]):
+    headers = [
+        "Kernel",
+        "Anchor",
+        "Signature",
+        "Start",
+        "End",
+        "Span",
+        "Read B",
+        "Write B",
+        "Trip",
+        "Walked",
+        "Folded",
+        "Period iters",
+        "Periods folded",
+        "Cycles/period",
+        "Compute/period",
+        "DMA/period",
+        "Bound",
+        "Ops/iteration",
+        "Analytic cyc/iter",
+        "Calibration",
+        "Measured cyc/iter",
+    ]
+    lines = [
+        (
+            r.kernel,
+            r.anchor,
+            r.signature,
+            r.start,
+            r.end,
+            r.span,
+            r.read_bytes,
+            r.write_bytes,
+            r.trip_count,
+            r.walked,
+            r.skipped,
+            r.period,
+            r.repeats,
+            r.period_cycles,
+            r.compute_per_period,
+            r.dram_per_period,
+            r.bound,
+            r.ops_text,
+            r.analytic_per_iteration,
+            r.calibration,
+            r.measured_per_iteration,
+        )
+        for r in rows
+    ]
+    _table(wb, "Kernels", headers, lines, {0: 40, 1: 28, 2: 14, 17: 40})
+
+
+def _operations(wb, result: ScheduleResult):
+    headers = [
+        "Node",
+        "Kernel",
+        "Op type",
+        "Units",
+        "Input",
+        "Weight",
+        "Output",
+        "Dtypes",
+        "Macs / Ops",
+        "Ideal cycles",
+        "Utilization",
+        "Analytic cycles",
+        "Effective cycles",
+        "Calibration",
+    ]
+    lines = [
+        (
+            op.key,
+            op.kernel,
+            op.op_type,
+            "/".join(op.units),
+            _shape(op, "input"),
+            _shape(op, "weight"),
+            _shape(op, "output"),
+            op.detail.get("dtypes", ""),
+            op.detail.get("macs", op.detail.get("ops", 0)),
+            op.ideal_cycles,
+            op.utilization,
+            op.analytic_cycles,
+            op.effective_cycles,
+            op.calibration,
+        )
+        for op in result.ops
+    ]
+    _table(wb, "Operations", headers, lines, {0: 32, 1: 40, 4: 16, 5: 16})
+
+
+def _events(wb, result: ScheduleResult, max_rows: int):
+    headers = [
+        "EID",
+        "Node",
+        "Kernel",
+        "Kind",
+        "Resource",
+        "Iter",
+        "Bytes",
+        "Category",
+        "Start",
+        "Latency",
+        "End",
+    ]
+    folds = {}
+    for s in result.skips:
+        folds.setdefault(s.after_eid, []).append(s)
+
+    def lines():
+        n = 0
+        for rec in result.records:
+            if n >= max_rows:
+                return
+            yield (
+                rec.eid,
+                rec.node_name,
+                rec.kernel,
+                rec.kind,
+                "/".join(rec.resource),
+                str(rec.iteration_path),
+                rec.bytes,
+                rec.category,
+                rec.start,
+                rec.end - rec.start,
+                rec.end,
+            )
+            n += 1
+            for s in folds.get(rec.eid, ()):
+                yield (
+                    None,
+                    s.kernel,
+                    s.kernel,
+                    "fold",
+                    "",
+                    f"{s.first_step}..{s.first_step + s.iterations - 1} "
+                    f"({s.repeats} x {s.period} iters)",
+                    (s.bytes.get("read", 0) + s.bytes.get("write", 0))
+                    * s.repeats,
+                    "",
+                    s.start,
+                    s.end - s.start,
+                    s.end,
+                )
+                n += 1
+
+    _table(wb, "Events", headers, lines(), {1: 28, 2: 40, 5: 24})
+
+
+def _architecture(wb, result: ScheduleResult):
+    cost = result.cost
+    lines = [
+        ("frequency_ghz", float(cost.frequency)),
+        ("dram_bandwidth_gbs", float(cost.dram_bandwidth)),
+        ("dram_access_latency_ns", float(cost.dram_access_latency)),
+        ("bytes_per_cycle", cost.dram_bandwidth / cost.frequency),
+        ("pe_rows", int(cost.pe_array_size[0])),
+        ("pe_cols", int(cost.pe_array_size[1])),
+        ("vector_lanes", int(cost.vector_lanes)),
+    ]
+    _table(wb, "Architecture", ["Knob", "Value"], lines, {0: 24, 1: 14})
 
 
 def write_excel_report(
-    result: ScheduleResult,
-    path: str,
-    *,
-    max_gantt_rows: int = _MAX_GANTT_ROWS,
-    compress_events: bool = False,
+    result: ScheduleResult, path: str, *, max_events: int = _XLS_ROW_MAX - 1
 ) -> str:
-    """Write the live workbook to ``path`` and return it.  Run
-    ``compress_schedule`` first to populate the per-loop summary / period views.
-
-    With ``compress_events`` the Events sheet emits only the compressed
-    schedule (prefix + K representative periods + suffix per loop), staying live
-    via per-loop initiation-interval cells -- so its size no longer grows with
-    the loop trip counts.
-    """
-    global xl_rowcol_to_cell
+    """Write the workbook to ``path`` and return it.  The Events sheet is
+    cut at ``max_events`` rows; every other sheet is complete."""
+    # ``xlsxwriter`` is imported here so that importing voyager_compiler never
+    # hard-requires it; only writing a workbook does.
     import xlsxwriter
-    from xlsxwriter.utility import xl_rowcol_to_cell as _xrc
 
-    xl_rowcol_to_cell = _xrc
-
-    if compress_events:
-        written_recs = _written_records(result)
-    else:
-        written_recs = list(result.records)
-    if len(written_recs) > _XLS_ROW_MAX - 1:
-        written_recs = written_recs[: _XLS_ROW_MAX - 1]
-    eid_to_row = {rec.eid: i + 1 for i, rec in enumerate(written_recs)}
-
+    rows = kernel_rows(result)
     wb = xlsxwriter.Workbook(path, {"nan_inf_to_errors": True})
+    _summary(wb, result, rows)
+    _kernels(wb, rows)
+    _operations(wb, result)
+    _events(wb, result, max_events)
     _architecture(wb, result)
-    op_row = _operations(wb, result)
-
-    ii_names: Dict[int, str] = {}
-    if compress_events:
-        for i, L in enumerate(result.loops):
-            if L.uncompressed:
-                continue
-            a1, a2 = L.ii_anchor_eids
-            c1 = xl_rowcol_to_cell(eid_to_row[a1], C_START)
-            c2 = xl_rowcol_to_cell(eid_to_row[a2], C_START)
-            ii_names[L.loop_uid] = f"loop_ii_{i}"
-            wb.define_name(ii_names[L.loop_uid], f"=Events!{c2}-Events!{c1}")
-
-    _events(wb, result, op_row, written_recs, eid_to_row, ii_names)
-
-    n = len(written_recs)
-    hi = min(n, max_gantt_rows)
-    label = "whole graph" if hi == n else f"first {hi} of {n} events"
-    _gantt(wb, 1, hi, f"Schedule ({label})", "Gantt")
-
-    for L in result.loops:
-        rows = [eid_to_row[e] for e in L.period_eids if e in eid_to_row]
-        if rows:
-            _gantt(
-                wb,
-                min(rows),
-                max(rows),
-                f"Representative period: {L.loop_name}",
-                "Period",
-            )
-            break
-
-    _summary(wb, result, n, compress_events)
     wb.close()
     return path

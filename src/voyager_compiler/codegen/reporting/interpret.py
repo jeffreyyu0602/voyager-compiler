@@ -13,12 +13,17 @@ as zero-time control. A DPS ``insert`` writes a compute result into its buffer
 and is pure bookkeeping (skipped). An asynchronous compute is dispatched by
 ``voyager.commit``, which posts its done-semaphore when it finishes -- so
 ``async_wait`` can reconcile compute the same way it does a DMA.
+
+A ``while_loop`` is not walked iteration by iteration: once its steady
+state repeats, the remaining periods are folded in one step (``_Fold``),
+exactly, with the loop's ``Structure`` vouching for every skipped
+iteration.
 """
 
 import math
 import operator
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from torch.fx import GraphModule, Node
@@ -29,9 +34,28 @@ from voyager_compiler.codegen.node_info import (
     is_compute_op,
     is_nop,
 )
+from voyager_compiler.codegen.reporting.calibration import kernel_signatures
 from voyager_compiler.codegen.reporting.cost import _shape, _val, tile_bytes
-from voyager_compiler.codegen.reporting.model import ScheduleResult
-from voyager_compiler.codegen.reporting.scheduler import ResourceState
+from voyager_compiler.codegen.reporting.model import (
+    LoopSkip,
+    LoopStats,
+    ScheduleResult,
+)
+from voyager_compiler.codegen.reporting.periods import MAX_PERIOD, PeriodFinder
+from voyager_compiler.codegen.reporting.busy import busy_unions
+from voyager_compiler.codegen.reporting.scheduler import (
+    T_LOOP,
+    T_SKIP,
+    Checkpoint,
+    Recipe,
+    ResourceState,
+    advance_snapshot,
+    snapshot_recipe,
+)
+from voyager_compiler.codegen.reporting.structure import (
+    Structure,
+    loop_structure,
+)
 from voyager_compiler.codegen.transform.bufferize.bufferization import (
     _produces_tensor,
     _viewed_buffer,
@@ -62,6 +86,8 @@ class _Ctx:
     # placeholder -> the outer source node it is bound to (for semaphore-slot
     # rooting across loop / cond boundaries).
     bind: Dict[Node, Node]
+    fold: bool = True  # fold each loop's steady state instead of walking it
+    depth: int = 0  # control-flow nesting below the top-level graph
 
 
 def _resolve(a, env):
@@ -103,9 +129,9 @@ def _defining(node, bind: Dict[Node, Node]):
 
 
 def _root(node, bind: Dict[Node, Node]):
-    """Follow placeholder bindings and tile ``subview`` / ``getitem`` indexing to
-    the root buffer node (the top-level alloc / input that carries
-    ``meta['space']``)."""
+    """Follow placeholder bindings and tile ``subview`` / ``getitem``
+    indexing to the root buffer node (the top-level alloc / input that
+    carries ``meta['space']``)."""
     while isinstance(node, Node):
         if node in bind:
             node = bind[node]
@@ -288,11 +314,11 @@ def _sem_key(sem_arg, env, bind):
     """``(slots_id, slot)`` for an ``async_copy``/``async_wait`` semaphore arg.
 
     The arg is a ``subview(slots, [slot], [1], [1])`` behind the NOP that
-    squeezes the slot dim off — possibly reached through a chain of placeholder bindings
-    when the pick sits outside a ``cond`` that the DMA lives in.  ``slot`` is
-    resolved against the shared ``env`` (the slot index, e.g.
-    ``step % num_slots``, was computed in that outer scope), so an ``async_copy``
-    into a slot and its matching ``async_wait`` hash equal.
+    squeezes the slot dim off — possibly reached through a chain of
+    placeholder bindings when the pick sits outside a ``cond`` that the DMA
+    lives in.  ``slot`` is resolved against the shared ``env`` (the slot
+    index, e.g. ``step % num_slots``, was computed in that outer scope), so
+    an ``async_copy`` into a slot and its matching ``async_wait`` hash equal.
     """
     node = _defining(sem_arg, bind)
     while (
@@ -322,16 +348,25 @@ def _placeholders(gm: GraphModule) -> List[Node]:
 
 def _walk(gm: GraphModule, env, ctx: _Ctx, path):
     """Schedule every node of ``gm`` in program order; return the resolved
-    values of its ``output`` (for loop-carried threading)."""
+    values of its ``output`` (for loop-carried threading).  A top-level node
+    names the kernel (its ``meta['scope']``) every event under it is
+    attributed to."""
+    rs = ctx.rs
     for node in gm.graph.nodes:
         if node.op in ("placeholder", "get_attr"):
             continue
         if node.op == "output":
             return _resolve(node.args[0], env)
+        if ctx.depth == 0:
+            scope = node.meta.get("scope")
+            kernel = scope[0] if scope else node.name
+            if kernel != rs.cur_kernel:
+                rs.cur_kernel = kernel
+                rs.launch(kernel)
 
         t = node.target
         if node.op == "call_module":
-            ctx.rs.compute(node, path)
+            rs.compute(node, path)
         elif t is WHILE_LOOP:
             env[node] = _run_loop(node, gm, env, ctx, path)
         elif t is COND:
@@ -346,7 +381,7 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
                 n_bytes = math.ceil(n_bytes * fill)
             key = _sem_key(node.args[4], env, ctx.bind)
             post_count = _resolve(get_arg_value(node, 10, "post_count", 1), env)
-            ctx.rs.async_copy(
+            rs.async_copy(
                 node,
                 n_bytes,
                 is_load,
@@ -361,9 +396,9 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             value = int(get_arg_value(node, 2, "value", 0) or 0)
             slots = int(get_arg_value(node, 3, "num_slots", 1) or 1)
             for slot in range(slots):
-                ctx.rs.seed_semaphore((id(node), slot), value)
+                rs.seed_semaphore((id(node), slot), value)
         elif t is _ASYNC_WAIT:
-            ctx.rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
+            rs.async_wait(node, _sem_key(node.args[0], env, ctx.bind), path)
         elif t is _INSERT:
             # Destination-passing write: pure bookkeeping, zero-time -- the
             # producing compute already carries its destination.  (An async
@@ -371,12 +406,12 @@ def _walk(gm: GraphModule, env, ctx: _Ctx, path):
             # the insert.)
             pass
         elif _produces_tensor(node) and is_compute_op(node):
-            ctx.rs.compute(node, path)
+            rs.compute(node, path)
         elif _is_dram_copy(node):
             reads, write = _copy_traffic(node, ctx.bind)
-            ctx.rs.dram_copy(node, reads, write, path)
+            rs.dram_copy(node, reads, write, path)
         elif _is_scratchpad_op(node, ctx.bind):
-            ctx.rs.compute(node, path)
+            rs.compute(node, path)
         elif _should_eval(node):
             env[node] = _eval(node, env)
     return None
@@ -396,23 +431,329 @@ def _bind(phs, sources, env, ctx, carried_vals=None):
             ctx.bind[ph] = src
 
 
+# --------------------------------------------------------------------------
+# Loops: walk the fill, fold the steady state, walk the drain
+# --------------------------------------------------------------------------
+
+
+def _carried_delta(old, new) -> tuple:
+    """How the loop-carried values changed over one iteration: a numeric
+    difference per scalar, ``0`` for an object threaded through unchanged,
+    and a fresh marker for anything else (which no other iteration can
+    match)."""
+    out = []
+    for a, b in zip(old, new):
+        if isinstance(b, (int, float)) and isinstance(a, (int, float)):
+            out.append(b - a)
+        elif b is a:
+            out.append(0)
+        else:
+            out.append(("obj", id(b)))
+    return tuple(out)
+
+
+@dataclass
+class _Iteration:
+    """One walked iteration as the folder remembers it."""
+
+    key: tuple
+    snapshot: tuple
+    counters: tuple
+    clock: int
+    carried: list
+    first_eid: int
+    end_eid: int
+
+
+@dataclass
+class _Plan:
+    """A confirmed period: what one more period does to the state."""
+
+    period: int
+    shift: int
+    recipe: Recipe
+    counters: tuple
+    template: List[tuple]  # the period's iteration keys, in order
+    snapshot: tuple  # the state at the end of the template period
+
+
+@dataclass
+class _Trial:
+    """A jump under verification: the next ``period`` walked iterations
+    must reproduce ``plan.template`` and land on the predicted state, or
+    the jump is undone and retried one period shorter."""
+
+    plan: _Plan
+    repeats: int
+    cp: Checkpoint
+    step: int
+    carried: list
+    finder_len: int
+    window_len: int
+    keys_len: int
+    matched: int = 0
+
+
+class _Fold:
+    """Fold one ``while_loop``'s steady state while it is walked.
+
+    Every walked iteration is pushed as a key to a ``PeriodFinder``.  When
+    the last ``2P`` iterations form two identical periods and the scheduler
+    state after them is a pure time-shift of the state one period earlier,
+    the whole periods ahead are skipped in one step -- but only as far as
+    the loop's ``Structure`` shows every skipped iteration repeating the
+    class of the one a period before it, so a store every K-th step or an
+    edge row the two periods did not contain is walked, never folded.  The
+    state advances by ``repeats`` periods under the recipe, the byte
+    counters by ``repeats`` periods' worth, the carried scalars to their
+    solved values, and a ``LoopSkip`` stands in for the records.  The next
+    period is then walked and must match the template; if it does not, the
+    jump is undone from a checkpoint and retried one period shorter.  At
+    least two periods always remain to be walked after a jump.  A loop with
+    no ``Structure`` is walked in full.
+
+    ``keys`` is the iteration-key stream (walked keys plus skip markers) an
+    enclosing loop hashes to recognise *its* period.
+    """
+
+    WINDOW = 2 * MAX_PERIOD + 1
+
+    def __init__(
+        self,
+        rs: ResourceState,
+        stats: LoopStats,
+        steps: int,
+        structure: Optional[Structure],
+    ):
+        self.rs = rs
+        self.stats = stats
+        self.steps = steps
+        self.structure = structure
+        self.finder = PeriodFinder(
+            multiple_of=(
+                max(1, structure.class_period()) if structure is not None else 1
+            )
+        )
+        self.window: List[_Iteration] = []
+        self.keys: list = []
+        self.trial: Optional[_Trial] = None
+        self.cap: Dict[int, int] = {}  # period -> repeats still allowed
+        self.next_first = len(rs.records)
+
+    def observe(self, key, step: int, carried: list):
+        """Record the iteration just walked (``step`` is the next index);
+        return the index and carried values to continue from."""
+        rs = self.rs
+        self.stats.walked += 1
+        self.keys.append(key)
+        if self.structure is None:
+            return step, carried
+        self.window.append(
+            _Iteration(
+                key,
+                rs.snapshot(),
+                rs.counters(),
+                rs.clock(),
+                carried,
+                self.next_first,
+                len(rs.records),
+            )
+        )
+        self.next_first = len(rs.records)
+        if self.trial is not None:
+            return self._check(key, step, carried)
+        if len(self.window) > self.WINDOW:
+            del self.window[: len(self.window) - self.WINDOW]
+        period = self.finder.push(key)
+        if period is None or self.steps - step < 3 * period:
+            return step, carried
+        cap = self.cap.get(period)
+        if cap is not None and cap <= 0:
+            self.finder.reject(period)
+            return step, carried
+        plan = self._confirm(period)
+        if plan is None:
+            self.finder.reject(period)
+            return step, carried
+        repeats = (self.steps - step - 2 * period) // period
+        if cap is not None:
+            repeats = min(repeats, cap)
+        return self._jump(plan, repeats, step, carried)
+
+    def _confirm(self, period: int) -> Optional[_Plan]:
+        w = self.window
+        n = len(w)
+        if n < 2 * period:
+            return None
+        a, b = n - 2 * period, n - period
+        for m in range(period):
+            if w[a + m].key != w[b + m].key:
+                return None
+        last_a, last_b = w[b - 1], w[n - 1]
+        shift = last_b.clock - last_a.clock
+        recipe = snapshot_recipe(last_a.snapshot, last_b.snapshot, shift)
+        if recipe is None:
+            return None
+        return _Plan(
+            period=period,
+            shift=shift,
+            recipe=recipe,
+            counters=tuple(
+                y - x for x, y in zip(last_a.counters, last_b.counters)
+            ),
+            template=[w[b + m].key for m in range(period)],
+            snapshot=last_b.snapshot,
+        )
+
+    def _jump(self, plan: _Plan, repeats: int, step: int, carried: list):
+        rs = self.rs
+        period = plan.period
+        # The skipped iterations and the period walked to verify the landing
+        # must all repeat the class of the iteration a period before them.
+        # A structure that breaks before the loop ends means the period is a
+        # divisor of the true one (a store every K-th step, a row of tiles);
+        # a longer period folds past the break, so this one is dropped after
+        # the jump, or at once when the jump is not worth taking.
+        wanted = repeats
+        allowed = self.structure.periodic(step, period, (repeats + 1) * period)
+        repeats = min(repeats, allowed // period - 1)
+        if repeats < wanted:
+            self.cap[period] = 0
+            if repeats < 4:
+                self.finder.reject(period)
+                return step, carried
+        advanced = advance_snapshot(plan.snapshot, plan.recipe, repeats)
+        if advanced is None:
+            self.cap[plan.period] = 0
+            self.finder.reject(plan.period)
+            return step, carried
+        cp = rs.checkpoint()
+        w = self.window
+        n = len(w)
+        rs.load_snapshot(advanced)
+        rs.add_counters(plan.counters, repeats)
+        rs.skips.append(
+            LoopSkip(
+                loop_uid=self.stats.loop_uid,
+                kernel=rs.cur_kernel,
+                after_eid=len(rs.records) - 1,
+                first_step=step,
+                period=plan.period,
+                repeats=repeats,
+                template=tuple(
+                    range(w[n - plan.period].first_eid, w[n - 1].end_eid)
+                ),
+                shift=plan.shift,
+                start=w[n - 1].clock,
+                bytes=dict(
+                    zip(
+                        ("read", "write", "weight", "activation", "kv"),
+                        plan.counters,
+                    )
+                ),
+            )
+        )
+        self.stats.skipped += plan.period * repeats
+        self.stats.period = plan.period
+        self.stats.shift = plan.shift
+        self.trial = _Trial(
+            plan=plan,
+            repeats=repeats,
+            cp=cp,
+            step=step,
+            carried=carried,
+            finder_len=len(self.finder),
+            window_len=n,
+            keys_len=len(self.keys),
+        )
+        self.keys.append((T_SKIP, plan.period, repeats, plan.shift))
+        landing = step + plan.period * repeats
+        return landing, self.structure.carried_at(landing)
+
+    def _check(self, key, step: int, carried: list):
+        t = self.trial
+        plan = t.plan
+        ok = key == plan.template[t.matched]
+        t.matched += 1
+        if ok and t.matched < plan.period:
+            return step, carried
+        if ok:
+            want = advance_snapshot(plan.snapshot, plan.recipe, t.repeats + 1)
+            ok = self.window[-1].snapshot == want
+        if ok:
+            self.trial = None
+            return step, carried
+        return self._undo()
+
+    def _undo(self):
+        t = self.trial
+        self.trial = None
+        self.rs.restore(t.cp)
+        self.finder.truncate(t.finder_len)
+        del self.window[t.window_len :]
+        del self.keys[t.keys_len :]
+        self.next_first = len(self.rs.records)
+        repeats = t.repeats - 1
+        self.cap[t.plan.period] = repeats
+        if repeats <= 0:
+            self.finder.reject(t.plan.period)
+            return t.step, t.carried
+        return self._jump(t.plan, repeats, t.step, t.carried)
+
+
 def _run_loop(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
     body = getattr(gm, str(node.args[1].target))
     carried = list(node.args[2])
     extra = list(node.args[3]) if len(node.args) > 3 else []
     phs = _placeholders(body)
-    carried_vals = [_resolve(c, env) for c in carried]
-
     steps = _num_steps(node)
-    out = carried_vals
-    prev_loop = ctx.rs.cur_loop
-    ctx.rs.cur_loop = id(node)
-    ctx.rs.loop_names[id(node)] = node.name
-    for step in range(steps):
-        _bind(phs, carried + extra, env, ctx, carried_vals)
+    rs = ctx.rs
+    stats = rs.enter_loop(node, steps)
+    prev_loop, rs.cur_loop = rs.cur_loop, id(node)
+    outer_trace, outer_base = rs.trace, rs.trace_base
+    entry = rs.clock()
+    ctx.depth += 1
+
+    def iteration(step, vals):
+        _bind(phs, carried + extra, env, ctx, vals)
         out = _walk(body, env, ctx, tuple(path) + (step,))
-        carried_vals = list(out) if isinstance(out, (list, tuple)) else [out]
-    ctx.rs.cur_loop = prev_loop
+        return out, (list(out) if isinstance(out, (list, tuple)) else [out])
+
+    out = vals = [_resolve(c, env) for c in carried]
+    if not ctx.fold:
+        for step in range(steps):
+            out, vals = iteration(step, vals)
+        stats.walked += steps
+    else:
+        structure = (
+            loop_structure(node, gm, env, vals, steps) if steps >= 4 else None
+        )
+        fold = _Fold(rs, stats, steps, structure)
+        step = 0
+        while step < steps:
+            base = rs.clock()
+            rs.trace, rs.trace_base = [], base
+            out, new = iteration(step, vals)
+            key = (
+                tuple(rs.trace),
+                rs.clock() - base,
+                _carried_delta(vals, new),
+            )
+            step, vals = fold.observe(key, step + 1, new)
+        rs.trace, rs.trace_base = outer_trace, outer_base
+        if outer_trace is not None:
+            outer_trace.append(
+                (
+                    T_LOOP,
+                    id(node),
+                    entry - outer_base,
+                    tuple(fold.keys),
+                    rs.clock() - outer_base,
+                )
+            )
+    ctx.depth -= 1
+    rs.exit_loop(stats)
+    rs.cur_loop = prev_loop
     return out
 
 
@@ -422,7 +763,11 @@ def _run_cond(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
     branch_gm = getattr(gm, str(branch.target))
     operands = list(node.args[3]) if len(node.args) > 3 else []
     _bind(_placeholders(branch_gm), operands, env, ctx)
-    return _walk(branch_gm, env, ctx, path)
+    ctx.depth += 1
+    try:
+        return _walk(branch_gm, env, ctx, path)
+    finally:
+        ctx.depth -= 1
 
 
 def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
@@ -444,27 +789,42 @@ def _run_commit(node: Node, gm: GraphModule, env, ctx: _Ctx, path):
 
     def run():
         _bind(_placeholders(sub), list(node.args[1:]), env, ctx)
-        result["out"] = _walk(sub, env, ctx, path)
+        ctx.depth += 1
+        try:
+            result["out"] = _walk(sub, env, ctx, path)
+        finally:
+            ctx.depth -= 1
         if done_key is not None:
             ctx.rs.post_semaphore(done_key, ctx.rs.last_commit_node or node)
 
-    ctx.rs.register_commit(deps, run)
+    ctx.rs.register_commit(node, deps, run)
     return result.get("out")
 
 
-def estimate_schedule(model: GraphModule, config) -> ScheduleResult:
+def estimate_schedule(
+    model: GraphModule, config, *, full_walk: bool = False, calibration=None
+) -> ScheduleResult:
     """Walk a bufferized + memory-planned FX graph and return its schedule:
-    per-node timing records, total latency, and DRAM read / write bytes.
+    the walked timing records, the folded steady-state runs, total latency,
+    and DRAM read / write bytes.
 
-    ``config`` is the ``AcceleratorConfig``; ``cost.py`` converts its physical
-    units to cycles.  Shapes are read from the nodes' existing ``meta['val']`` /
-    ``.value`` (set during bufferization), so the model needs no re-execution.
+    Args:
+        model: The graph; shapes come from its nodes' ``meta['val']`` /
+            ``.value`` (set during bufferization), so nothing is re-run.
+        config: The ``AcceleratorConfig``; ``cost.py`` converts its physical
+            units to cycles.
+        full_walk: Walk every loop iteration instead of folding the steady
+            state -- the reference the fold must match exactly.
+        calibration: A ``Calibration`` of RTL-measured kernel cycles, applied
+            to each compute op as it is priced.
     """
-    cost = config
-    rs = ResourceState(cost)
-    ctx = _Ctx(rs=rs, cost=cost, bind={})
+    signatures = kernel_signatures(model, config)
+    rs = ResourceState(config, calibration)
+    rs.kernel_signatures = {k: s.key for k, s in signatures.items()}
+    ctx = _Ctx(rs=rs, cost=config, bind={}, fold=not full_walk)
     _walk(model, {}, ctx, ())
     rs.assert_commits_drained("<graph end>")
+    busy_compute, busy_dram, busy_any = busy_unions(rs.records, rs.skips)
 
     return ScheduleResult(
         records=rs.records,
@@ -472,9 +832,14 @@ def estimate_schedule(model: GraphModule, config) -> ScheduleResult:
         total_latency=rs.now,
         dram_read_bytes=rs.read_bytes,
         dram_write_bytes=rs.write_bytes,
-        cost=cost,
+        cost=config,
         dram_weight_bytes=rs.cat_bytes["weight"],
         dram_activation_bytes=rs.cat_bytes["activation"],
         dram_kv_bytes=rs.cat_bytes["kv"],
-        loop_names=dict(rs.loop_names),
+        skips=rs.skips,
+        loops=list(rs.loop_stats.values()),
+        busy_compute=busy_compute,
+        busy_dram=busy_dram,
+        busy_any=busy_any,
+        kernel_signatures=signatures,
     )
