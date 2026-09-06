@@ -32,6 +32,7 @@ from voyager_compiler.shape_prop import (
     propagate_shape,
     set_node_value,
     written_buffers,
+    run_op,
 )
 
 logger = logging.getLogger(__name__)
@@ -447,7 +448,7 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     model.recompile()
 
 
-def fold_constant_generators(model: GraphModule):
+def fold_constant_generators(model: GraphModule, shape_only: bool = False):
     """Constant-fold ``call_function`` nodes whose inputs are all constants:
     input-free generators (``arange`` / ``zeros`` / …) and, transitively, any op
     fed only by already-folded constants — so a whole constant subgraph (e.g.
@@ -457,8 +458,16 @@ def fold_constant_generators(model: GraphModule):
     Walking in program order, a node is constant iff every FX-Node input is a
     ``get_attr`` (an initial buffer or one this pass just created) that the
     graph never writes; it is then evaluated with the real buffer values and
-    replaced by a ``get_attr`` to the result.  Orphaned constant ancestors
-    are dropped by dead-code elimination.
+    replaced by a ``get_attr`` to the result.  A buffer this pass created is
+    deleted as soon as its last reader folds, so a chain's intermediates
+    (the index grids a causal mask is built from) never accumulate; other
+    orphaned ancestors are dropped by dead-code elimination.
+
+    Args:
+        model: The graph to fold, in place.
+        shape_only: The caller will neither execute nor dump the graph, so a
+            folded constant at or above the fake-value limit may be recorded
+            as a FakeTensor buffer instead of being computed (``run_op``).
     """
     graph = model.graph
     # A buffer the graph writes -- a KV cache, or a ``cond`` operand -- is
@@ -467,6 +476,7 @@ def fold_constant_generators(model: GraphModule):
     constants = {
         n for n in graph.nodes if n.op == "get_attr" and n.target not in written
     }
+    folded = set()
 
     def resolve(n: Node):
         return fetch_attr(model, n.target)
@@ -489,10 +499,14 @@ def fold_constant_generators(model: GraphModule):
             and node.value.shape != node.args[0].value.shape
         ):
             continue
-        const = node.target(
-            *map_arg(node.args, resolve), **map_arg(node.kwargs, resolve)
-        )
-        src = next((n.target for n in node.all_input_nodes), "const")
+        args = map_arg(node.args, resolve)
+        kwargs = map_arg(node.kwargs, resolve)
+        if shape_only:
+            const = run_op(node.target, args, kwargs)
+        else:
+            const = node.target(*args, **kwargs)
+        inputs = node.all_input_nodes
+        src = next((n.target for n in inputs), "const")
         prefix = re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
         with graph.inserting_before(node):
             attr = create_getattr_from_value(model, graph, prefix, const)
@@ -501,6 +515,13 @@ def fold_constant_generators(model: GraphModule):
         node.replace_all_uses_with(attr)
         graph.erase_node(node)
         constants.add(attr)
+        folded.add(attr)
+        for inp in inputs:
+            if inp in folded and not inp.users:
+                delattr(model, inp.target)
+                graph.erase_node(inp)
+                folded.discard(inp)
+                constants.discard(inp)
 
     graph.eliminate_dead_code()
     graph.lint()

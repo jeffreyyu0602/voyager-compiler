@@ -215,7 +215,12 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
+    shape_only=False,
 ):
+    """Lower ``model`` in place through the graph-level passes.  With
+    ``shape_only`` the caller promises never to execute or dump the graph,
+    so a large folded constant may be a FakeTensor buffer
+    (``fold_constant_generators``)."""
     if example_kwargs is None:
         example_kwargs = {}
 
@@ -226,7 +231,7 @@ def transform(
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*flatten_args)
 
-    fold_constant_generators(model)
+    fold_constant_generators(model, shape_only=shape_only)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
     scalarize_index_arithmetic(model)

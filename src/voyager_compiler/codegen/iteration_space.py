@@ -38,6 +38,211 @@ logger = logging.getLogger(__name__)
 
 
 Shape = Tuple[int, ...]
+# One dimension of an address map: row-major ``(radix, stride)`` digits.
+Digits = Tuple[Tuple[int, int], ...]
+
+
+def _canonical(digits) -> Digits:
+    """``digits`` with radix-1 entries dropped and adjacent entries merged
+    where the higher one's stride is the lower one's radix times its stride,
+    so two equal maps have equal digits.  A size-1 dimension is ``((1, 0),)``.
+    """
+    out = []
+    for radix, stride in digits:
+        if radix == 1:
+            continue
+        if out and out[-1][1] == radix * stride:
+            out[-1] = (out[-1][0] * radix, stride)
+        else:
+            out.append((radix, stride))
+    return tuple(out) or ((1, 0),)
+
+
+def _axis(dim: int, ndim: int) -> int:
+    if not -ndim <= dim < ndim:
+        raise ValueError(f"dimension {dim} out of range for {ndim} dims")
+    return dim % ndim
+
+
+@dataclass(frozen=True)
+class AddressMap:
+    """Where every position of a fused subgraph value reads its external
+    input: the flat index of that input, as a function of the position.
+
+    The function is held symbolically.  ``dims[d]`` is the row-major list of
+    ``(radix, stride)`` digits of dimension ``d``: an index along it
+    contributes each of its mixed-radix digits times that digit's stride,
+    and ``offset`` is added to the total.  A map over a 32-head ``n x n``
+    attention tensor is then a handful of tuples, not an int64 tensor of
+    ``32 n^2`` entries, and every shape op the normalizer replays keeps the
+    form exact: a permute reorders dimensions, an expand is a zero-stride
+    digit, and a reshape regroups digits, splitting one where a new boundary
+    falls inside it.  A dimension of one digit is read at a fixed stride;
+    one that keeps several (the head axis once a GQA repeat is merged) is
+    not, and ``affine_strides`` reports it as such.
+    """
+
+    dims: Tuple[Digits, ...]
+    offset: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "dims", tuple(_canonical(d) for d in self.dims)
+        )
+
+    @classmethod
+    def arange(cls, shape: Sequence[int]) -> "AddressMap":
+        """The identity map over ``shape``: position ``p`` reads element
+        ``p`` of a contiguous input of that shape."""
+        dims = []
+        stride = 1
+        for size in reversed([int(s) for s in shape]):
+            dims.append(((size, stride),))
+            stride *= max(size, 1)
+        return cls(tuple(reversed(dims)))
+
+    @property
+    def shape(self) -> Shape:
+        return tuple(math.prod(r for r, _ in d) for d in self.dims)
+
+    def numel(self) -> int:
+        return math.prod(self.shape)
+
+    def affine_strides(self) -> Optional[Shape]:
+        """One stride per dimension (0 along a size-1 or broadcast one), or
+        ``None`` when some dimension is not read at a single stride."""
+        strides = []
+        for digits in self.dims:
+            if len(digits) != 1:
+                return None
+            radix, stride = digits[0]
+            strides.append(stride if radix > 1 else 0)
+        return tuple(strides)
+
+    def reshape(self, shape: Sequence[int]) -> "AddressMap":
+        """Regroup the digits into ``shape`` (one ``-1`` allowed).  A
+        dimension boundary that falls inside a digit splits it; one that
+        falls at no multiple of the digit's radix cannot be expressed."""
+        shape = [int(s) for s in shape]
+        if shape.count(-1) == 1:
+            known = math.prod(s for s in shape if s != -1)
+            shape[shape.index(-1)] = self.numel() // max(known, 1)
+        if math.prod(shape) != self.numel():
+            raise ValueError(f"cannot reshape {self.shape} to {shape}")
+        flat = [d for dim in self.dims for d in dim if d[0] != 1]
+        dims = []
+        for size in shape:
+            taken = []
+            remaining = size
+            while remaining > 1:
+                radix, stride = flat.pop(0)
+                if radix <= remaining:
+                    if remaining % radix:
+                        raise ValueError(
+                            f"reshape of {self.shape} to {shape} cuts a "
+                            "dimension inside a digit"
+                        )
+                    taken.append((radix, stride))
+                    remaining //= radix
+                else:
+                    if radix % remaining:
+                        raise ValueError(
+                            f"reshape of {self.shape} to {shape} cuts a "
+                            "dimension inside a digit"
+                        )
+                    taken.append((remaining, stride * (radix // remaining)))
+                    flat.insert(0, (radix // remaining, stride))
+                    remaining = 1
+            dims.append(tuple(taken))
+        return AddressMap(tuple(dims), self.offset)
+
+    def flatten(self, start_dim: int = 0, end_dim: int = -1) -> "AddressMap":
+        shape = self.shape
+        start = _axis(start_dim, len(shape))
+        end = _axis(end_dim, len(shape))
+        merged = math.prod(shape[start : end + 1])
+        return self.reshape(shape[:start] + (merged,) + shape[end + 1 :])
+
+    def permute(self, order: Sequence[int]) -> "AddressMap":
+        ndim = len(self.dims)
+        return AddressMap(
+            tuple(self.dims[_axis(o, ndim)] for o in order), self.offset
+        )
+
+    def transpose(self, dim0: int, dim1: int) -> "AddressMap":
+        order = list(range(len(self.dims)))
+        a, b = _axis(dim0, len(order)), _axis(dim1, len(order))
+        order[a], order[b] = order[b], order[a]
+        return self.permute(order)
+
+    def unsqueeze(self, dim: int) -> "AddressMap":
+        d = _axis(dim, len(self.dims) + 1)
+        return AddressMap(
+            self.dims[:d] + (((1, 0),),) + self.dims[d:], self.offset
+        )
+
+    def squeeze(self, dims=None) -> "AddressMap":
+        """Drop the size-1 dimensions, or those of ``dims`` that are size 1."""
+        ndim = len(self.dims)
+        if dims is None:
+            drop = set(range(ndim))
+        elif isinstance(dims, int):
+            drop = {_axis(dims, ndim)}
+        else:
+            drop = {_axis(d, ndim) for d in dims}
+        shape = self.shape
+        kept = tuple(
+            digits
+            for d, digits in enumerate(self.dims)
+            if not (d in drop and shape[d] == 1)
+        )
+        return AddressMap(kept, self.offset)
+
+    def select(self, dim: int, index: int) -> "AddressMap":
+        d = _axis(dim, len(self.dims))
+        index = _axis(index, self.shape[d])
+        offset = self.offset
+        for radix, stride in reversed(self.dims[d]):
+            offset += (index % radix) * stride
+            index //= radix
+        return AddressMap(self.dims[:d] + self.dims[d + 1 :], offset)
+
+    def slice(self, dim=0, start=None, end=None, step=1) -> "AddressMap":
+        d = _axis(dim, len(self.dims))
+        size = self.shape[d]
+        start = 0 if start is None else start
+        end = size if end is None else end
+        start = max(start + size, 0) if start < 0 else min(start, size)
+        end = max(end + size, 0) if end < 0 else min(end, size)
+        length = max(0, -(-(end - start) // step))
+        if start == 0 and length == size and step == 1:
+            return self
+        if len(self.dims[d]) != 1:
+            raise ValueError("slice of a dimension read at several strides")
+        radix, stride = self.dims[d][0]
+        dims = (
+            self.dims[:d] + (((length, stride * step),),) + self.dims[d + 1 :]
+        )
+        return AddressMap(dims, self.offset + start * stride)
+
+    def expand(self, sizes: Sequence[int]) -> "AddressMap":
+        """Broadcast to ``sizes`` (``-1`` keeps a dimension): a size-1
+        dimension, or a new leading one, becomes a zero-stride digit."""
+        sizes = [int(s) for s in sizes]
+        lead = len(sizes) - len(self.dims)
+        if lead < 0:
+            raise ValueError(f"cannot expand {self.shape} to {sizes}")
+        dims = [((size, 0),) for size in sizes[:lead]]
+        for size, digits, current in zip(sizes[lead:], self.dims, self.shape):
+            if size in (-1, current):
+                dims.append(digits)
+            elif current == 1:
+                dims.append(((size, 0),))
+            else:
+                raise ValueError(f"cannot expand {self.shape} to {sizes}")
+        return AddressMap(tuple(dims), self.offset)
+
+
 NodePredicate = Callable[[fx.Node], bool]
 
 # Emit relayouts as aten call_function ops (not call_method): the rest of the
@@ -127,15 +332,12 @@ class NormalizationConfig:
         node.meta["pointwise"] = True
     """
 
-    max_address_map_elements: int = 1 << 64
     require_contiguous_inputs: bool = True
     parent_shape_method: str = "view"  # "view" or "reshape"
     anchor_predicate: Optional[NodePredicate] = None
     pointwise_predicate: Optional[NodePredicate] = None
 
     def __post_init__(self) -> None:
-        if self.max_address_map_elements <= 0:
-            raise ValueError("max_address_map_elements must be positive")
         if self.parent_shape_method not in {"view", "reshape"}:
             raise ValueError("parent_shape_method must be 'view' or 'reshape'")
 
@@ -213,8 +415,6 @@ class IterationSpaceNormalizer:
                 p for p in placeholders if p not in anchor_inputs
             ]
 
-        self._check_analysis_size(iteration_shape, context="iteration space")
-
         # Quantization lookup tables (qmap/code/...) are indexed by value, not
         # by iteration position, so they have no address map to propagate;
         # they are passed whole to every tile. Skip them.
@@ -270,7 +470,6 @@ class IterationSpaceNormalizer:
                 iteration_shape=iteration_shape,
                 base=base,
                 strides=strides,
-                propagated=propagated,
                 placeholder=placeholder,
             )
             input_plans[placeholder.name] = InputPlan(
@@ -336,14 +535,10 @@ class IterationSpaceNormalizer:
         seed_node: fx.Node,
         output_value: fx.Node,
         anchor: Optional[fx.Node],
-    ) -> Optional[torch.Tensor]:
-        seed_shape = seed_node.shape
-        self._check_analysis_size(seed_shape, context=f"seed {seed_node.name}")
-        seed = torch.arange(math.prod(seed_shape), dtype=torch.int64).reshape(
-            seed_shape
-        )
+    ) -> Optional[AddressMap]:
+        seed = AddressMap.arange(seed_node.shape)
 
-        env: Dict[fx.Node, Optional[torch.Tensor]] = {}
+        env: Dict[fx.Node, Optional[AddressMap]] = {}
         for node in child.graph.nodes:
             if node is seed_node:
                 env[node] = seed
@@ -398,7 +593,7 @@ class IterationSpaceNormalizer:
                     ]
                     first = broadcasted[0]
                     for other in broadcasted[1:]:
-                        if not torch.equal(first, other):
+                        if first != other:
                             raise NormalizationError(
                                 "One external input reaches the same "
                                 "pointwise operation through incompatible "
@@ -446,11 +641,9 @@ class IterationSpaceNormalizer:
                 "The tail expands or contracts the anchor-produced stream",
                 node=anchor,
             )
-        expected = torch.arange(
-            math.prod(iteration_shape), dtype=torch.int64
-        ).reshape(iteration_shape)
-        actual = propagated.reshape(iteration_shape)
-        if not torch.equal(actual, expected):
+        if propagated.reshape(iteration_shape) != AddressMap.arange(
+            iteration_shape
+        ):
             raise NormalizationError(
                 "The tail changes the order or multiplicity of the "
                 "anchor-produced stream",
@@ -459,7 +652,7 @@ class IterationSpaceNormalizer:
 
     def _recover_and_validate_affine_map(
         self,
-        propagated: torch.Tensor,
+        propagated: AddressMap,
         iteration_shape: Shape,
         placeholder: fx.Node,
     ) -> Tuple[int, Shape]:
@@ -469,41 +662,14 @@ class IterationSpaceNormalizer:
                 f"{iteration_shape}",
                 node=placeholder,
             )
-        origin = (0,) * len(iteration_shape)
-        base = (
-            int(propagated[origin].item())
-            if iteration_shape
-            else int(propagated.item())
-        )
-        strides = []
-        for dim, extent in enumerate(iteration_shape):
-            if extent <= 1:
-                strides.append(0)
-                continue
-            index = [0] * len(iteration_shape)
-            index[dim] = 1
-            strides.append(int(propagated[tuple(index)].item()) - base)
-
-        expected = torch.full(iteration_shape, base, dtype=torch.int64)
-        for dim, (extent, stride) in enumerate(zip(iteration_shape, strides)):
-            if extent <= 1 or stride == 0:
-                continue
-            shape = [1] * len(iteration_shape)
-            shape[dim] = extent
-            expected = (
-                expected
-                + torch.arange(extent, dtype=torch.int64).reshape(shape)
-                * stride
-            )
-
-        if not torch.equal(expected, propagated):
-            mismatch = self._first_mismatch(expected, propagated)
+        strides = propagated.affine_strides()
+        if strides is None:
             raise NormalizationError(
                 "Input map is not representable by one fixed base and one "
-                f"stride per iteration dimension; first mismatch at {mismatch}",
+                "stride per iteration dimension",
                 node=placeholder,
             )
-        return base, tuple(strides)
+        return propagated.offset, strides
 
     def _derive_boundary_shape(
         self,
@@ -512,7 +678,6 @@ class IterationSpaceNormalizer:
         iteration_shape: Shape,
         base: int,
         strides: Shape,
-        propagated: torch.Tensor,
         placeholder: fx.Node,
     ) -> Tuple[Shape, Tuple[int, ...]]:
         if base != 0:
@@ -534,24 +699,19 @@ class IterationSpaceNormalizer:
                 node=placeholder,
             )
 
-        candidate = torch.arange(
-            math.prod(original_shape), dtype=torch.int64
-        ).reshape(boundary)
-        try:
-            candidate = torch.broadcast_to(candidate, iteration_shape)
-        except RuntimeError as exc:
-            raise NormalizationError(
-                f"Boundary shape {boundary} cannot broadcast to "
-                f"{iteration_shape}",
-                node=placeholder,
-            ) from exc
-
-        if not torch.equal(candidate, propagated):
-            mismatch = self._first_mismatch(candidate, propagated)
+        # The map must read ``boundary`` in row-major order, broadcast along
+        # the dimensions it drops.
+        contiguous = self._contiguous_strides(boundary)
+        expected = tuple(
+            0 if extent <= 1 or boundary_extent == 1 else stride
+            for extent, boundary_extent, stride in zip(
+                iteration_shape, boundary, contiguous
+            )
+        )
+        if tuple(strides) != expected:
             raise NormalizationError(
                 "Affine access is not specifically expressible as an "
-                "order-preserving view plus fetch-side broadcast; first "
-                f"mismatch at {mismatch}",
+                "order-preserving view plus fetch-side broadcast",
                 node=placeholder,
             )
 
@@ -972,30 +1132,45 @@ class IterationSpaceNormalizer:
     # Shape operation interpretation
     # ------------------------------------------------------------------
 
-    def _apply_shape_noop(
-        self, node: fx.Node, value: torch.Tensor
-    ) -> torch.Tensor:
-        """Replay a shape-only op on the integer address map by rerunning the
-        op with the map substituted for its tensor input.  This reindexes the
-        map exactly as the op would the data, and handles this repo's aten ops
-        (``view`` / ``reshape`` / ``squeeze`` / ``unsqueeze`` / ``select`` /
-        identity ``slice``) generically; a non-order-preserving op yields a map
-        that later fails the fixed-stride check."""
-        new_args = tuple(
-            value if isinstance(a, fx.Node) else a for a in node.args
-        )
-        new_kwargs = {
-            k: (value if isinstance(v, fx.Node) else v)
-            for k, v in node.kwargs.items()
-        }
+    def _apply_shape_noop(self, node: fx.Node, value: AddressMap) -> AddressMap:
+        """Replay a shape-only op on the address map, reindexing it exactly as
+        the op would the data: ``view`` / ``reshape`` / ``flatten`` regroup
+        the digits, ``squeeze`` / ``unsqueeze`` / ``select`` / ``slice`` drop
+        or restrict dimensions, ``transpose`` / ``permute`` reorder them and
+        ``expand`` broadcasts.  A non-order-preserving op yields a map that
+        later fails the fixed-stride check."""
+        aten = torch.ops.aten
+        args = node.args[1:]
         try:
-            return node.target(*new_args, **new_kwargs)
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 - surface as a normalization error
+            if node.target in (
+                aten.view.default,
+                aten.reshape.default,
+                aten._unsafe_view.default,
+            ):
+                return value.reshape(args[0])
+            if node.target is aten.flatten.using_ints:
+                return value.flatten(*args)
+            if node.target in (aten.squeeze.dim, aten.squeeze.dims):
+                return value.squeeze(args[0])
+            if node.target is aten.squeeze.default:
+                return value.squeeze()
+            if node.target is aten.unsqueeze.default:
+                return value.unsqueeze(args[0])
+            if node.target is aten.select.int:
+                return value.select(args[0], args[1])
+            if node.target is aten.slice.Tensor:
+                return value.slice(*args)
+            if node.target is aten.transpose.int:
+                return value.transpose(args[0], args[1])
+            if node.target is aten.permute.default:
+                return value.permute(args[0])
+            if node.target is aten.expand.default:
+                return value.expand(args[0])
+        except ValueError as exc:
             raise NormalizationError(
                 "Unsupported shape no-op", node=node
             ) from exc
+        raise NormalizationError("Unsupported shape no-op", node=node)
 
     # ------------------------------------------------------------------
     # Metadata and FX utilities
@@ -1054,26 +1229,16 @@ class IterationSpaceNormalizer:
         return bindings
 
     def _broadcast_map(
-        self, value: torch.Tensor, output_shape: Shape, node: fx.Node
-    ) -> torch.Tensor:
-        self._check_analysis_size(output_shape, context=f"node {node.name}")
+        self, value: AddressMap, output_shape: Shape, node: fx.Node
+    ) -> AddressMap:
         try:
-            return torch.broadcast_to(value, output_shape)
-        except RuntimeError as exc:
+            return value.expand(output_shape)
+        except ValueError as exc:
             raise NormalizationError(
                 f"Address map with shape {tuple(value.shape)} cannot "
                 f"broadcast to {output_shape}",
                 node=node,
             ) from exc
-
-    def _check_analysis_size(self, shape: Shape, *, context: str) -> None:
-        count = math.prod(shape)
-        if count > self.config.max_address_map_elements:
-            raise NormalizationError(
-                f"Concrete address-map analysis for {context} requires "
-                f"{count} elements, exceeding limit "
-                f"{self.config.max_address_map_elements}"
-            )
 
     @staticmethod
     def _contiguous_strides(shape: Shape) -> Tuple[int, ...]:
@@ -1085,12 +1250,3 @@ class IterationSpaceNormalizer:
             strides[index] = running
             running *= max(shape[index], 1)
         return tuple(strides)
-
-    @staticmethod
-    def _first_mismatch(
-        expected: torch.Tensor, actual: torch.Tensor
-    ) -> Tuple[int, ...]:
-        mismatch = torch.nonzero(expected != actual, as_tuple=False)
-        if mismatch.numel() == 0:
-            return ()
-        return tuple(int(x) for x in mismatch[0].tolist())

@@ -65,6 +65,7 @@ from transformers.integrations.executorch import (
 import voyager_compiler  # noqa: F401  registers voyager.*
 from voyager_compiler import (
     OpMatcher,
+    QScheme,
     QuantizationSpec,
     convert_pt2e,
     export_model,
@@ -94,6 +95,10 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     build_interstellar_tiler,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.quantization.fake_quantize import (
+    FakeQuantizeBase,
+    FusedAmaxObsFakeQuantize,
+)
 from voyager_compiler.shape_prop import ShapeProp
 
 try:
@@ -200,7 +205,9 @@ class SweepConfig:
     ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
     dequant / activation / requantize tail becomes separate kernels and the
     GQA KV repeat is materialised in memory instead of folding into the
-    block index.
+    block index.  ``quantize_attention_mask`` stores prefill's causal mask
+    as int1, the way ``test_codegen --quantize_attention_mask`` does; decode
+    rebuilds its mask every step and keeps bf16.
 
     ``calibration`` names a filled-in RTL calibration form (see
     ``write_calibration_form``) whose measured kernel cycles price the
@@ -228,6 +235,7 @@ class SweepConfig:
     attn_implementation: str = "eager"
     pipelined: bool = True
     fuse_operators: bool = True
+    quantize_attention_mask: bool = True
     single_buffer_tail: bool = False
     num_layers_override: Optional[int] = None
 
@@ -651,6 +659,72 @@ def _scale(m: "Metrics", count: int) -> "Metrics":
     )
 
 
+MASK_QSPEC = "int1,qs=per_tensor_symmetric,qmax=1"
+
+
+def _annotate_attention_mask(gm) -> int:
+    """Annotate prefill's causal mask int1, as ``test/utils/models/llama.py``
+    does: the HF export builds the mask in-graph as a ``where`` that the
+    attention scores' ``add`` reads, and ``convert_pt2e`` then leaves an int1
+    constant plus its dequantize.  Returns how many masks were annotated;
+    raises if the graph has none."""
+    qspec = QuantizationSpec.from_str(MASK_QSPEC)
+    masks = [
+        n
+        for n in gm.graph.nodes
+        if n.target is torch.ops.aten.where.ScalarOther
+        and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
+    ]
+    if not masks:
+        raise RuntimeError("no causal-mask where node feeds an add")
+    for mask in masks:
+        _annotate_output_qspec(mask, qspec)
+    return len(masks)
+
+
+def _stateless(fq) -> bool:
+    """A fake-quant module that records nothing in a calibration pass:
+    microscaling computes its block scales per call."""
+    return (
+        isinstance(fq, FusedAmaxObsFakeQuantize)
+        and fq.qscheme == QScheme.MICROSCALING
+        and fq.outlier_pct is None
+        and not fq.record_histogram
+    )
+
+
+def _calibrate(gm, example_args, example_kwargs, mask_dtype):
+    """Run the two calibration passes.  The mask's per-tensor observer is fed
+    the two values the constant mask holds, ``0`` and ``mask_dtype``'s
+    minimum, and then disabled.  When no other observer records state, the
+    passes run node by node through ``ShapeProp``, whose large results stay
+    fake, so a long prefill never materializes its attention scores; any
+    other observer keeps the real forward passes."""
+    modules = dict(gm.named_modules())
+    real = False
+    for node in gm.graph.nodes:
+        if node.op != "call_module":
+            continue
+        fq = modules[node.target]
+        if not isinstance(fq, FakeQuantizeBase) or _stateless(fq):
+            continue
+        if node.args[0].target is torch.ops.aten.where.ScalarOther:
+            edge = torch.tensor([0.0, torch.finfo(mask_dtype).min])
+            for _ in range(2):
+                fq(edge)
+            fq.disable_observer()
+            continue
+        real = True
+    flat_args, _ = torch.utils._pytree.tree_flatten(
+        (example_args, example_kwargs)
+    )
+    for _ in range(2):
+        if real:
+            gm(*example_args, **example_kwargs)
+        else:
+            ShapeProp(gm).propagate(*flat_args)
+
+
 def _frontend(cfg: SweepConfig):
     """Export -> quantize -> transform -> ShapeProp for ``cfg``, and build the
     interstellar tiler.  Returns ``(gm, model, tiler)`` -- the graph is
@@ -678,11 +752,12 @@ def _frontend(cfg: SweepConfig):
     # not applicable there.
     if is_decode:
         _annotate_kv_cache(gm, cfg)
+    elif cfg.quantize_attention_mask:
+        _annotate_attention_mask(gm)
 
     quantizer = build_quantizer(cfg)
     gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
-    for _ in range(2):
-        gm(*example_args, **example_kwargs)
+    _calibrate(gm, example_args, example_kwargs, model.dtype)
     convert_pt2e(gm, None)
 
     transform(
@@ -693,6 +768,7 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
+        shape_only=True,
     )
 
     if cfg.dump_dir is not None:

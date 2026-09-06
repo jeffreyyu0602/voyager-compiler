@@ -41,6 +41,7 @@ import operator
 import os
 import signal
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import graphviz
@@ -86,7 +87,7 @@ from voyager_compiler.codegen.voyager_ir_pb2 import (
     TensorBoxRef,
     Tiling,
 )
-from voyager_compiler.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp, materialized_values
 
 logger = logging.getLogger(__name__)
 
@@ -1244,7 +1245,9 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     # while_loop / cond body + fused call_module — with a ``.value``, so the
     # emitter below just reads it (no per-body ShapeProp).  oracle_disabled:
     # bodies are walked a single iteration, where a wait may precede its copy.
-    with oracle_disabled():
+    # A dump writes those values out, so it records every one of them whole.
+    whole = materialized_values() if output_dir is not None else nullcontext()
+    with whole, oracle_disabled():
         ShapeProp(model, recurse=True).propagate(*args)
 
     # One iteration is all a tile needs, but it leaves the DRAM buffers holding
@@ -1252,7 +1255,8 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     # loop for real and re-stamps only the top level, so the buffers end up with
     # the true tensors and the tiles keep theirs.
     if output_dir is not None:
-        ShapeProp(model).propagate(*args)
+        with materialized_values():
+            ShapeProp(model).propagate(*args)
 
     return _Emitter(model, output_dir).build()
 
