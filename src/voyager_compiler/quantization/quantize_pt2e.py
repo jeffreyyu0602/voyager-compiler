@@ -445,8 +445,12 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
     if activation_post_process.outlier_threshold is not None:
+        # The stream takes the observed maximum plus one percentage point,
+        # rounded up to a whole percent: headroom for the blocks above the
+        # mean.  ``round`` keeps a float artifact (2.0000000000000004) from
+        # adding a further percent.
         observed = activation_post_process.max_outlier_pct
-        stream_pct = max(observed, 1e-4)
+        stream_pct = math.ceil(round((observed + 0.01) * 100, 9)) / 100
         logger.info(
             f"{node.target}: {observed:.4%} outliers observed, stream "
             f"declared at {stream_pct:.4%}"

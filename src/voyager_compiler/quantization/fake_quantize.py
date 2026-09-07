@@ -305,7 +305,6 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
         self.is_per_channel = self.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
 
         if outlier_pct is not None:
-            self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
             self.register_buffer(
                 "outlier_threshold", torch.tensor([], **factory_kwargs)
             )
@@ -378,18 +377,26 @@ class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
             self.histogram += torch.histc(exp, 254, min=-126, max=127)
 
         if self.outlier_pct is not None and self.observer_enabled[0] == 1:
-            flat = x.abs().flatten()
-            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+            # Outliers cluster by channel, so the threshold is measured per
+            # cell -- one microscaling block of channels over every row --
+            # and the largest cell threshold is kept: every cell then holds
+            # at most ``outlier_pct`` of its elements above it.
+            magnitudes = x.abs().movedim(self.ch_axis, -1)
+            cells = magnitudes.shape[-1] // self.block_size
+            magnitudes = magnitudes.reshape(-1, cells, self.block_size)
+            magnitudes = magnitudes.transpose(0, 1).reshape(cells, -1)
+            k = max(1, math.ceil(self.outlier_pct * magnitudes.shape[1]))
+            vals = torch.topk(magnitudes, k, dim=1, largest=True, sorted=False)
+            threshold = vals.values.amin(dim=1).max()
 
-            vals = torch.topk(flat, k, largest=True, sorted=False).values
-            threshold = vals.min()
-
+            # The largest threshold any calibration batch asked for, so
+            # the cell bound holds on every batch seen.
             if self.outlier_threshold.numel() == 0:
                 self.outlier_threshold.resize_as_(threshold)
                 self.outlier_threshold.copy_(threshold)
             else:
-                self.outlier_threshold.mul_(self.outlier_ema_decay).add_(
-                    threshold * (1.0 - self.outlier_ema_decay)
+                self.outlier_threshold.copy_(
+                    torch.maximum(self.outlier_threshold, threshold)
                 )
 
         # Remove outliers from x before quantization
