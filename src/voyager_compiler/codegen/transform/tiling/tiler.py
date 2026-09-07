@@ -80,6 +80,20 @@ BANK_SWITCH_CYCLES = 8
 # rows.  Measured on the Sphinx SoC: 7.3-7.5.
 SPMM_ROW_CYCLES = 8
 
+# Block-scale rows the SpMM unit's weight-scale buffer holds
+# (``DoubleBuffer<32>`` in ``SpMMUnit.h``, fixed in the Sphinx silicon).  A
+# streaming weight tile takes one row per K block per inner OC pass, and the
+# hardware wraps the address rather than checking it.
+SPMM_SCALE_ROWS = 32
+
+
+def spmm_scale_rows(mapping):
+    """Weight-scale buffer rows ``mapping``'s tile takes in the SpMM unit:
+    its K blocks (the L1 and L2 IC blockings; the PE level is the array)
+    times its L1 OC passes -- ``C * K0`` in the toolchain's ``SpMM.h``."""
+    ic, oc = mapping.loop_blockings[le.IC], mapping.loop_blockings[le.OC]
+    return ic[1] * ic[2] * oc[1]
+
 # The non-reduction L3 loops a builder's grid may permute, outermost to
 # innermost, in the order it emits when nothing says otherwise.  The reduction
 # is always innermost (the kernels accumulate in place) and the gemm batch dims
@@ -487,6 +501,8 @@ def make_size_fn(
     # staged in its own buffer.
     csr_data_bits = _node_dtype_bits(node.kwargs.get("A_data"), 0)
     csr_index_bits = _node_dtype_bits(node.kwargs.get("A_indices"), 0)
+    # A CSR consumer streams its weight tile through the SpMM unit.
+    is_spmm = node.kwargs.get("A_data") is not None
 
     def _align(size):
         """Round ``size`` up to a whole ``bank_width`` store word."""
@@ -543,6 +559,11 @@ def make_size_fn(
         # attention head (the MHA relayout must store whole heads), a CSR
         # slice width the coupled ops agreed on.
         if constraint is not None and not constraint.allows(extent):
+            return None, 0.0, 1
+        # TEMPORARY WORKAROUND: veto a tile whose block scales overflow the
+        # SpMM unit's fixed 32-row buffer (the RTL wraps and applies the
+        # wrong scales).  Drop once the depth is an accelerator parameter.
+        if is_spmm and spmm_scale_rows(point) > SPMM_SCALE_ROWS:
             return None, 0.0, 1
 
         # The output is a wide partial sum until IC is fully reduced; only the
