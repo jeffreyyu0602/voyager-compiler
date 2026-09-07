@@ -696,6 +696,8 @@ def _tail_fits(
     Returns:
         True if some pattern admits the chain.
     """
+    if tail and tail[0].target == torch.ops.quantized_ops.dequantize.default:
+            tail = tail[1:]
     add = torch.ops.aten.add.Tensor
     for pattern in patterns:
         if not pattern[0].matches(anchor):
