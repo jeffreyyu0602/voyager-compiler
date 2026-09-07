@@ -75,13 +75,13 @@ VECTOR_PIPELINE = [
         OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS, "mul", "div"),
+        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS, "mul", "div"),
+        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher("layer_norm", "softmax"),
