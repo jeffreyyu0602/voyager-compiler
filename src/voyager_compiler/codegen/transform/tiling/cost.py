@@ -253,26 +253,33 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
 # well holds it for the entire kernel.  Whatever a fused tail brings of its own
 # has no role and is diced by the output block, like the output.
 def operand_roles(node) -> dict:
-    """Each operand FX node -> the role it plays, for the tables below and for
-    grouping into banks.
+    """Each buffer the kernel loads for an anchor operand -> ``(role,
+    operand)``, keyed by the outer FX node the memory planner allocates.
 
-    A fused ``call_module``'s operands have no roles of their own, so read them
-    off the anchor: ``get_node_to_key_map`` maps each placeholder back to the
-    outer node the shape map is keyed by (``bound_operands`` -- the call binds
-    them positionally).  What the tail brought of its own the anchor never
-    reads, so it stays unnamed and takes a bank of its own.  A bare node is
-    its own anchor.
+    A fused ``call_module``'s operands take their roles from the anchor, which
+    reads them through the prologue's expand / transpose / dequantize; the
+    kernel loads the placeholder beneath (``weight_transforms``), bound to an
+    outer node (``bound_operands``).  ``operand`` is the anchor-side node,
+    which keeps the expand ``_operand_spans`` prices reuse by.  What the tail
+    or prologue brings of its own has no role and takes a bank of its own.
     """
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor):
         return {}
-    roles = get_node_to_key_map(
-        anchor, bound_operands(node, node.meta.get("submodule"))
-    )
+    submod = node.meta.get("submodule")
+    bound = bound_operands(node, submod)
+    roles = {}
+    for n, role in get_node_to_key_map(anchor, bound).items():
+        if n is anchor:
+            continue
+        loaded = n
+        if submod is not None and n.graph is submod.graph:
+            source = weight_transforms(n)[0]
+            loaded = bound.get(source, source)
+        roles[loaded] = (role, n)
     # The output is named on the outer node -- what the shape map keys it by --
     # in place of the anchor's own entry, which is inside the submodule.
-    del roles[anchor]
-    roles[node] = "output"
+    roles[node] = ("output", node)
     return roles
 
 
@@ -480,8 +487,11 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     for n, shape in tiled_shapes.items():
         if n is node or shape is None or not require_allocation(n):
             continue
-        dims = _GEMV_GRID_DIMS.get(roles.get(n), _OUTPUT_GRID_DIMS)
-        transfers = _block_transfers(_operand_spans(n, dims, nb), grid)
+        # Bytes come off the loaded buffer (its packed dtype); the reuse off
+        # the anchor-side operand, which carries the expand.
+        role, operand = roles.get(n, (None, n))
+        dims = _GEMV_GRID_DIMS.get(role, _OUTPUT_GRID_DIMS)
+        transfers = _block_transfers(_operand_spans(operand, dims, nb), grid)
         n_bytes = _operand_bytes(shape, n)
         dmas.append((_transfer_cost(shape, n_bytes, lat, bpc), transfers))
         traffic += transfers * n_bytes

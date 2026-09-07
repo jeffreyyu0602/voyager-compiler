@@ -26,6 +26,7 @@ from voyager_compiler.codegen.node_info import (
     tensor_alloc_bytes,
     trailing_mha_perm,
     weight_is_ck,
+    weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_tile_latency,
@@ -223,14 +224,15 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
     """The bank partition one candidate tile implies: ``(bytes, members)``
     pairs, one per bank, already merged smallest-first while the groups
     outnumber the banks (see ``scratchpad_bytes``, which prices exactly this
-    partition).  ``members`` are the operand FX nodes sharing the bank — the
+    partition).  ``members`` are the operand FX nodes sharing the bank -- the
+    buffers the kernel loads, which the shape maps key their tiles by -- the
     op node itself stands for the output, ``BANK_GROUP_RESERVED`` for the
     ``reduction_scratch`` regions.  Unmerged (one group per operand) when
     ``config.bank_size`` is unset."""
     # ``groups`` is the bank layout, one entry per bank: the groups that match,
     # then any operand they do not name on its own.  A ``where`` lays out as
     # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
-    roles = operand_roles(node)
+    roles = {n: role for n, (role, _) in operand_roles(node).items()}
     groups = [
         [n for n in tiled_shapes if roles.get(n) in group]
         for group in GEMV_BANK_GROUPS
@@ -485,6 +487,18 @@ def _operand_placeholders(root):
     return leaves
 
 
+def _prologue_tile(tile, operand_shape, param_shape):
+    """Tile of a parameter read beside an operand: the operand's tile, shrunk
+    along every dim by the ratio of the two full shapes.  Ranks that do not
+    line up fall back to the whole parameter."""
+    if len(tile) != len(operand_shape) or len(operand_shape) != len(param_shape):
+        return tuple(param_shape)
+    return tuple(
+        max(1, math.ceil(t * q / f))
+        for t, f, q in zip(tile, operand_shape, param_shape)
+    )
+
+
 def _build_gemv_shape_map(node, tile_sizes, tiling):
     """``_build_gemm_shape_map`` for the whole kernel a GEMV builds, keyed by
     the FX node each tile belongs to.
@@ -505,19 +519,32 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
 
     if node is not anchor:
-        # An operand reaching the anchor through a GQA expand or a dequantize
-        # takes its role on that node, not on the placeholder the kernel loads,
-        # so trace the anchor's own back and skip them by position.
-        own = set(_operand_placeholders(anchor))
-        placeholders = [
-            p
-            for p in node.meta["submodule"].graph.nodes
-            if p.op == "placeholder"
-        ]
-        for n, p in zip(node.all_input_nodes, placeholders):
-            if p in own or n in shapes or not require_allocation(n):
+        submod = node.meta["submodule"]
+        bound = bound_operands(node, submod)
+        # Key an anchor operand by the placeholder the kernel loads beneath
+        # its expand / transpose / dequantize (what the planner allocates).
+        # Whatever else that prologue reads (a dequantize's scale and zero
+        # point) has no role; it takes the operand's tile scaled by shape.
+        for n in list(shapes):
+            if n.graph is not submod.graph:
                 continue
-            shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
+            tile = shapes.pop(n)
+            source = weight_transforms(n)[0]
+            for p in _operand_placeholders(n):
+                outer = bound.get(p, p)
+                if outer in shapes or not require_allocation(outer):
+                    continue
+                shapes[outer] = (
+                    tile
+                    if p is source
+                    else _prologue_tile(tile, tuple(n.shape), tuple(outer.shape))
+                )
+
+        # What the tail brought of its own -- a residual, a mask -- has no role
+        # and is diced by the output block, the way the builder dices it.
+        for n in node.all_input_nodes:
+            if n not in shapes and require_allocation(n):
+                shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
 
     if tuple(_output_shape(node)) == tuple(anchor.shape):
         shapes[node] = compute_output_tiled_shapes(node, divisor)
