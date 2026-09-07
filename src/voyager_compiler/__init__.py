@@ -102,7 +102,12 @@ from voyager_compiler.quantization.dtypes import (
     quantize_to_nf,
     quantize_to_posit,
 )
-from voyager_compiler.shape_prop import ShapeProp, fetch_attr, propagate_shape
+from voyager_compiler.shape_prop import (
+    ShapeProp,
+    fake_like,
+    fetch_attr,
+    propagate_shape,
+)
 from voyager_compiler.utils import with_execution_context
 
 __all__ = [
@@ -215,12 +220,9 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
-    shape_only=False,
 ):
-    """Lower ``model`` in place through the graph-level passes.  With
-    ``shape_only`` the caller promises never to execute or dump the graph,
-    so a large folded constant may be a FakeTensor buffer
-    (``fold_constant_generators``)."""
+    """Lower ``model`` in place through the graph-level passes.  The passes
+    run on fake inputs and read shapes only; see ``shape_prop``."""
     if example_kwargs is None:
         example_kwargs = {}
 
@@ -229,9 +231,9 @@ def transform(
         config = AcceleratorConfig(pe_array_size=None)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*flatten_args)
+    ShapeProp(model).propagate(*map(fake_like, flatten_args))
 
-    fold_constant_generators(model, shape_only=shape_only)
+    fold_constant_generators(model)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
     scalarize_index_arithmetic(model)
@@ -277,7 +279,7 @@ def compile(
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*flatten_args)
+    ShapeProp(model).propagate(*map(fake_like, flatten_args))
 
     gen_compute_graph(model, os.path.join(output_dir, output_file))
 

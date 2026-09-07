@@ -99,7 +99,7 @@ from voyager_compiler.quantization.fake_quantize import (
     FakeQuantizeBase,
     FusedAmaxObsFakeQuantize,
 )
-from voyager_compiler.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp, fake_like
 
 try:
     # torchao helper the KIVI 2-bit KV path annotates cache buffers with.
@@ -722,7 +722,7 @@ def _calibrate(gm, example_args, example_kwargs, mask_dtype):
         if real:
             gm(*example_args, **example_kwargs)
         else:
-            ShapeProp(gm).propagate(*flat_args)
+            ShapeProp(gm).propagate(*map(fake_like, flat_args))
 
 
 def _frontend(cfg: SweepConfig):
@@ -768,7 +768,6 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
-        shape_only=True,
     )
 
     if cfg.dump_dir is not None:
@@ -793,7 +792,7 @@ def _frontend(cfg: SweepConfig):
     flat_args, _ = torch.utils._pytree.tree_flatten(
         (example_args, example_kwargs)
     )
-    ShapeProp(gm).propagate(*flat_args)
+    ShapeProp(gm).propagate(*map(fake_like, flat_args))
 
     tiler = build_interstellar_tiler(
         cfg.acc_config, runtime_tolerance=cfg.runtime_tolerance

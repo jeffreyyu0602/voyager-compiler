@@ -5,21 +5,19 @@ single-node twin, used by the passes that build nodes one at a time.  Both
 resolve ``get_attr`` through ``fetch_attr`` and stamp their result with
 ``set_node_value``, so all four live together.
 
-A stamped value is a clone, and the graph keeps every one of them, so a long
-prefill would hold dozens of 32-head ``n x n`` attention tensors per layer.
-``set_node_value`` therefore records a tensor at or above ``VALUE_LIMIT_BYTES``
-as a storage-free FakeTensor of the same shape, dtype and strides; lowering
-reads only that metadata.  A parameter, or a value computed from parameters
-alone, is always recorded whole, and ``materialized_values`` forces every
-value whole for the emitter's tensor dump, the one reader of activation
-contents.  Execution follows the same rule: a node runs under the fake mode
-first, which sizes its result without allocating it, and for real only when
-the result is below the limit, so those tensors are never materialized
-either.
+Lowering reads shapes and dtypes, never activation contents, so a pass
+runs the graph on fake tensors: the callers fake the model inputs
+(``fake_like``), an input-free generator (``arange``, ``full``,
+``voyager.alloc``) is fake, and a node is real only when every input it
+has is real -- a parameter, or a value computed from parameters alone,
+which a pass may bake into a buffer.  Nothing past the fake frontier is
+allocated, whatever its size.  A propagation given real inputs is a real
+run (``materialized_values``): generators run for real and a constant the
+folder deferred is computed from its producer and installed, so the
+emitter's tensor dump and a numeric check see real values.
 """
 
 import logging
-import os
 from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Optional
 
@@ -28,11 +26,14 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.fx import GraphModule
 from torch.fx.graph import map_arg
 from torch.fx.node import Node
+from torch.utils._pytree import tree_flatten
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ShapeProp",
+    "constant_value",
+    "fake_like",
     "fetch_attr",
     "materialized_values",
     "propagate_shape",
@@ -40,13 +41,6 @@ __all__ = [
     "set_node_value",
     "written_buffers",
 ]
-
-# A recorded tensor at or above this many bytes is kept as a FakeTensor
-# instead of a clone.  The passes that read contents (a codebook, a chunk
-# offset table) do so on tensors far below the limit.
-# ``VOYAGER_VALUE_LIMIT`` overrides it, so a run can push fakes onto every
-# activation and prove the lowering reads none of them.
-VALUE_LIMIT_BYTES = int(os.environ.get("VOYAGER_VALUE_LIMIT", 64 << 20))
 
 # One mode for every fake value: fakes of two modes cannot meet in an op.
 # ``allow_non_fake_inputs`` lets a fake operand combine with a real one, as
@@ -58,7 +52,8 @@ _materialize = False
 
 @contextmanager
 def materialized_values():
-    """Record every value whole inside the block, whatever its size."""
+    """Run everything for real inside the block: generators too, and the
+    constants the folder deferred."""
     global _materialize
     saved, _materialize = _materialize, True
     try:
@@ -67,44 +62,40 @@ def materialized_values():
         _materialize = saved
 
 
+def fake_like(value):
+    """A storage-free stand-in for a real tensor, of its shape, dtype and
+    strides; a fake tensor or a non-tensor is returned as it is.  The
+    callers that propagate a model's inputs fake them with this."""
+    if isinstance(value, torch.Tensor) and not isinstance(value, FakeTensor):
+        return _FAKE_MODE.from_tensor(value)
+    return value
+
+
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _HOPS = (_WHILE_LOOP, _COND)
 _LOCAL_SCALAR = torch.ops.aten._local_scalar_dense.default
 
 
-def _large(result) -> bool:
-    """Whether ``result`` holds a tensor at or above ``VALUE_LIMIT_BYTES``."""
-    tensors = result if isinstance(result, (tuple, list)) else (result,)
-    return any(
-        isinstance(t, torch.Tensor)
-        and t.numel() * t.element_size() >= VALUE_LIMIT_BYTES
-        for t in tensors
-    )
-
-
 def run_op(fn, args, kwargs):
-    """Call ``fn`` on ``args`` / ``kwargs`` and return its result.  Outside
-    ``materialized_values`` the call runs under the fake mode first, which
-    sizes the result without allocating it, and runs for real only when the
-    result is below ``VALUE_LIMIT_BYTES``.  A higher-order op, whose fake
-    path traces its body instead of running it, and an op the fake mode
-    cannot run are called for real.  A scalar read off a fake buffer
-    (``_local_scalar_dense``, a bufferized nest's datapath-to-control
-    boundary) is a zero of the buffer's dtype: no lowering decision reads
-    it."""
+    """Call ``fn`` on ``args`` / ``kwargs`` and return its result.  An op
+    with a tensor operand is called directly: real operands make a real
+    result, and a fake one makes a fake result through its own dispatch,
+    while any real tensor the op touches on the side (a module's enable
+    flag, a parameter) stays real.  An op with no tensor operand is a
+    generator and runs under the fake mode, so its result is fake -- except
+    inside ``materialized_values``, where everything runs for real.  A
+    scalar read off a fake buffer (``_local_scalar_dense``, a bufferized
+    nest's datapath-to-control boundary) is a zero of the buffer's dtype:
+    no lowering decision reads it."""
     if fn is _LOCAL_SCALAR and isinstance(args[0], FakeTensor):
         return torch.zeros((), dtype=args[0].dtype).item()
-    if _materialize or isinstance(fn, torch._ops.HigherOrderOperator):
+    if _materialize or any(
+        isinstance(t, torch.Tensor) for t in tree_flatten((args, kwargs))[0]
+    ):
         return fn(*args, **kwargs)
-    try:
-        with _FAKE_MODE:
-            result = fn(*args, **kwargs)
-    except Exception:  # noqa: BLE001 - no fake kernel: run it for real
+    with _FAKE_MODE:
         return fn(*args, **kwargs)
-    if _large(result):
-        return result
-    return fn(*args, **kwargs)
 
 
 def written_buffers(graph) -> set:
@@ -147,33 +138,17 @@ def fetch_attr(module, target):
     return attr_itr
 
 
-def _record(value: torch.Tensor, whole: bool) -> torch.Tensor:
-    """The tensor stored for ``value``: a CPU clone when ``whole`` or below
-    ``VALUE_LIMIT_BYTES``, else a storage-free FakeTensor of its shape, dtype
-    and strides.  A value that is already fake is stored as it is."""
-    if isinstance(value, FakeTensor):
-        return value
-    if whole or value.numel() * value.element_size() < VALUE_LIMIT_BYTES:
-        return value.cpu().clone()
-    return _FAKE_MODE.from_tensor(value).cpu()
-
-
-def _constant_derived(node: Node) -> bool:
-    """A node computed from parameters alone -- a quantized or relaid weight,
-    a baked block scale -- whose value a pass may bake into a buffer."""
-    inputs = node.all_input_nodes
-    return bool(inputs) and all(n.op == "get_attr" for n in inputs)
+def _record(value: torch.Tensor) -> torch.Tensor:
+    """The tensor stored for ``value``: itself, on CPU.  A fake tensor has
+    no storage to move."""
+    return value if isinstance(value, FakeTensor) else value.cpu()
 
 
 def set_node_value(node: Node, value):
-    """Record ``value`` on ``node`` as ``.value`` (plus ``.shape``).  A
-    parameter (``get_attr``), or a value computed from parameters alone, is
-    recorded whole; any other tensor at or above ``VALUE_LIMIT_BYTES`` is
-    recorded as a FakeTensor."""
-    whole = _materialize or node.op == "get_attr" or _constant_derived(node)
+    """Record ``value`` on ``node`` as ``.value`` (plus ``.shape``)."""
     if isinstance(value, torch.Tensor):
         node.shape = value.shape
-        node.value = _record(value, whole)
+        node.value = _record(value)
     elif isinstance(value, (tuple, list)):
         # A tuple may mix tensors with scalars (e.g. the integer loop counters
         # carried by a while_loop); keep non-tensor elements as-is.
@@ -181,11 +156,33 @@ def set_node_value(node: Node, value):
             x.shape if isinstance(x, torch.Tensor) else None for x in value
         )
         node.value = tuple(
-            _record(x, whole) if isinstance(x, torch.Tensor) else x
-            for x in value
+            _record(x) if isinstance(x, torch.Tensor) else x for x in value
         )
     else:
         node.value = value
+
+
+def constant_value(module, node: Node):
+    """The real tensor a ``get_attr`` node resolves to, for a pass that must
+    read a constant's contents: a constant the folder deferred is computed
+    from its producer and installed in place of its fake stand-in.  A fake
+    with no producer is returned as it is."""
+    value = fetch_attr(module, node.target)
+    producer = node.meta.get("producer")
+    if producer is not None and isinstance(value, FakeTensor):
+        value = producer()
+        *path, name = node.target.split(".")
+        parent = fetch_attr(module, ".".join(path)) if path else module
+        setattr(parent, name, value)
+    return value
+
+
+def _attr_value(module, node: Node):
+    """The tensor a ``get_attr`` node resolves to: in a real run, the real
+    one."""
+    if _materialize:
+        return constant_value(module, node)
+    return fetch_attr(module, node.target)
 
 
 def propagate_shape(node: Node, model: GraphModule = None):
@@ -197,7 +194,7 @@ def propagate_shape(node: Node, model: GraphModule = None):
     modules = dict(model.named_modules()) if model is not None else {}
 
     if node.op == "get_attr":
-        result = fetch_attr(model, node.target)
+        result = _attr_value(model, node)
     elif node.op == "call_function":
         result = run_op(node.target, load_arg(node.args), load_arg(node.kwargs))
     elif node.op == "call_method":
@@ -234,6 +231,9 @@ class ShapeProp:
     The module's own state is left as found: a buffer the graph writes in
     place (a KV cache) is run on a copy, and a ``get_attr`` is stamped with
     the value it holds when the graph starts, before any write of the step.
+
+    Fake inputs make a fake run, the passes' mode; inputs with no fake
+    tensor among them make a real run (see ``materialized_values``).
     """
 
     def __init__(
@@ -249,8 +249,10 @@ class ShapeProp:
         self._recurse = recurse
 
     def propagate(self, *args):
+        real = not any(isinstance(t, FakeTensor) for t in tree_flatten(args)[0])
         with self._mode or nullcontext():
-            return self._propagate(*args)
+            with materialized_values() if real else nullcontext():
+                return self._propagate(*args)
 
     def _subprop(self, target, inputs):
         """Recursively propagate a HOP / ``call_module`` subgraph, returning its
@@ -290,7 +292,7 @@ class ShapeProp:
             if node.op == "placeholder":
                 result = next(args_iter)
             elif node.op == "get_attr":
-                result = fetch_attr(self.mod, node.target)
+                result = _attr_value(self.mod, node)
                 if node.target in written and isinstance(result, torch.Tensor):
                     result = result.clone()
                 set_node_value(node, result)

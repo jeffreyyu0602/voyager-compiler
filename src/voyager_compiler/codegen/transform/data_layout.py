@@ -23,7 +23,10 @@ from voyager_compiler.codegen.transform.operator_fusion import (
     duplicate_shared_nodes,
 )
 from voyager_compiler.codegen.transform.rewrites import deduplicate_nodes
-from voyager_compiler.export_utils import create_getattr_from_value
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    derived_producer,
+)
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
     GEMM_WEIGHT_LAYOUTS,
@@ -401,7 +404,11 @@ def _insert_transposed_input(arg: Node, model: GraphModule):
         ):
             value = fetch_attr(model, arg.target)
             transposed = create_getattr_from_value(
-                model, model.graph, arg.name + "_T", value.mT
+                model,
+                model.graph,
+                arg.name + "_T",
+                value.mT,
+                derived_producer(arg, torch.ops.aten.transpose.int, -2, -1),
             )
         else:
             transposed = model.graph.call_function(

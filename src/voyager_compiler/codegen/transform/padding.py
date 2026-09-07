@@ -19,6 +19,7 @@ from voyager_compiler.codegen.node_info import (
 )
 from voyager_compiler.export_utils import (
     create_getattr_from_value,
+    derived_producer,
     get_aten_graph_module,
 )
 from voyager_compiler.shape_prop import (
@@ -217,7 +218,11 @@ def _fold_pad_into_cache(model, idx, pad, pad_value, fold_cache):
     baked = F.pad(fetch_attr(model, cache.target), pad, "constant", pad_value)
     with model.graph.inserting_before(idx):
         wide = create_getattr_from_value(
-            model, model.graph, cache.target + "_padded", baked
+            model,
+            model.graph,
+            cache.target + "_padded",
+            baked,
+            derived_producer(cache, F.pad, pad, "constant", pad_value),
         )
         propagate_shape(wide, model)
 
@@ -272,7 +277,11 @@ def _insert_pad(model, node, pad, pad_value, fold_cache=False):
         )
         with model.graph.inserting_after(node):
             wide = create_getattr_from_value(
-                model, model.graph, node.target + "_padded", baked
+                model,
+                model.graph,
+                node.target + "_padded",
+                baked,
+                derived_producer(node, F.pad, pad, "constant", pad_value),
             )
         propagate_shape(wide, model)
         wide.meta["dtype"] = node.meta.get("dtype")

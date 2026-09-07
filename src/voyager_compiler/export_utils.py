@@ -120,7 +120,11 @@ def get_aten_graph_module(
 
 
 def create_getattr_from_value(
-    module: torch.nn.Module, graph: Graph, prefix: str, value: Any
+    module: torch.nn.Module,
+    graph: Graph,
+    prefix: str,
+    value: Any,
+    producer: Optional[GraphModule] = None,
 ) -> Node:
     """Register ``value`` as a buffer and return a ``get_attr`` node for it.
 
@@ -129,7 +133,10 @@ def create_getattr_from_value(
         graph: Graph the node is created in.
         prefix: Base attribute name; dots become underscores and a numeric
             suffix is appended until the name is unused (``s``, ``s_1``, …).
-        value: Tensor or scalar to store.
+        value: Tensor or scalar to store.  A fake tensor stores a shape-only
+            stand-in, which a real run replaces by running ``producer``.
+        producer: A graph over the module's own buffers that computes the
+            real value; kept on the node as ``meta['producer']``.
 
     Returns:
         The ``get_attr`` node referencing the new buffer.
@@ -146,7 +153,31 @@ def create_getattr_from_value(
         else torch.tensor(value)
     )
     module.register_buffer(attr_name, new_value)
-    return graph.create_node("get_attr", attr_name)
+    node = graph.create_node("get_attr", attr_name)
+    if producer is not None:
+        node.meta["producer"] = producer
+    return node
+
+
+def derived_producer(
+    source: Node, fn, *args, **kwargs
+) -> Optional[GraphModule]:
+    """A producer for a constant that is ``fn(constant of source, *args)``,
+    or ``None`` when ``source`` has no producer, so its value is real and
+    needs none.  The source's producer is copied in, not referenced, so
+    the derived constant outlives the source's buffer."""
+    src = source.meta.get("producer")
+    if src is None:
+        return None
+    graph = Graph()
+    local = {}
+    for n in src.graph.nodes:
+        if n.op == "output":
+            value = local[n.args[0]]
+            break
+        local[n] = graph.node_copy(n, lambda x: local[x])
+    graph.output(graph.call_function(fn, (value, *args), kwargs))
+    return GraphModule(src, graph)
 
 
 def get_node_name_to_scope(

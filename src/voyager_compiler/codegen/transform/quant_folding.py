@@ -47,6 +47,7 @@ from voyager_compiler.codegen.subgraph import get_new_node_name_with_prefix
 from voyager_compiler.export_utils import create_getattr_from_value
 from voyager_compiler.ops.quantized import expand
 from voyager_compiler.shape_prop import (
+    constant_value,
     fetch_attr,
     propagate_shape,
     set_node_value,
@@ -1033,13 +1034,22 @@ def _fold_quantize_into_split_cache(
             f"{cache.target}: a {length}-position residual is not a whole "
             f"number of {block_size}-wide blocks"
         )
+    # The offsets are real only when folded from a constant; in a fake
+    # propagation nothing has run the graph past a fold, so there is
+    # nothing to check.
     contents = fetch_attr(model, cache.target)
-    chunk = offsets.value.to(contents.device)
-    if contents.index_select(dim, chunk).abs().sum() != 0:
-        raise RuntimeError(
-            f"{cache.target} already holds data at the chunk this step folds:"
-            " the graph was run past a fold before transform"
-        )
+    chunk = (
+        constant_value(model, offsets)
+        if isinstance(offsets, Node) and offsets.op == "get_attr"
+        else offsets.value
+    )
+    if not isinstance(chunk, FakeTensor):
+        chunk = chunk.to(contents.device)
+        if contents.index_select(dim, chunk).abs().sum() != 0:
+            raise RuntimeError(
+                f"{cache.target} already holds data at the chunk this step "
+                "folds: the graph was run past a fold before transform"
+            )
 
     consts = [
         fetch_attr(model, a.target) if isinstance(a, Node) else a

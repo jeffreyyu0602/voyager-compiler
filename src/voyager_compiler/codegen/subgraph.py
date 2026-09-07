@@ -30,8 +30,6 @@ from voyager_compiler.shape_prop import (
 logger = logging.getLogger(__name__)
 
 
-
-
 def copy_graph_module(
     gm: GraphModule, remap: Optional[Dict[Node, Node]] = None
 ) -> GraphModule:
@@ -123,7 +121,7 @@ def replace_node_with_graph_module(
                     value_remap[n] = graph.create_node("get_attr", name)
                 else:
                     value_remap[n] = create_getattr_from_value(
-                        model, graph, n.target, attr
+                        model, graph, n.target, attr, n.meta.get("producer")
                     )
             elif n.op == "call_module":
                 # A fused compute submodule (the attention builders run

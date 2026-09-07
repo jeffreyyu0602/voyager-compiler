@@ -19,7 +19,11 @@ import operator
 import torch
 from torch.fx import GraphModule, Node
 
-from voyager_compiler.shape_prop import fetch_attr, propagate_shape
+from voyager_compiler.shape_prop import (
+    constant_value,
+    fetch_attr,
+    propagate_shape,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +85,7 @@ def _index_vector(model: GraphModule, node):
         or value.dtype not in _INTEGER_DTYPES
     ):
         return None
+    value = constant_value(model, node)
     steps = value[1:] - value[:-1]
     if not bool((steps == steps[0]).all()):
         return None
@@ -117,7 +122,7 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
         if operand in scalar_of:
             return scalar_of[operand]
         if operand.op == "get_attr":
-            return fetch_attr(model, operand.target).item()
+            return constant_value(model, operand).item()
         if operand not in reads:
             with graph.inserting_before(before):
                 reads[operand] = graph.call_function(

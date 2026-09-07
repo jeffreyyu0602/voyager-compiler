@@ -1,10 +1,10 @@
 import logging
 import re
-from typing import List, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch.fx import GraphModule, Interpreter, Node
+from torch.fx import Graph, GraphModule, Interpreter, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torch.library import Library, impl
@@ -448,7 +448,28 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     model.recompile()
 
 
-def fold_constant_generators(model: GraphModule, shape_only: bool = False):
+def _producer_graph(node: Node, producers: Dict[Node, Graph]) -> Graph:
+    """The graph computing ``node``'s constant from the model's own buffers:
+    ``node`` over its inputs, each a ``get_attr`` of an original buffer or
+    the copied-in producer of a constant this pass folded earlier."""
+    graph = Graph()
+    remap = {}
+    for inp in node.all_input_nodes:
+        src = producers.get(inp)
+        if src is None:
+            remap[inp] = graph.get_attr(inp.target)
+            continue
+        local = {}
+        for n in src.nodes:
+            if n.op == "output":
+                remap[inp] = local[n.args[0]]
+                break
+            local[n] = graph.node_copy(n, lambda x: local[x])
+    graph.output(graph.node_copy(node, lambda x: remap[x]))
+    return graph
+
+
+def fold_constant_generators(model: GraphModule):
     """Constant-fold ``call_function`` nodes whose inputs are all constants:
     input-free generators (``arange`` / ``zeros`` / …) and, transitively, any op
     fed only by already-folded constants — so a whole constant subgraph (e.g.
@@ -457,17 +478,16 @@ def fold_constant_generators(model: GraphModule, shape_only: bool = False):
 
     Walking in program order, a node is constant iff every FX-Node input is a
     ``get_attr`` (an initial buffer or one this pass just created) that the
-    graph never writes; it is then evaluated with the real buffer values and
-    replaced by a ``get_attr`` to the result.  A buffer this pass created is
-    deleted as soon as its last reader folds, so a chain's intermediates
-    (the index grids a causal mask is built from) never accumulate; other
-    orphaned ancestors are dropped by dead-code elimination.
+    graph never writes.  It is evaluated by the shape-propagation rule: real
+    when it descends from parameters alone, a fake stand-in when it descends
+    from a generator, as a causal mask does.  Either way the chain that
+    produced it is kept on the new ``get_attr`` node as ``meta['producer']``,
+    a graph over the model's own buffers, so a real run can compute the
+    tensor when it needs it.  A buffer this pass created is deleted as soon
+    as its last reader folds; its producer lives on inside its readers'.
 
     Args:
         model: The graph to fold, in place.
-        shape_only: The caller will neither execute nor dump the graph, so a
-            folded constant at or above the fake-value limit may be recorded
-            as a FakeTensor buffer instead of being computed (``run_op``).
     """
     graph = model.graph
     # A buffer the graph writes -- a KV cache, or a ``cond`` operand -- is
@@ -476,7 +496,7 @@ def fold_constant_generators(model: GraphModule, shape_only: bool = False):
     constants = {
         n for n in graph.nodes if n.op == "get_attr" and n.target not in written
     }
-    folded = set()
+    producers: Dict[Node, Graph] = {}
 
     def resolve(n: Node):
         return fetch_attr(model, n.target)
@@ -501,26 +521,26 @@ def fold_constant_generators(model: GraphModule, shape_only: bool = False):
             continue
         args = map_arg(node.args, resolve)
         kwargs = map_arg(node.kwargs, resolve)
-        if shape_only:
-            const = run_op(node.target, args, kwargs)
-        else:
-            const = node.target(*args, **kwargs)
+        const = run_op(node.target, args, kwargs)
         inputs = node.all_input_nodes
+        producer = _producer_graph(node, producers)
         src = next((n.target for n in inputs), "const")
         prefix = re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
         with graph.inserting_before(node):
-            attr = create_getattr_from_value(model, graph, prefix, const)
+            attr = create_getattr_from_value(
+                model, graph, prefix, const, GraphModule(model, producer)
+            )
         attr.meta["dtype"] = node.meta.get("dtype")
         set_node_value(attr, const)
         node.replace_all_uses_with(attr)
         graph.erase_node(node)
         constants.add(attr)
-        folded.add(attr)
+        producers[attr] = producer
         for inp in inputs:
-            if inp in folded and not inp.users:
+            if inp in producers and not inp.users:
                 delattr(model, inp.target)
                 graph.erase_node(inp)
-                folded.discard(inp)
+                del producers[inp]
                 constants.discard(inp)
 
     graph.eliminate_dead_code()
