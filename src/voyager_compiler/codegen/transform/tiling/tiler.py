@@ -75,12 +75,9 @@ OUTPUT_SLACK = 24
 # the Sphinx SoC (requests resume once the in-flight beats drain).
 BANK_SWITCH_CYCLES = 8
 
-# Cycles the SpMM unit spends per row of each PE-array-wide column pass on
-# top of the row's outliers: it streams them one per cycle, then sums and
-# resets its accumulator ring and restarts the pipelined row loop before the
-# next row can begin (``SpMMUnit.h``, ``run_accumulation``).  Measured on the
-# Sphinx SoC as 7.3-7.5 cycles per row visit (llama_prefill_spmm q_proj, 1 %
-# outliers).
+# Cycles the SpMM unit spends per row of each PE-array-wide pass on top of
+# the row's outliers: it drains and restarts its accumulator ring between
+# rows.  Measured on the Sphinx SoC: 7.3-7.5.
 SPMM_ROW_CYCLES = 8
 
 # The non-reduction L3 loops a builder's grid may permute, outermost to
@@ -1070,7 +1067,8 @@ class RuntimeCalculator:
         the SpMM unit, which must deliver the block's sparse correction
         before the vector pipeline releases any of its rows: per 64-column
         pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
-        turnaround plus that row's outliers -- plus the once-per-sweep
+        turnaround plus that row's outliers, each gather a bank switch when
+        the weight tile spans several banks -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
         spread over the steps a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
@@ -1209,22 +1207,34 @@ class RuntimeCalculator:
             computation_l1_time, self._bank_cycles(words, bank_groups)
         )
 
-        # The SpMM unit runs the same block alongside: one pass per
-        # PE-array-wide column slice, every row of the block in each pass.
-        # Its work per row barely grows with K (``outlier_rate`` of it) while
-        # the array's grows as K / IC_DIMENSION, so deep-K tiles hide it and
-        # shallow ones do not.
+        # The SpMM unit runs the block alongside and the vector pipeline
+        # waits for its correction on every output vector, so a block also
+        # costs its pace: per PE-array-wide pass, every row's turnaround
+        # plus its gathered weight rows.
         if self.outlier_rate:
             rows = 1
             for loop in [le.OX, le.OY, le.ON]:
                 rows *= self._extent(mapping, loop, 1)
             k_block = self._extent(mapping, le.IC, 2)
             passes = blockings[le.OC][1]
-            spmm_block_time = (
-                passes
-                * rows
-                * (SPMM_ROW_CYCLES + k_block * self.outlier_rate)
-            )
+            visits = passes * rows
+            gathers = visits * k_block * self.outlier_rate
+            # Gathers hit random K rows of the weight tile; when it spans
+            # several banks most consecutive gathers change bank and pay the
+            # read path's round trip, as the streams above do.
+            switch = 0.0
+            if self.bank_size:
+                weight_tile_bytes = (
+                    self._extent(mapping, le.OC, 2)
+                    * k_block
+                    * blockings[le.FX][1]
+                    * blockings[le.FY][1]
+                    * self.weight_dtype_width
+                    / 8
+                )
+                banks = max(1, math.ceil(weight_tile_bytes / self.bank_size))
+                switch = BANK_SWITCH_CYCLES * (1 - 1 / banks)
+            spmm_block_time = visits * SPMM_ROW_CYCLES + gathers * (1 + switch)
             block_time = max(block_time, spmm_block_time)
 
         # The first tile's loads overlap nothing; the last parked tile's drain
