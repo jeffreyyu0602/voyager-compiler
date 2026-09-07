@@ -75,6 +75,14 @@ OUTPUT_SLACK = 24
 # the Sphinx SoC (requests resume once the in-flight beats drain).
 BANK_SWITCH_CYCLES = 8
 
+# Cycles the SpMM unit spends per row of each PE-array-wide column pass on
+# top of the row's outliers: it streams them one per cycle, then sums and
+# resets its accumulator ring and restarts the pipelined row loop before the
+# next row can begin (``SpMMUnit.h``, ``run_accumulation``).  Measured on the
+# Sphinx SoC as 7.3-7.5 cycles per row visit (llama_prefill_spmm q_proj, 1 %
+# outliers).
+SPMM_ROW_CYCLES = 8
+
 # The non-reduction L3 loops a builder's grid may permute, outermost to
 # innermost, in the order it emits when nothing says otherwise.  The reduction
 # is always innermost (the kernels accumulate in place) and the gemm batch dims
@@ -724,7 +732,10 @@ class RuntimeCalculator:
     its halo; the bank port width is one number for every operand,
     ``sram_bandwidth``, which the SoC is assumed to present as a single bus;
     and a stream's bank switches (``BANK_SWITCH_CYCLES``) are counted on
-    bank-aligned tile buffers, ignoring the block scales.
+    bank-aligned tile buffers, ignoring the block scales.  The SpMM unit's cost is per row visit
+    (``SPMM_ROW_CYCLES``) plus its outliers, at the L2 block's K depth; the
+    outlier density is the layer's average, so a tile with more outliers
+    than average runs longer than priced.
 
     Args:
         input_dtype_width: Input element width, bits.
@@ -1055,7 +1066,11 @@ class RuntimeCalculator:
         the accumulator read back and rewritten while the reduction is
         split, the finished tile and the tail's operands when it is not,
         the round trips a stream idles for when it changes bank, each
-        summed with whatever shares its bank -- plus the once-per-sweep
+        summed with whatever shares its bank -- and, for an outlier GEMM,
+        the SpMM unit, which must deliver the block's sparse correction
+        before the vector pipeline releases any of its rows: per 64-column
+        pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
+        turnaround plus that row's outliers -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
         spread over the steps a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
@@ -1193,6 +1208,24 @@ class RuntimeCalculator:
         block_time = max(
             computation_l1_time, self._bank_cycles(words, bank_groups)
         )
+
+        # The SpMM unit runs the same block alongside: one pass per
+        # PE-array-wide column slice, every row of the block in each pass.
+        # Its work per row barely grows with K (``outlier_rate`` of it) while
+        # the array's grows as K / IC_DIMENSION, so deep-K tiles hide it and
+        # shallow ones do not.
+        if self.outlier_rate:
+            rows = 1
+            for loop in [le.OX, le.OY, le.ON]:
+                rows *= self._extent(mapping, loop, 1)
+            k_block = self._extent(mapping, le.IC, 2)
+            passes = blockings[le.OC][1]
+            spmm_block_time = (
+                passes
+                * rows
+                * (SPMM_ROW_CYCLES + k_block * self.outlier_rate)
+            )
+            block_time = max(block_time, spmm_block_time)
 
         # The first tile's loads overlap nothing; the last parked tile's drain
         # is a whole vector pass, while a single-buffered accumulator's drain
