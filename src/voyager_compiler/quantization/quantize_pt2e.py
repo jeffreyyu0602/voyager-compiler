@@ -446,12 +446,10 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     if activation_post_process.outlier_threshold is not None:
         observed = activation_post_process.max_outlier_pct
-        activation_post_process.max_outlier_pct = (
-            math.ceil((observed + 0.01) * 100) / 100
-        )
+        stream_pct = max(observed, 1e-4)
         logger.info(
-            f"{node.target}: {observed:.2%} outliers observed, stream "
-            f"declared at {activation_post_process.max_outlier_pct:.0%}"
+            f"{node.target}: {observed:.4%} outliers observed, stream "
+            f"declared at {stream_pct:.4%}"
         )
 
     dequant_code, quant_code = None, None
@@ -547,7 +545,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 args.extend(
                     [
                         float(activation_post_process.outlier_threshold),
-                        activation_post_process.max_outlier_pct,
+                        stream_pct,
                     ]
                 )
                 num_outputs = 5
@@ -580,6 +578,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 scale_dtype,
                 activation_post_process.dtype,
             )
+            quantize_mx_node.meta["outlier_rate"] = observed
         else:
             scale_node, quantized_node = output_nodes
             dtype_tuple = (scale_dtype, activation_post_process.dtype)
@@ -698,6 +697,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     "A_indices": csr_indices_node,
                     "A_indptr": csr_indptr_node,
                 }
+                mx_op_node.meta["outlier_rate"] = observed
             else:
                 with graph.inserting_before(mx_op_node):
                     spmm_node = graph.call_function(

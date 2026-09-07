@@ -1613,27 +1613,19 @@ def _prepare_search(node, tiler, constraint=None):
             constraint = head.merged(constraint)
 
     # An outlier GEMM's CSR: what fraction of the activation the packed stream
-    # is sized to hold (the staging window), and what fraction the example
-    # input actually filled (the weight rows the engine gathers).  Read off
-    # the operands rather than the producer's geometry, so tiling stays
-    # independent of the bufferize builders.  The filled fraction is measured
-    # once and kept on the anchor: once the producer is lowered, its outputs
-    # carry the values of its buffers, not the example CSR.
+    # is sized to hold (the staging window), read off the operand's shape so
+    # tiling stays independent of the bufferize builders, and what fraction
+    # calibration observed (the weight rows the engine gathers), which
+    # ``convert_pt2e`` stamps on the GEMM.  The two differ: the stream is
+    # storage and may carry headroom.
     outlier_pct = 0.0
-    outlier_rate = anchor.meta.get("outlier_rate", 0.0)
+    outlier_rate = 0.0
     a_data = anchor.kwargs.get("A_data")
     if a_data is not None and getattr(a_data, "value", None) is not None:
         act = anchor.args[0].value
         elements = act.shape[-2] * act.shape[-1]
         outlier_pct = a_data.value.shape[-1] / elements
-        indptr = getattr(anchor.kwargs.get("A_indptr"), "value", None)
-        if "outlier_rate" not in anchor.meta:
-            outlier_rate = outlier_pct
-            if indptr is not None and not indptr.is_meta:
-                # Each slice's pointer array ends at that slice's count.
-                nnz = float(indptr[..., -1].sum())
-                outlier_rate = nnz / (math.prod(act.shape[:-2]) * elements)
-            anchor.meta["outlier_rate"] = outlier_rate
+        outlier_rate = anchor.meta["outlier_rate"]
 
     # A CSR producer's stream is unquantized, so ``meta["dtype"]`` leaves its
     # entries empty; resolve them against the traced values (the rule

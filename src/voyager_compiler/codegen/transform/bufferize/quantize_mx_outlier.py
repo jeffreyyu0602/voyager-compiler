@@ -143,15 +143,13 @@ class _Geometry:
         tk: Columns one K slice spans — the consuming GEMM's own k tile, so
             each block's columns land inside the weight tile.
         block_size: Microscaling block size, which ``tk`` must be a multiple of.
-        budget: Nonzeros one block may hold, the cap ``_pad_csr`` enforces.
-            The block's proportional share of the stream, unless
-            ``_fit_block_budget`` grew it to hold the calibration
-            activation's worst block.
+        budget: Nonzeros one block may hold, the cap ``_pad_csr`` enforces:
+            the block's proportional share of the stream.
         max_pct: Fraction of the whole matrix the declared stream holds; the
             graph-level op's own bound.
-        fill: Mean occupancy of a block's ``budget`` over the calibration
-            activation -- what a block's copy moves at run time, which the
-            reporting model prices it at.  1.0 until the producer measures it.
+        fill: Occupancy of a block's ``budget`` at the rate calibration
+            observed -- what a block's copy moves at run time, which the
+            reporting model prices it at.  1.0 until the producer sets it.
         dropped: Leading batch dims a reshape removed between the producer and
             this consumer; 0 on a producer's own geometry.
     """
@@ -213,54 +211,6 @@ class _Geometry:
     def ones(self) -> Tuple[int, ...]:
         """A unit extent per batch dim — every tile spans one batch element."""
         return (1,) * self.nb
-
-
-def _fit_block_budget(act, threshold, geom) -> _Geometry:
-    """Grow ``geom.budget`` to hold the worst block of ``act``, if it must.
-
-    Outliers concentrate by channel, so a K slice covering outlier-heavy
-    channels holds far more than the whole tensor's average rate -- the
-    proportional share ``budget`` starts from. ``_pad_csr`` truncates an
-    overfull block rather than raising, because shape propagation runs a
-    nest over buffers no step has written yet and would read uninitialized
-    memory as nearly all-outlier; the activation here is the live one, so
-    this is where the real capacity is read off. The declared stream keeps
-    the op's own ``max_pct`` bound — only the per-block cap (and the
-    on-chip windows sized from it) grows.
-
-    Args:
-        act: The tensor the quantize sees, ``[*batch, M, K]``; ``None`` when
-            no value reached this node, which leaves the share in place.
-        threshold: Magnitude above which an element is an outlier; ``None``
-            means no CSR, nothing to fit.
-        geom: The producer's geometry, with ``budget`` at the block's
-            proportional share of the stream.
-
-    Returns:
-        ``geom``, its ``budget`` raised to the calibration worst block when
-        that exceeds the share.
-    """
-    if act is None or threshold is None or act.is_meta:
-        return geom
-    counts = (
-        act.abs()
-        .gt(threshold)
-        .reshape(*act.shape[:-2], geom.n_rb, geom.rows, geom.n_k, geom.tk)
-        .sum(dim=(-3, -1))
-    )
-    worst = int(counts.max())
-    if worst <= geom.budget:
-        return geom
-    logger.warning(
-        "a %dx%d block holds up to %d outliers (%.1f%% of the block); "
-        "raising its budget from the %d-entry share to fit",
-        geom.rows,
-        geom.tk,
-        worst,
-        100 * worst / (geom.rows * geom.tk),
-        geom.budget,
-    )
-    return replace(geom, budget=worst)
 
 
 class _Bufs:
@@ -869,7 +819,6 @@ def build_quantize_mx_outlier(
         max_pct=max_pct,
     )
     threshold = get_arg_value(qnode, 8, "threshold")
-    geom = _fit_block_budget(act, threshold, geom)
 
     # The reduction is traced against the twin that names its scratch, which
     # takes the prefix's own operands plus one trailing placeholder per
@@ -984,10 +933,10 @@ def build_quantize_mx_outlier(
         )
     _tag_loop_extents(gm, [[(0, producer.num_steps, 1)]])
     tag_base_table(gm, node.name, base_table_shape(geom))
-    # Each slice's pointer array ends at that slice's count.
-    nnz = float(vals[2][..., -1].sum())
-    blocks = math.prod(geom.batch) * geom.n_rb * geom.n_k
-    geom = replace(geom, fill=nnz / (blocks * geom.budget))
+    # A block's occupancy at the rate calibration observed; its budget is
+    # the share of the declared stream, which may carry headroom.
+    rate = qnode.meta["outlier_rate"]
+    geom = replace(geom, fill=rate * geom.rows * geom.tk / geom.budget)
     stamp_csr_fill(gm, geom.fill)
     # The consumer has to know how the stream was diced -- how many blocks span
     # one of its row tiles, and how big each may be -- and cannot derive it

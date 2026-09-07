@@ -761,8 +761,8 @@ def _pad_csr(
     # running both ``cond`` branches and one ``while_loop`` iteration from the
     # carried *initial* values, so a tiled quantize is propagated over an
     # accumulator no step has written yet and reads uninitialized memory as
-    # nearly all-outlier.  The capacity a tile really needs is checked against
-    # the live activation where the builder derives its geometry.
+    # nearly all-outlier.  A block's capacity is its share of the declared
+    # stream, and a block holding more is truncated, as the hardware does.
     logger.warning(
         f"Number of outliers {nse} exceeds capacity {max_nnz}; "
         f"{nse - max_nnz} dropped."

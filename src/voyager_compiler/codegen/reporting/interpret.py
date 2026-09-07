@@ -69,6 +69,7 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
     _norm_extent,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
+from voyager_compiler.shape_prop import run_op
 
 _ALLOC = torch.ops.voyager.alloc.default
 _ZEROS = torch.ops.voyager.zeros.default
@@ -115,9 +116,11 @@ def _should_eval(node: Node) -> bool:
 
 
 def _eval(node: Node, env):
+    """Re-run a control node on its resolved operands.  ``run_op`` supplies
+    the stand-in for a scalar read off a fake buffer."""
     args = [_resolve(a, env) for a in node.args]
     kwargs = {k: _resolve(v, env) for k, v in node.kwargs.items()}
-    return node.target(*args, **kwargs)
+    return run_op(node.target, args, kwargs)
 
 
 def _defining(node, bind: Dict[Node, Node]):

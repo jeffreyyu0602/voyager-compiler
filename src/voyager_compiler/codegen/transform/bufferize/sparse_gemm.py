@@ -54,7 +54,6 @@ from voyager_compiler.codegen.transform.bufferize.pipeline import (
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     _Bufs,
     _entry,
-    _fit_block_budget,
     _Geometry,
     _QUANTIZE_MX_OUTLIER,
     _scalar,
@@ -995,7 +994,7 @@ def _epilogue_geometry(node, plan) -> _Geometry:
             f"{node.name}: column tile {plan.tile_n} is not a whole number "
             f"of the planned {tk}-wide CSR slices"
         )
-    geom = _Geometry(
+    return _Geometry(
         batch=batch,
         M=M,
         K=K,
@@ -1004,14 +1003,6 @@ def _epilogue_geometry(node, plan) -> _Geometry:
         block_size=bs,
         budget=int(plan.tile_m * tk * max_pct),
         max_pct=max_pct,
-    )
-    # The tile search has already run, so the submodule carries the GEMM's
-    # real output -- what the quantize will see, and the only chance to size
-    # a block that does not fit before ``_pad_csr`` silently drops its tail.
-    return _fit_block_budget(
-        getattr(qnode.args[0], "value", None),
-        qnode.args[8] if len(qnode.args) > 8 else None,
-        geom,
     )
 
 
@@ -1236,7 +1227,7 @@ def build_sparse_gemm(
     if geom is not None:
         tag_base_table(gm, ptr.meta[PRODUCER_META], base_table_shape(geom))
     # A gather moves a block's own count, at the occupancy its producer
-    # measured.  A nest that also stores a CSR (the epilogue producer) is
+    # stamped.  A nest that also stores a CSR (the epilogue producer) is
     # left at the budget.
     if geom is not None and out_geom is None:
         stamp_csr_fill(gm, geom.fill)
