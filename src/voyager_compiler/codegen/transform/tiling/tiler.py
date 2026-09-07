@@ -1715,7 +1715,16 @@ def _prepare_search(node, tiler, constraint=None):
         f"bs={anchor.kwargs.get('block_size')}"
     )
 
-    sram_bandwidth = min(tiler.config.pe_array_size) * if_bits
+    # A scratchpad bank moves one store word per cycle, ``bank_width`` bytes:
+    # a port the hardware fixes, not one that widens with the element.  So a
+    # row of elements wider than the port's lanes (int6 attention operands on
+    # the 4-bit NF4 port) takes more than one beat.  Without a bank width the
+    # port is taken as one input row per cycle.
+    sram_bandwidth = (
+        tiler.config.bank_width * 8
+        if tiler.config.bank_width
+        else min(tiler.config.pe_array_size) * if_bits
+    )
 
     batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
 
