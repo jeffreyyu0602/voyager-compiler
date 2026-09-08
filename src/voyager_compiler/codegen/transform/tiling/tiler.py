@@ -56,10 +56,6 @@ from voyager_compiler.shape_prop import ShapeProp
 logger = logging.getLogger(__name__)
 le = interstellar.le
 
-# Partial-sum width, bits -- shared by the timing model and the tile sizing.
-# ``accumulate_fp32`` is never enabled today; wire it through if that changes.
-PSUM_BITS = 16
-
 # Finished output vectors the matrix -> vector path holds before a
 # single-buffered accumulator's array feels the tail's drain rate: the
 # matrix processor's output FIFO (8), the vector pipeline's input FIFO (9)
@@ -493,8 +489,6 @@ def make_size_fn(
     if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
     fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
     of_scale_bits = get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
-    # A staged single round holds the anchor's finished tile in its own
-    # physical dtype (``_gemm_scratch_and_kernel``'s num_k == 1 staging).
     stage_bits = get_dtype_width(node.value.dtype)
     block_size = node.kwargs.get("block_size") or 1
     # A gathered-CSR entry: the outlier value and its column index, each
@@ -566,9 +560,9 @@ def make_size_fn(
         if is_spmm and spmm_scale_rows(point) > SPMM_SCALE_ROWS:
             return None, 0.0, 1
 
-        # The output is a wide partial sum until IC is fully reduced; only the
-        # final value carries an output scale.
-        out_bits = PSUM_BITS if is_psum else of_bits
+        # The output is a partial sum in the anchor's dtype until IC is fully
+        # reduced; only the final value carries an output scale.
+        out_bits = stage_bits if is_psum else of_bits
         of_scale = 0.0 if is_psum else _scale_bytes(of_count, of_scale_bits)
         bias = _alloc_bytes(extent(le.OC), bias_bits)
         # A CSR the tail emits stages in the output's bank before its packed
@@ -1769,7 +1763,7 @@ def _prepare_search(node, tiler, constraint=None):
         if_bits,
         fl_bits,
         of_bits,
-        PSUM_BITS,
+        get_dtype_width(anchor.value.dtype),
         tiler.config.double_buffered_accum_buffer,
         sram_bandwidth,
         tiler.config.bytes_per_cycle,
