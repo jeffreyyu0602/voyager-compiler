@@ -117,8 +117,11 @@ def vector_op_utilization(
     Everything not running on the matrix unit is a vector op, and all are
     bandwidth-bound the same way -- only the bytes fetched per lane group
     differ.  A fully-connected (matrix-vector) GEMM streams its weight once per
-    output, so it is sized by the weight width; every other vector op is sized
-    by the widest of ``node`` and its inputs.  The rules key off the *anchor*
+    output, so it is sized by the weight width -- the width of the buffer the
+    kernel *loads* (``weight_transforms``), not of what a fused prologue
+    decodes it into, because a packed cache reaches the bank packed.  Every
+    other vector op is sized by the widest of ``node`` and its inputs.  The
+    rules key off the *anchor*
     (``get_anchor_node``), so a fused ``call_module`` -- whose own target is
     just the submodule name -- resolves to the real op inside; a bare vector op
     is its own anchor.  This is the single copy of the formula;
@@ -126,8 +129,11 @@ def vector_op_utilization(
     """
     anchor = get_anchor_node(node) or node
     if is_fully_connected(anchor):
-        bound = bound_operands(node, node.meta.get("submodule"))
+        submodule = node.meta.get("submodule")
+        bound = bound_operands(node, submodule)
         weight = anchor.args[1]
+        if submodule is not None and weight.graph is submodule.graph:
+            weight = weight_transforms(weight)[0]
         widths = [_node_dtype_bits(bound.get(weight, weight))]
     else:
         widths = [
