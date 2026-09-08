@@ -2075,7 +2075,7 @@ def prefetch_tilings(nodes, tiler):
         if key in tiler.cache:
             continue
         if search is None:
-            tiler.cache[key] = (None,) * 3  # interstellar skips it
+            tiler.cache[key] = (None, None, None, 1)  # interstellar skips it
             continue
         jobs[key] = search
 
