@@ -2,6 +2,7 @@ import copy
 import logging
 import math
 import operator
+import os
 import re
 from collections import OrderedDict
 from dataclasses import asdict, replace
@@ -446,11 +447,14 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     if activation_post_process.outlier_threshold is not None:
         # The stream takes the observed maximum plus one percentage point,
-        # rounded up to a whole percent: headroom for the blocks above the
-        # mean.  ``round`` keeps a float artifact (2.0000000000000004) from
-        # adding a further percent.
+        # rounded to the nearest whole percent: headroom for the blocks
+        # above the mean.
         observed = activation_post_process.max_outlier_pct
-        stream_pct = math.ceil(round((observed + 0.01) * 100, 9)) / 100
+        stream_pct = round((observed + 0.01) * 100) / 100
+        # ``CSR_STREAM_PCT`` declares the stream at that rate instead (never
+        # below what was observed).
+        if os.environ.get("CSR_STREAM_PCT"):
+            stream_pct = max(observed, float(os.environ["CSR_STREAM_PCT"]))
         logger.info(
             f"{node.target}: {observed:.4%} outliers observed, stream "
             f"declared at {stream_pct:.4%}"
