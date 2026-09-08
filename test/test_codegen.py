@@ -152,6 +152,15 @@ def main():
         help="Context length for the LLM decoding.",
     )
     parser.add_argument(
+        "--spec_length",
+        type=int,
+        default=1,
+        help=(
+            "Tokens a llama_verify step writes at once: the draft tokens a "
+            "speculative-decoding verification step checks."
+        ),
+    )
+    parser.add_argument(
         "--residual_length",
         type=int,
         default=None,
@@ -331,7 +340,12 @@ def main():
         if args.evaluate:
             bert.evaluate_gm(gm, preprocessed_dataset)
 
-    elif args.model in ("llama_prefill", "llama_decode", "llama_decode_kivi"):
+    elif args.model in (
+        "llama_prefill",
+        "llama_decode",
+        "llama_decode_kivi",
+        "llama_verify",
+    ):
         model, tokenizer = llama.load_model(args)
 
         gm, old_output, new_output = llama.quantize_and_dump_model(

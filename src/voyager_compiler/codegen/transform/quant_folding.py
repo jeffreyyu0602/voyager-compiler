@@ -504,16 +504,33 @@ def _split_one_cache(
     # The write lands in the residual at ``p mod R``; the attention's main
     # half reads the cache buffer directly.  The residual keeps the cache's
     # name as its prefix, which is what a traffic report files it under.
+    # A step writing several positions (a speculative-decoding verification)
+    # fills consecutive slots from its first position's and completes the
+    # chunk when its last position lands on slot ``R - 1``; it must not
+    # cross a chunk boundary.
+    tokens = _shape_of(index)[0]
+    if tokens > length:
+        raise ValueError(
+            f"{cache.target}: a step writes {tokens} positions, more than "
+            f"the {length}-slot residual holds"
+        )
     with graph.inserting_before(idx):
         residual_attr = create_getattr_from_value(
             model, graph, f"{cache.target}_residual", residual
         )
         _stamp_fake(residual_attr, fake_mode)
+        new_nodes = []
+        first = index
+        if tokens > 1:
+            first = graph.call_function(
+                torch.ops.aten.select.int, (index, 0, 0)
+            )
+            new_nodes.append(first)
         slot = graph.call_function(
-            torch.ops.aten.remainder.Scalar, (index, length)
+            torch.ops.aten.remainder.Scalar, (first, length)
         )
         chunk = graph.call_function(
-            torch.ops.aten.floor_divide.default, (index, length)
+            torch.ops.aten.floor_divide.default, (first, length)
         )
         base = graph.call_function(torch.ops.aten.mul.Tensor, (chunk, length))
         arange = graph.call_function(
@@ -522,13 +539,29 @@ def _split_one_cache(
             {"dtype": torch.int64, "device": _shape_device(index)},
         )
         offsets = graph.call_function(torch.ops.aten.add.Tensor, (base, arange))
-        pred = graph.call_function(torch.ops.aten.eq.Scalar, (slot, length - 1))
-        for n in (slot, chunk, base, arange, offsets, pred):
+        new_nodes += [slot, chunk, base, arange, offsets]
+        slots = last = slot
+        if tokens > 1:
+            steps = graph.call_function(
+                torch.ops.aten.arange.default,
+                (tokens,),
+                {"dtype": torch.int64, "device": _shape_device(index)},
+            )
+            slots = graph.call_function(
+                torch.ops.aten.add.Tensor, (slot, steps)
+            )
+            last = graph.call_function(
+                torch.ops.aten.add.Tensor, (slot, tokens - 1)
+            )
+            new_nodes += [steps, slots, last]
+        pred = graph.call_function(torch.ops.aten.eq.Scalar, (last, length - 1))
+        new_nodes.append(pred)
+        for n in new_nodes:
             _copy_scope(n, idx)
             _stamp_fake(n, fake_mode)
     idx.replace_all_uses_with(cache)
     idx.update_arg(0, residual_attr)
-    idx.update_arg(2, slot)
+    idx.update_arg(2, slots)
     _stamp_fake(idx, fake_mode)
 
     # The residual half: the same relayouts and matmul, over the residual's
@@ -637,6 +670,11 @@ def split_kv_cache(
     read and leaves the residual alone; the lowering turns the rewrite
     into a conditional store of the quantized chunk.
 
+    A step may write several consecutive positions -- a speculative-decoding
+    verification step -- at most ``residual_length`` of them and never
+    across a chunk boundary: they take consecutive residual slots and the
+    chunk completes when the last one lands on its last slot.
+
     Args:
         model: The decode graph from ``convert_and_export_with_cache``, its
             cache buffers loaded with ``context_len`` positions; rewritten
@@ -649,8 +687,9 @@ def split_kv_cache(
         The number of caches split.
 
     Raises:
-        ValueError: A cache is not a multiple of ``residual_length`` long, or
-            its write does not reach a single attention matmul.
+        ValueError: A cache is not a multiple of ``residual_length`` long,
+            its write does not reach a single attention matmul, or a step
+            writes more positions than the residual holds.
     """
     graph = model.graph
     fake_mode = next(

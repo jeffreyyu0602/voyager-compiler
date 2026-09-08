@@ -5,7 +5,9 @@ Both stages are exported straight from Hugging Face's ``AutoModelForCausalLM``
 the same way ``benchmarks/common.py`` builds its sweep graphs.  Prefill keeps
 only the last position's logits (``logits_to_keep=1``) so the vocabulary
 projection lowers as a matrix-vector product; decode is one token over a
-static KV cache captured by ``convert_and_export_with_cache``.
+static KV cache captured by ``convert_and_export_with_cache``, and a
+speculative-decoding verification step (``llama_verify``) is the same export
+over ``--spec_length`` tokens at once.
 """
 
 import logging
@@ -151,15 +153,28 @@ def build_prefill(model, tokenizer, args):
     return gm, example_args, example_kwargs
 
 
-def build_decode(model, tokenizer, args, config):
-    """Export one decode step at ``cache_position = [context_length]`` over a
-    static BF16 KV cache of ``max_cache_len`` slots, via Hugging Face's
-    ``convert_and_export_with_cache``, then prefill the exported cache with
-    the ``context_length`` prompt tokens so calibration and the baked cache
-    see real contents.  The caches are then split into completed chunks and
-    a full-precision residual of ``residual_length(args)`` positions.
-    Returns ``(gm, (), example_kwargs)``.
+def build_decode(model, tokenizer, args, config, tokens):
+    """Export one decode step of ``tokens`` positions from ``cache_position =
+    context_length`` over a static BF16 KV cache of ``max_cache_len`` slots,
+    via Hugging Face's ``convert_and_export_with_cache``, then prefill the
+    exported cache with the ``context_length`` prompt tokens so calibration
+    and the baked cache see real contents.  The caches are then split into
+    completed chunks and a full-precision residual of ``residual_length(args)``
+    positions.  ``tokens`` is 1 for plain decode; a speculative-decoding
+    verification step writes the draft's tokens at once, and must not cross
+    a residual chunk boundary.  Returns ``(gm, (), example_kwargs)``.
     """
+    length = residual_length(args)
+    if tokens > DECODE_MAX_GEN:
+        raise ValueError(
+            f"a {tokens}-token step exceeds the {DECODE_MAX_GEN} generation "
+            "slots the cache holds past the context"
+        )
+    if args.context_length % length + tokens > length:
+        raise ValueError(
+            f"a {tokens}-token step from position {args.context_length} "
+            f"crosses a {length}-position residual chunk boundary"
+        )
     model.generation_config = GenerationConfig(
         use_cache=True,
         cache_implementation="static",
@@ -168,9 +183,12 @@ def build_decode(model, tokenizer, args, config):
             "max_cache_len": max_cache_len(args, config),
         },
     )
-    # The first token past the prompt, so decode reads a real id.
-    input_ids = _prompt_ids(tokenizer, args.context_length + 1)[:, -1:]
-    cache_position = torch.tensor([args.context_length], dtype=torch.long)
+    # The tokens past the prompt, so the step reads real ids.
+    prompt = _prompt_ids(tokenizer, args.context_length + tokens)
+    input_ids = prompt[:, -tokens:]
+    cache_position = torch.arange(
+        args.context_length, args.context_length + tokens
+    )
     # Strict export bakes in aten._assert_tensor_metadata guards (the
     # attention softmax's float32); remove_softmax_dtype_cast later rewrites
     # that softmax to bf16, so the guards must be suppressed at export.
@@ -182,7 +200,7 @@ def build_decode(model, tokenizer, args, config):
         )
     gm = ep.module()
 
-    prompt = _prompt_ids(tokenizer, args.context_length)
+    prompt = prompt[:, : args.context_length]
     cache = StaticCache(
         config=model.config,
         max_batch_size=1,
@@ -194,7 +212,7 @@ def build_decode(model, tokenizer, args, config):
         getattr(gm, f"key_cache_{i}").copy_(layer.keys)
         getattr(gm, f"value_cache_{i}").copy_(layer.values)
 
-    split_kv_cache(gm, residual_length(args), args.context_length)
+    split_kv_cache(gm, length, args.context_length)
 
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, (), example_kwargs
@@ -265,8 +283,8 @@ def restore_kv_cache(gm, state):
 
 def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     """Export and quantize the stage ``args.model`` names (``llama_prefill`` /
-    ``llama_decode``), stopping short of ``transform``.  Returns ``(gm,
-    example_args, example_kwargs, old_output, transform_args,
+    ``llama_decode`` / ``llama_verify``), stopping short of ``transform``.
+    Returns ``(gm, example_args, example_kwargs, old_output, transform_args,
     compile_args, kv_state)`` -- the converted graph with shapes propagated,
     its example inputs and reference output, the keyword sets ``transform``
     and ``compile`` take, and the KV-cache state to restore before running
@@ -275,10 +293,15 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     compile_args = get_compile_args(args)
     config = transform_args["config"]
 
-    is_decode = args.model in ("llama_decode", "llama_decode_kivi")
+    is_decode = args.model in (
+        "llama_decode",
+        "llama_decode_kivi",
+        "llama_verify",
+    )
+    tokens = args.spec_length if args.model == "llama_verify" else 1
     if is_decode:
         gm, example_args, example_kwargs = build_decode(
-            model, tokenizer, args, config
+            model, tokenizer, args, config, tokens
         )
     else:
         gm, example_args, example_kwargs = build_prefill(model, tokenizer, args)
@@ -287,7 +310,7 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     remove_softmax_dtype_cast(gm)
 
     hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
-    seq = 1 if is_decode else 128
+    seq = tokens if is_decode else 128
     example_input = torch.randn(1, seq, hidden_size, dtype=model.dtype)
     replace_rmsnorm_with_layer_norm(
         gm, model.model.layers[0].input_layernorm, (example_input,)
