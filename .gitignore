@@ -15,3 +15,4 @@ test
 !test/test_codgen.py
 wandb
 .vscode
+!src/voyager_compiler/mapping/models/
