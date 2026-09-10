@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from .timing.transfer import ceil_div
 
-ACCUMULATION_POLICY = "static-output-address-prefix"
+ACCUMULATION_POLICY = "loop-lifetime-prefix"
 
 
 # Share physical widths, buffers, interfaces, and vector geometry between matrix backends
@@ -97,10 +97,10 @@ class CIMTarget(MappingTarget):
     c_beat_layout: int
     result_slots_per_output_lane: int
     local_accum_contexts: int
+    accumulation_policy: str
     b_store_scope: str = "L1-compute-resident"
     weight_policy: str = "fitting-sequence-replay-else-singleton-refetch"
     a_policy: str = "fresh-beat-per-MAC-full-array-multicast-reduce"
-    accumulation_policy: str = ACCUMULATION_POLICY
     backend: str = "cim"
 
     # Reject descriptors outside the implemented processor and macro contracts

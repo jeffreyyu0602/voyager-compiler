@@ -57,6 +57,15 @@ def outer_context(schedule: Schedule, loop: str) -> bool:
     return any(schedule.l2.bound(reduction) > 1 and schedule.l2.inside(loop, reduction)
                for reduction in ("IC", "FY"))
 
+# Count simultaneous feedback registers independently of SRAM output addressing
+def local_accum_footprint(schedule: Schedule) -> int:
+    levels = (schedule.l2, schedule.l1)
+    reductions = [(level, loop) for level in range(2) for loop in REDUCTIONS
+                  if levels[level].bound(loop) > 1]
+    return prod(levels[level].bound(loop) for level in range(2) for loop in ("OC", "OY", "OX")
+                if any(outer < level or (outer == level and levels[level].inside(loop, reduction))
+                       for outer, reduction in reductions))
+
 # Reject shapes and schedules that overflow or disagree across the current ABI
 def _legality(target, schedule, workload, fetch, pack, width, height):
     l1, l2 = schedule.l1, schedule.l2
@@ -186,10 +195,11 @@ class Evaluator:
         if reasons:
             return Evaluation(False, tuple(reasons))
 
-        traffic = count_traffic(target, schedule, workload, fetch, policy, inputs, pack, self.useful_positions, footprint)
+        traffic = count_traffic(target, schedule, workload, fetch, policy, inputs, pack, self.useful_positions)
+        live_outputs = local_accum_footprint(schedule)
         timing = estimate_cycles(target, schedule, workload, fetch, options, policy, traffic, inputs)
         return Evaluation(True, (), policy=policy, traffic=traffic,
-                          accumulation_footprint=footprint,
+                          accumulation_footprint=footprint, local_accum_footprint=live_outputs,
                           input_footprint=width * height * l1.bound("IC"),
                           timing=timing)
 
@@ -202,12 +212,13 @@ def evaluate(target: CIMTarget, schedule: Schedule, workload: Workload,
 
 
 # Count physical work for a legal schedule before timing it
-def count_traffic(target, schedule, workload, fetch, policy, inputs, pack, useful_positions, footprint):
+def count_traffic(target, schedule, workload, fetch, policy, inputs, pack, useful_positions):
     l1, l2 = schedule.l1, schedule.l2
     operations = prod(l1.bounds) * prod(l2.bounds)
     outputs = prod(level.bound(loop) for level in (l1, l2) for loop in ("OX", "OY", "OC"))
     reductions = prod(level.bound(loop) for level in (l1, l2) for loop in REDUCTIONS)
-    local_outputs = outputs // footprint * min(footprint, target.local_accum_contexts)
+    live_outputs = local_accum_footprint(schedule)
+    local_outputs = outputs // live_outputs * min(live_outputs, target.local_accum_contexts)
     buffer_outputs = outputs - local_outputs
     banked = target.double_buffered_accum and schedule.write_output_to_accum_buffer
     loads = policy.full_set_loads

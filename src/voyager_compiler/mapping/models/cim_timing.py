@@ -68,8 +68,10 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     total_output_cycles = outputs * output_cycles_per_vector
     total_bias_cycles = traffic.bias_requests * (
         ceil_div(target.n * target.accum_bits, target.oc_port_bits) + options.memory_request_latency)
-    # Model one extra service cycle for each SRAM-backed dependent reduction
+    # Approximate ordered SRAM dependencies; local feedback needs no extra transfer
     total_accumulation_cycles = traffic.a_beats + traffic.buffer_accum_reads * options.sram_dependency_cycles
+    sram_reads = traffic.buffer_accum_reads + traffic.buffer_output_reads
+    sram_writes = traffic.buffer_accum_intermediate_writes + traffic.buffer_accum_final_writes
     startup = max(inputs.first_fill_cycles, first_weight) + options.input_handoff_cycles
     remaining_weights = total_weight_cycles - first_weight
     # Writing weights and computing cannot overlap when both use the only resident set
@@ -96,6 +98,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         effective_utilization=ideal / runtime,
         resource_cycles=dict(compute=compute, result_slots=total_issue_cycles,
                             input=inputs.total_fill_cycles, weight=total_weight_cycles,
-                            accumulation=total_accumulation_cycles, output=total_output_cycles, bias=total_bias_cycles),
+                            accumulation=total_accumulation_cycles, output=total_output_cycles, bias=total_bias_cycles,
+                            accumulation_sram_reads=sram_reads, accumulation_sram_writes=sram_writes),
         startup_cycles=startup, drain_cycles=drain, options=options,
     )
