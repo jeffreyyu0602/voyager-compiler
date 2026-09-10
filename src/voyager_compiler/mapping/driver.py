@@ -42,7 +42,7 @@ def resolve_timing(target, options=None):
 
 
 # Map both backends through the same traversal, invocation cache, and reporting
-def generate_tilings(model, target, *, timing_options=None):
+def generate_tilings(model, target, *, timing_options=None, verbose=0):
     timing = resolve_timing(target, timing_options)
     tilings = tiling_pb2.ModelTiling(backend=target.backend, target_configuration=target.configuration_json)
     report = dict(target=target.to_dict(), operations=[], skipped=[])
@@ -63,9 +63,16 @@ def generate_tilings(model, target, *, timing_options=None):
             if not reused:
                 workload, vector_timing = parse_operation(target, operation)
                 inputs = prepare_search(target, workload, vector_timing=vector_timing, options=timing)
+                if verbose:
+                    layer = inputs.layer
+                    print(f"Searching {name}: backend={target.backend}; lanes={target.k}x{target.n}; "
+                          f"IC={layer.nifm} OC={layer.nofm} OX={layer.wofm} OY={layer.hofm} "
+                          f"FX={layer.wfil} FY={layer.hfil}", flush=True)
                 started = perf_counter()
-                mapping = search_mapping(inputs)
+                mapping = search_mapping(inputs, verbose=verbose)
                 cache[key] = mapping, inputs, perf_counter() - started
+            elif verbose:
+                print(f"Reusing an identical operation's mapping for {name}", flush=True)
             mapping, inputs, elapsed = cache[key]
             tiling, detail = serialize(name, target, mapping, inputs)
         except ValueError as error:
@@ -84,6 +91,8 @@ def generate_tilings(model, target, *, timing_options=None):
         print(f"{name}: {evaluation.runtime_cycles:g} cycles; ideal {evaluation.ideal_cycles:g}; "
               f"spatial {evaluation.spatial_utilization:.2%}; useful work {evaluation.useful_work_fraction:.2%}; "
               f"effective {evaluation.effective_utilization:.2%}; search {elapsed:.3f}s", flush=True)
+        if verbose and "search" in detail:
+            print(f"{name} search statistics: {json.dumps(detail['search'], sort_keys=True)}", flush=True)
     return tilings, report
 
 
@@ -99,11 +108,13 @@ def main(argv=None):
     parser.add_argument("--backend", choices=("sa", "cim"))
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--timing_options", type=Path, help="JSON timing assumptions in cycles")
+    parser.add_argument("--verbose", type=int, choices=range(4), default=0,
+                        help="0: results, 1: progress, 2: tile factors and best updates, 3: every evaluated candidate")
     args = parser.parse_args(argv)
     target = load_target(args.target)
     if args.backend is not None and args.backend != target.backend:
         parser.error("selected backend does not match mapping target")
     model = text_format.Parse((args.codegen_dir / "model.txt").read_text(), param_pb2.Model())
     timing = json.loads(args.timing_options.read_text()) if args.timing_options else None
-    tilings, report = generate_tilings(model, target, timing_options=timing)
+    tilings, report = generate_tilings(model, target, timing_options=timing, verbose=args.verbose)
     write_tilings(tilings, report, args.output_dir)

@@ -32,7 +32,8 @@ def search_mapping(inputs, *, verbose=0):
         callbacks = {name: getattr(inputs, name)
                      for name in ("capacity_filter", "candidate_evaluator")
                      if getattr(inputs, name) is not None}
-        _, _, mapping, _ = opt_optimizer(inputs.resource, inputs.layer, inputs.schedule, **callbacks)
+        _, _, mapping, _ = opt_optimizer(inputs.resource, inputs.layer, inputs.schedule,
+                                         verbose=verbose, **callbacks)
     except AssertionError as error:
         if str(error) != "No valid mapping point found.":
             raise
