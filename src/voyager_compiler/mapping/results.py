@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 
 from google.protobuf import text_format
+from .reporting import render_report
 from dataclasses import asdict
 from voyager_compiler.codegen import tiling_pb2
 
@@ -82,3 +83,4 @@ def write_tilings(tilings, report, output_dir):
     output_dir = Path(output_dir)
     write_if_changed(output_dir / "tilings.txtpb", text_format.MessageToString(tilings))
     write_if_changed(output_dir / "mapping-evaluations.json", json_text(report))
+    write_if_changed(output_dir / "mapping-report.md", render_report(report, tilings))

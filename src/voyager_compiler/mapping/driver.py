@@ -8,6 +8,7 @@ from voyager_compiler.codegen import tiling_pb2
 from .operations import channel_metadata, matrix_operation, parse_operation, skip_reason
 from .search import prepare_search, search_mapping
 from .results import serialize, write_tilings
+from .reporting import utilization_metrics
 
 
 
@@ -86,11 +87,13 @@ def generate_tilings(model, target, *, timing_options=None, verbose=0):
                        spatial_utilization=evaluation.spatial_utilization,
                        useful_work_fraction=evaluation.useful_work_fraction,
                        effective_utilization=evaluation.effective_utilization)
+        metrics.update(utilization_metrics(metrics, detail["evaluation"]))
         report["operations"].append(dict(name=name, reused=reused, search_seconds=elapsed,
                                          metrics=metrics, useful_work_basis="compiler logical channels" if logical else "supplied extents without padding metadata", **detail))
-        print(f"{name}: {evaluation.runtime_cycles:g} cycles; ideal {evaluation.ideal_cycles:g}; "
-              f"spatial {evaluation.spatial_utilization:.2%}; useful work {evaluation.useful_work_fraction:.2%}; "
-              f"effective {evaluation.effective_utilization:.2%}; search {elapsed:.3f}s", flush=True)
+        print(f"{name}: {evaluation.runtime_cycles:g} cycles; "
+              f"dense ideal {metrics['dense_ideal_cycles']:g}; useful ideal {metrics['useful_ideal_cycles']:g}; "
+              f"utilization {metrics['utilization']:.2%}; true utilization {metrics['true_utilization']:.2%}; "
+              f"search {elapsed:.3f}s", flush=True)
         if verbose and "search" in detail:
             print(f"{name} search statistics: {json.dumps(detail['search'], sort_keys=True)}", flush=True)
     return tilings, report
