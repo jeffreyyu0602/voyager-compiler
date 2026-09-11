@@ -11,6 +11,7 @@ post-op tail in the kernel.
 Runs after operator fusion and before memory allocation.
 """
 
+import hashlib
 import itertools
 import logging
 import math
@@ -495,7 +496,9 @@ def propagate_logical_dtypes(
             )
         elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
+            _thread_hop(
+                gm, node, operands, (node.args[1], node.args[2]), rules
+            )
         elif t is _COMMIT:
             _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
         elif rules.get(t) is not None:
@@ -632,8 +635,28 @@ def _nest_output_values(sub_gm) -> list:
     if not isinstance(outs, (tuple, list)):
         outs = [outs]
     return [
-        getattr(n, "value", None) if isinstance(n, Node) else None for n in outs
+        getattr(n, "value", None) if isinstance(n, Node) else None
+        for n in outs
     ]
+
+
+def _key_digest(key) -> Optional[str]:
+    """A stable short digest of a ``_bufferize_key``, or ``None`` when the
+    key cannot be serialised deterministically.
+
+    ``build_group`` is a per-run counter, so it cannot carry a measurement
+    from one compile to another; this digest can, because the key is content
+    addressed -- two nodes that build the same nest produce the same key in
+    any compile.  ``repr`` is used rather than ``hash``, whose string salt
+    differs per process.  A literal whose repr embeds its address would not
+    be stable, so such a key gets no digest at all.
+    """
+    if key is None:
+        return None
+    text = repr(key)
+    if " at 0x" in text or " object at " in text:
+        return None
+    return hashlib.sha1(text.encode()).hexdigest()[:12]
 
 
 def _bufferize_key(node):
@@ -655,6 +678,24 @@ def _bufferize_key(node):
         return None
 
 
+def _stamp_unbuilt_keys(model: GraphModule) -> None:
+    """Give a ``build_key`` to the nodes bufferization never built.
+
+    A DMA-only node is spliced from no nest, so the splice loop never stamps
+    it and reporting can group it only by byte counts, which collide between
+    unrelated operations.  ``_bufferize_key`` signs it structurally instead;
+    it raises on some non-build-candidates, and those simply get no key.
+    """
+    for node in model.graph.nodes:
+        if node.op == "placeholder" or node.meta.get("build_key") is not None:
+            continue
+        try:
+            key = _bufferize_key(node)
+        except (AttributeError, TypeError, ValueError):
+            key = None
+        node.meta["build_key"] = _key_digest(key)
+
+
 def _producer_names(node):
     """The outlier-producer names a nest built at ``node`` bakes into its
     base-table tags: the node's own name (its produced table) and each
@@ -674,12 +715,6 @@ def _producer_names(node):
 # ---------------------------------------------------------------------------
 
 _FUSED_SUFFIX = "_fused"
-
-
-def _base_name(name: str) -> str:
-    """A node name without the per-graph counter FX appended (``select_11`` ->
-    ``select``), so the model-wide numbering can start it afresh."""
-    return re.sub(r"_\d+$", "", name)
 
 
 def _keeps_scope(gm: GraphModule) -> set:
@@ -748,7 +783,9 @@ def rename_nest_nodes(model: GraphModule) -> None:
         elif n in keep:
             candidate = f"{scope}_{n.name}"
         else:
-            candidate = _base_name(n.name)
+            # Drop FX's per-graph counter (``select_11`` -> ``select``) so the
+            # model-wide numbering can start it afresh.
+            candidate = re.sub(r"_\d+$", "", n.name)
         rename(n, candidate)
 
         if sub is not None:
@@ -890,9 +927,9 @@ def bufferize_graph(
                     async_pipeline=pipelined,
                     tiler=tiler,
                 )
-            elif anchor.kwargs.get("A_indptr") is not None or gemm_produces_csr(
-                node
-            ):
+            elif anchor.kwargs.get(
+                "A_indptr"
+            ) is not None or gemm_produces_csr(node):
                 # A GEMM whose activation carries an outlier CSR: same dense
                 # nest, plus the per-step gather of the row tile's blocks.
                 sub_gm = build_sparse_gemm(
@@ -915,7 +952,9 @@ def bufferize_graph(
                 sub_gm = (
                     build_attention_fa3(node, tiler=tiler)
                     if flash_attention_v3
-                    else build_attention(node, num_slots=num_slots, tiler=tiler)
+                    else build_attention(
+                        node, num_slots=num_slots, tiler=tiler
+                    )
                 )
             elif csr_quantize_node(node) is not None:
                 # A row-swept producer: the quantize needs a per-K-slice tiling
@@ -939,7 +978,9 @@ def bufferize_graph(
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):
-                sub_gm = build_pointwise(node, num_slots=num_slots, tiler=tiler)
+                sub_gm = build_pointwise(
+                    node, num_slots=num_slots, tiler=tiler
+                )
             else:
                 sub_gm = None
 
@@ -1004,10 +1045,16 @@ def bufferize_graph(
             for old, new in zip(tag_sources, _producer_names(node))
             if old is not None and new is not None and old != new
         }
+        digest = _key_digest(key)
         for src, new in value_remap.items():
             if src.op != "placeholder" and isinstance(new, Node):
                 new.meta["scope"] = (scope, anchor.target)
                 new.meta["build_group"] = group
+                # The group says which layers of THIS compile were built
+                # alike; the key says the same across compiles, which is what
+                # carries an RTL measurement from a two-layer compile to the
+                # full model.
+                new.meta["build_key"] = digest
                 tag = new.meta.get(BASE_TABLE_TAG)
                 if tag in retag:
                     new.meta[BASE_TABLE_TAG] = retag[tag]
@@ -1063,6 +1110,7 @@ def bufferize_graph(
     _dedup_regions(model)
     annotate_tensor_spaces(model)
     rename_nest_nodes(model)
+    _stamp_unbuilt_keys(model)
     return model
 
 

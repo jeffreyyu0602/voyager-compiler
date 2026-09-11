@@ -23,8 +23,9 @@ from voyager_compiler.codegen.reporting.model import (
 class KernelRow:
     kernel: str
     anchor: str = ""
-    signature: str = ""
-    signature_text: str = ""
+    group: str = ""  # calibration identity: meta['build_key']
+    group_id: int = -1  # meta['build_group'], readable, per-compile
+    num_shared_kernels: int = 0  # kernels sharing this build key
     start: int = 0
     end: int = 0
     read_bytes: int = 0
@@ -83,12 +84,13 @@ def kernel_rows(result: ScheduleResult) -> List[KernelRow]:
         loops_by_kernel.setdefault(stats.kernel, []).append(stats)
 
     for kernel, recs in by_kernel.items():
-        sig = result.kernel_signatures.get(kernel)
+        grp = result.kernel_groups.get(kernel)
         row = KernelRow(
             kernel=kernel,
-            anchor=sig.anchor if sig else "",
-            signature=sig.key if sig else "",
-            signature_text=sig.text if sig else "",
+            anchor=grp.anchor if grp else "",
+            group=grp.key if grp else "",
+            group_id=grp.group if grp else -1,
+            num_shared_kernels=grp.num_shared_kernels if grp else 0,
             start=min(r.start for r in recs),
             end=max(r.end for r in recs),
         )

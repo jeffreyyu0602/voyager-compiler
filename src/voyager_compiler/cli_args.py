@@ -5,6 +5,7 @@ from voyager_compiler.hardware_config import (
     DEFAULT_DOUBLE_BUFFERED_L2,
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
     DEFAULT_DRAM_BANDWIDTH_GBS,
+    DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
     DEFAULT_DRAM_SIZE_GB,
     DEFAULT_FREQUENCY_GHZ,
     DEFAULT_INPUT_BUFFER_SIZE,
@@ -357,6 +358,12 @@ def add_compile_args(parser=None):
         "frequency.",
     )
     parser.add_argument(
+        "--dram_energy_per_bit",
+        type=float,
+        default=DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
+        help="DRAM access energy (pJ/bit) for the reporting energy columns.",
+    )
+    parser.add_argument(
         "--frequency",
         type=float,
         default=DEFAULT_FREQUENCY_GHZ,
@@ -423,5 +430,12 @@ def add_compile_args(parser=None):
         "--report_basename",
         default="schedule",
         help="Base filename for the reporting outputs.",
+    )
+    parser.add_argument(
+        "--calib_in",
+        default=None,
+        help="A filled-in calibration sheet (a standalone form or a previous "
+        "<basename>.xlsx): price compute ops by its RTL measurements and "
+        "carry its power numbers into the Operation Table.",
     )
     return parser

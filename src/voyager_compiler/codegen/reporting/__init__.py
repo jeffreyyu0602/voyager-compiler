@@ -4,8 +4,8 @@ Two stages:
 
   * ``estimate_schedule``  walk the graph -> per-node timing + DRAM traffic,
     folding each loop's steady state as it goes
-  * ``write_excel_report`` / ``write_perfetto`` / ``write_calibration_form``
-    write the workbook, the trace, and the RTL calibration form
+  * ``write_excel_report`` / ``write_perfetto``  write the workbook (whose
+    Calibration sheet is the RTL recipe) and the trace
 
 ``report`` runs the common case (call it after ``plan_memory``).
 """
@@ -14,11 +14,11 @@ import os
 
 from voyager_compiler.codegen.reporting.calibration import (
     Calibration,
-    KernelSignature,
+    KernelGroup,
     Measurement,
-    kernel_signatures,
+    kernel_groups,
     load_calibration,
-    write_calibration_form,
+    calibration_sheet,
 )
 from voyager_compiler.codegen.reporting.excel import write_excel_report
 from voyager_compiler.codegen.reporting.interpret import estimate_schedule
@@ -39,7 +39,7 @@ from voyager_compiler.codegen.reporting.summary import (
 __all__ = [
     "Calibration",
     "KernelRow",
-    "KernelSignature",
+    "KernelGroup",
     "LoopSkip",
     "LoopStats",
     "Measurement",
@@ -49,10 +49,10 @@ __all__ = [
     "coverage",
     "estimate_schedule",
     "kernel_rows",
-    "kernel_signatures",
+    "kernel_groups",
     "load_calibration",
     "report",
-    "write_calibration_form",
+    "calibration_sheet",
     "write_excel_report",
     "write_perfetto",
 ]
@@ -90,7 +90,11 @@ def report(
         model, config, full_walk=full_walk, calibration=calibration
     )
     os.makedirs(output_dir, exist_ok=True)
-    write_excel_report(result, os.path.join(output_dir, f"{basename}.xlsx"))
+    write_excel_report(
+        result,
+        os.path.join(output_dir, f"{basename}.xlsx"),
+        calibration=calibration,
+    )
     if perfetto:
         write_perfetto(
             result, os.path.join(output_dir, f"{basename}.perfetto.json")

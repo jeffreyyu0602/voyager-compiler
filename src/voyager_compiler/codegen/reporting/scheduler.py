@@ -91,7 +91,7 @@ class ResourceState:
         self.dram_free = 0
         self.cur_loop = -1  # id() of the while_loop currently being walked
         self.cur_kernel = ""  # the bufferized nest being walked
-        self.kernel_signatures: Dict[str, str] = {}
+        self.kernel_groups: Dict[str, str] = {}
         self.launched: set = set()  # kernels charged their launch overhead
         self.loop_stats: Dict[int, LoopStats] = {}  # id(loop) -> stats
         self.read_bytes = 0
@@ -154,7 +154,7 @@ class ResourceState:
             op.kernel = self.cur_kernel
             if self.calibration is not None:
                 self.calibration.apply(
-                    op, self.kernel_signatures.get(self.cur_kernel)
+                    op, self.kernel_groups.get(self.cur_kernel)
                 )
             self.ops[key] = op
         return op
@@ -228,6 +228,7 @@ class ResourceState:
             bytes=n_bytes,
             is_read=is_read,
             category=category,
+            sync=sync,
         )
         self.records.append(rec)
         self.dram_free = end
@@ -391,9 +392,7 @@ class ResourceState:
         if self.calibration is None or kernel in self.launched:
             return
         self.launched.add(kernel)
-        cycles = self.calibration.launch_cycles(
-            self.kernel_signatures.get(kernel)
-        )
+        cycles = self.calibration.launch_cycles(self.kernel_groups.get(kernel))
         if not cycles:
             return
         rec = TimingRecord(

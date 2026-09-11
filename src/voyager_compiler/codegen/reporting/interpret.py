@@ -34,7 +34,7 @@ from voyager_compiler.codegen.node_info import (
     is_compute_op,
     is_nop,
 )
-from voyager_compiler.codegen.reporting.calibration import kernel_signatures
+from voyager_compiler.codegen.reporting.calibration import kernel_groups
 from voyager_compiler.codegen.reporting.cost import _shape, _val, tile_bytes
 from voyager_compiler.codegen.reporting.model import (
     LoopSkip,
@@ -821,9 +821,9 @@ def estimate_schedule(
         calibration: A ``Calibration`` of RTL-measured kernel cycles, applied
             to each compute op as it is priced.
     """
-    signatures = kernel_signatures(model, config)
+    groups = kernel_groups(model)
     rs = ResourceState(config, calibration)
-    rs.kernel_signatures = {k: s.key for k, s in signatures.items()}
+    rs.kernel_groups = {k: g.key for k, g in groups.items()}
     ctx = _Ctx(rs=rs, cost=config, bind={}, fold=not full_walk)
     _walk(model, {}, ctx, ())
     rs.assert_commits_drained("<graph end>")
@@ -844,5 +844,5 @@ def estimate_schedule(
         busy_compute=busy_compute,
         busy_dram=busy_dram,
         busy_any=busy_any,
-        kernel_signatures=signatures,
+        kernel_groups=groups,
     )

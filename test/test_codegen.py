@@ -16,6 +16,13 @@ from voyager_compiler import (
     get_default_quantizer,
 )
 from voyager_compiler.codegen.node_info import is_fully_connected
+from voyager_compiler.codegen.reporting import (
+    coverage,
+    kernel_rows,
+    load_calibration,
+    report,
+)
+from voyager_compiler.hardware_config import AcceleratorConfig
 
 logger = logging.getLogger()
 
@@ -171,11 +178,16 @@ def main():
         ),
     )
     parser.add_argument(
-        "--compile_single_layer",
-        action="store_true",
+        "--num_hidden_layers",
+        type=int,
+        default=None,
         help=(
-            "Only compile for a single encoder/decoder layer in Transformer "
-            "models."
+            "Compile only the first N encoder/decoder layers of a Transformer "
+            "(the whole model when unset).  Two is the useful minimum for "
+            "calibration: a model's last layer is built differently from the "
+            "ones before it -- its MLP down_proj fuses the residual quantize "
+            "and stores fp8 rather than bf16 -- so a one-layer compile only "
+            "ever produces the tail variant."
         ),
     )
     parser.add_argument(
@@ -365,12 +377,14 @@ def main():
         else:
             imagenet_dataset = imagenet.retrieve_dataset(10, "vit")
 
-        gm, old_output, new_output, preprocess_fn = vit.quantize_and_dump_model(
-            model=model,
-            quantizer=quantizer,
-            calibration_data=imagenet_dataset,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
+        gm, old_output, new_output, preprocess_fn = (
+            vit.quantize_and_dump_model(
+                model=model,
+                quantizer=quantizer,
+                calibration_data=imagenet_dataset,
+                vector_stages=VECTOR_PIPELINE,
+                args=args,
+            )
         )
 
         if args.dump_dataset:
@@ -386,6 +400,44 @@ def main():
             vit.evaluate(gm, preprocessed_imagenet)
     else:
         raise ValueError(f"Model {args.model} not supported")
+
+    if args.report:
+        # Estimate the schedule of the graph the compile just produced, so
+        # the workbook, its Calibration sheet and the emitted model all
+        # describe one tiling -- which the sheet's frozen "Analytic
+        # cyc/iter" requires.
+        out_dir = args.report_output_dir
+        if out_dir == "." and args.model_output_dir:
+            out_dir = args.model_output_dir
+        calibration = (
+            load_calibration(args.calib_in) if args.calib_in else None
+        )
+        if calibration is not None:
+            print(
+                f"[report] {len(calibration.measurements)} measured groups "
+                f"from {args.calib_in}"
+            )
+        print(f"[report] {args.model} -> {out_dir}", flush=True)
+        result = report(
+            gm,
+            AcceleratorConfig.from_args(args),
+            output_dir=out_dir,
+            basename=args.report_basename,
+            calibration=calibration,
+        )
+        rows = kernel_rows(result)
+        # Compute kernels only: the DMA-only ones carry a key too, but they
+        # are not things the RTL measures.
+        groups = len({r.group for r in rows if r.group and r.ops_per_period})
+        print(
+            f"[report] total_latency={result.total_latency} "
+            f"dram_read={result.dram_read_bytes} "
+            f"dram_write={result.dram_write_bytes} "
+            f"kernels={len(rows)} groups={groups} "
+            f"calibrated={sum(1 for r in rows if r.calibration)} "
+            f"coverage={coverage(rows, result.total_latency):.3f}",
+            flush=True,
+        )
 
     if new_output is None:
         print("Skipping output verification (pass --debug to run it)")

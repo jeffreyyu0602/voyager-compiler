@@ -24,7 +24,10 @@ class TimingRecord:
     VU); a DMA holds ``("dram",)``; an ``async_wait`` holds
     ``("control",)`` -- a synchronization that uses no bandwidth.
     ``kernel`` names the bufferized nest the event belongs to, ``op_key``
-    the ``OpInfo`` a compute event was priced by.
+    the ``OpInfo`` a compute event was priced by.  ``sync`` marks a DRAM
+    event the program clock waits on -- the whole-tensor materialization of
+    a ``pad`` / ``permute`` / ``cat`` / ``expand``, which cannot overlap --
+    as against a tile ``async_copy``, which can.
     """
 
     eid: int
@@ -40,6 +43,7 @@ class TimingRecord:
     is_read: bool = False  # DRAM loads (vs stores)
     category: str = ""
     op_key: str = ""
+    sync: bool = False  # DRAM: a materialization that stalls the program clock
 
 
 @dataclass
@@ -136,7 +140,7 @@ class ScheduleResult:
     ``records`` holds the walked events; ``skips`` the folded steady-state
     runs between them, so the two together describe the whole schedule.
     ``busy_*`` are exact union lengths of the compute, DRAM and either
-    lanes' busy intervals over the whole makespan.  ``kernel_signatures``
+    lanes' busy intervals over the whole makespan.  ``kernel_groups``
     maps each kernel to its ``calibration.KernelSignature``.
     """
 
@@ -154,4 +158,4 @@ class ScheduleResult:
     busy_compute: int = 0
     busy_dram: int = 0
     busy_any: int = 0
-    kernel_signatures: Dict[str, object] = field(default_factory=dict)
+    kernel_groups: Dict[str, object] = field(default_factory=dict)

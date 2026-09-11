@@ -92,8 +92,8 @@ SCHEME_INPUT_BYTES = {
 assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 
 # Reused per-command extra-flag groups.
-_SINGLE = "--compile_single_layer"
-_LLM = "--context_length 1024 --compile_single_layer --quantize_attention_mask"
+_SINGLE = "--num_hidden_layers 1"
+_LLM = "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask"
 _LLM_MP = _LLM + " --qconfig mxnf4_attn_head_int6"
 _LLM_SPMM = _LLM + " --qconfig mxnf4_outlier"
 _DB = "--double_buffered_l2"

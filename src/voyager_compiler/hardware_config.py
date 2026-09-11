@@ -8,8 +8,10 @@ every layer.
 
 Physical units: ``dram_bandwidth`` is GB/s, ``dram_access_latency`` ns,
 ``frequency`` GHz, so bytes/cycle is ``dram_bandwidth / frequency`` and
-per-transfer latency in cycles is ``dram_access_latency * frequency``.  The
-reporting model reads this object directly as its cost knobs.
+per-transfer latency in cycles is ``dram_access_latency * frequency``.
+``dram_energy_per_bit`` is pJ/bit, which ``dram_energy_per_byte`` turns into
+J/B for the reporting energy columns.  The reporting model reads this object
+directly as its cost knobs.
 """
 
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ DEFAULT_DOUBLE_BUFFERED_L2 = True
 DEFAULT_DRAM_SIZE_GB = 16.0
 DEFAULT_DRAM_BANDWIDTH_GBS = 64.0
 DEFAULT_DRAM_ACCESS_LATENCY_NS = 100.0
+DEFAULT_DRAM_ENERGY_PJ_PER_BIT = 6.25
 
 
 @dataclass(frozen=True)
@@ -67,6 +70,7 @@ class AcceleratorConfig:
     dram_size: Optional[float] = DEFAULT_DRAM_SIZE_GB
     dram_bandwidth: Optional[float] = DEFAULT_DRAM_BANDWIDTH_GBS
     dram_access_latency: Optional[float] = DEFAULT_DRAM_ACCESS_LATENCY_NS
+    dram_energy_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT  # pJ/bit
 
     def __post_init__(self):
         """Reject a reservation the rest of the compiler could not honour.
@@ -104,6 +108,11 @@ class AcceleratorConfig:
         if self.vector_unit_width is not None:
             return self.vector_unit_width
         return self.pe_array_size[1]
+
+    @property
+    def dram_energy_per_byte(self) -> float:
+        """DRAM access energy in joules per byte, from the pJ/bit figure."""
+        return self.dram_energy_per_bit * 8 * 1e-12
 
     @property
     def bytes_per_cycle(self) -> float:
@@ -162,4 +171,5 @@ class AcceleratorConfig:
             dram_size=args.dram_size,
             dram_bandwidth=args.dram_bandwidth,
             dram_access_latency=args.dram_access_latency,
+            dram_energy_per_bit=args.dram_energy_per_bit,
         )

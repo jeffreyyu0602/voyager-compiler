@@ -94,18 +94,23 @@ _KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
 
 
 def load_model(args):
-    """Load the causal LM (one decoder layer under
-    ``--compile_single_layer``) and its tokenizer."""
+    """Load the causal LM (its first ``--num_hidden_layers`` decoder layers,
+    when given) and its tokenizer."""
     if args.model_name_or_path is None:
         args.model_name_or_path = DEFAULT_MODEL
 
-    extra = {"num_hidden_layers": 1} if args.compile_single_layer else {}
+    n = getattr(args, "num_hidden_layers", None)
+    extra = {"num_hidden_layers": n} if n else {}
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
         attn_implementation=args.attn_implementation,
         **extra,
     ).eval()
+    # StaticCache sizes itself from layer_types, which num_hidden_layers
+    # does not truncate (Qwama-0.5B: 2 layers, 24 cache entries).
+    if n and getattr(model.config, "layer_types", None):
+        model.config.layer_types = model.config.layer_types[:n]
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     return model, tokenizer
 

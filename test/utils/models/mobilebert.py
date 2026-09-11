@@ -64,13 +64,13 @@ def quantize_and_dump_model(
             self.classifier = model.classifier
 
         def forward(self, hidden_states, attention_mask):
-            for layer_module in self.mobilebert.encoder.layer:
+            for i, layer_module in enumerate(self.mobilebert.encoder.layer):
                 hidden_states = layer_module(
                     hidden_states,
                     attention_mask=attention_mask,
                 )
 
-                if args.compile_single_layer:
+                if args.num_hidden_layers and i + 1 >= args.num_hidden_layers:
                     break
 
             pooled_output = self.mobilebert.pooler(hidden_states)
