@@ -764,7 +764,7 @@ def fuse_operator(
 
     for fused_nodes in fused_nodes_list:
         anchor = next((n for n in fused_nodes if is_gemm_op(n)), None)
-        drain_fusible = accumulate_fusible = False
+        single_k_tail_fusible = split_k_tail_fusible = False
         if anchor is not None and operations is not None:
             tail = [
                 n
@@ -772,11 +772,13 @@ def fuse_operator(
                 if not (is_nop(n) or is_reshape_op(n))
             ]
             # The sparse correction takes an add stage ahead of the tail;
-            # a split reduction's accumulate takes one more.  A tail the
-            # drain cannot hold runs as a second pass over the staged tile.
+            # a split reduction's accumulate takes one more.  A tail that
+            # does not fit runs as a pass of its own after the GEMM's.
             reserved = 1 if is_spmm(anchor) else 0
-            drain_fusible = _tail_fits(anchor, tail, operations, reserved)
-            accumulate_fusible = _tail_fits(
+            single_k_tail_fusible = _tail_fits(
+                anchor, tail, operations, reserved
+            )
+            split_k_tail_fusible = _tail_fits(
                 anchor, tail, operations, reserved + 1
             )
         node = create_and_insert_subgraph(
@@ -786,8 +788,8 @@ def fuse_operator(
             continue
         propagate_shape(node, model)
         if anchor is not None:
-            node.meta["drain_fusible"] = drain_fusible
-            node.meta["accumulate_fusible"] = accumulate_fusible
+            node.meta["single_k_tail_fusible"] = single_k_tail_fusible
+            node.meta["split_k_tail_fusible"] = split_k_tail_fusible
 
     # A fused group lands at its last op, which can carry a KV cache read
     # below the cache's fold: put every fold back after its last reader.

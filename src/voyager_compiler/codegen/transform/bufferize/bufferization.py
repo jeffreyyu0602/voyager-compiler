@@ -52,7 +52,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     oracle_disabled,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
-    _map_kernel,
+    _single_pass_kernel,
     build_conv2d,
     build_gemm,
     build_pipelined_buffers,
@@ -1312,7 +1312,7 @@ def _build_for_untiled(node: Node, tiler):
         for o in outputs
     ]
     scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
-    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
+    kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

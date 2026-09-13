@@ -1132,9 +1132,10 @@ def build_pipelined_buffers(
 # ``GraphModule`` (a rolled ``while_loop`` of ``voyager.*`` primitives) that
 # substitutes for the node, or ``None`` when uncovered.  They mirror
 # ``bufferization._build_for_*`` but target the pipelined scheduler: a
-# return-style per-tile ``compute`` is wrapped mutate-style by ``_map_kernel``
-# (each result written into its output slot), accumulating across the reduction
-# grid dim for a GEMM / conv and overwriting for a map.
+# return-style per-tile ``compute`` is wrapped mutate-style by
+# ``_single_pass_kernel`` (each result written into its output slot),
+# accumulating across the reduction grid dim for a GEMM / conv and
+# overwriting for a map.
 # ---------------------------------------------------------------------------
 
 
@@ -1360,7 +1361,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     )
 
 
-def _map_kernel(
+def _single_pass_kernel(
     compute: Callable,
     num_outputs: int,
     num_scratch: int = 0,
@@ -1408,6 +1409,43 @@ def _map_kernel(
         grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
+        commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
+
+    return kernel
+
+
+def _inplace_tail_kernel(
+    compute: Callable,
+    fused_gm,
+    fused_operand_indices,
+    async_pipeline: bool = False,
+):
+    """Kernel for a single-round op whose tail the drain cannot hold in one
+    pass but which keeps the tile's shape: the op writes its output slot,
+    and the tail runs a second pass over that slot in place.  No scratch is
+    needed -- the slot rotates per tile, so nothing reads it before its
+    store -- and the staged tile is in the output's dtype either way.
+
+    ``compute(in_slots, first)`` is the bare op; ``fused_gm`` takes the
+    tile and the operands ``fused_operand_indices`` name in the input
+    slots.  ``async_pipeline=True`` dispatches both passes as one commit,
+    waiting the input loads and the slot's store free, as
+    ``_single_pass_kernel`` does.
+    """
+
+    def inner(grid_index, *args):
+        *in_slots, out_slot = args
+        voyager.insert(compute(in_slots, True).to(out_slot.dtype), out_slot)
+        fused = [in_slots[i] for i in fused_operand_indices]
+        voyager.insert(fused_gm(out_slot, *fused), out_slot)
+
+    if not async_pipeline:
+        return inner
+
+    def kernel(
+        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
+    ):
+        operands = [grid_index, *in_slots, *out_slots]
         commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
 
     return kernel
@@ -1683,48 +1721,45 @@ def _reduction_fused_kernel(
     scratch_slots: int = 1,
     async_pipeline: bool = False,
 ):
-    """Kernel for an op that stages its result in scratch: a reduction that
-    needs > 1 tile (num_k > 1 GEMM / conv), or a single-tile one whose fused
-    tail must read a materialized tile (the num_k == 1 case whose tail rides
-    the compute pass uses ``_map_kernel``).
+    """Kernel for an op whose finished tile passes through scratch: a
+    reduction over several K tiles, or a single round whose tail cannot ride
+    the compute pass (``_single_pass_kernel`` handles the one that can).
 
-    The partial accumulates into a scratch ref; the last step casts it to
-    ``op_dtype`` and maps it through the fused tail (if any) into the out
-    slot(s).  The bias rides only the first step — the same step that
-    initializes the accumulator — so bias gate and reduction init share the
-    single reduction ``torch.cond``.
+    Every round but the last accumulates into the scratch ref.  What the
+    last round does depends on ``chain_tail`` and ``split``::
 
-    A ``chain_tail`` finalize runs the tail chained on the live value —
-    whole (``split is None``), or its layout-preserving head only, with the
-    split-off ``quantize_mx`` reading the staged tile in the accumulator's
-    own layout, the relayout (if any) folded into that pass.  An unchained
-    tail reads the completed accumulator back from scratch.  Both nests
-    share this logic; the async variant dispatches each round as a
-    ``commit``.
+        chain_tail  split   last round
+        ----------  ------  --------------------------------------------
+        True        None    whole tail chained on the live value, stored
+        True        given   head chained on the live value into scratch;
+                            the relayout + quantize run as a staged pass
+        False       any     live value written to scratch; the whole tail
+                            runs as a staged pass
+
+    The bias rides the first round only, the one that initializes the
+    accumulator.  Both nests share this logic; the async variant dispatches
+    each round as a ``commit``.
 
     Args:
-        compute: ``compute(in_slots, first)`` — the bare op on the current
-            tiles; ``first`` folds the bias straight into the op.
+        compute: ``compute(in_slots, first)``, the bare op on the current
+            tiles; ``first`` folds the bias into the op.
         reduction_dim: Grid dim of the cross-tile reduction (K / C).
         last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``);
-            0 selects the single-round staging variant.
-        op_dtype: Output dtype the finished accumulator is cast to, or
-            ``None`` when it already accumulates in the output dtype.
+            0 selects the single-round variant.
+        op_dtype: Dtype the finished accumulator is cast to, or ``None``
+            when it already accumulates in the output dtype.
         num_outputs: Number of output tiles the kernel writes.
         fused_gm: The fused tail ``[acc, *operands] -> output(s)``, or
             ``None``.
-        chain_tail: Finalize the fused tail on the live accumulated value
-            instead of materializing it into scratch first
-            (``meta['accumulate_fusible']``).  Honored by both nests for a
-            multi-round reduction; the sync single-round case keeps the
-            staged shape.
-        split: The tail's ``_split_stream_break`` classification, from the
-            caller — ``None`` chains the tail whole.
+        chain_tail: Run the tail (or its head) on the live accumulated
+            value rather than from scratch; see the table.
+        split: The tail's ``_split_stream_break`` classification, or
+            ``None`` when nothing in it breaks the stream.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
-        scratch_slots: Slot count of the scratch accumulator — how the
-            scratch re-read race is closed (see ``on_last``); only 1 and 2
-            are meaningful, and only for the async variant.
+        scratch_slots: Slots of the scratch accumulator, 1 or 2; with 2 the
+            staged pass stays inside the commit, with 1 it runs bare after
+            it (async variant only).
         async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
             instead of the synchronous body.
 
@@ -2017,11 +2052,11 @@ def _gemm_scratch_and_kernel(
     fused_idx,
     anchor,
     accumulate_fp32,
-    chain_tail,
     async_pipeline,
     single_buffer_tail=False,
     split=_CLASSIFY,
-    staged=False,
+    single_k_tail_fusible=True,
+    split_k_tail_fusible=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -2039,18 +2074,18 @@ def _gemm_scratch_and_kernel(
         anchor: The op node, carrying the tiler's ``scratch_slots`` meta.
         accumulate_fp32: Accumulate the reduction in fp32 rather than the
             output dtype.
-        chain_tail: Whether the tail chains into the async finalize pass.
         async_pipeline: The async kernel variants, or the sync ones.
         single_buffer_tail: Collapse a sync reduction's operand banks to one.
         split: The tail's ``_split_stream_break`` result, precomputed by a
             caller whose kernel is rebuilt under export tracing (the sparse
             GEMM), where the classification's graph walk cannot run; the
             sentinel classifies here.
-        staged: Force the staged path even for an unsplit single round —
-            the tail re-reads its tile from scratch (a CSR-producing
-            epilogue staging its prefix result, or a tail the drain cannot
-            hold in one pass, ``meta['drain_fusible']``), so the
-            ``num_k == 1`` map shortcut must not apply.
+        single_k_tail_fusible: The tail rides a single round's pass.
+            Otherwise it runs a second pass over the finished tile: in
+            place on the output slot if it keeps the tile's shape, else
+            through scratch.
+        split_k_tail_fusible: The tail chains into a split reduction's
+            finalize pass.
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -2083,10 +2118,21 @@ def _gemm_scratch_and_kernel(
 
     if split is _CLASSIFY:
         split = _split_stream_break(fused_gm, acc_shape)
-    if num_k == 1 and split is None and not staged:
+    if num_k == 1 and split is None and single_k_tail_fusible:
         scratch_specs = []
-        kernel = _map_kernel(
+        kernel = _single_pass_kernel(
             compute, len(out_specs), async_pipeline=async_pipeline
+        )
+    elif (
+        num_k == 1
+        and split is None
+        and fused_gm is not None
+        and len(out_specs) == 1
+        and tuple(out_specs[0].tile_sizes) == tuple(acc_shape)
+    ):
+        scratch_specs = []
+        kernel = _inplace_tail_kernel(
+            gemm_kernel, fused_gm, fused_idx, async_pipeline=async_pipeline
         )
     elif fused_gm is None and acc_dtype == out_dtype:
         scratch_specs = []
@@ -2106,7 +2152,7 @@ def _gemm_scratch_and_kernel(
         # second slot; a chained-whole tail never races and keeps one.  The
         # count is the tiler's per-node call (the scratch ladder winner,
         # stamped with the tiling).
-        sync = not chain_tail or split is not None
+        sync = not split_k_tail_fusible or split is not None
         scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
         slots = scratch_slots if sync else 1
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
@@ -2117,7 +2163,7 @@ def _gemm_scratch_and_kernel(
             num_outputs=len(out_specs),
             op_dtype=(out_dtype if acc_dtype != out_dtype else None),
             fused_gm=fused_gm,
-            chain_tail=chain_tail,
+            chain_tail=split_k_tail_fusible,
             split=split,
             fused_operand_indices=fused_idx,
             scratch_slots=slots,
@@ -2366,10 +2412,10 @@ def build_conv2d(
         fused_idx=fused_idx,
         anchor=anchor,
         accumulate_fp32=accumulate_fp32,
-        chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
-        staged=not node.meta.get("drain_fusible", True),
+        single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
+        split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
     gm = build_pipelined_buffers(
         kernel,
@@ -2777,10 +2823,10 @@ def build_gemm(
         fused_idx=plan.fused_idx,
         anchor=plan.anchor,
         accumulate_fp32=accumulate_fp32,
-        chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
-        staged=not node.meta.get("drain_fusible", True),
+        single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
+        split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
     gm = build_pipelined_buffers(
         kernel,
@@ -2980,7 +3026,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         for o, ts in zip(outputs, tiled_shape)
     ]
     scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
-    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
+    kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,
@@ -3085,7 +3131,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
             # Padding zeroed (folded into the halo load).
             return anchor.target(tile, [kH, kW], [sh, sw], [0, 0], *extra)
 
-        kernel = _map_kernel(compute, 1)
+        kernel = _single_pass_kernel(compute, 1)
         return build_pipelined_buffers(
             kernel,
             grid,
@@ -3128,7 +3174,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    kernel = _map_kernel(submod, len(outputs))
+    kernel = _single_pass_kernel(submod, len(outputs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

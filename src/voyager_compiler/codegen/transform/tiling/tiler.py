@@ -90,6 +90,7 @@ def spmm_scale_rows(mapping):
     ic, oc = mapping.loop_blockings[le.IC], mapping.loop_blockings[le.OC]
     return ic[1] * ic[2] * oc[1]
 
+
 # The non-reduction L3 loops a builder's grid may permute, outermost to
 # innermost, in the order it emits when nothing says otherwise.  The reduction
 # is always innermost (the kernels accumulate in place) and the gemm batch dims
@@ -404,7 +405,8 @@ def make_size_fn(
     fused_specs=(),
     constraint=None,
     has_tail=False,
-    staged_tail=False,
+    single_k_tail_extra_pass=False,
+    tail_keeps_shape=False,
     scratch_regions=1,
     num_slots=1,
     batch=1,
@@ -438,12 +440,14 @@ def make_size_fn(
     what lets a load overlap the compute reading the other half.  A split
     reduction with a fused tail also accumulates into a scratch buffer the
     builders allocate exactly once (``_ScratchSpec``); it is charged a single
-    bank-aligned region on top.  So is the finished tile a stream-breaking
-    tail (``staged_tail``) stages even for a single round.  Leaving either
-    out is what let the tiler return tilings ``plan_memory`` could not
-    place.  A split reduction whose tail reads that tile back from scratch
-    may take ``scratch_regions`` of them: a second region lets the read-back
-    pass ride the finalize commit instead of running bare, so it is charged
+    bank-aligned region on top.  So is the finished tile a tail that needs
+    a pass of its own (``single_k_tail_extra_pass``) parks even for a
+    single round, unless it keeps the tile's shape (``tail_keeps_shape``)
+    and runs that pass in place on the output slot.  Leaving either out is
+    what let the tiler return tilings ``plan_memory`` could not place.  A
+    split reduction whose tail reads that tile back from scratch may take
+    ``scratch_regions`` of them: a second region lets the read-back pass
+    ride the finalize commit instead of running bare, so it is charged
     whenever it fits beside the sources, and the tile falls back to one
     region -- priced as the bare pass -- when it does not.
 
@@ -647,9 +651,11 @@ def make_size_fn(
         # A reduction split across L3 steps accumulates into a scratch buffer
         # the builders allocate once for the whole kernel, not per ping-pong
         # half -- so it is charged one region, outside ``num_slots``.  A
-        # stream-breaking tail (``staged_tail``) stages even a single
-        # round's finished tile.
-        if has_tail and (point.loop_blocking(le.IC)[3] > 1 or staged_tail):
+        # shape-changing extra pass parks even a single round's tile.
+        if has_tail and (
+            point.loop_blocking(le.IC)[3] > 1
+            or (single_k_tail_extra_pass and not tail_keeps_shape)
+        ):
             scratch = _alloc_bytes(of_count, stage_bits)
         else:
             scratch = 0.0
@@ -775,12 +781,17 @@ class RuntimeCalculator:
             matmul as thirty-two.  ``None`` = one apiece.
         has_tail: The node has a fused post-op, so a reduction drains through
             the vector unit; a bare GEMM reduces in place and does not.
-        staged_tail: The tail runs over the staged tile even in a single
-            round, so the finished tile is read back from scratch.
-        bare_tail: A split reduction's tail reads the finished tile back
-            from scratch; with one scratch region that pass runs bare on
-            the control stream, which then issues the next tile's loads
-            only after the matrix and vector passes both finish.
+        single_k_tail_extra_pass: The tail cannot ride a single
+            round's drain and runs as a pass of its own over the finished
+            tile.
+        split_k_tail_extra_pass: The tail cannot ride a split
+            reduction's last round and reads the finished tile back from
+            scratch; with one scratch region that pass runs bare on the
+            control stream, which then issues the next tile's loads only
+            after the matrix and vector passes both finish.
+        tail_keeps_shape: The tail's output has the anchor's tile shape, so
+            a single round's extra pass runs in place on the output slot
+            instead of through scratch.
         tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
             pairs, from ``_fused_operand_specs``, in the order the bank
             partition's ``("fused", i)`` roles name them; ``vector_cycles``
@@ -814,8 +825,9 @@ class RuntimeCalculator:
         batch: int = 1,
         weight_batch: Optional[int] = None,
         has_tail: bool = False,
-        staged_tail: bool = False,
-        bare_tail: bool = False,
+        single_k_tail_extra_pass: bool = False,
+        split_k_tail_extra_pass: bool = False,
+        tail_keeps_shape: bool = False,
         tail_specs=(),
         input_scale_width: int = 0,
         weight_scale_width: int = 0,
@@ -838,8 +850,9 @@ class RuntimeCalculator:
         self.batch = batch
         self.weight_batch = batch if weight_batch is None else weight_batch
         self.has_tail = has_tail
-        self.staged_tail = staged_tail
-        self.bare_tail = bare_tail
+        self.single_k_tail_extra_pass = single_k_tail_extra_pass
+        self.split_k_tail_extra_pass = split_k_tail_extra_pass
+        self.tail_keeps_shape = tail_keeps_shape
         self.tail_specs = tuple(tail_specs)
         self.input_scale_width = input_scale_width
         self.weight_scale_width = weight_scale_width
@@ -1135,7 +1148,7 @@ class RuntimeCalculator:
         )
         store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
         vector_beats = store_cycles
-        if num_k == 1 and not self.staged_tail:
+        if num_k == 1 and not self.single_k_tail_extra_pass:
             for dims, bits in self.tail_specs:
                 vector_beats = max(
                     vector_beats,
@@ -1203,10 +1216,17 @@ class RuntimeCalculator:
             words["scratch"] = 2 * self._bus_words(
                 output_elems, self.accum_dtype_width
             )
-        elif self.staged_tail:
+        elif self.single_k_tail_extra_pass and not self.tail_keeps_shape:
             # A staged single round parks the finished tile in scratch for
             # the tail's own pass (``vector_cycles``) to read back.
             words["scratch"] = self._bus_words(
+                output_elems, self.output_dtype_width
+            )
+        elif self.single_k_tail_extra_pass:
+            # An in-place pass reads the tile back from its output slot and
+            # rewrites it: two bank visits beyond a riding tail's.
+            words.update(self._tail_words(mapping, 1))
+            words["output"] += 2 * self._bus_words(
                 output_elems, self.output_dtype_width
             )
         else:
@@ -1293,9 +1313,16 @@ class RuntimeCalculator:
         lane_bytes = max(widths) / 8 * oc_dim
         lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
         words = self._tail_words(mapping, 2)
-        if blockings[le.IC][3] > 1 or self.staged_tail:
+        if blockings[le.IC][3] > 1 or (
+            self.single_k_tail_extra_pass and not self.tail_keeps_shape
+        ):
             words["scratch"] = self._bus_words(
                 output_size * oc_dim, self.accum_dtype_width
+            )
+        elif self.single_k_tail_extra_pass:
+            # The in-place pass reads the finished tile from its output slot.
+            words["output"] += self._bus_words(
+                output_size * oc_dim, self.output_dtype_width
             )
         return max(lanes, self._bank_cycles(words, bank_groups))
 
@@ -1460,16 +1487,18 @@ class RuntimeCalculator:
 
         if not self.double_buffered_l2:
             total_time = l3_blocks * matrix_cycles + sum(t * c for c, t in dmas)
-            if num_k > 1 or self.staged_tail:
+            if num_k > 1 or self.single_k_tail_extra_pass:
                 total_time += output_tiles * vector_cycles
             return total_time
 
         if num_k == 1:
             # Every step finishes a tile: one schedule covers the sweep.  A
-            # riding tail drains inside the matrix pass; a staged one is a
-            # pass of its own, serial on the single scratch region.
+            # riding tail drains inside the matrix pass, and an in-place one
+            # overlaps the next tile's (its bank words are in the block);
+            # a staged one is a pass of its own, serial on the single
+            # scratch region.
             step = matrix_cycles
-            if self.staged_tail:
+            if self.single_k_tail_extra_pass and not self.tail_keeps_shape:
                 step += vector_cycles
             return _sweep_cycles(dmas, l3_blocks, step)
 
@@ -1493,7 +1522,7 @@ class RuntimeCalculator:
         # window to the next -- hence one price per class.
         for tail, count in classes:
             prefetch = load + tail
-            if self.bare_tail and scratch_slots == 1:
+            if self.split_k_tail_extra_pass and scratch_slots == 1:
                 # The bare pass holds the control stream through both the
                 # matrix and the vector pass, so the window's loads are
                 # issued only then and nothing hides them.
@@ -1622,12 +1651,12 @@ def _prepare_search(node, tiler, constraint=None):
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
-    # A tail whose quantize breaks the compute stream, or that the drain
-    # cannot hold in one pass, stages the finished tile even for a
-    # single-round reduction (``_gemm_scratch_and_kernel``); the footprint
-    # model must charge that region for unsplit mappings too.
-    staged_tail = stream_breaking_quantize(sub_gm) is not None or not (
-        node.meta.get("drain_fusible", True)
+    # The tail needs a pass of its own when its quantize breaks the stream
+    # or the pipeline has no stage left for it: after the drain on a single
+    # round, after the accumulate on a split one, which takes one more.
+    breaks_stream = stream_breaking_quantize(sub_gm) is not None
+    single_k_tail_extra_pass = (
+        breaks_stream or not node.meta.get("single_k_tail_fusible", True)
     )
     # The tail's own ``quantize_mx_outlier``, if it has one: this group is
     # then a CSR producer as well as (possibly) a consumer.
@@ -1637,28 +1666,30 @@ def _prepare_search(node, tiler, constraint=None):
             (n for n in sub_gm.graph.nodes if n.target is _QUANTIZE_MX_OUTLIER),
             None,
         )
-    if not staged_tail and out_quant is not None:
+    if not single_k_tail_extra_pass and out_quant is not None:
         # A CSR-producing epilogue (``_EpilogueTail``) re-dices its tile at
         # the consumers' slice width: ops between the anchor and the
         # quantize run once on the whole tile, and their result is staged in
         # the scratch whenever a slice is finer than the column tile.  The
         # slice count is a consumer property the search cannot see, so every
         # prefixed producer tail charges the staged region.
-        staged_tail = (
+        single_k_tail_extra_pass = (
             isinstance(out_quant.args[0], torch.fx.Node)
             and out_quant.args[0].target is not anchor.target
         )
-    # A split reduction's tail reads the finished tile back from scratch
-    # when the accumulate cannot chain it, or a quantize breaks the stream
-    # (``_gemm_scratch_and_kernel``'s sync path).  A second scratch region
-    # lets that pass ride the finalize commit -- except in a CSR-producing
-    # nest, whose stores run bare after the commit and pin one region
-    # (``_SparseGemm``).
-    bare_tail = has_tail and (
-        stream_breaking_quantize(sub_gm) is not None
-        or not node.meta.get("accumulate_fusible", False)
+    # A single round's extra pass runs in place when the tail keeps the
+    # tile's shape, else through scratch (``_gemm_scratch_and_kernel``).
+    tail_keeps_shape = (
+        not isinstance(node.value, (tuple, list))
+        and tuple(node.value.shape) == tuple(anchor.value.shape)
     )
-    scratch_regions = 2 if bare_tail and out_quant is None else 1
+    # A split reduction's extra pass reads the tile back from scratch; a
+    # second region lets it ride the finalize commit, except in a
+    # CSR-producing nest, whose bare stores pin one (``_SparseGemm``).
+    split_k_tail_extra_pass = has_tail and (
+        breaks_stream or not node.meta.get("split_k_tail_fusible", False)
+    )
+    scratch_regions = 2 if split_k_tail_extra_pass and out_quant is None else 1
 
     # A projection GEMM feeding an MHA relayout must tile OC on whole heads
     # else _detect_mha_relayout can't store the tile: that joins whatever
@@ -1670,12 +1701,6 @@ def _prepare_search(node, tiler, constraint=None):
             head = TileConstraint(multiple=((le.OC, perm.value.shape[-1]),))
             constraint = head.merged(constraint)
 
-    # An outlier GEMM's CSR: what fraction of the activation the packed stream
-    # is sized to hold (the staging window), read off the operand's shape so
-    # tiling stays independent of the bufferize builders, and what fraction
-    # calibration observed (the weight rows the engine gathers), which
-    # ``convert_pt2e`` stamps on the GEMM.  The two differ: the stream is
-    # storage and may carry headroom.
     outlier_pct = 0.0
     outlier_rate = 0.0
     a_data = anchor.kwargs.get("A_data")
@@ -1706,8 +1731,9 @@ def _prepare_search(node, tiler, constraint=None):
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
         has_tail,
-        staged_tail,
-        bare_tail,
+        single_k_tail_extra_pass,
+        split_k_tail_extra_pass,
+        tail_keeps_shape,
         scratch_regions,
         constraint,
         outlier_pct,
@@ -1772,8 +1798,9 @@ def _prepare_search(node, tiler, constraint=None):
         batch=batch,
         weight_batch=batch // weight_repeat,
         has_tail=has_tail,
-        staged_tail=staged_tail,
-        bare_tail=bare_tail,
+        single_k_tail_extra_pass=single_k_tail_extra_pass,
+        split_k_tail_extra_pass=split_k_tail_extra_pass,
+        tail_keeps_shape=tail_keeps_shape,
         tail_specs=fused_specs,
         input_scale_width=if_scale_bits,
         weight_scale_width=fl_scale_bits,
@@ -1794,7 +1821,8 @@ def _prepare_search(node, tiler, constraint=None):
         fused_specs,
         constraint=constraint,
         has_tail=has_tail,
-        staged_tail=staged_tail,
+        single_k_tail_extra_pass=single_k_tail_extra_pass,
+        tail_keeps_shape=tail_keeps_shape,
         scratch_regions=scratch_regions,
         num_slots=tiler.config.num_slots,
         batch=batch,

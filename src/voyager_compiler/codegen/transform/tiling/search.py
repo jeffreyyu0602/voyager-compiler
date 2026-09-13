@@ -250,7 +250,7 @@ def _staged_scratch_bytes(node, tiled_shapes, config) -> int:
         for n, (role, _) in operand_roles(node).items()
     )
     staged = stream_breaking_quantize(sub_gm) is not None or not node.meta.get(
-        "drain_fusible", True
+        "single_k_tail_fusible", True
     )
     if not (split_k or staged):
         return 0

@@ -245,8 +245,8 @@ class _SparseGemm(torch.nn.Module):
         data_dtype,
         *,
         out_geom=None,
-        accumulate_fusible: bool,
-        drain_fusible: bool = True,
+        split_k_tail_fusible: bool,
+        single_k_tail_fusible: bool = True,
         num_slots: int = _DEFAULT_NUM_SLOTS,
         accumulate_fp32: bool = False,
         async_pipeline: bool = False,
@@ -339,9 +339,9 @@ class _SparseGemm(torch.nn.Module):
             out_geom is not None
             and self.n_sub == 1
             and not racing
-            and (accumulate_fusible or plan.num_k == 1)
+            and (split_k_tail_fusible or plan.num_k == 1)
         )
-        self.chain_fused_tail = accumulate_fusible and out_geom is None
+        self.chain_fused_tail = split_k_tail_fusible and out_geom is None
         if geom is not None:
             # ``in_sems`` carries one semaphore per *tiled* operand — a
             # ``None``-spec operand is passed through without one — so the
@@ -359,8 +359,8 @@ class _SparseGemm(torch.nn.Module):
         # its tile at an index the rolled loop supplies at runtime, and an
         # unchained single-slice one, which runs its stores bare after the
         # commit.  ``staged`` is what puts the tile in scratch: its sole
-        # effect is to disqualify ``_map_kernel``, which allocates none.
-        self.stage_tile = not drain_fusible or (
+        # effect is to disqualify ``_single_pass_kernel``, which allocates none.
+        self.stage_tile = not single_k_tail_fusible or (
             out_geom is not None and (self.n_sub > 1 or not self.chain_epilogue)
         )
         # A finalize writes the five staging tiles, and the store that
@@ -461,10 +461,10 @@ class _SparseGemm(torch.nn.Module):
             fused_idx=fused_idx,
             anchor=plan.anchor,
             accumulate_fp32=self.accumulate_fp32,
-            chain_tail=self.chain_epilogue or self.chain_fused_tail,
             async_pipeline=self.async_pipeline,
             split=self.tail_split if tail is plan.fused_gm else None,
-            staged=self.stage_tile,
+            single_k_tail_fusible=not self.stage_tile,
+            split_k_tail_fusible=self.chain_epilogue or self.chain_fused_tail,
         )
 
     def _gather_rolled(self, idx, slots, slot=None, row=None, post_count=1):
@@ -1180,8 +1180,8 @@ def build_sparse_gemm(
         geom,
         data_dtype,
         out_geom=out_geom,
-        accumulate_fusible=node.meta.get("accumulate_fusible", False),
-        drain_fusible=node.meta.get("drain_fusible", True),
+        split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
+        single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
         num_slots=num_slots,
         accumulate_fp32=accumulate_fp32,
         async_pipeline=async_pipeline,
