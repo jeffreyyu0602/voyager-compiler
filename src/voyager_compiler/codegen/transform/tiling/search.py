@@ -23,6 +23,7 @@ from voyager_compiler.codegen.node_info import (
     quant_param_arg_nodes,
     reduction_scratch,
     require_allocation,
+    stream_breaking_quantize,
     tensor_alloc_bytes,
     trailing_mha_perm,
     weight_is_ck,
@@ -220,6 +221,50 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
     )
 
 
+def _staged_scratch_bytes(node, tiled_shapes, config) -> int:
+    """Bytes of the accumulator a GEMV's fused tail reduces into.
+
+    Mirrors ``make_size_fn``'s charge on the interstellar side (``tiler.py``):
+    the builder allocates one ``_ScratchSpec`` for the whole kernel when the
+    reduction is split across K, and when a stream-breaking tail stages the
+    finished tile even for a single round (``_gemm_scratch_and_kernel``).
+    0 when it allocates none.
+
+    Sized off the shape-preserving output tile -- a ``quantize_mx`` tail
+    returns ``(scale, value)`` -- in the anchor's own dtype, the psum type
+    the accumulator holds.
+    """
+    anchor = get_anchor_node(node)
+    sub_gm = node.meta.get("submodule")
+    if anchor is None or sub_gm is None or not is_fully_connected(anchor):
+        return 0
+    # A submodule is not a tail: one holding only the anchor's prologue
+    # leaves the builder no tail to stage, and it allocates nothing.
+    ops = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
+    if not ops or ops[-1] is anchor:
+        return 0
+    split_k = any(
+        role == "input"
+        and n in tiled_shapes
+        and tiled_shapes[n][-1] < anchor.args[0].shape[-1]
+        for n, (role, _) in operand_roles(node).items()
+    )
+    staged = stream_breaking_quantize(sub_gm) is not None or not node.meta.get(
+        "drain_fusible", True
+    )
+    if not (split_k or staged):
+        return 0
+    out_tile = tiled_shapes[node]
+    if isinstance(out_tile[0], (tuple, list)):
+        out_tile = out_tile[-1]
+    return tensor_alloc_bytes(
+        math.prod(out_tile),
+        anchor.value.dtype,
+        config.bank_width,
+        config.vector_lanes,
+    )
+
+
 def _bank_groups(node, tiled_shapes, config, extra_sharing):
     """The bank partition one candidate tile implies: ``(bytes, members)``
     pairs, one per bank, already merged smallest-first while the groups
@@ -227,7 +272,8 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
     partition).  ``members`` are the operand FX nodes sharing the bank -- the
     buffers the kernel loads, which the shape maps key their tiles by -- the
     op node itself stands for the output, ``BANK_GROUP_RESERVED`` for the
-    ``reduction_scratch`` regions.  Unmerged (one group per operand) when
+    ``reduction_scratch`` regions and the tail's accumulator
+    (``_staged_scratch_bytes``).  Unmerged (one group per operand) when
     ``config.bank_size`` is unset."""
     # ``groups`` is the bank layout, one entry per bank: the groups that match,
     # then any operand they do not name on its own.  A ``where`` lays out as
@@ -261,6 +307,7 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
             node, tiled_shapes[node], config.vector_lanes
         )
     )
+    reserved += _staged_scratch_bytes(node, tiled_shapes, config)
     if reserved:
         sized.append((reserved, [BANK_GROUP_RESERVED]))
 
@@ -491,7 +538,9 @@ def _prologue_tile(tile, operand_shape, param_shape):
     """Tile of a parameter read beside an operand: the operand's tile, shrunk
     along every dim by the ratio of the two full shapes.  Ranks that do not
     line up fall back to the whole parameter."""
-    if len(tile) != len(operand_shape) or len(operand_shape) != len(param_shape):
+    if len(tile) != len(operand_shape) or len(operand_shape) != len(
+        param_shape
+    ):
         return tuple(param_shape)
     return tuple(
         max(1, math.ceil(t * q / f))
@@ -537,7 +586,9 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
                 shapes[outer] = (
                     tile
                     if p is source
-                    else _prologue_tile(tile, tuple(n.shape), tuple(outer.shape))
+                    else _prologue_tile(
+                        tile, tuple(n.shape), tuple(outer.shape)
+                    )
                 )
 
         # What the tail brought of its own -- a residual, a mask -- has no role
