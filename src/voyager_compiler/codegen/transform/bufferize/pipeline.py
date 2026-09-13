@@ -72,7 +72,7 @@ from voyager_compiler.ops.layout import (
     project,
     unproject,
 )
-from voyager_compiler.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp, fake_like, set_node_value
 
 _SRAM = int(MemoryLevel.SRAM)
 
@@ -1494,6 +1494,11 @@ def _split_part(fused_gm, part_ops, root, name, result):
         remap[p] = pg.placeholder(p.name)
     for n in part_ops:
         remap[n] = pg.node_copy(n, lambda x: remap[x])
+    # Re-rooting changes no shapes: keep the tile-granularity values
+    # ``_stamp_tail_shapes`` gave the tail, which ``node_copy`` drops.
+    for src, dst in remap.items():
+        if hasattr(src, "value"):
+            set_node_value(dst, src.value)
     pg.output(
         tuple(remap[r] for r in result)
         if isinstance(result, (tuple, list))
@@ -1501,6 +1506,32 @@ def _split_part(fused_gm, part_ops, root, name, result):
     )
     pg.lint()
     return torch.fx.GraphModule(torch.nn.Module(), pg)
+
+
+def _stamp_tail_shapes(
+    fused_gm, acc_shape, acc_dtype, inputs, in_specs, fused_idx
+):
+    """Give the fused tail its tile-granularity shapes.
+
+    ``_build_fused_gm`` copies the tail's nodes without the values ShapeProp
+    stamped on the submodule -- whole-tensor shapes anyway.  A shapeless tail
+    makes ``stream_breaking_quantize`` take every relayout for a real permute
+    and stage a tile a rename of size-1 dims never needed, so run the tail
+    once on fakes of what the kernel hands it: the accumulator tile and each
+    fused operand's tile (the operand itself when it is passed whole).
+    """
+    if not isinstance(fused_gm, torch.fx.GraphModule):
+        return
+    acc = fake_like(torch.empty(tuple(acc_shape), dtype=acc_dtype))
+    tiles = []
+    for i in fused_idx:
+        spec = in_specs[i]
+        if spec is None:
+            tiles.append(fake_like(inputs[i]))
+        else:
+            tile = torch.empty(tuple(spec.tile_sizes), dtype=inputs[i].dtype)
+            tiles.append(fake_like(tile))
+    ShapeProp(fused_gm).propagate(acc, *tiles)
 
 
 def _split_stream_break(fused_gm, acc_shape):
@@ -2694,12 +2725,17 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         bias = in_tiles[bias_idx] if first else None
         return op(act_tile, weight_tile, bias, **kw)
 
+    acc_shape = tuple(tb) + (tm, tn)
+    _stamp_tail_shapes(
+        fused_gm, acc_shape, anchor.value.dtype, inputs, in_specs, fused_idx
+    )
+
     return _GemmPlan(
         anchor=anchor,
         grid=grid,
         grid_dims=(gm, gn, gk),
         tile_k=tk,
-        acc_shape=tuple(tb) + (tm, tn),
+        acc_shape=acc_shape,
         inputs=tuple(inputs),
         in_specs=in_specs,
         out_specs=out_specs,
