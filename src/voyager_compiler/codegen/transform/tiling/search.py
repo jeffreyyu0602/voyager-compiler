@@ -913,8 +913,9 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
             math.prod(shape), acc_dtype, config.bank_width, config.vector_lanes
         )
 
-    # m, l, row_tmp, alpha; o, pv_buf; the double-buffered s_buf.
-    total += 4 * acc_bytes((tq, 1))
+    # m, row_tmp, alpha and the two slots of l; o, pv_buf; the
+    # double-buffered s_buf.
+    total += 5 * acc_bytes((tq, 1))
     total += 2 * acc_bytes((tq, head_dim))
     total += 2 * acc_bytes((tq, tkv))
     block_size = node.kwargs.get("block_size")

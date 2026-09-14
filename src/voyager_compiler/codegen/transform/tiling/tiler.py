@@ -2398,8 +2398,8 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
     identical shapes share one search, run concurrently by
     ``prefetch_tilings`` -- and ranks the candidates by
     ``attention_tile_latency`` the way ``_search_tiling`` ranks a vector
-    op: the least DRAM traffic among the tilings within
-    ``DEFAULT_RUNTIME_TOLERANCE`` of the fastest.  The winner's product
+    op: the least DRAM traffic among the tilings within the tiler's
+    ``runtime_tolerance`` of the fastest.  The winner's product
     mappings are left as ``node.meta["product_tilings"]`` -- ``"scores"``
     and ``"context"``, each what ``get_tiling`` stamps on a GEMM -- for the
     builder to copy onto the kernels that run them.
@@ -2502,7 +2502,7 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
     if not scored:
         raise RuntimeError(f"{node}: no tiling of its products maps on chip")
 
-    fastest = min(s[0] for s in scored) * (1.0 + DEFAULT_RUNTIME_TOLERANCE)
+    fastest = min(s[0] for s in scored) * (1.0 + tiler.runtime_tolerance)
     best = min(
         (s for s in scored if s[0] <= fastest), key=lambda s: (s[1], s[0])
     )

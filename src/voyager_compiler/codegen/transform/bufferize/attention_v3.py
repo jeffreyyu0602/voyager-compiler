@@ -11,16 +11,22 @@ accumulate/rescale are synchronous.  Each async matmul is dispatched with
 posts a done-semaphore (``sem_scores`` for QKᵀ, ``sem_pv`` for P@V) that
 ``voyager.async_wait`` consumes where a synchronous op reads the result.
 
-Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program order:
+Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``, ``sweep =
+step // N`` the Q tile's index), in program order:
 
   [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];  commit, post sem_scores
   [B] pv_buf = p_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
-  [C] kv == 0 only (a Q-tile boundary): wait sem_pv; o += pv_buf; drain the
-      previous output store; (o / l) -> o_slots; store o_slots to the PREVIOUS
-      tile's DRAM rows (the finalize belongs to the tile that just ended);
-      reset m/o/l.
+  [C] kv == 0 only (a Q-tile boundary): fresh state for the new tile, m =
+      -inf and l[sweep % 2] = 0.  The sum ``l`` is double-buffered by sweep
+      parity so the tile that just ended keeps its own for [E]; m and o are
+      not, since [E] never reads m and zeroes o before the next [F].
   [D] wait sem_scores;  softmax chain (rowmax, m, alpha, P, rowsum, l).
-  [E] kv >= 1 only (vector unit, after [D]): wait sem_pv;  the deferred
+  [E] kv == 0 only: wait sem_pv; o += pv_buf; drain the previous output
+      store; (o / l[(sweep + 1) % 2]) -> o_slots; store o_slots to the
+      PREVIOUS tile's DRAM rows (the finalize belongs to the tile that just
+      ended); o = 0.  After [D], so the vector unit is not held on sem_pv
+      before the softmax that overlaps [B].
+  [F] kv >= 1 only (vector unit, after [D]): wait sem_pv;  the deferred
       rescale fused with the accumulate, o = alpha·(o + pv_buf).
 
 The probabilities ``p_buf`` are ``s_buf`` itself -- [D] exponentiates the
@@ -325,10 +331,10 @@ class _FA3Pipeline(torch.nn.Module):
             voyager.insert(scale, p_scale)
             voyager.insert(codes, p_slot)
 
-    def _reset(self, m, l, o):
+    def _reset(self, m, l):
+        """[C]: the running max and sum a new Q tile starts from."""
         voyager.insert(torch.full_like(m, _MASK_FILL), m)
         voyager.insert(torch.zeros_like(l), l)
-        voyager.insert(torch.zeros_like(o), o)
 
     def _fold_mask(self, mask):
         return fold_mask_tensor(
@@ -397,11 +403,12 @@ class _FA3Pipeline(torch.nn.Module):
         out_slots = voyager.alloc([*unit, tq, d], out.dtype, _SRAM, 1)
         out_sem = voyager.zeros([], torch.int64, num_slots=1)
 
-        # Running softmax state (single-buffered — see module docstring)
-        # and the parity-double-buffered scores/probabilities tile.
+        # Running softmax state -- the sum per sweep parity, the rest
+        # single-buffered (see module docstring) -- and the
+        # parity-double-buffered scores/probabilities tile.
         acc = self.acc_dtype
         m = voyager.alloc([*unit, tq, 1], acc, _SRAM)
-        l = voyager.alloc([*unit, tq, 1], acc, _SRAM)
+        l = voyager.alloc([*unit, tq, 1], acc, _SRAM, 2)
         o = voyager.alloc([*unit, tq, d], acc, _SRAM)
         s_buf = voyager.alloc([*unit, tq, tkv], acc, _SRAM, 2)
         # P: under MX its codes and block scales (see the module docstring);
@@ -508,12 +515,12 @@ class _FA3Pipeline(torch.nn.Module):
                 tiles = [p_tile, v_tile]
             return tiles, deps
 
-        def softmax(slot):
+        def softmax(slot, sweep_slot):
             self._softmax(
                 get_slot(s_buf, slot),
                 get_slot(p_buf, slot),
                 m,
-                l,
+                get_slot(l, sweep_slot),
                 row_tmp,
                 alpha,
                 sem_scores,
@@ -537,10 +544,11 @@ class _FA3Pipeline(torch.nn.Module):
         # consumes no V.
         load_v(1 % 2, c0)
 
-        self._reset(m, l, o)
+        self._reset(m, get_slot(l, 0))
+        voyager.insert(torch.zeros_like(o), o)
         tiles, deps = qk_operands(0, 0)
         self._matmul_qk(tiles, get_slot(s_buf, 0), sem_scores, deps)
-        softmax(0)
+        softmax(0, 0)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
         def cond_fn(step):
@@ -567,11 +575,11 @@ class _FA3Pipeline(torch.nn.Module):
             torch.cond(step + 1 < num_steps, k_fetch, lambda: 0)
             load_v(nxt_slot, cur)
 
-            q_next_slot = ((step + 1) // N) % 2
-            torch._check(q_next_slot < 2)
+            next_sweep_slot = ((step + 1) // N) % 2
+            torch._check(next_sweep_slot < 2)
 
             def q_fetch():
-                load_q(q_next_slot, nxt)
+                load_q(next_sweep_slot, nxt)
                 return 1
 
             torch.cond(
@@ -583,10 +591,10 @@ class _FA3Pipeline(torch.nn.Module):
             # Q is loaded once per sweep, so its load posts N times (see
             # _load_sweep) to balance the per-step consume.  V is not a
             # dependency here — it feeds [B], so [A] issues while V's DMA is
-            # in flight.
-            q_slot = (step // N) % 2
-            torch._check(q_slot < 2)
-            tiles, deps = qk_operands(q_slot, cur_slot)
+            # in flight.  The sweep's parity picks its Q slot and its ``l``.
+            sweep_slot = (step // N) % 2
+            torch._check(sweep_slot < 2)
+            tiles, deps = qk_operands(sweep_slot, cur_slot)
             self._matmul_qk(tiles, get_slot(s_buf, cur_slot), sem_scores, deps)
 
             # [B] the lagged P@V on the matrix unit: previous step's
@@ -597,29 +605,43 @@ class _FA3Pipeline(torch.nn.Module):
             tiles, deps = pv_operands(prev_slot, cur_slot)
             self._matmul_pv(tiles, pv_buf, sem_pv, deps)
 
-            # [C] Q-tile boundary: land the previous tile's last P@V into o,
-            # finalize (o / l) to ITS rows, reset for the new tile.  Runs
-            # before [D] so the new tile's softmax sees fresh m/l.
-            def boundary():
+            # [C] Q-tile boundary, first half: fresh m and l for the new
+            # tile.  The tile that just ended keeps its sum in the other l
+            # slot for the finalize, which waits until after [D].
+            def reset():
+                self._reset(m, get_slot(l, sweep_slot))
+                return 1
+
+            torch.cond(kv == 0, reset, lambda: 0)
+
+            # [D] softmax of the current block on the vector unit — runs
+            # (synchronously) while the matrix [B] matmul is still in flight.
+            softmax(cur_slot, sweep_slot)
+
+            # [E] Q-tile boundary, second half: land the previous tile's last
+            # P@V into o, finalize (o / its l) to ITS rows, zero o for the
+            # new tile.  After [D] so the vector unit is not held on sem_pv
+            # before the softmax.
+            prev_sweep_slot = (step // N + 1) % 2
+            torch._check(prev_sweep_slot < 2)
+
+            def finalize():
                 voyager.async_wait(sem_pv)
                 voyager.insert(o + pv_buf, o)
                 # Drain the previous boundary's store before overwriting
                 # the slot (no prior store exists at the first boundary).
                 _guarded_wait(get_slot(out_sem, 0), step >= 2 * N)
                 voyager.insert(
-                    (o / l).to(self.out_dtype), get_slot(out_slots, 0)
+                    (o / get_slot(l, prev_sweep_slot)).to(self.out_dtype),
+                    get_slot(out_slots, 0),
                 )
                 self._store_out(get_slot(out_slots, 0), out, out_sem, prev)
-                self._reset(m, l, o)
+                voyager.insert(torch.zeros_like(o), o)
                 return 1
 
-            torch.cond(kv == 0, boundary, lambda: 0)
+            torch.cond(kv == 0, finalize, lambda: 0)
 
-            # [D] softmax of the current block on the vector unit — runs
-            # (synchronously) while the matrix [B] matmul is still in flight.
-            softmax(cur_slot)
-
-            # [E] deferred rescale fused with the P@V accumulate: o = alpha·(o
+            # [F] deferred rescale fused with the P@V accumulate: o = alpha·(o
             # + pv).  Runs after softmax (kv >= 1 only) so the vector unit
             # isn't blocked on sem_pv before the softmax.
             def rescale():
@@ -643,7 +665,11 @@ class _FA3Pipeline(torch.nn.Module):
         voyager.insert(o + pv_buf, o)
         if num_steps > N:  # a prior boundary store exists (static)
             voyager.async_wait(get_slot(out_sem, 0))
-        voyager.insert((o / l).to(self.out_dtype), get_slot(out_slots, 0))
+        last_sweep_slot = ((num_steps - 1) // N) % 2
+        voyager.insert(
+            (o / get_slot(l, last_sweep_slot)).to(self.out_dtype),
+            get_slot(out_slots, 0),
+        )
         self._store_out(get_slot(out_slots, 0), out, out_sem, c_last)
         voyager.async_wait(get_slot(out_sem, 0))  # drain
         if self.g_head > 1:

@@ -455,10 +455,11 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     the matrix unit while the vector unit runs the softmax chain, which had
     to wait for the scores -- so a step costs the scores plus the busier of
     the two, then the rescale that folds the context in.  A query block's
-    first step is a boundary: the vector unit waits for the previous block's
-    context to finalize that block before its own softmax, so nothing
-    overlaps there.  The products are priced by their interstellar mappings
-    (``matrix``); each vector pass at the bandwidth-bound rate
+    first step is a boundary: the vector unit resets its state, runs the
+    softmax, then finalizes the previous block once that block's context has
+    landed, so the finalize takes the rescale's place beside the context.
+    The products are priced by their interstellar mappings (``matrix``);
+    each vector pass at the bandwidth-bound rate
     ``vector_op_utilization`` charges, plus its launch.  Query and output
     move once per query block, while key, value, mask and every block scale
     reload on each step, and the DMAs overlap compute the way
@@ -494,16 +495,16 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     # The softmax chain: rowmax, exponentials and rowsum over the score tile
     # (and P's quantize under MX); the running max, the rescale factor, its
     # copy and the running sum over a column.  Then the fused
-    # rescale-accumulate over the output tile, or at a boundary the
-    # accumulate, the finalize and the reset of the output tile and the two
-    # columns.
+    # rescale-accumulate over the output tile, or at a boundary the reset of
+    # the two columns before the softmax and, after it, the accumulate, the
+    # finalize and the zeroing of the output tile.
     softmax = passes(4 if node.kwargs.get("block_size") else 3, tile)
     softmax += passes(4, rows)
     rescale = passes(1, out)
     boundary = passes(3, out) + passes(2, rows)
     scores, context = matrix
     interior = scores + max(context, softmax) + rescale
-    boundary_step = scores + context + boundary + softmax
+    boundary_step = scores + max(context, softmax + boundary)
 
     lat = config.access_latency_cycles
     bpc = config.bytes_per_cycle
