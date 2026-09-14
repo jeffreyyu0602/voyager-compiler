@@ -74,6 +74,12 @@ POWER_OF_TWO_SCALE = {"mxint8", "mxint4", "mxfp4"}
 QUANTIZATION_CONFIGS["mxnf4"] = {
     torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
     torch.ops.aten.matmul.default: [MXNF4_SPEC, MXNF4_VALUE_SPEC],
+    # Flash attention (``--attn_implementation sdpa``): the specs the two
+    # attention matmuls take, on the one node that stands for both.
+    torch.ops.aten.scaled_dot_product_attention.default: [
+        MXNF4_SPEC,
+        MXNF4_VALUE_SPEC,
+    ],
 }
 
 # Attribution configs: quantize one side at a time, so the weight term, the

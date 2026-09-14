@@ -101,6 +101,7 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
+_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
 
 
 def _produces_tensor(node: Node) -> bool:
@@ -948,7 +949,7 @@ def bufferize_graph(
                 )
             elif is_pooling(anchor):
                 sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
-            elif anchor.target is _SDPA:
+            elif anchor.target in (_SDPA, _SDPA_MX):
                 sub_gm = (
                     build_attention_fa3(node, tiler=tiler)
                     if flash_attention_v3

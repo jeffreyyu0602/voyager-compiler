@@ -20,6 +20,8 @@ from voyager_compiler.quantization.quantizer.quantizer import (
     QuantizationSpec,
 )
 
+_SDPA = torch.ops.aten.scaled_dot_product_attention.default
+
 
 # In the absence of better name, just winging it with QuantizationConfig
 @dataclass(eq=True, frozen=True)
@@ -222,6 +224,48 @@ def _annotate_matmul(
 
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
+            output_qspec=output_act_qspec,
+            _annotated=True,
+        )
+        annotated_partitions.append(node)
+    return annotated_partitions
+
+
+@register_annotator("sdpa")
+def _annotate_sdpa(
+    gm: torch.fx.GraphModule,
+    quantization_config: Optional[QuantizationConfig],
+    filter_fn: Optional[Callable[[Node], bool]] = None,
+) -> Optional[List[List[Node]]]:
+    """Annotate ``scaled_dot_product_attention`` like the two matmuls it
+    stands for: the query takes the input activation spec, the key and the
+    value the weight spec.  The key is passed ``[keys, head_dim]`` and
+    contracts along its last axis, so its blocks go there rather than on
+    the axis the spec names for a ``[contraction, out]`` operand; the value
+    contracts along the keys, as the spec says.  The probabilities are
+    quantized inside the attention kernel with the query's spec."""
+    annotated_partitions = []
+    input_act_qspec = quantization_config.input_activation
+    output_act_qspec = quantization_config.output_activation
+    weight_qspec = quantization_config.weight
+    key_qspec = (
+        replace(weight_qspec, ch_axis=-1) if weight_qspec is not None else None
+    )
+    for node in gm.graph.nodes:
+        if node.op != "call_function" or node.target != _SDPA:
+            continue
+        if filter_fn and not filter_fn(node):
+            continue
+        if _is_annotated([node]):
+            continue
+
+        query, key, value = node.args[:3]
+        node.meta["quantization_annotation"] = QuantizationAnnotation(
+            input_qspec_map={
+                query: input_act_qspec,
+                key: key_qspec,
+                value: weight_qspec,
+            },
             output_qspec=output_act_qspec,
             _annotated=True,
         )

@@ -572,6 +572,111 @@ def _(
     return torch.ops.aten.matmul(self, other)
 
 
+def _dequantize_mx(input, scale, code, block_size):
+    """``input``'s codes read back through ``code`` and scaled by their
+    block ``scale``; either may be absent."""
+    if code is not None:
+        input = decode(input, code)
+    if scale is not None:
+        input = input * expand(scale, input.shape, block_size)
+    return input
+
+
+quantized_ops_lib.define(
+    "sdpa_mx(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, "
+    "float dropout_p=0., bool is_causal=False, *, float? scale=None, "
+    "bool enable_gqa=False, Tensor? query_scale=None, Tensor? key_scale=None, "
+    "Tensor? value_scale=None, int? block_size=None, Tensor? input_code=None, "
+    "Tensor? weight_code=None, Tensor? probs_qmap=None, "
+    "float? probs_quant_max=None, Tensor? probs_scale_qmap=None, "
+    "Tensor? probs_code=None, bool force_scale_power_of_two=False) -> Tensor"
+)
+
+
+@impl(quantized_ops_lib, "sdpa_mx", "CompositeExplicitAutograd")
+def sdpa_mx(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    *,
+    scale: Optional[float] = None,
+    enable_gqa: bool = False,
+    query_scale: Optional[torch.Tensor] = None,
+    key_scale: Optional[torch.Tensor] = None,
+    value_scale: Optional[torch.Tensor] = None,
+    block_size: Optional[int] = None,
+    input_code: Optional[torch.Tensor] = None,
+    weight_code: Optional[torch.Tensor] = None,
+    probs_qmap: Optional[torch.Tensor] = None,
+    probs_quant_max: Optional[float] = None,
+    probs_scale_qmap: Optional[torch.Tensor] = None,
+    probs_code: Optional[torch.Tensor] = None,
+    force_scale_power_of_two: bool = False,
+) -> torch.Tensor:
+    """``scaled_dot_product_attention`` over microscaling operands.
+
+    The query, key and value are codes with block scales along their
+    contraction axes (``query_scale`` / ``key_scale`` / ``value_scale``) and
+    codebooks (``input_code`` for the query, ``weight_code`` for the key and
+    value).  The softmax's probabilities are quantized along the keys with
+    the query's parameters (``probs_qmap`` / ``probs_quant_max`` /
+    ``probs_scale_qmap`` / ``probs_code``, the arguments ``quantize_mx``
+    takes) before the value matmul, as the attention kernel does on chip.
+    ``dropout_p`` is ignored; ``is_causal`` is unsupported, the mask being
+    explicit.
+
+    Returns:
+        The attention output, in the codebooks' dtype.
+    """
+    assert not is_causal, "is_causal is unsupported; pass an explicit mask"
+    query = _dequantize_mx(query, query_scale, input_code, block_size)
+    key = _dequantize_mx(key, key_scale, weight_code, block_size)
+    value = _dequantize_mx(value, value_scale, weight_code, block_size)
+    if enable_gqa:
+        group = query.shape[-3] // key.shape[-3]
+        key = key.repeat_interleave(group, dim=-3)
+        value = value.repeat_interleave(group, dim=-3)
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.shape[-1])
+
+    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            scores = scores.masked_fill(~attn_mask, float("-inf"))
+        else:
+            scores = scores + attn_mask
+    probs = torch.softmax(scores, dim=-1)
+    if probs_qmap is not None:
+        probs_scale, probs = quantize_mx(
+            probs,
+            probs_qmap,
+            [-1],
+            block_size,
+            probs_quant_max,
+            force_scale_power_of_two,
+            probs_scale_qmap,
+            probs_code,
+        )
+        probs = _dequantize_mx(probs, probs_scale, input_code, block_size)
+    return torch.matmul(probs, value)
+
+
+@torch.library.register_fake("quantized_ops::sdpa_mx")
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: Optional[torch.Tensor] = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    **kwargs,
+):
+    return query.new_empty(*query.shape[:-1], value.shape[-1])
+
+
 quantized_ops_lib.define(
     "calculate_mx_qparam(Tensor self, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "

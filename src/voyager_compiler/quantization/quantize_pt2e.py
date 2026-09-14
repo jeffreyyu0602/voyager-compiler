@@ -105,6 +105,9 @@ def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
     return replace(qspec, ch_axis=ch_axis)
 
 
+_SDPA = torch.ops.aten.scaled_dot_product_attention.default
+
+
 def get_microscaling_quantizer(
     activation: Optional[QuantizationSpec], weight: Optional[QuantizationSpec]
 ):
@@ -126,6 +129,7 @@ def get_microscaling_quantizer(
         .set_object_type(torch.ops.aten.conv2d.default, qconfig_conv2d)
         .set_object_type(torch.ops.aten.linear.default, qconfig_linear)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
+        .set_object_type(_SDPA, qconfig_matmul)
     )
 
 
@@ -426,7 +430,11 @@ MX_OP_MAPPING = {
     torch.ops.aten.conv2d.default: torch.ops.quantized_ops.conv2d_mx.default,
     torch.ops.aten.linear.default: torch.ops.quantized_ops.linear_mx.default,
     torch.ops.aten.matmul.default: torch.ops.quantized_ops.matmul_mx.default,
+    _SDPA: torch.ops.quantized_ops.sdpa_mx.default,
 }
+
+# An attention operand's scale kwarg, by its position among the operands.
+_ATTENTION_SCALES = ("query_scale", "key_scale", "value_scale")
 
 
 def _replace_observer_with_quantize_mx_node_decomposed(
@@ -496,6 +504,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         if level_bits is not None:
             dequant_code.meta["dtype"] = f"int{level_bits.group(1)}"
 
+    get_attr_node = scale_qmap = None
     if input_node.op == "get_attr":
         # quantize model parameter and remove the fq module
         param = fetch_attr(model, input_node.target)
@@ -611,6 +620,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     for user in orig_fq_users:
         # Keep the original nodes for other users
         kwarg1, kwarg2 = dequant_code, scale_node
+        operand = quantized_node
 
         # Skip device alignment node
         if user.target == torch.Tensor.to:
@@ -623,11 +633,33 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 kwarg2 = graph.call_function(
                     torch.Tensor.to, (scale_node, user_device)
                 )
+            operand = user
             user = next(iter(user.users))
 
         kwargs = OrderedDict(user.kwargs)
         kwargs.setdefault("block_size", activation_post_process.block_size)
-        if input_node.op == "get_attr" or id(quantized_node) == id(
+        if user.target in (_SDPA, MX_OP_MAPPING[_SDPA]):
+            # The query, key and value each carry their own scale; the
+            # query and the probabilities share a codebook, the key and the
+            # value the other.  The probabilities are quantized inside the
+            # attention kernel with the query's parameters.
+            position = user.args.index(operand)
+            kwargs.setdefault(_ATTENTION_SCALES[position], kwarg2)
+            if position == 0:
+                kwargs.setdefault("input_code", kwarg1)
+                kwargs.setdefault("probs_qmap", get_attr_node)
+                kwargs.setdefault(
+                    "probs_quant_max", activation_post_process.quant_max
+                )
+                kwargs.setdefault("probs_scale_qmap", scale_qmap)
+                kwargs.setdefault("probs_code", quant_code)
+                kwargs.setdefault(
+                    "force_scale_power_of_two",
+                    activation_post_process.force_scale_power_of_two,
+                )
+            else:
+                kwargs.setdefault("weight_code", kwarg1)
+        elif input_node.op == "get_attr" or id(quantized_node) == id(
             user.args[1]
         ):
             kwargs.setdefault("weight_code", kwarg1)
@@ -636,19 +668,27 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             kwargs.setdefault("input_code", kwarg1)
             kwargs.setdefault("input_scale", kwarg2)
 
-        # Sort kwargs so that they can be accessed sequentially during MHA splitting
         order = [
             "input_scale",
             "weight_scale",
+            "query_scale",
+            "key_scale",
+            "value_scale",
             "block_size",
             "input_code",
             "weight_code",
+            "probs_qmap",
+            "probs_quant_max",
+            "probs_scale_qmap",
+            "probs_code",
+            "force_scale_power_of_two",
             "A_data",
             "A_indices",
             "A_indptr",
         ]
         kwargs = OrderedDict(
-            (key, kwargs[key]) for key in order if key in kwargs
+            [(key, kwargs[key]) for key in order if key in kwargs]
+            + [(key, val) for key, val in kwargs.items() if key not in order]
         )
 
         # Replace the node with its MX counterpart

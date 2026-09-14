@@ -4,7 +4,8 @@
 an op that runs on the vector unit -- an elementwise / reduction op, or a
 matrix-vector GEMM -- so ``_search_tiling`` can rank the tiles that fit rather
 than take the largest.  Both cost the schedule ``PipelinedKernel`` emits, via
-``_sweep_cycles``.
+``_sweep_cycles``.  ``attention_tile_latency`` scores a flash-attention tiling
+the same way, against the FA3 schedule instead.
 
 Kept independent of the ``reporting`` package on purpose: the tiling pass runs
 inside ``transform()``, long before any reporting stage exists.  The dependency
@@ -24,6 +25,7 @@ from voyager_compiler.codegen.node_info import (
     bound_operands,
     dtype_byte_size,
     get_anchor_node,
+    get_arg_value,
     get_node_to_key_map,
     is_fully_connected,
     is_gemm_op,
@@ -98,6 +100,15 @@ def _node_dtype_bits(node, default: Optional[int] = None):
     return get_dtype_width(value.dtype)
 
 
+def bandwidth_utilization(bits, num_passes, vector_lanes, bytes_per_cycle):
+    """Fraction of peak a vector pass sustains: one ``vector_lanes``-wide
+    lane group per cycle at ``bits`` per element, fetched once per pass
+    over its data, against the scratchpad's ``bytes_per_cycle``."""
+    total_bytes = vector_lanes * bits / 8
+    fetch_cycles = num_passes * math.ceil(total_bytes / bytes_per_cycle)
+    return min(1.0, 1.0 / fetch_cycles)
+
+
 def vector_op_utilization(
     node, vector_lanes, bytes_per_cycle, ideal_cycles=None
 ):
@@ -143,10 +154,10 @@ def vector_op_utilization(
         ]
     # A multi-output node contributes one width per output.
     bits = [b for w in widths for b in (w if isinstance(w, list) else [w])]
-    total_bytes = vector_lanes * max(bits, default=16) / 8
     num_passes = OP_PASSES.get(anchor.target, 1)
-    fetch_cycles = num_passes * math.ceil(total_bytes / bytes_per_cycle)
-    util = min(1.0, 1.0 / fetch_cycles)
+    util = bandwidth_utilization(
+        max(bits, default=16), num_passes, vector_lanes, bytes_per_cycle
+    )
     if not ideal_cycles:
         return util
     return ideal_cycles / (
@@ -434,6 +445,95 @@ def _sweep_cycles(dmas, steps, compute):
         + max(store, compute)  # compute the last tile; no load left to issue
         + store  # the last store, once that compute ends
     )
+
+
+def attention_tile_latency(node, tiles, grid, config, matrix):
+    """Latency and DRAM traffic of a flash-attention node under a tiling.
+
+    Prices the FA3 schedule (``bufferize/attention_v3.py``) a step at a
+    time.  The scores product runs first; the context product then runs on
+    the matrix unit while the vector unit runs the softmax chain, which had
+    to wait for the scores -- so a step costs the scores plus the busier of
+    the two, then the rescale that folds the context in.  A query block's
+    first step is a boundary: the vector unit waits for the previous block's
+    context to finalize that block before its own softmax, so nothing
+    overlaps there.  The products are priced by their interstellar mappings
+    (``matrix``); each vector pass at the bandwidth-bound rate
+    ``vector_op_utilization`` charges, plus its launch.  Query and output
+    move once per query block, while key, value, mask and every block scale
+    reload on each step, and the DMAs overlap compute the way
+    ``_sweep_cycles`` prices a double-buffered sweep.
+
+    Args:
+        node: The attention node being tiled.
+        tiles: Operand FX node -> its SRAM tile shape (``_attention_tiles``).
+        grid: The FA3 loop grid, ``(*kv_batch, num_q_blocks, num_kv_blocks)``.
+        config (AcceleratorConfig): The hardware description.
+        matrix: ``(scores, context)`` -- the matrix unit's cycles for one
+            step's two products.
+
+    Returns:
+        ``(cycles, DRAM bytes)``; the bytes break a latency tie.
+    """
+    query, key, value = node.args[0], node.args[1], node.args[2]
+    steps = math.prod(grid)
+    boundaries = steps // grid[-1]  # one per query block
+    tq, head_dim = tiles[query][-2], tiles[query][-1]
+    tkv = tiles[key][-1]
+
+    # The vector unit's passes, at the softmax's width (the output's).
+    util = bandwidth_utilization(
+        _node_dtype_bits(node), 1, config.vector_lanes, config.bytes_per_cycle
+    )
+
+    def passes(count, elems):
+        cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
+        return count * (cycles + KERNEL_LAUNCH_OVERHEAD)
+
+    rows, tile, out = tq, tq * tkv, tq * head_dim
+    # The softmax chain: rowmax, exponentials and rowsum over the score tile
+    # (and P's quantize under MX); the running max, the rescale factor, its
+    # copy and the running sum over a column.  Then the fused
+    # rescale-accumulate over the output tile, or at a boundary the
+    # accumulate, the finalize and the reset of the output tile and the two
+    # columns.
+    softmax = passes(4 if node.kwargs.get("block_size") else 3, tile)
+    softmax += passes(4, rows)
+    rescale = passes(1, out)
+    boundary = passes(3, out) + passes(2, rows)
+    scores, context = matrix
+    interior = scores + max(context, softmax) + rescale
+    boundary_step = scores + context + boundary + softmax
+
+    lat = config.access_latency_cycles
+    bpc = config.bytes_per_cycle
+    # ``_sweep_cycles`` reads the store off the front.
+    out_bytes = _operand_bytes(tiles[node], node)
+    dmas = [(_transfer_cost(tiles[node], out_bytes, lat, bpc), boundaries)]
+    traffic = boundaries * out_bytes
+    for operand, transfers in (
+        (query, boundaries),
+        (key, steps),
+        (value, steps),
+        (get_arg_value(node, 3, "attn_mask", None), steps),
+        (node.kwargs.get("query_scale"), boundaries),
+        (node.kwargs.get("key_scale"), steps),
+        (node.kwargs.get("value_scale"), steps),
+    ):
+        if not isinstance(operand, Node):
+            continue
+        shape = tiles[operand]
+        operand_bytes = _operand_bytes(shape, operand)
+        dmas.append((_transfer_cost(shape, operand_bytes, lat, bpc), transfers))
+        traffic += transfers * operand_bytes
+
+    if config.double_buffered_l2:
+        latency = _sweep_cycles(dmas, steps, interior)
+    else:
+        latency = sum(count * cycles for cycles, count in dmas)
+        latency += steps * interior
+    latency += boundaries * (boundary_step - interior)
+    return latency, traffic
 
 
 def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):

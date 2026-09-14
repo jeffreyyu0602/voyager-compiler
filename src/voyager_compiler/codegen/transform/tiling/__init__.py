@@ -1,12 +1,13 @@
 """Choosing tile sizes: the analytic per-op tilers and the mapping search.
 
-``search`` sizes a vector / GEMV op against its own DRAM cost model;
-``tiler`` drives the ``interstellar`` loop-nest mapper for everything the
-matrix unit runs.  Nothing here imports ``bufferize`` — the dependency runs
-one way, so the builders can ask for a tiling without a cycle.
+``search`` sizes a vector / GEMV / attention op against its own DRAM cost
+model; ``tiler`` drives the ``interstellar`` loop-nest mapper for everything
+the matrix unit runs.  Nothing here imports ``bufferize`` — the dependency
+runs one way, so the builders can ask for a tiling without a cycle.
 """
 
 from voyager_compiler.codegen.transform.tiling.cost import (
+    attention_tile_latency,
     gemv_tile_latency,
     vector_op_utilization,
     vector_tile_latency,
@@ -26,6 +27,7 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
     GEMM_L3_ORDER,
     TileConstraint,
     TilerContext,
+    attention_op_tiling,
     build_interstellar_tiler,
     get_tiling,
     prefetch_tilings,
@@ -38,6 +40,8 @@ __all__ = [
     "GEMM_L3_ORDER",
     "TileConstraint",
     "TilerContext",
+    "attention_op_tiling",
+    "attention_tile_latency",
     "build_interstellar_tiler",
     "gemv_op_tiling",
     "gemv_tile_latency",

@@ -164,6 +164,7 @@ class XNNPACKQuantizer(Quantizer):
         "linear",
         "conv",
         "matmul",
+        "sdpa",
         "residual",
         "activation",
         "softmax",

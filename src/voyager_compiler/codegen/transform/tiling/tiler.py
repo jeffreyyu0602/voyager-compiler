@@ -43,15 +43,19 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     _node_dtype_bits,
     _step_classes,
     _sweep_cycles,
+    attention_tile_latency,
     get_dtype_width,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     DEFAULT_RUNTIME_TOLERANCE,
+    _attention_sram_bytes,
+    _attention_tiles,
+    _divisors_descending,
     _operand_placeholders,
     gemv_op_tiling,
 )
 from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
-from voyager_compiler.shape_prop import ShapeProp
+from voyager_compiler.shape_prop import ShapeProp, set_node_value
 
 logger = logging.getLogger(__name__)
 le = interstellar.le
@@ -2270,3 +2274,237 @@ def get_tiling(node, tiler=None):
         return (b[le.OY][3], b[le.OX][3], b[le.OC][3], b[le.IC][3]), order
     order = _l3_order_from_mapping(mapping, GEMM_L3_ORDER, _GEMM_LOOP)
     return gemm_batch + (b[le.OX][3], b[le.OC][3], b[le.IC][3]), order
+
+
+def _product_node(name, out_dtype, left, right, block_size, scales, codes):
+    """A bare 2-D product ``left @ right`` as a node of its own graph, for
+    the mapping search: placeholders carrying the operands' tile shapes and
+    the logical dtypes of the nodes the tiles are cut from.
+
+    Args:
+        name: The node's name, for the search's logging.
+        out_dtype: The product's torch dtype.
+        left: ``(shape, source)`` -- the tile shape and the FX node it is
+            cut from, whose dtype it takes.  Likewise ``right``.
+        block_size: The MX block, or ``None`` for an unquantized product.
+        scales: Under MX, the ``(shape, source)`` of each operand's block
+            scales, left then right.
+        codes: Under MX, the two codebook nodes, left then right.
+    """
+    graph = torch.fx.Graph()
+
+    def placeholder(label, source, shape=None):
+        ph = graph.placeholder(f"{name}_{label}")
+        shape = tuple(source.value.shape) if shape is None else shape
+        set_node_value(ph, torch.empty(shape, dtype=source.value.dtype))
+        ph.meta["dtype"] = source.meta.get("dtype")
+        return ph
+
+    a = placeholder("a", left[1], left[0])
+    b = placeholder("b", right[1], right[0])
+    if block_size is None:
+        node = graph.call_function(
+            torch.ops.aten.matmul.default, (a, b), name=name
+        )
+    else:
+        (a_scale, b_scale), (a_code, b_code) = scales, codes
+        node = graph.call_function(
+            torch.ops.quantized_ops.matmul_mx.default,
+            (a, b),
+            {
+                "input_scale": placeholder("a_scale", a_scale[1], a_scale[0]),
+                "weight_scale": placeholder("b_scale", b_scale[1], b_scale[0]),
+                "block_size": block_size,
+                "input_code": placeholder("a_code", a_code),
+                "weight_code": placeholder("b_code", b_code),
+            },
+            name=name,
+        )
+    set_node_value(
+        node, torch.empty((left[0][0], right[0][1]), dtype=out_dtype)
+    )
+    return node
+
+
+def _attention_products(node, tq, tkv):
+    """The two products a ``(tq, tkv)`` attention tile runs, as bare 2-D
+    GEMM nodes of the tile shapes (``_product_node``): ``"scores"``, the
+    query tile times the transposed key tile, and ``"context"``, the
+    probabilities times the value tile.  The probabilities take the query's
+    dtype and scales, as the kernel quantizes them so."""
+    query, key, value = node.args[0], node.args[1], node.args[2]
+    head_dim = query.value.shape[-1]
+    block_size = node.kwargs.get("block_size")
+    out_dtype = node.value.dtype
+    kw = node.kwargs
+    if block_size is None:
+        codes = scores_scales = context_scales = ()
+    else:
+        codes = (kw["input_code"], kw["weight_code"])
+        scores_scales = (
+            ((tq, head_dim // block_size), kw["query_scale"]),
+            ((head_dim // block_size, tkv), kw["key_scale"]),
+        )
+        context_scales = (
+            ((tq, tkv // block_size), kw["query_scale"]),
+            ((tkv // block_size, head_dim), kw["value_scale"]),
+        )
+    scores = _product_node(
+        f"attention_scores_{tq}x{tkv}",
+        out_dtype,
+        ((tq, head_dim), query),
+        ((head_dim, tkv), key),
+        block_size,
+        scores_scales,
+        codes,
+    )
+    context = _product_node(
+        f"attention_context_{tq}x{tkv}",
+        out_dtype,
+        ((tq, tkv), query),
+        ((tkv, head_dim), value),
+        block_size,
+        context_scales,
+        codes,
+    )
+    return {"scores": scores, "context": context}
+
+
+def _product_cycles(node, tiler):
+    """The matrix unit's cycles for the whole product ``node`` -- mapped as
+    one on-chip tile (``attention_op_tiling`` pins it so) -- and the
+    mapping metadata the kernel running it is stamped with (what
+    ``get_tiling`` leaves on a GEMM), or ``None`` when interstellar maps
+    nothing."""
+    counts, _ = get_tiling(node, tiler)
+    if counts is None or math.prod(counts) != 1:
+        return None
+    tiling = node.meta["tiling"]
+    mapping, _ = tiling["interstellar_tiling"]
+    cycles = tiling["runtime_calculator"].matrix_cycles(
+        mapping, tiling["bank_groups"]
+    )
+    return cycles, tiling
+
+
+def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
+    """Block counts for a flash-attention node, ``(num_q_blocks,
+    num_kv_blocks)``.
+
+    Enumerates the query / key tile lengths that divide the (GQA-folded)
+    query rows and the key rows in whole PE-array widths, keeps those whose
+    FA3 SRAM footprint fits the scratchpad, maps each one's two products
+    (``_attention_products``) through interstellar -- ``get_tiling``, so
+    identical shapes share one search, run concurrently by
+    ``prefetch_tilings`` -- and ranks the candidates by
+    ``attention_tile_latency`` the way ``_search_tiling`` ranks a vector
+    op: the least DRAM traffic among the tilings within
+    ``DEFAULT_RUNTIME_TOLERANCE`` of the fastest.  The winner's product
+    mappings are left as ``node.meta["product_tilings"]`` -- ``"scores"``
+    and ``"context"``, each what ``get_tiling`` stamps on a GEMM -- for the
+    builder to copy onto the kernels that run them.
+
+    Args:
+        node: The attention node to tile.
+        tiler: The ``TilerContext``.
+        sq_eff: Query rows after the GQA fold (``plan_gqa_fold``).
+        kv_batch: The key / value batch dims, which lead the loop grid.
+        acc_dtype: The accumulation dtype of the softmax state.
+
+    Returns:
+        ``(num_q_blocks, num_kv_blocks)``.
+
+    Raises:
+        RuntimeError: when no tiling of the operands fits the scratchpad.
+    """
+    config = tiler.config
+    query, key = node.args[0], node.args[1]
+    head_dim = query.value.shape[-1]
+    skv = key.value.shape[-2]
+    # Under MX the query and key block along head_dim, the value and the
+    # probabilities along the keys, so a key tile holds whole blocks.
+    block_size = node.kwargs.get("block_size")
+    if block_size is not None and head_dim % block_size:
+        raise ValueError(
+            f"{node}: head_dim {head_dim} is not a multiple of the "
+            f"{block_size}-element MX block"
+        )
+
+    logger.info(f"Running L2 tiling for attention: {node}")
+
+    unit = max(config.pe_array_size)
+    budget = config.usable_scratchpad_size
+    candidates = []  # (tq, tkv, tiles)
+    for tq in _divisors_descending(sq_eff):
+        if tq % unit and tq != sq_eff:
+            continue
+        for tkv in _divisors_descending(skv):
+            if tkv % unit and tkv != skv:
+                continue
+            if block_size is not None and tkv % block_size:
+                continue
+            tiles = _attention_tiles(node, tq, tkv)
+            if _attention_sram_bytes(node, tiles, acc_dtype, config) > budget:
+                continue
+            candidates.append((tq, tkv, tiles))
+    if not candidates:
+        raise RuntimeError(
+            f"{node}: no tiling of its operands fits the scratchpad"
+        )
+
+    products = {
+        (tq, tkv): _attention_products(node, tq, tkv)
+        for tq, tkv, _ in candidates
+    }
+    # The kernel holds each product's operands whole on chip, so its L2 tile
+    # is pinned to the product and the search maps only the L1 / PE levels.
+    for pair in products.values():
+        for product in pair.values():
+            m, k = product.args[0].value.shape
+            n = product.args[1].value.shape[-1]
+            tiler.constraints[product] = TileConstraint(
+                exact=((le.IC, k), (le.OC, n), (le.OX, m))
+            )
+    prefetch_tilings(
+        [p for pair in products.values() for p in pair.values()], tiler
+    )
+
+    scored = []  # (latency, dram_bytes, blocks, product tilings)
+    for tq, tkv, tiles in candidates:
+        try:
+            priced = {
+                name: _product_cycles(p, tiler)
+                for name, p in products[(tq, tkv)].items()
+            }
+        except RuntimeError:  # a product no mapping fits on chip
+            continue
+        if any(v is None for v in priced.values()):
+            continue
+        blocks = (sq_eff // tq, skv // tkv)
+        latency, traffic = attention_tile_latency(
+            node,
+            tiles,
+            tuple(kv_batch) + blocks,
+            config,
+            (priced["scores"][0], priced["context"][0]),
+        )
+        scored.append(
+            (latency, traffic, blocks, {k: v[1] for k, v in priced.items()})
+        )
+        logger.info(
+            "[tiling] %s: %d x %d -> %.0f cycles, %.1f MB",
+            node.name,
+            tq,
+            tkv,
+            latency,
+            traffic / 1e6,
+        )
+    if not scored:
+        raise RuntimeError(f"{node}: no tiling of its products maps on chip")
+
+    fastest = min(s[0] for s in scored) * (1.0 + DEFAULT_RUNTIME_TOLERANCE)
+    best = min(
+        (s for s in scored if s[0] <= fastest), key=lambda s: (s[1], s[0])
+    )
+    node.meta["product_tilings"] = best[3]
+    return best[2]

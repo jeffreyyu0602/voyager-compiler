@@ -357,7 +357,15 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
             and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
         ]
         if not masks:
-            raise RuntimeError("no causal-mask where node feeds an add")
+            sdpa = any(
+                n.target is torch.ops.aten.scaled_dot_product_attention.default
+                for n in gm.graph.nodes
+            )
+            if not sdpa:
+                raise RuntimeError("no causal-mask where node feeds an add")
+            # SDPA takes the causal mask as its bool ``attn_mask``, which the
+            # compiler already stores and moves at one bit per element.
+            logger.info("attention mask is already 1-bit under sdpa")
         for mask in masks:
             annotate_output_qspec(mask, qspec)
 

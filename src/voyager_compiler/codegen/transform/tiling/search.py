@@ -855,6 +855,79 @@ def vector_op_tiling(node, config):
     return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
 
 
+def _divisors_descending(n):
+    return [d for d in range(n, 0, -1) if n % d == 0]
+
+
+def _attention_tiles(node, tq, tkv):
+    """Operand FX node -> its FA3 SRAM tile under query / key tile lengths
+    ``tq`` / ``tkv``: the query, the (transposed) key, the value, the
+    output, the mask when there is one, and under MX each operand's block
+    scales."""
+    query, key, value = node.args[0], node.args[1], node.args[2]
+    head_dim = query.value.shape[-1]
+    tiles = {
+        query: (tq, head_dim),
+        key: (head_dim, tkv),
+        value: (tkv, head_dim),
+        node: (tq, head_dim),
+    }
+    mask = get_arg_value(node, 3, "attn_mask", None)
+    if isinstance(mask, torch.fx.Node):
+        tiles[mask] = (tq, tkv)
+    block_size = node.kwargs.get("block_size")
+    if block_size is not None:
+        tiles[node.kwargs["query_scale"]] = (tq, head_dim // block_size)
+        tiles[node.kwargs["key_scale"]] = (head_dim // block_size, tkv)
+        tiles[node.kwargs["value_scale"]] = (tkv // block_size, head_dim)
+    return tiles
+
+
+def _attention_sram_bytes(node, tiles, acc_dtype, config):
+    """Bytes the FA3 kernel's SRAM allocations take under ``tiles``.
+
+    Mirrors the allocations ``_FA3Pipeline.forward`` makes: two slots of
+    every operand tile but the output's one, the running softmax state and
+    the score tile at ``acc_dtype``, and the probabilities -- under MX
+    their codes at the query's dtype plus their block scales, else a
+    buffer at V's dtype when the softmax runs at a dtype other than the
+    operands' -- each sized the way ``plan_memory`` will place it.
+
+    Args:
+        node: The attention node.
+        tiles: Operand FX node -> its tile shape (``_attention_tiles``).
+        acc_dtype: The accumulation dtype of the softmax state.
+        config (AcceleratorConfig): The hardware description.
+    """
+    query, value = node.args[0], node.args[2]
+    tq, head_dim = tiles[query]
+    tkv = tiles[value][0]
+
+    total = sum(
+        (1 if operand is node else 2) * _tensor_bytes(operand, shape, config)
+        for operand, shape in tiles.items()
+    )
+
+    def acc_bytes(shape):
+        return tensor_alloc_bytes(
+            math.prod(shape), acc_dtype, config.bank_width, config.vector_lanes
+        )
+
+    # m, l, row_tmp, alpha; o, pv_buf; the double-buffered s_buf.
+    total += 4 * acc_bytes((tq, 1))
+    total += 2 * acc_bytes((tq, head_dim))
+    total += 2 * acc_bytes((tq, tkv))
+    block_size = node.kwargs.get("block_size")
+    if block_size is not None:
+        total += 2 * _tensor_bytes(query, (tq, tkv), config)
+        total += 2 * _tensor_bytes(
+            node.kwargs["query_scale"], (tq, tkv // block_size), config
+        )
+    elif acc_dtype != value.value.dtype:
+        total += 2 * _tensor_bytes(value, (tq, tkv), config)
+    return total
+
+
 def _pool_input_extent(tile, stride, dilation, kernel_size):
     """Input extent covered by ``tile`` consecutive pooling outputs."""
     return (tile - 1) * stride + dilation * (kernel_size - 1) + 1
