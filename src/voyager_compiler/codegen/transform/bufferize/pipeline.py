@@ -26,6 +26,7 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_reshape_op,
     quant_param_arg_nodes,
     reduction_op,
     reduction_scratch,
@@ -1532,8 +1533,8 @@ def _split_part(fused_gm, part_ops, root, name, result):
         remap[p] = pg.placeholder(p.name)
     for n in part_ops:
         remap[n] = pg.node_copy(n, lambda x: remap[x])
-    # Re-rooting changes no shapes: keep the tile-granularity values
-    # ``_stamp_tail_shapes`` gave the tail, which ``node_copy`` drops.
+    # Re-rooting changes no shapes: keep the tail's tile-granularity values,
+    # which ``node_copy`` drops.
     for src, dst in remap.items():
         if hasattr(src, "value"):
             set_node_value(dst, src.value)
@@ -1549,14 +1550,16 @@ def _split_part(fused_gm, part_ops, root, name, result):
 def _stamp_tail_shapes(
     fused_gm, acc_shape, acc_dtype, inputs, in_specs, fused_idx
 ):
-    """Give the fused tail its tile-granularity shapes.
+    """Give the fused tail its tile-granularity shapes, and respell a
+    relayout that only renames the tile's dims as a view.
 
-    ``_build_fused_gm`` copies the tail's nodes without the values ShapeProp
-    stamped on the submodule -- whole-tensor shapes anyway.  A shapeless tail
-    makes ``stream_breaking_quantize`` take every relayout for a real permute
-    and stage a tile a rename of size-1 dims never needed, so run the tail
-    once on fakes of what the kernel hands it: the accumulator tile and each
-    fused operand's tile (the operand itself when it is passed whole).
+    The tail arrives without values (its nodes were copied from a submodule
+    whose shapes are whole-tensor anyway), so run it once on fakes of what
+    the kernel hands it: the accumulator tile and each fused operand's tile
+    (the operand itself when it is passed whole).  At that shape an MHA
+    context matmul's ``transpose(1, 2)`` moves nothing (it lifts the head
+    past the sequence, but a tile holds one head): as a view it breaks no
+    stream, and no consumer mistakes it for a real permute.
     """
     if not isinstance(fused_gm, torch.fx.GraphModule):
         return
@@ -1571,20 +1574,39 @@ def _stamp_tail_shapes(
             tiles.append(fake_like(tile))
     ShapeProp(fused_gm).propagate(acc, *tiles)
 
+    graph = fused_gm.graph
+    renames = [
+        n
+        for n in graph.nodes
+        if is_reshape_op(n)
+        and relayout_view_shape([n], tuple(n.args[0].value.shape)) is not None
+    ]
+    for n in renames:
+        # A view feeding the rename folds in: one view from its source.
+        src = n.args[0]
+        while src.target is torch.ops.aten.view.default and len(src.users) == 1:
+            src = src.args[0]
+        with graph.inserting_before(n):
+            view = graph.call_function(
+                torch.ops.aten.view.default, (src, list(n.value.shape))
+            )
+        set_node_value(view, src.value.view(n.value.shape))
+        n.replace_all_uses_with(view)
+        graph.erase_node(n)
+    if renames:
+        graph.eliminate_dead_code()
+        graph.lint()
+        fused_gm.recompile()
 
-def _split_stream_break(fused_gm, acc_shape):
+
+def _split_stream_break(fused_gm):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
-    ``stream_breaking_quantize`` decides: a non-last scale axis always
-    breaks (the scale unit groups along the stream, so the tile must be
-    materialized first), as does a relayout that moves elements (the store
-    folds a permute into the value's addressing but writes the scales in
-    stream order).  It reads the shape off the chain's input, and a fused
-    tail's accumulator placeholder carries none, so a chain rooted there is
-    replayed on the tile shape first: one that only renames the tile's dims
-    -- an MHA context matmul's ``transpose(1, 2)`` lifts the head dim past
-    the sequence, but a tile holds one head -- is respelled as a view, which
-    breaks nothing, and the quantize rides the op's output pass.
+    The quantize breaks the stream when its scale axis is not the last
+    (the scale unit groups along the stream, so the tile must be
+    materialized first) or when a relayout that moves elements feeds it
+    (the store folds a permute into the value's addressing but writes the
+    scales in stream order).
 
     The cut lands *before* the relayout chain feeding the quantize: the
     staged tile keeps the accumulator's layout and the relayout rides the
@@ -1593,11 +1615,9 @@ def _split_stream_break(fused_gm, acc_shape):
     any) immediately before it.
 
     Args:
-        fused_gm: The fused tail ``[acc, *operands] -> output(s)``, whose
-            relayout may be rewritten in place; a non-``GraphModule`` tail
-            (``None``, a sparse ``_EpilogueTail``) is never split.
-        acc_shape: The accumulator tile's shape -- what the tail's first
-            placeholder is handed.
+        fused_gm: The fused tail ``[acc, *operands] -> output(s)``; a
+            non-``GraphModule`` tail (``None``, a sparse ``_EpilogueTail``)
+            is never split.
 
     Returns:
         ``None`` when the tail has no such quantize (run ``fused_gm`` whole),
@@ -1611,24 +1631,6 @@ def _split_stream_break(fused_gm, acc_shape):
     quant, relayout, spine = broken
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
-
-    if relayout and spine is phs[0]:
-        view_shape = relayout_view_shape(relayout, tuple(acc_shape))
-        if view_shape is not None:
-            with graph.inserting_before(relayout[0]):
-                view = graph.call_function(
-                    torch.ops.aten.view.default, (spine, list(view_shape))
-                )
-            relayout[0].replace_all_uses_with(view)
-            for n in relayout:
-                graph.erase_node(n)
-            graph.lint()
-            fused_gm.recompile()
-            broken = stream_breaking_quantize(fused_gm)
-            if broken is None:
-                return None
-            quant, relayout, spine = broken
-
     relayout.reverse()
     ops = [n for n in graph.nodes if n.op == "call_function"]
     head_ops = [n for n in ops[:-1] if n not in relayout]
@@ -2117,7 +2119,7 @@ def _gemm_scratch_and_kernel(
             )
 
     if split is _CLASSIFY:
-        split = _split_stream_break(fused_gm, acc_shape)
+        split = _split_stream_break(fused_gm)
     if num_k == 1 and split is None and single_k_tail_fusible:
         scratch_specs = []
         kernel = _single_pass_kernel(

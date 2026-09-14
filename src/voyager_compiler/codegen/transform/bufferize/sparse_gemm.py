@@ -353,7 +353,7 @@ class _SparseGemm(torch.nn.Module):
             )
         # Classified once: the traced per-step kernel rebuild cannot walk
         # a graph.
-        self.tail_split = _split_stream_break(plan.fused_gm, plan.acc_shape)
+        self.tail_split = _split_stream_break(plan.fused_gm)
         # A tail the drain cannot hold in one pass runs over the staged
         # tile.  So does a multi-sub-slice epilogue, which reads windows of
         # its tile at an index the rolled loop supplies at runtime, and an
