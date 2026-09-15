@@ -21,7 +21,7 @@ def small_target(**changes):
         result_slots_per_output_lane=8, local_accum_contexts=4,
         input_buffer_words=256, accum_buffer_words=32,
         double_buffered_accum=False, ic_port_bits=64, oc_port_bits=64,
-        accumulation_policy="loop-lifetime-prefix")
+        accumulation_policy="loop-lifetime-prefix", vector_config=dict(lanes=8, output_fifo_packets=8))
     return replace(target, **changes)
 
 

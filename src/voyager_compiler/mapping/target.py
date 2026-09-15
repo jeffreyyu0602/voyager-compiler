@@ -19,6 +19,7 @@ class MappingTarget:
     double_buffered_accum: bool
     ic_port_bits: int
     oc_port_bits: int
+    vector_config: dict
     hardware_options: dict = field(default_factory=dict)
 
     # Validate shared hardware facts before backend-specific constraints
@@ -27,6 +28,7 @@ class MappingTarget:
                                 "accum_buffer_words", "ic_port_bits", "oc_port_bits")
         if type(self.double_buffered_accum) is not bool:
             raise ValueError("double_buffered_accum must be boolean")
+        validate_vector_config(self.vector_config)
 
     # Apply the same positive-integer rule to shared and backend-specific dimensions
     def _validate_positive(self, *names):
@@ -74,6 +76,12 @@ def load_target(path):
     if values.get("backend") == "cim":
         return CIMTarget(**values)
     raise ValueError("mapping target must identify backend=sa or backend=cim")
+
+
+# Require complete exported vector geometry
+def validate_vector_config(config):
+    if set(config) != {"lanes", "output_fifo_packets"} or any(type(n) is not int or n <= 0 for n in config.values()):
+        raise ValueError("vector configuration requires positive lanes and output_fifo_packets")
 
 # Describe one effective current-hardware instance in resolved units
 @dataclass(frozen=True)

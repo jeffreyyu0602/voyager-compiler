@@ -1,5 +1,6 @@
 # Drive operation traversal, callback-based search, retained reports, and artifacts
 import json
+import subprocess
 from pathlib import Path
 from time import perf_counter
 
@@ -42,8 +43,23 @@ def resolve_timing(target, options=None):
     return options
 
 
+# Export compiler-selected epilogue stages and transfers for all matrix-search operations
+def export_epilogues(model, executable):
+    from google.protobuf import text_format
+    selected = type(model)()
+    for operation in model.ops:
+        if skip_reason(matrix_operation(operation)) is None:
+            selected.ops.add().CopyFrom(operation)
+    result = subprocess.run([str(Path(executable).resolve())],
+                            input=text_format.MessageToString(selected),
+                            text=True, capture_output=True)
+    if result.returncode:
+        raise ValueError("epilogue export failed: " + result.stderr.strip())
+    return json.loads(result.stdout)
+
+
 # Map both backends through the same traversal, invocation cache, and reporting
-def generate_tilings(model, target, *, timing_options=None, verbose=0):
+def generate_tilings(model, target, *, timing_options=None, verbose=0, epilogues=None):
     timing = resolve_timing(target, timing_options)
     tilings = tiling_pb2.ModelTiling(backend=target.backend, target_configuration=target.configuration_json)
     report = dict(target=target.to_dict(), operations=[], skipped=[])
@@ -58,11 +74,12 @@ def generate_tilings(model, target, *, timing_options=None, verbose=0):
         if name in names:
             raise ValueError(f"duplicate matrix operation name: {name}")
         names.add(name)
-        key = operation_key(operation)
+        epilogue = None if epilogues is None else epilogues[name]
+        key = operation_key(operation), json.dumps(epilogue, sort_keys=True)
         reused = key in cache
         try:
             if not reused:
-                workload, vector_timing = parse_operation(target, operation)
+                workload, vector_timing = parse_operation(target, operation, epilogue)
                 inputs = prepare_search(target, workload, vector_timing=vector_timing, options=timing)
                 if verbose:
                     layer = inputs.layer
@@ -109,6 +126,7 @@ def main(argv=None):
     parser.add_argument("--codegen_dir", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True, help="Resolved mapping-target.json")
     parser.add_argument("--backend", choices=("sa", "cim"))
+    parser.add_argument("--epilogue_exporter", type=Path, help="Host exporter for epilogue execution descriptions")
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--timing_options", type=Path, help="JSON timing assumptions in cycles")
     parser.add_argument("--verbose", type=int, choices=range(4), default=0,
@@ -119,5 +137,6 @@ def main(argv=None):
         parser.error("selected backend does not match mapping target")
     model = text_format.Parse((args.codegen_dir / "model.txt").read_text(), param_pb2.Model())
     timing = json.loads(args.timing_options.read_text()) if args.timing_options else None
-    tilings, report = generate_tilings(model, target, timing_options=timing, verbose=args.verbose)
+    epilogues = export_epilogues(model, args.epilogue_exporter) if args.epilogue_exporter else None
+    tilings, report = generate_tilings(model, target, timing_options=timing, verbose=args.verbose, epilogues=epilogues)
     write_tilings(tilings, report, args.output_dir)

@@ -5,6 +5,7 @@ from .workload import Workload
 from .timing.transfer import ceil_div, transfer_cycles
 import re
 from .models.cim_timing import TimingOptions
+from .models.vector import VectorHardware, VectorPass, Transfer, dtype_bits, evaluate_passes
 import os
 
 
@@ -69,12 +70,30 @@ def skip_reason(matrix):
         return "matrix-vector unit"
     return None
 
-# Return a compiler dtype's scalar width
-def dtype_bits(dtype: str):
-    bit_search = re.search(r"[^\d](\d+)(_.*)?$", str(dtype))
-    if bit_search is None:
-        raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
-    return int(bit_search.groups()[0])
+# Estimate vector vector_timing from the compiler-exported epilogue description
+def evaluate_epilogue(target, operations, output, *, hardware=None, epilogue=None):
+    hardware = hardware or VectorHardware.from_target(target)
+    vector_elements, input_bits, output_bits = target.n, target.accum_bits, dtype_bits(output.dtype)
+    if epilogue is None:
+        if len(operations) != 1 or output.HasField("reshape"):
+            raise ValueError("fused vector timing requires compiler-exported epilogue descriptions; use --epilogue_exporter")
+        return evaluate_passes(hardware, vector_elements, input_bits, output_bits,
+            (VectorPass("matrix", transfers=(Transfer("output", vector_elements, output_bits),)),), direct=True)
+    passes = []
+    for entry in epilogue["passes"]:
+        if entry.get("modes"):
+            raise ValueError("unmodeled vector hardware modes: " + ", ".join(entry["modes"]))
+        transfers = tuple(Transfer(t["resource"], vector_elements, dtype_bits(t["dtype"]))
+                          for t in entry["transfers"])
+        passes.append(VectorPass(entry["source"], tuple(entry["stages"]), transfers,
+                                 entry["dequantize"]))
+    return evaluate_passes(hardware, vector_elements, input_bits, output_bits, passes, direct=epilogue["direct"])
+
+# Evaluate the epilogue attached to one compiler operation vector_elements
+def evaluate_operation_epilogue(target, operation, epilogue=None):
+    operations = [operation.op] if operation.HasField("op") else list(operation.fused_op.op_list)
+    output = operation.output if operation.HasField("output") else operation.outputs.tensors[-1]
+    return evaluate_epilogue(target, operations, output, epilogue=epilogue)
 
 
 # Match MatrixOps.h output banking and model the external consumer's vector_timing rate
