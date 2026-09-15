@@ -143,6 +143,41 @@ def layer_report(operation, target, tilings=None):
             if spacing:
                 safety = "checked against the supplied latency" if readiness.get("accumulation_feedback_safe") else "not checked: SRAM feedback latency is unspecified"
                 lines += [f"Minimum SRAM feedback spacing: {number(spacing)} cycles; {safety}.", ""]
+    inputs = op.get("input_loading")
+    if inputs:
+        lines += ["### Input loading", "",
+                  f"{inputs['lane_elements']} elements per bank word, {inputs['element_bits']} bits per source element; "
+                  f"{inputs['pack_factor']} words per request on a {inputs['port_bits']}-bit port.", "",
+                  f"{number(inputs['requests'])} external requests / {number(inputs['external_beats'])} beats; "
+                  f"{number(inputs['writes'])} buffer-word writes including zero padding. "
+                  f"{number(inputs['fills'])} bank fills; first fill {number(inputs['first_fill_cycles'])} cycles; "
+                  f"fill time {number(inputs['min_fill_cycles'])}–{number(inputs['max_fill_cycles'])} cycles.", "",
+                  f"Input-bank readiness adds {number(inputs['wait_cycles'])} cycles to the compute schedule. "
+                  "This overlaps other stage constraints and must not be added to their waits.", ""]
+        if inputs['max_fill_bound']:
+            lines += ["Variable boundary fills use a maximum-fill timing bound.", ""]
+        if inputs['serialized_bound']:
+            lines += ["Input readiness reached its work limit and uses a serialized upper bound.", ""]
+    vector = op.get("vector_unit")
+    if vector:
+        lines += ["### Vector timing", "",
+                  f"One result vector contains {vector['elements_per_vector']} output elements; "
+                  f"input/output precision: {vector['input_element_bits']}/{vector['output_element_bits']} bits per element. "
+                  f"Shared-resource throughput bound: {vector['cycles_per_vector']} cycles per result vector.", ""]
+        for index, stage_pass in enumerate(vector["passes"], 1):
+            stages = ", ".join(f"stage {i}: {name}" for i, name in enumerate(stage_pass["stages"]) if name) or "forwarding"
+            lines += [f"- Pass {index}: source {stage_pass['source']}; {stages}; "
+                      f"{stage_pass['cycles_per_vector']} cycles per result vector"]
+        lines += [""]
+    output_ready = timing.get("readiness", {}) or op.get("output_timing", {})
+    if "output_stall_cycles" in output_ready:
+        lines += [f"Finite output buffering adds **{number(output_ready['output_stall_cycles'])} producer stall cycles**. "
+                  f"Effective capacity: {number(output_ready['output_capacity_vectors'])} result vectors of "
+                  f"{number(output_ready['output_elements_per_vector'])} elements; output processing time: "
+                  f"{number(output_ready['output_cycles_per_vector'])} cycles per result vector. "
+                  f"Remaining consumer work: {number(output_ready['output_backlog_cycles'])} cycles.", ""]
+        if not output_ready["output_capacity_explicit"]:
+            lines += ["Effective capacity uses only the exported output FIFO; additional elasticity is unspecified.", ""]
     policy = evaluation.get("policy")
     if policy:
         lines += [f"Resident weight sequence: {policy['sequence_sets']} sets / {target['b_sets']} available; "
@@ -161,21 +196,6 @@ def layer_report(operation, target, tilings=None):
         lines += [f"{origin}: {number(search['evaluated'])} evaluated, {number(search['legal'])} legal, "
                   f"{number(search['capacity_rejected'])} early capacity rejections; "
                   f"{number(op.get('search_seconds'), 3)} seconds.", ""]
-    inputs = op.get("input_loading")
-    if inputs:
-        lines += ["### Input loading", "",
-                  f"{inputs['lane_elements']} elements per bank word, {inputs['element_bits']} bits per source element; "
-                  f"{inputs['pack_factor']} words per request on a {inputs['port_bits']}-bit port.", "",
-                  f"{number(inputs['requests'])} external requests / {number(inputs['external_beats'])} beats; "
-                  f"{number(inputs['writes'])} buffer-word writes including zero padding. "
-                  f"{number(inputs['fills'])} bank fills; first fill {number(inputs['first_fill_cycles'])} cycles; "
-                  f"fill time {number(inputs['min_fill_cycles'])}–{number(inputs['max_fill_cycles'])} cycles.", "",
-                  f"Input-bank readiness adds {number(inputs['wait_cycles'])} cycles to the compute schedule. "
-                  "This overlaps other stage constraints and must not be added to their waits.", ""]
-        if inputs['max_fill_bound']:
-            lines += ["Variable boundary fills use a maximum-fill timing bound.", ""]
-        if inputs['serialized_bound']:
-            lines += ["Input readiness reached its work limit and uses a serialized upper bound.", ""]
     return "\n".join(lines)
 
 

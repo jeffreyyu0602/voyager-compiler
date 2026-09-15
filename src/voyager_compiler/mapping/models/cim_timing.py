@@ -6,10 +6,11 @@ from typing import Tuple
 from ..schedule import REDUCTIONS
 from ..timing.transfer import ceil_div, transfer_cycles, stream_fill
 from ..timing.buffers import buffer_completion
+from .output import OutputOptions, output_timing
 
 # Configure manually assumed pipeline delays and external service rates
 @dataclass(frozen=True)
-class TimingOptions:
+class TimingOptions(OutputOptions):
     memory_request_latency: int = 0
     output_cycles_per_vector: int = 1
     # TODO: Calibrate these assumed stage delays against the selected HLS build
@@ -21,6 +22,7 @@ class TimingOptions:
 
     # Require a positive consumer service rate
     def __post_init__(self):
+        super().__post_init__()
         if type(self.output_cycles_per_vector) is not int or self.output_cycles_per_vector <= 0:
             raise ValueError("output_cycles_per_vector must be a positive integer")
 
@@ -41,7 +43,9 @@ class TimingEstimate:
     assumptions: Tuple[str, ...] = (
         "resident-set readiness and release use bounded repeated-state timing; other interfaces use overlapping resource work",
         "one beat per cycle plus specified request latency; double-buffered input prefetch",
-        "result-slot capacity bounds average issue rate; no per-operation FIFO simulation",
+        "result-slot capacity bounds average issue rate; final-reduction bursts use a bandwidth and effective-capacity envelope",
+        "output bursts preserve backlog with a bandwidth and effective-capacity equation; loop repetitions compose algebraically",
+        "without an explicit output capacity only the exported FIFO contributes elasticity",
         "SRAM reads and writes overlap accumulation at one vector per cycle per port; no dependency waits",
         "schedule and local contexts must cover SRAM feedback latency; RAW safety is not validated",
         "non-transposed weight streams sustain pipelined loads with explicit first-pass readiness and final-use release",
@@ -51,7 +55,7 @@ class TimingEstimate:
         "banked output drain uses repeated two-bank timing",
         "independent readiness envelopes overlap by maximum; cross-interface stall phasing is approximate",
         "useful work excludes convolution and channel padding; repeated L2 slices use mean useful work",
-        "excludes command serialization, HLS-added stages, and downstream vector work",
+        "excludes command serialization and unprofiled HLS stages; fused epilogue timing is derived from scheduled vector passes",
     )
 
 # Count intervening output updates before the innermost active reduction advances
@@ -123,6 +127,12 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     final_output = min(outputs, final_vectors) * output_cycles_per_vector
     resource_cycles['output'] = max(0, total_output_cycles - final_output)
     output_bound = False
+    output_readiness = {}
+    if not banked:
+        loops = tuple((loop, level.bound(loop)) for level in (schedule.l1, schedule.l2) for loop in level.order)
+        stream, output_readiness = output_timing(target, options, loops, output_cycles_per_vector,
+                                               interval=issue_interval, direct=workload.output_to_memory)
+        resource_cycles['issue'] = max(resource_cycles['issue'], stream.producer_cycles)
     if banked:
         blocks = outputs // final_vectors
         bank_finish, _, output_bound = buffer_completion(
@@ -142,7 +152,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                             accumulation=total_accumulation_cycles, output=total_output_cycles, bias=total_bias_cycles,
                             accumulation_sram_reads=sram_reads, accumulation_sram_writes=sram_writes),
         startup_cycles=startup, drain_cycles=drain, options=options,
-        readiness=dict(weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
+        readiness=dict(**output_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
                        weight_sequence_steps=weight_steps, weight_serialized_bound=weight_bound,
                        input_wait_cycles=max(0, input_issue - total_issue_cycles),
                        input_sequence_steps=input_steps,

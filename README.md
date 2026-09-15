@@ -30,7 +30,9 @@ The evaluator reports minimum SRAM feedback spacing from loop order. Supply
 to conservatively exclude schedules whose unstalled spacing is too short. The
 default zero leaves feedback safety unvalidated; it does not invent hardware
 stalls or certify read-after-write correctness. Capacity checks and traffic counts are separate from timing. Energy is
-unavailable without hardware characterization.
+unavailable without hardware characterization. Both SA and CIM use complete
+Voyager evaluators with Interstellar enumeration and ranking; see
+[the mapping boundary](doc/mapping-service.md#search-and-evaluation-boundary).
 
 `mapping-report.md` explains readiness waits and active bounds. Cached search
 results track timing-source changes automatically. Focused checks:

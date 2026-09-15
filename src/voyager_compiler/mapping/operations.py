@@ -2,9 +2,6 @@
 from dataclasses import replace
 from math import prod
 from .workload import Workload
-from .timing.transfer import ceil_div, transfer_cycles
-import re
-from .models.cim_timing import TimingOptions
 from .models.vector import VectorHardware, VectorPass, Transfer, dtype_bits, evaluate_passes
 import os
 
@@ -54,8 +51,6 @@ def channel_metadata(matrix):
     return logical, padded
 
 
-
-
 # Keep separate execution paths outside ordinary matrix temporal search
 def skip_reason(matrix):
     if matrix.target not in ("conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"):
@@ -70,7 +65,8 @@ def skip_reason(matrix):
         return "matrix-vector unit"
     return None
 
-# Estimate vector vector_timing from the compiler-exported epilogue description
+
+# Estimate vector timing from the compiler-exported epilogue description
 def evaluate_epilogue(target, operations, output, *, hardware=None, epilogue=None):
     hardware = hardware or VectorHardware.from_target(target)
     vector_elements, input_bits, output_bits = target.n, target.accum_bits, dtype_bits(output.dtype)
@@ -89,96 +85,30 @@ def evaluate_epilogue(target, operations, output, *, hardware=None, epilogue=Non
                                  entry["dequantize"]))
     return evaluate_passes(hardware, vector_elements, input_bits, output_bits, passes, direct=epilogue["direct"])
 
-# Evaluate the epilogue attached to one compiler operation vector_elements
+
+# Evaluate the epilogue attached to one compiler operation
 def evaluate_operation_epilogue(target, operation, epilogue=None):
     operations = [operation.op] if operation.HasField("op") else list(operation.fused_op.op_list)
     output = operation.output if operation.HasField("output") else operation.outputs.tensors[-1]
     return evaluate_epilogue(target, operations, output, epilogue=epilogue)
 
 
-# Match MatrixOps.h output banking and model the external consumer's vector_timing rate
-def cim_output_timing(target, operations, output):
-    direct = len(operations) == 1 and not output.HasField("reshape")
+# Match MatrixOps.h output banking and derive output cycles per result vector
+def cim_output_timing(target, operations, output, epilogue=None):
+    vector_timing = evaluate_epilogue(target, operations, output, epilogue=epilogue)
+    direct = vector_timing.direct
     supported = {f"int{target.accum_bits}": target.accum_bits} if direct else {"int8": 8, "bfloat16": 16}
     if output.dtype not in supported:
         raise ValueError(f"unsupported CIM {'matrix' if direct else 'vector'} output dtype: {output.dtype}")
-    widths = [supported[output.dtype]]
-    for operation in operations[1:]:
-        if operation.target in ("quantize_mx", "quantize_mx_outlier"):
-            raise ValueError("CIM search does not model microscaled vector output")
-        key = "scale" if operation.target == "quantize" else "other"
-        if key not in operation.kwargs:
-            continue
-        other = operation.kwargs[key]
-        if not other.HasField("tensor") or prod(tensor_shape(other.tensor)) == 1:
-            continue
-        tensor = other.tensor if other.tensor.HasField("memory") else operation.kwargs["input"].tensor
-        if tensor.dtype not in ("int8", "bfloat16"):
-            raise ValueError(f"unsupported CIM vector operand dtype: {tensor.dtype}")
-        widths.append(8 if tensor.dtype == "int8" else 16)
-    bits = max(widths) * target.n
-    return direct, target.double_buffered_accum and bits > target.oc_port_bits, TimingOptions(
-        output_cycles_per_vector=ceil_div(bits, target.oc_port_bits))
+    for stage_pass in (epilogue or {}).get("passes", ()):
+        for transfer in stage_pass["transfers"]:
+            if transfer["resource"] != "output" and transfer["dtype"] not in ("int8", "bfloat16"):
+                raise ValueError(f"unsupported CIM vector operand dtype: {transfer['dtype']}")
+    return vector_timing
 
 
 # Describe dense matrix work without inventing padding or materializing transposes
-def parse_cim_operation(target, operation):
-    operations = [operation.op] if operation.HasField("op") else list(operation.fused_op.op_list)
-    if not operations:
-        raise ValueError("CIM mapping requires a matrix operation")
-    matrix = operations[0]
-    if matrix.target not in ("conv2d", "linear", "matmul"):
-        raise ValueError(f"unsupported CIM operation: {matrix.target}")
-    if any(key in matrix.kwargs for key in ("input_code", "weight_code", "A_indptr", "A_indices", "A_data")):
-        raise ValueError("CIM search requires dense operands without codebooks or sparse fusion")
-    input_tensor = matrix.kwargs["input"].tensor
-    weight = matrix.kwargs["other" if matrix.target == "matmul" else "weight"].tensor
-    if input_tensor.dtype != "int8" or weight.dtype != "int8":
-        raise ValueError("CIM search requires signed int8 input and weight tensors")
-    if input_tensor.HasField("reshape") and input_tensor.reshape.target != "reshape":
-        raise ValueError("input transpose or head permutation must be materialized before CIM search")
-    if weight.HasField("reshape") and weight.reshape.target not in ("reshape", "transpose"):
-        raise ValueError("unsupported CIM weight layout transformation")
-    inputs, weights = tensor_shape(input_tensor), tensor_shape(weight)
-    outputs = [operation.output] if operation.HasField("output") else list(operation.outputs.tensors)
-    if len(outputs) != 1:
-        raise ValueError("CIM search requires one dense output tensor")
-    output = outputs[0]
-    direct, banked, options = cim_output_timing(target, operations, output)
-    bias = matrix.kwargs.get("bias")
-    if bias is not None and (not bias.HasField("tensor") or bias.tensor.dtype != f"int{target.accum_bits}"):
-        raise ValueError("CIM bias must use the configured accumulation datatype")
-    if matrix.target == "conv2d":
-        if len(inputs) != 4 or len(weights) != 4 or inputs[0] != 1:
-            raise ValueError("CIM convolution requires batch-one NHWC input and HWIO weights")
-        if matrix.kwargs.get("groups") is not None and matrix.kwargs["groups"].int_value != 1:
-            raise ValueError("grouped convolution uses a separate compiler path")
-        if symmetric_parameter(matrix, "dilation", 1) != 1:
-            raise ValueError("CIM convolution requires unit dilation")
-        fy, fx, ic, oc = weights
-        workload = Workload(inputs[2], inputs[1], ic, oc, fx, fy,
-                            symmetric_parameter(matrix, "stride", 1),
-                            symmetric_parameter(matrix, "padding", 0), bias is not None, direct,
-                            weight_transpose=weight.reshape.target == "transpose")
-    else:
-        if len(weights) != 2:
-            raise ValueError("CIM search requires a two-dimensional weight matrix")
-        ic, oc = weights
-        workload = Workload(prod(inputs[:-1]), 1, ic, oc, has_bias=bias is not None,
-                            output_to_memory=direct, weight_transpose=weight.reshape.target == "transpose")
-    if inputs[-1] != ic:
-        raise ValueError("CIM input channels do not match the logical weight shape")
-    if prod(tensor_shape(output)) != workload.output_x * workload.output_y * oc:
-        raise ValueError("CIM output shape does not match the dense matrix or convolution workload")
-    if bias is not None and prod(tensor_shape(bias.tensor)) != oc:
-        raise ValueError("CIM bias must contain one value per output channel")
-    logical, padded = channel_metadata(matrix)
-    workload = replace(workload, logical_channels=logical, padded_channels=padded)
-    return workload, options.output_cycles_per_vector
-
-
-# Describe dense matrix work without inventing padding or materializing transposes
-def parse_sa_operation(target, operation, epilogue=None):
+def parse_operation(target, operation, epilogue=None):
     operations = [operation.op] if operation.HasField("op") else list(operation.fused_op.op_list)
     if not operations:
         raise ValueError("mapping requires a matrix operation")
@@ -235,10 +165,3 @@ def parse_sa_operation(target, operation, epilogue=None):
     workload = replace(workload, logical_channels=logical, padded_channels=padded,
                        input_bits=dtype_bits(input_tensor.dtype), weight_bits=dtype_bits(weight.dtype))
     return workload, vector_timing
-
-
-
-def parse_operation(target, operation, epilogue=None):
-    if target.backend == "cim":
-        return parse_cim_operation(target, operation)
-    return parse_sa_operation(target, operation, epilogue)

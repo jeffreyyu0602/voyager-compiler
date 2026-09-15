@@ -69,7 +69,7 @@ def serialize(name, target, mapping, inputs):
         detail.pop("schedule")
         detail["runtime_cycles"] = result.runtime_cycles
         return tiling, dict(workload=asdict(context.workload), schedule=asdict(schedule), evaluation=detail,
-                            search=context.statistics())
+                            vector_unit=context.vector_timing.report(), search=context.statistics())
     detail = asdict(evaluation)
     detail.pop("metadata")
     return tiling, dict(evaluation=detail, vector_unit=context.vector_timing.report(), **result.details,
