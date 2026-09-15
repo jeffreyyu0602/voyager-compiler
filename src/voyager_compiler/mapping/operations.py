@@ -177,34 +177,65 @@ def parse_cim_operation(target, operation):
     return workload, options.output_cycles_per_vector
 
 
-# Convert SA shapes and output-port demand without compiler types in the model
+# Describe dense matrix work without inventing padding or materializing transposes
 def parse_sa_operation(target, operation, epilogue=None):
-    matrix = matrix_operation(operation)
-    inputs = tensor_shape(matrix.kwargs["input"].tensor)
+    operations = [operation.op] if operation.HasField("op") else list(operation.fused_op.op_list)
+    if not operations:
+        raise ValueError("mapping requires a matrix operation")
+    matrix = operations[0]
+    cim = target.backend == "cim"
+    if cim and matrix.target not in ("conv2d", "linear", "matmul"):
+        raise ValueError(f"unsupported CIM operation: {matrix.target}")
+    input_tensor = matrix.kwargs["input"].tensor
     weight = matrix.kwargs["other" if matrix.target.startswith("matmul") else "weight"].tensor
-    weights = tensor_shape(weight)
+    if input_tensor.HasField("reshape") and input_tensor.reshape.target != "reshape":
+        raise ValueError("input transpose or head permutation must be materialized before mapping")
+    if cim:
+        if any(key in matrix.kwargs for key in ("input_code", "weight_code", "A_indptr", "A_indices", "A_data")):
+            raise ValueError("CIM search requires dense operands without codebooks or sparse fusion")
+        if input_tensor.dtype != "int8" or weight.dtype != "int8":
+            raise ValueError("CIM search requires signed int8 input and weight tensors")
+        if weight.HasField("reshape") and weight.reshape.target not in ("reshape", "transpose"):
+            raise ValueError("unsupported CIM weight layout transformation")
+    inputs, weights = tensor_shape(input_tensor), tensor_shape(weight)
+    outputs = [operation.output] if operation.HasField("output") else list(operation.outputs.tensors)
+    if cim and len(outputs) != 1:
+        raise ValueError("CIM search requires one dense output tensor")
+    output = outputs[-1]
+    vector_timing = (cim_output_timing(target, operations, output, epilogue) if cim else
+                     evaluate_epilogue(target, operations, output, epilogue=epilogue))
+    bias = matrix.kwargs.get("bias")
+    if cim and bias is not None and (not bias.HasField("tensor") or bias.tensor.dtype != f"int{target.accum_bits}"):
+        raise ValueError("CIM bias must use the configured accumulation datatype")
     if matrix.target.startswith("conv2d"):
-        if len(weights) != 4:
-            raise ValueError("SA convolution requires HWIO weights")
+        if len(inputs) != 4 or len(weights) != 4 or inputs[0] != 1:
+            raise ValueError("mapping requires batch-one NHWC input and HWIO weights")
+        if cim and matrix.kwargs.get("groups") is not None and matrix.kwargs["groups"].int_value != 1:
+            raise ValueError("grouped convolution uses a separate compiler path")
+        if symmetric_parameter(matrix, "dilation", 1) != 1:
+            raise ValueError("mapping requires unit dilation")
         fy, fx, ic, oc = weights
         workload = Workload(inputs[2], inputs[1], ic, oc, fx, fy,
                             symmetric_parameter(matrix, "stride", 1),
-                            symmetric_parameter(matrix, "padding", 0))
+                            symmetric_parameter(matrix, "padding", 0), bias is not None, vector_timing.direct,
+                            weight_transpose=weight.reshape.target == "transpose")
     else:
         if len(weights) != 2:
-            raise ValueError("SA mapping requires two-dimensional weights")
+            raise ValueError("mapping requires a two-dimensional weight matrix")
         ic, oc = weights
-        workload = Workload(prod(inputs[:-1]), 1, ic, oc)
-    output = operation.output if operation.HasField("output") else operation.outputs.tensors[-1]
-    widths = [dtype_bits(output.dtype)]
-    for op in operation.fused_op.op_list[1:]:
-        widths.extend(dtype_bits(arg.tensor.dtype) for arg in op.kwargs.values()
-                      if arg.HasField("tensor") and arg.tensor.HasField("memory"))
-    output_cycles = transfer_cycles(target.n * max(widths), target.oc_port_bits)
+        workload = Workload(prod(inputs[:-1]), 1, ic, oc, has_bias=bias is not None,
+                            output_to_memory=vector_timing.direct, weight_transpose=weight.reshape.target == "transpose")
+    if cim and inputs[-1] != ic:
+        raise ValueError("CIM input channels do not match the logical weight shape")
+    if cim and prod(tensor_shape(output)) != workload.output_x * workload.output_y * oc:
+        raise ValueError("CIM output shape does not match the dense matrix or convolution workload")
+    if cim and bias is not None and prod(tensor_shape(bias.tensor)) != oc:
+        raise ValueError("CIM bias must contain one value per output channel")
     logical, padded = channel_metadata(matrix)
     workload = replace(workload, logical_channels=logical, padded_channels=padded,
-                       input_bits=dtype_bits(matrix.kwargs["input"].tensor.dtype), weight_bits=dtype_bits(weight.dtype))
-    return workload, output_cycles
+                       input_bits=dtype_bits(input_tensor.dtype), weight_bits=dtype_bits(weight.dtype))
+    return workload, vector_timing
+
 
 
 def parse_operation(target, operation, epilogue=None):

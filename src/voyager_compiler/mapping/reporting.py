@@ -161,6 +161,21 @@ def layer_report(operation, target, tilings=None):
         lines += [f"{origin}: {number(search['evaluated'])} evaluated, {number(search['legal'])} legal, "
                   f"{number(search['capacity_rejected'])} early capacity rejections; "
                   f"{number(op.get('search_seconds'), 3)} seconds.", ""]
+    inputs = op.get("input_loading")
+    if inputs:
+        lines += ["### Input loading", "",
+                  f"{inputs['lane_elements']} elements per bank word, {inputs['element_bits']} bits per source element; "
+                  f"{inputs['pack_factor']} words per request on a {inputs['port_bits']}-bit port.", "",
+                  f"{number(inputs['requests'])} external requests / {number(inputs['external_beats'])} beats; "
+                  f"{number(inputs['writes'])} buffer-word writes including zero padding. "
+                  f"{number(inputs['fills'])} bank fills; first fill {number(inputs['first_fill_cycles'])} cycles; "
+                  f"fill time {number(inputs['min_fill_cycles'])}–{number(inputs['max_fill_cycles'])} cycles.", "",
+                  f"Input-bank readiness adds {number(inputs['wait_cycles'])} cycles to the compute schedule. "
+                  "This overlaps other stage constraints and must not be added to their waits.", ""]
+        if inputs['max_fill_bound']:
+            lines += ["Variable boundary fills use a maximum-fill timing bound.", ""]
+        if inputs['serialized_bound']:
+            lines += ["Input readiness reached its work limit and uses a serialized upper bound.", ""]
     return "\n".join(lines)
 
 

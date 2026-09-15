@@ -72,7 +72,7 @@ def serialize(name, target, mapping, inputs):
                             search=context.statistics())
     detail = asdict(evaluation)
     detail.pop("metadata")
-    return tiling, dict(evaluation=detail, **result.details,
+    return tiling, dict(evaluation=detail, vector_unit=context.vector_timing.report(), **result.details,
                        workload=dict(input_channels=context.workload.input_channels,
                                      output_channels=context.workload.output_channels,
                                      output_x=context.workload.output_x, output_y=context.workload.output_y))

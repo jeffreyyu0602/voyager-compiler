@@ -10,7 +10,7 @@ from .target import MappingTarget
 from .schedule import LOOPS, Schedule, TemporalLevel
 from .models import sa, cim
 from .models.input import input_tile_shape
-from .models.sa import TimingOptions as OutputOptions
+from .models.output import OutputOptions
 
 
 # Bind generic enumeration to a target's constraints and evaluation callbacks
@@ -230,7 +230,7 @@ def prepare_search(target, workload, *, vector_timing=None, write_output_to_accu
     else:
         model = sa.Evaluator(target, workload, vector_timing, options=options or OutputOptions())
         resource, constraints = sa_search_space(target)
-        write_output_to_accum_buffer = target.double_buffered_accum and vector_timing > 1
+        write_output_to_accum_buffer = target.double_buffered_accum and vector_timing.port_cycles_per_vector > 1
         useful_fraction = workload.useful_work_fraction
     layer = interstellar.Layer(workload.input_channels, workload.output_channels,
         workload.output_x, workload.output_y, workload.filter_x, workload.filter_y,

@@ -7,13 +7,11 @@ from time import perf_counter
 from google.protobuf.json_format import MessageToDict
 from voyager_compiler.codegen import tiling_pb2
 from .operations import channel_metadata, matrix_operation, parse_operation, skip_reason
+from .reporting import utilization_metrics
 from .search import prepare_search, search_mapping
 from .results import serialize, write_tilings
-from .reporting import utilization_metrics
-
-
-
-
+from .models.cim_timing import TimingOptions
+from .models.output import OutputOptions
 
 
 # Remove identity-only operation fields while retaining shape, route, and dtype
@@ -29,13 +27,9 @@ def operation_key(operation):
     return json.dumps(normalize(MessageToDict(operation, preserving_proto_field_name=True)), sort_keys=True)
 
 
-
-
 # Resolve only the options supported by the selected hardware evaluator
 def resolve_timing(target, options=None):
-    from .models import sa
-    from .models.cim_timing import TimingOptions
-    option_type = TimingOptions if target.backend == "cim" else sa.TimingOptions
+    option_type = TimingOptions if target.backend == "cim" else OutputOptions
     if options is None or isinstance(options, dict):
         return option_type(**(options or {}))
     if type(options) is not option_type:
