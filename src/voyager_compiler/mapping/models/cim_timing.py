@@ -15,7 +15,6 @@ class TimingOptions:
     input_handoff_cycles: int = 1
     result_return_cycles: int = 5
     output_pipeline_cycles: int = 4
-    sram_dependency_cycles: int = 1
 
     # Require a positive consumer service rate
     def __post_init__(self):
@@ -39,7 +38,8 @@ class TimingEstimate:
         "aggregate service totals overlap across independent input, weight, bias, and output interfaces",
         "one beat per cycle plus specified request latency; double-buffered input prefetch",
         "result-slot capacity bounds average issue rate; no per-operation FIFO simulation",
-        "configured SRAM dependency service approximates ordered write/read waits",
+        "SRAM reads and writes overlap accumulation at one vector per cycle per port; no dependency waits",
+        "schedule and local contexts must cover SRAM feedback latency; RAW safety is not validated",
         "writes into a single resident CIM set serialize with compute",
         "input packing and bank boundaries use aggregate service estimates",
         "useful work excludes convolution and channel padding; repeated L2 slices use mean useful work",
@@ -68,10 +68,11 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     total_output_cycles = outputs * output_cycles_per_vector
     total_bias_cycles = traffic.bias_requests * (
         ceil_div(target.n * target.accum_bits, target.oc_port_bits) + options.memory_request_latency)
-    # Approximate ordered SRAM dependencies; local feedback needs no extra transfer
-    total_accumulation_cycles = traffic.a_beats + traffic.buffer_accum_reads * options.sram_dependency_cycles
     sram_reads = traffic.buffer_accum_reads + traffic.buffer_output_reads
     sram_writes = traffic.buffer_accum_intermediate_writes + traffic.buffer_accum_final_writes
+    # II=1 accumulation overlaps independent DualPortBuffer reads and writes
+    # Feedback spacing is a schedule assumption, not a hardware dependency stall
+    total_accumulation_cycles = max(traffic.a_beats, sram_reads, sram_writes)
     startup = max(inputs.first_fill_cycles, first_weight) + options.input_handoff_cycles
     remaining_weights = total_weight_cycles - first_weight
     # Writing weights and computing cannot overlap when both use the only resident set
