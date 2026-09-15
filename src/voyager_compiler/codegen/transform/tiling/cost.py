@@ -35,20 +35,26 @@ from voyager_compiler.codegen.node_info import (
 
 le = interstellar.le
 
-# Passes an op makes over its data; it fetches its operands once per pass.
-# Single source of truth: reporting/cost.py imports this via
+# Passes an op makes over its data, each as what it streams in and what it
+# writes per element: IN the op's input, MID the intermediate a normalization
+# stages between passes, OUT its output, None a reduction that writes one
+# value per row.  Single source of truth: reporting/cost.py imports this via
 # ``vector_op_utilization``.
+IN, MID, OUT = "in", "mid", "out"
+_LAYER_NORM_PASSES = [(IN, None), (IN, None), (IN, MID), (MID, OUT)]
+_SOFTMAX_PASSES = [(IN, None), (IN, None), (IN, OUT)]
 OP_PASSES = {
-    torch.ops.aten.layer_norm.default: 4,
-    torch.ops.aten.softmax.int: 3,
-    torch.ops.quantized_ops.layer_norm.default: 4,
-    torch.ops.quantized_ops.softmax.default: 3,
+    torch.ops.aten.layer_norm.default: _LAYER_NORM_PASSES,
+    torch.ops.aten.softmax.int: _SOFTMAX_PASSES,
+    torch.ops.quantized_ops.layer_norm.default: _LAYER_NORM_PASSES,
+    torch.ops.quantized_ops.softmax.default: _SOFTMAX_PASSES,
 }
 
-# Cycles a tile costs the vector unit whatever it holds: instruction issue and
-# pipeline fill/drain.  Fixed per tile, so a tile too small to amortise it is
-# dominated by overhead.
-KERNEL_LAUNCH_OVERHEAD = 64
+# Cycles a pass costs the vector unit whatever it holds: params, instruction
+# issue and pipeline fill/drain.  Fixed per pass, so a tile too small to
+# amortise it is dominated by overhead.  96 on every layer_norm and softmax
+# pass the Sphinx RTL measured.
+KERNEL_LAUNCH_OVERHEAD = 96
 
 
 def get_dtype_width(dtype) -> int:
@@ -109,59 +115,103 @@ def bandwidth_utilization(bits, num_passes, vector_lanes, bytes_per_cycle):
     return min(1.0, 1.0 / fetch_cycles)
 
 
+def _record_writes(record_bits: int, beat: int) -> float:
+    """Write cycles per record of ``record_bits`` on a ``beat``-byte bus,
+    averaged over the alignment cycle: one per beat-sized word, two where
+    the record starts mid-beat and the bus splits the word."""
+    nbytes = math.ceil(record_bits / 8)
+    words = math.ceil(nbytes / beat)
+    period = math.lcm(nbytes, beat) // nbytes
+    split = sum(1 for g in range(period) if (g * nbytes) % beat)
+    return words * (period + split) / period
+
+
+def _input_bits(node, anchor) -> int:
+    """Element width of the buffer the anchor's primary input is fetched
+    from: through a fused dequantize prologue to the operand the call binds,
+    so a packed input is sized as loaded, not as decoded."""
+    src = anchor.args[0]
+    if src.target is torch.ops.quantized_ops.dequantize.default:
+        src = src.args[0]
+    submodule = node.meta.get("submodule")
+    if submodule is not None and src.graph is submodule.graph:
+        src = bound_operands(node, submodule).get(src, src)
+    bits = _node_dtype_bits(src)
+    return max(bits) if isinstance(bits, list) else bits
+
+
+def _output_writes(node, lanes: int, beat: int) -> float:
+    """Write cycles per lane group of ``node``'s outputs: the data output's
+    record, plus one per block scale a ``quantize_mx`` tail writes beside
+    it."""
+    widths = _node_dtype_bits(node)
+    if not isinstance(widths, list):
+        return _record_writes(lanes * widths, beat)
+    values = getattr(node, "value", None)
+    if values is None:
+        values = node.meta.get("val")
+    data = max(range(len(widths)), key=lambda i: values[i].numel())
+    return _record_writes(lanes * widths[data], beat) + len(widths) - 1
+
+
 def vector_op_utilization(
     node, vector_lanes, bytes_per_cycle, ideal_cycles=None
 ):
-    """Fraction of peak a vector ``node`` sustains, bound by SRAM bandwidth.
+    """Fraction of peak a vector ``node`` sustains, bound by the bus.
 
-    Peak is one ``vector_lanes``-wide lane group per cycle, fetched at the
-    widest of the op's input / output element widths, once per pass it makes
-    over its data (softmax 3, layer_norm 4 -- see ``OP_PASSES``).
-
-    Given ``ideal_cycles`` -- what one tile would cost at 100% -- the fixed
-    ``KERNEL_LAUNCH_OVERHEAD`` is folded in, so that ``ideal_cycles / result``
-    is the bandwidth-bound cost *plus* the launch.  Utilization then falls as
-    the tile shrinks, collapsing to ``ideal_cycles / KERNEL_LAUNCH_OVERHEAD``
-    for a tile too small to amortise it; without it the answer depends only on
-    dtype widths, lanes and passes, and holds for every tile size.
-
-    Everything not running on the matrix unit is a vector op, and all are
-    bandwidth-bound the same way -- only the bytes fetched per lane group
-    differ.  A fully-connected (matrix-vector) GEMM streams its weight once per
-    output, so it is sized by the weight width -- the width of the buffer the
-    kernel *loads* (``weight_transforms``), not of what a fused prologue
-    decodes it into, because a packed cache reaches the bank packed.  Every
-    other vector op is sized by the widest of ``node`` and its inputs.  The
-    rules key off the *anchor*
-    (``get_anchor_node``), so a fused ``call_module`` -- whose own target is
-    just the submodule name -- resolves to the real op inside; a bare vector op
-    is its own anchor.  This is the single copy of the formula;
+    Peak is one ``vector_lanes``-wide lane group per cycle.  Each pass over
+    the data (``OP_PASSES``; one for everything else) costs a lane group the
+    greater of its read cycles, the bus beats its widest streamed operand is
+    fetched in, and its write cycles, at ``bytes_per_cycle`` per beat: a
+    reduction pass writes one value per row, so it runs at the read rate,
+    and a record that ends mid-beat is split by the bus, so a sub-byte
+    output can take more write cycles than read cycles.  A fully-connected
+    GEMM streams its weight once per output and is sized by the buffer the
+    kernel loads (``weight_transforms``), not by what a fused prologue
+    decodes it into.  Given ``ideal_cycles``, the per-pass
+    ``KERNEL_LAUNCH_OVERHEAD`` is folded in so ``ideal_cycles / result`` is
+    the tile's whole cost.  The single copy of the formula:
     ``reporting/cost.op_utilization`` calls it for its vector branch.
     """
     anchor = get_anchor_node(node) or node
+    beat = max(1, round(bytes_per_cycle))
     if is_fully_connected(anchor):
         submodule = node.meta.get("submodule")
         bound = bound_operands(node, submodule)
         weight = anchor.args[1]
         if submodule is not None and weight.graph is submodule.graph:
             weight = weight_transforms(weight)[0]
-        widths = [_node_dtype_bits(bound.get(weight, weight))]
+        bits = _node_dtype_bits(bound.get(weight, weight))
+        reads = {IN: max(bits) if isinstance(bits, list) else bits}
+        profile = [(IN, None)]
+    elif anchor.target in OP_PASSES:
+        profile = OP_PASSES[anchor.target]
+        reads = {IN: _input_bits(node, anchor), MID: _node_dtype_bits(anchor)}
     else:
         widths = [
             _node_dtype_bits(n)
-            for n in [node, *node.all_input_nodes]
-            if n is node or require_allocation(n)
+            for n in node.all_input_nodes
+            if require_allocation(n)
         ]
-    # A multi-output node contributes one width per output.
-    bits = [b for w in widths for b in (w if isinstance(w, list) else [w])]
-    num_passes = OP_PASSES.get(anchor.target, 1)
-    util = bandwidth_utilization(
-        max(bits, default=16), num_passes, vector_lanes, bytes_per_cycle
-    )
+        reads = {IN: max(widths, default=16)}
+        profile = [(IN, OUT)]
+    cycles_per_group = 0.0
+    for read, write in profile:
+        read_cycles = math.ceil(
+            vector_lanes * reads[read] / 8 / bytes_per_cycle
+        )
+        if write is None:
+            write_cycles = 0.0
+        elif write is MID:
+            write_cycles = _record_writes(vector_lanes * reads[MID], beat)
+        else:
+            write_cycles = _output_writes(node, vector_lanes, beat)
+        cycles_per_group += max(read_cycles, write_cycles)
+    util = min(1.0, 1.0 / cycles_per_group)
     if not ideal_cycles:
         return util
     return ideal_cycles / (
-        ideal_cycles / util + num_passes * KERNEL_LAUNCH_OVERHEAD
+        ideal_cycles / util + len(profile) * KERNEL_LAUNCH_OVERHEAD
     )
 
 
