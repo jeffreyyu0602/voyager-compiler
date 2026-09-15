@@ -5,15 +5,16 @@ from itertools import product
 from ..timing.transfer import ceil_div, transfer_cycles
 
 
-
-
-# Summarize bank fills without traversing every input packet
+# Separate first-fill latency from total bank-fill work
 @dataclass(frozen=True)
 class InputTraffic:
     requests: int
     writes: int
     total_fill_cycles: int
     first_fill_cycles: int
+    fills: int
+    max_fill_cycles: int
+    min_fill_cycles: int
 
 
 # Derive the input bank's halo extents from temporal factors
@@ -51,7 +52,7 @@ def _axis_tiles(count, extent, inputs, offset, fetch_steps, writer_steps):
     return result
 
 
-# Count exact input traffic and estimate pipelined memory/unpacking total_fill_cycles per bank
+# Count exact input traffic and estimate memory and unpacking cycles per bank
 def input_bank_traffic(l1, l2, workload, *, lanes, element_bits, port_bits, pack, request_latency=0):
     width, height = input_tile_shape(l1, workload)
     stride, padding = workload.stride, workload.padding
@@ -72,7 +73,8 @@ def input_bank_traffic(l1, l2, workload, *, lanes, element_bits, port_bits, pack
     channels = l1["IC"] // pack
     writes = width * height * l1["IC"]
     memory_interval = transfer_cycles(lanes * pack * element_bits, port_bits, request_latency)
-    requests = total_fill_cycles = 0
+    requests = total_fill_cycles = max_fill = 0
+    min_fill = None
     for ((xf, xw), nx), ((yf, yw), ny) in product(xs.items(), ys.items()):
         valid = (xf[1] - xf[0]) * (yf[1] - yf[0])
         writer_valid = (xw[1] - xw[0]) * (yw[1] - yw[0])
@@ -80,12 +82,16 @@ def input_bank_traffic(l1, l2, workload, *, lanes, element_bits, port_bits, pack
             return None, ["input fetcher and writer disagree on padding at this stride"]
         packets = valid * channels
         requests += nx * ny * packets
-        total_fill_cycles += nx * ny * (max(packets * memory_interval, writes)
-                              + (min(memory_interval, pack) if packets else 0))
+        # Fetching the next bank overlaps the current bank's final writes
+        fill_cycles = max(packets * memory_interval, writes)
+        total_fill_cycles += nx * ny * fill_cycles
+        max_fill = max(max_fill, fill_cycles)
+        min_fill = fill_cycles if min_fill is None else min(min_fill, fill_cycles)
     first_x = _valid_span(-padding, x_fetch[1], width, workload.input_x)
     first_y = _valid_span(-padding, y_fetch[1], height, workload.input_y)
     first_packets = (first_x[1] - first_x[0]) * (first_y[1] - first_y[0]) * channels
     first_cycles = max(first_packets * memory_interval, writes) + (min(memory_interval, pack) if first_packets else 0)
     repetitions = l2["IC"] * l2["OC"]
     fills = l2["OX"] * l2["OY"] * l2["FY"] * repetitions
-    return InputTraffic(requests * repetitions, writes * fills, total_fill_cycles * repetitions, first_cycles), []
+    return InputTraffic(requests * repetitions, writes * fills, total_fill_cycles * repetitions, first_cycles,
+                        fills, max_fill, min_fill), []

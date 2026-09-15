@@ -52,10 +52,12 @@ class Traffic:
     buffer_output_reads: int
     vector_output_vectors: int
 
+
 # Identify outer spatial contexts using the processor's exact nesting predicate
 def outer_context(schedule: Schedule, loop: str) -> bool:
     return any(schedule.l2.bound(reduction) > 1 and schedule.l2.inside(loop, reduction)
                for reduction in ("IC", "FY"))
+
 
 # Count simultaneous feedback registers independently of SRAM output addressing
 def local_accum_footprint(schedule: Schedule) -> int:
@@ -65,6 +67,7 @@ def local_accum_footprint(schedule: Schedule) -> int:
     return prod(levels[level].bound(loop) for level in range(2) for loop in ("OC", "OY", "OX")
                 if any(outer < level or (outer == level and levels[level].inside(loop, reduction))
                        for outer, reduction in reductions))
+
 
 # Reject shapes and schedules that overflow or disagree across the current ABI
 def _legality(target, schedule, workload, fetch, pack, width, height):
@@ -152,8 +155,6 @@ def _legality(target, schedule, workload, fetch, pack, width, height):
     return reasons
 
 
-
-
 # Bind immutable workload and timing assumptions once per search
 class Evaluator:
     # Reuse geometry summaries across candidates with the same temporal factors
@@ -198,6 +199,9 @@ class Evaluator:
         traffic = count_traffic(target, schedule, workload, fetch, policy, inputs, pack, self.useful_positions)
         live_outputs = local_accum_footprint(schedule)
         timing = estimate_cycles(target, schedule, workload, fetch, options, policy, traffic, inputs)
+        if timing.readiness.get("accumulation_feedback_safe") is False:
+            return Evaluation(False, ("SRAM feedback spacing is below the supplied feedback latency",),
+                              policy=policy, traffic=traffic, timing=timing)
         return Evaluation(True, (), policy=policy, traffic=traffic,
                           accumulation_footprint=footprint, local_accum_footprint=live_outputs,
                           input_footprint=width * height * l1.bound("IC"),
@@ -208,7 +212,6 @@ class Evaluator:
 def evaluate(target: CIMTarget, schedule: Schedule, workload: Workload,
              fetch: WeightFetch = None, *, options: TimingOptions = TimingOptions()) -> Evaluation:
     return Evaluator(target, workload, options=options)(schedule, fetch)
-
 
 
 # Count physical work for a legal schedule before timing it

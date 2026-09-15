@@ -54,5 +54,69 @@ class AccumulationTimingTests(unittest.TestCase):
         self.assertEqual(few_slots.timing.resource_cycles["result_slots"], 512)
 
 
+# Distinguish isolated load latency from sustained multi-set transfer service
+class WeightTimingTests(unittest.TestCase):
+    # Four eight-row sets stream at eight cycles per set with one startup tail
+    def test_streaming_weight_service(self):
+        schedule = Schedule(TemporalLevel.make(OX=1, IC=4))
+        workload = Workload(1, 1, 32, 8, output_to_memory=False)
+        result = evaluate(small_target(), schedule, workload)
+        self.assertTrue(result.legal, result.reasons)
+        self.assertEqual(result.traffic.full_set_loads, 4)
+        self.assertEqual(result.timing.resource_cycles["weight"], 32)
+        self.assertEqual(result.timing.startup_cycles, 10)
+        narrow = evaluate(small_target(oc_port_bits=32), schedule, workload)
+        self.assertTrue(narrow.legal, narrow.reasons)
+        self.assertEqual(narrow.timing.resource_cycles["weight"], 64)
+
+    # One resident set cannot preload the next set while the current set computes
+    def test_single_set_serialization(self):
+        schedule = Schedule(TemporalLevel.make(OX=1, IC=4))
+        workload = Workload(1, 1, 32, 8, output_to_memory=False)
+        result = evaluate(small_target(b_sets=1), schedule, workload)
+        self.assertTrue(result.legal, result.reasons)
+        self.assertEqual(result.timing.resource_cycles["weight"], 36)
+
+    # A transposed set retains its sequential gather and emit phases
+    def test_transpose_serialization(self):
+        schedule = Schedule(TemporalLevel.make(OX=1, IC=4))
+        workload = Workload(1, 1, 32, 8, output_to_memory=False, weight_transpose=True)
+        result = evaluate(small_target(), schedule, workload)
+        self.assertTrue(result.legal, result.reasons)
+        self.assertEqual(result.timing.resource_cycles["weight"], 64)
+
+
+# Check bank reuse bounds and explicitly supplied feedback safety constraints
+class BufferReadinessTests(unittest.TestCase):
+    # A narrow input port exposes bank-fill stalls even when weights remain resident
+    def test_input_bank_fill(self):
+        schedule = Schedule(TemporalLevel.make(OX=1), TemporalLevel.make(OX=4))
+        workload = Workload(4, 1, 8, 8, output_to_memory=False)
+        wide = evaluate(small_target(), schedule, workload)
+        narrow = evaluate(small_target(ic_port_bits=8), schedule, workload)
+        self.assertTrue(narrow.legal, narrow.reasons)
+        self.assertGreater(narrow.runtime_cycles, wide.runtime_cycles)
+        self.assertEqual(narrow.timing.readiness["input_wait_cycles"], 20)
+        self.assertFalse(narrow.timing.readiness["input_max_fill_bound"])
+
+    # SRAM spacing constrains legality only when feedback latency is explicitly supplied
+    def test_feedback_spacing(self):
+        schedule = Schedule(TemporalLevel.make(OX=16, IC=8))
+        workload = Workload(16, 1, 64, 8, output_to_memory=False)
+        unknown = evaluate(small_target(), schedule, workload)
+        safe = evaluate(small_target(), schedule, workload,
+                        options=TimingOptions(accumulation_feedback_cycles=16))
+        unsafe = evaluate(small_target(), schedule, workload,
+                          options=TimingOptions(accumulation_feedback_cycles=17))
+        local = evaluate(small_target(local_accum_contexts=16), schedule, workload,
+                         options=TimingOptions(accumulation_feedback_cycles=17))
+        self.assertIsNone(unknown.timing.readiness["accumulation_feedback_safe"])
+        self.assertTrue(safe.legal)
+        self.assertFalse(unsafe.legal)
+        self.assertIsNone(unsafe.runtime_cycles)
+        self.assertIn("feedback spacing", unsafe.reasons[0])
+        self.assertTrue(local.legal)
+
+
 if __name__ == "__main__":
     unittest.main()

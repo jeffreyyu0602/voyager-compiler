@@ -130,6 +130,19 @@ def layer_report(operation, target, tilings=None):
             if stage in timing["resource_cycles"]:
                 lines.append(f"| {stage.replace('_', ' ')} | {number(timing['resource_cycles'][stage])} |")
         lines += [""]
+        readiness = timing.get("readiness", {})
+        if readiness:
+            lines += [f"Weight readiness adds {number(readiness['weight_wait_cycles'])} cycles to MAC issue time; "
+                      f"input-bank readiness adds {number(readiness['input_wait_cycles'])}. "
+                      "These overlapping constraints are not additive.", ""]
+            if readiness.get("input_max_fill_bound"):
+                lines += ["Input timing uses a maximum-fill bound for variable boundary tiles.", ""]
+            if any(readiness.get(key) for key in ("weight_serialized_bound", "input_serialized_bound", "output_bank_serialized_bound")):
+                lines += ["Timing reached its fixed state/work limit and uses a serialized upper bound.", ""]
+            spacing = readiness.get("accumulation_feedback_spacing_cycles", 0)
+            if spacing:
+                safety = "checked against the supplied latency" if readiness.get("accumulation_feedback_safe") else "not checked: SRAM feedback latency is unspecified"
+                lines += [f"Minimum SRAM feedback spacing: {number(spacing)} cycles; {safety}.", ""]
     policy = evaluation.get("policy")
     if policy:
         lines += [f"Resident weight sequence: {policy['sequence_sets']} sets / {target['b_sets']} available; "
