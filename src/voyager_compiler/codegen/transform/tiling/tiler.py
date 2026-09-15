@@ -2289,7 +2289,8 @@ def _product_node(name, out_dtype, left, right, block_size, scales, codes):
         block_size: The MX block, or ``None`` for an unquantized product.
         scales: Under MX, the ``(shape, source)`` of each operand's block
             scales, left then right.
-        codes: Under MX, the two codebook nodes, left then right.
+        codes: Under MX, the two codebook nodes, left then right, each
+            ``None`` for a format without one (``fp4``).
     """
     graph = torch.fx.Graph()
 
@@ -2308,17 +2309,16 @@ def _product_node(name, out_dtype, left, right, block_size, scales, codes):
         )
     else:
         (a_scale, b_scale), (a_code, b_code) = scales, codes
+        kwargs = {
+            "input_scale": placeholder("a_scale", a_scale[1], a_scale[0]),
+            "weight_scale": placeholder("b_scale", b_scale[1], b_scale[0]),
+            "block_size": block_size,
+        }
+        for label, code in (("input_code", a_code), ("weight_code", b_code)):
+            if code is not None:
+                kwargs[label] = placeholder(label, code)
         node = graph.call_function(
-            torch.ops.quantized_ops.matmul_mx.default,
-            (a, b),
-            {
-                "input_scale": placeholder("a_scale", a_scale[1], a_scale[0]),
-                "weight_scale": placeholder("b_scale", b_scale[1], b_scale[0]),
-                "block_size": block_size,
-                "input_code": placeholder("a_code", a_code),
-                "weight_code": placeholder("b_code", b_code),
-            },
-            name=name,
+            torch.ops.quantized_ops.matmul_mx.default, (a, b), kwargs, name=name
         )
     set_node_value(
         node, torch.empty((left[0][0], right[0][1]), dtype=out_dtype)
@@ -2340,7 +2340,7 @@ def _attention_products(node, tq, tkv):
     if block_size is None:
         codes = scores_scales = context_scales = ()
     else:
-        codes = (kw["input_code"], kw["weight_code"])
+        codes = (kw.get("input_code"), kw.get("weight_code"))
         scores_scales = (
             ((tq, head_dim // block_size), kw["query_scale"]),
             ((head_dim // block_size, tkv), kw["key_scale"]),
@@ -2434,9 +2434,15 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
 
     unit = max(config.pe_array_size)
     budget = config.usable_scratchpad_size
+    # A causal query tile must not straddle a head under the GQA fold
+    # (``attention_kv_last``).
+    causal = get_arg_value(node, 5, "is_causal", False)
+    sq = query.value.shape[-2]
     candidates = []  # (tq, tkv, tiles)
     for tq in _divisors_descending(sq_eff):
         if tq % unit and tq != sq_eff:
+            continue
+        if causal and sq % tq:
             continue
         for tkv in _divisors_descending(skv):
             if tkv % unit and tkv != skv:

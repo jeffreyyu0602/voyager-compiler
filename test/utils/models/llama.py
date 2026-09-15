@@ -15,6 +15,8 @@ import math
 import os
 import re
 import sys
+from contextlib import contextmanager
+from unittest.mock import patch
 
 import torch
 from datasets import load_dataset
@@ -26,6 +28,7 @@ from transformers import (
     AutoTokenizer,
     GenerationConfig,
     StaticCache,
+    masking_utils,
 )
 from transformers.integrations.executorch import convert_and_export_with_cache
 
@@ -143,10 +146,35 @@ def max_cache_len(args, config):
     return -(-raw // block) * block
 
 
+@contextmanager
+def _sdpa_is_causal():
+    """Export sdpa attention with ``is_causal`` instead of a materialized
+    causal mask.  transformers builds the mask whenever it is tracing: it
+    refuses the ``is_causal`` skip, since a baked-in flag would be wrong for
+    a variable-length graph, and it cannot run the check that the batch
+    holds no packed sequences.  A fixed-length, single-sequence prefill
+    export wants the flag and has no packing."""
+
+    def skip(padding_mask, query_length, kv_length, *args, **kwargs):
+        return query_length == kv_length and (
+            padding_mask is None or bool(padding_mask.all())
+        )
+
+    with (
+        patch.object(masking_utils, "_ignore_causal_mask_sdpa", skip),
+        patch.object(
+            masking_utils, "find_packed_sequence_indices", lambda ids: None
+        ),
+    ):
+        yield
+
+
 def build_prefill(model, tokenizer, args):
     """Export the whole model over ``context_length`` prompt tokens with no
     cache; ``logits_to_keep=1`` slices the hidden states before ``lm_head``
-    so it lowers as a GEMV.  Returns ``(gm, example_args, example_kwargs)``."""
+    so it lowers as a GEMV.  Under ``--attn_implementation sdpa`` the
+    attention runs ``is_causal`` with no mask tensor.  Returns ``(gm,
+    example_args, example_kwargs)``."""
     input_ids = _prompt_ids(tokenizer, args.context_length)
     example_args = (input_ids,)
     example_kwargs = {
@@ -154,7 +182,11 @@ def build_prefill(model, tokenizer, args):
         "use_cache": False,
         "logits_to_keep": 1,
     }
-    gm = export_model(model, example_args, example_kwargs)
+    if args.attn_implementation == "sdpa":
+        with _sdpa_is_causal():
+            gm = export_model(model, example_args, example_kwargs)
+    else:
+        gm = export_model(model, example_args, example_kwargs)
     return gm, example_args, example_kwargs
 
 
@@ -363,9 +395,8 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
             )
             if not sdpa:
                 raise RuntimeError("no causal-mask where node feeds an add")
-            # SDPA takes the causal mask as its bool ``attn_mask``, which the
-            # compiler already stores and moves at one bit per element.
-            logger.info("attention mask is already 1-bit under sdpa")
+            # sdpa runs ``is_causal`` with no mask tensor to quantize.
+            logger.info("no attention mask under sdpa")
         for mask in masks:
             annotate_output_qspec(mask, qspec)
 

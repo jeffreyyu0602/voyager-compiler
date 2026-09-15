@@ -7,6 +7,7 @@ runs one way, so the builders can ask for a tiling without a cycle.
 """
 
 from voyager_compiler.codegen.transform.tiling.cost import (
+    attention_kv_last,
     attention_tile_latency,
     gemv_tile_latency,
     vector_op_utilization,
@@ -40,6 +41,7 @@ __all__ = [
     "GEMM_L3_ORDER",
     "TileConstraint",
     "TilerContext",
+    "attention_kv_last",
     "attention_op_tiling",
     "attention_tile_latency",
     "build_interstellar_tiler",

@@ -447,6 +447,15 @@ def _sweep_cycles(dmas, steps, compute):
     )
 
 
+def attention_kv_last(q_block, tq, tkv, sq):
+    """The last key block a causal query block attends: the one holding
+    the key of its last row.  The rows of query block ``q_block`` sit at
+    ``(q_block * tq) % sq`` within their head of ``sq`` rows (the GQA fold
+    stacks heads along the rows, a block never straddling one).
+    ``q_block`` may be a loop's SymInt."""
+    return ((q_block * tq) % sq + tq - 1) // tkv
+
+
 def attention_tile_latency(node, tiles, grid, config, matrix):
     """Latency and DRAM traffic of a flash-attention node under a tiling.
 
@@ -463,7 +472,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     ``vector_op_utilization`` charges, plus its launch.  Query and output
     move once per query block, while key, value, mask and every block scale
     reload on each step, and the DMAs overlap compute the way
-    ``_sweep_cycles`` prices a double-buffered sweep.
+    ``_sweep_cycles`` prices a double-buffered sweep.  Under ``is_causal``
+    only the live pairs are steps (``attention_kv_last``) and the mask
+    tiles stream from the kernel's table, one per step.
 
     Args:
         node: The attention node being tiled.
@@ -477,10 +488,17 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
         ``(cycles, DRAM bytes)``; the bytes break a latency tie.
     """
     query, key, value = node.args[0], node.args[1], node.args[2]
-    steps = math.prod(grid)
-    boundaries = steps // grid[-1]  # one per query block
+    causal = get_arg_value(node, 5, "is_causal", False)
+    boundaries = math.prod(grid[:-1])  # one per query block
     tq, head_dim = tiles[query][-2], tiles[query][-1]
     tkv = tiles[key][-1]
+    if causal:
+        sq = query.value.shape[-2]
+        steps = math.prod(grid[:-2]) * sum(
+            attention_kv_last(q, tq, tkv, sq) + 1 for q in range(grid[-2])
+        )
+    else:
+        steps = math.prod(grid)
 
     # The vector unit's passes, at the softmax's width (the output's).
     util = bandwidth_utilization(
@@ -527,6 +545,10 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
         operand_bytes = _operand_bytes(shape, operand)
         dmas.append((_transfer_cost(shape, operand_bytes, lat, bpc), transfers))
         traffic += transfers * operand_bytes
+    if causal:
+        mask_bytes = math.ceil(tq * tkv / 8)
+        dmas.append((_transfer_cost((tq, tkv), mask_bytes, lat, bpc), steps))
+        traffic += steps * mask_bytes
 
     if config.double_buffered_l2:
         latency = _sweep_cycles(dmas, steps, interior)

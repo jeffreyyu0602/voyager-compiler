@@ -625,13 +625,14 @@ def sdpa_mx(
     the query's parameters (``probs_qmap`` / ``probs_quant_max`` /
     ``probs_scale_qmap`` / ``probs_code``, the arguments ``quantize_mx``
     takes) before the value matmul, as the attention kernel does on chip.
-    ``dropout_p`` is ignored; ``is_causal`` is unsupported, the mask being
-    explicit.
+    ``dropout_p`` is ignored; ``is_causal`` masks every key past a query's
+    own position, as aten does, and excludes an explicit mask.
 
     Returns:
         The attention output, in the codebooks' dtype.
     """
-    assert not is_causal, "is_causal is unsupported; pass an explicit mask"
+    if is_causal and attn_mask is not None:
+        raise ValueError("is_causal excludes an explicit attn_mask")
     query = _dequantize_mx(query, query_scale, input_code, block_size)
     key = _dequantize_mx(key, key_scale, weight_code, block_size)
     value = _dequantize_mx(value, value_scale, weight_code, block_size)
@@ -643,6 +644,10 @@ def sdpa_mx(
         scale = 1.0 / math.sqrt(query.shape[-1])
 
     scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+    if is_causal:
+        attn_mask = torch.ones(
+            scores.shape[-2:], dtype=torch.bool, device=scores.device
+        ).tril()
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
             scores = scores.masked_fill(~attn_mask, float("-inf"))

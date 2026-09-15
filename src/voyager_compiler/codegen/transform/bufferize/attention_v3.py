@@ -11,8 +11,12 @@ accumulate/rescale are synchronous.  Each async matmul is dispatched with
 posts a done-semaphore (``sem_scores`` for QKᵀ, ``sem_pv`` for P@V) that
 ``voyager.async_wait`` consumes where a synchronous op reads the result.
 
-Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``, ``sweep =
-step // N`` the Q tile's index), in program order:
+The loop walks the live (Q tile, KV block) pairs: every pair under an
+explicit mask; under ``is_causal`` only the blocks up to each Q tile's last
+row, the rest being fully masked.  It carries the sweep (the Q tile's index
+over ``[*kv_batch, num_q_blocks]``) and ``kv``, the block within the sweep,
+and advances them each step past the sweep's last block (``_kv_last``).
+Per iteration (``N = num_kv_blocks``), in program order:
 
   [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];  commit, post sem_scores
   [B] pv_buf = p_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
@@ -40,6 +44,15 @@ data, K's transposed by the DMA like K.  Both products are ``matmul_mx``.
 [D] exponentiates S in place, sums the exact exponentials into ``l``, then
 one more vector pass quantizes them along the keys with the query's
 parameters into P's codes (``p_buf``) and block scales (``p_scale``).
+
+``is_causal`` (no mask tensor): [A] still masks with a bool tile, read from
+``causal_mask``, a constant table of every tile a live pair can need.  A
+pair's tile depends only on how far its Q tile's first row sits past its KV
+block's first key, ``(q·tq) mod sq - kv·tkv``, a multiple of ``gcd(tq,
+tkv)``; the table holds one tile per multiple from ``gcd - tq`` up to ``sq -
+tq``, a block wholly below the diagonal reading an all-true entry.  A Q tile
+must not straddle a head under the GQA fold (``tq`` divides ``sq``), so a
+row's position in its head is ``(q·tq) mod sq + r``.
 """
 
 import logging
@@ -70,7 +83,10 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _tag_loop_extents,
     voyager,
 )
-from voyager_compiler.codegen.transform.tiling import attention_op_tiling
+from voyager_compiler.codegen.transform.tiling import (
+    attention_kv_last,
+    attention_op_tiling,
+)
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import ShapeProp
 
@@ -98,6 +114,17 @@ def _unravel(flat, basis):
     return out
 
 
+def _causal_mask_table(tq, tkv, sq):
+    """The bool mask tiles ``is_causal`` attention reads (module
+    docstring): entry ``k`` keeps key ``c`` of row ``r`` when ``c <= r +
+    delta`` for ``delta = gcd(tq, tkv)·(k + 1) - tq``."""
+    g = math.gcd(tq, tkv)
+    deltas = torch.arange(sq // g) * g + (g - tq)
+    rows = torch.arange(tq).view(1, tq, 1)
+    cols = torch.arange(tkv).view(1, 1, tkv)
+    return (cols <= rows + deltas.view(-1, 1, 1)).unsqueeze(1)
+
+
 class _FA3Pipeline(torch.nn.Module):
     """The FA3 scheduler: prologue → uniform ``while_loop`` → epilogue
     (see the module docstring for the schedule).  Traced whole by
@@ -116,6 +143,7 @@ class _FA3Pipeline(torch.nn.Module):
         has_mask,
         mask_is_bool,
         mask_dyn,
+        is_causal,
         out_shape,
         out_dtype,
         acc_dtype,
@@ -152,7 +180,6 @@ class _FA3Pipeline(torch.nn.Module):
             tuple(mask_fold_shape) if mask_fold_shape is not None else None
         )
         self.grid = tuple(grid)  # (*kv_batch, num_q_blocks, num_kv_blocks)
-        self.num_steps = math.prod(grid)
         self.N = num_kv_blocks
         self.nb = len(grid) - 2
         self.gq, self.gkv = self.nb, self.nb + 1
@@ -170,6 +197,26 @@ class _FA3Pipeline(torch.nn.Module):
         # dynamic dims are the >1-block batch dims plus (for the >1 case)
         # the sequence dim; ``head_dim`` is always loaded whole.
         self.batch_dyn = [i for i in range(self.nb) if grid[i] > 1]
+        # The walk (module docstring): ``sweeps`` over ``grid[:-1]``, each
+        # running the KV blocks up to ``_kv_last``; under ``is_causal`` the
+        # mask tiles come from ``causal_mask``.
+        self.causal = is_causal
+        self.sweeps = math.prod(self.grid[:-1])
+        if is_causal:
+            self.causal_gcd = math.gcd(tq, tkv)
+            self.register_buffer(
+                "causal_mask", _causal_mask_table(tq, tkv, sq_orig)
+            )
+        self.num_steps = math.prod(self.grid[: self.gq]) * sum(
+            self._kv_last(q) + 1 for q in range(self.grid[self.gq])
+        )
+
+    def _kv_last(self, q_block):
+        """The last live KV block of Q tile ``q_block`` (an int, or the
+        loop's SymInt)."""
+        if not self.causal:
+            return self.N - 1
+        return attention_kv_last(q_block, self.tq, self.tkv, self.sq_orig)
 
     # --- DMA helpers (all take explicit coords; slots may be SymInts) ---
 
@@ -189,8 +236,10 @@ class _FA3Pipeline(torch.nn.Module):
     def _load_sweep(self, src, slots, slot, sem, coords, tile):
         """DMA ``src``'s ``tile`` at ``coords``' query block into
         ``slots[slot]``.  The block is loaded once per sweep but read on
-        every one of the sweep's N steps, so its semaphore posts N times to
-        balance the per-step [A] consume."""
+        every one of the sweep's live steps, so its semaphore posts once
+        per step to balance the per-step [A] consume -- exactly, or a
+        stale post would let a later sweep's [A] run before its tile
+        landed."""
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         voyager.async_copy(
             src,
@@ -199,7 +248,7 @@ class _FA3Pipeline(torch.nn.Module):
             (1,) * self.nb + tuple(tile),
             get_slot(sem, slot),
             dims,
-            post_count=self.N,
+            post_count=self._kv_last(coords[self.gq]) + 1,
         )
 
     def _load_step(self, src, slots, slot, sem, coords, tile, transposed):
@@ -219,8 +268,17 @@ class _FA3Pipeline(torch.nn.Module):
         )
 
     def _load_mask(self, mask, slots, slot, sem, coords):
-        dims = [d for d, _ in self.mask_dyn]
-        idx = [coords[g] for _, g in self.mask_dyn]
+        """DMA the mask tile of the pair at ``coords`` into
+        ``slots[slot]``: the explicit mask's block, or under ``is_causal``
+        the ``causal_mask`` entry for the pair's offset (module
+        docstring)."""
+        if self.causal:
+            q, kv = coords[self.gq], coords[self.gkv]
+            offset = (q * self.tq) % self.sq_orig + self.tq - kv * self.tkv
+            dims, idx = [0], [offset // self.causal_gcd - 1]
+        else:
+            dims = [d for d, _ in self.mask_dyn]
+            idx = [coords[g] for _, g in self.mask_dyn]
         munit = (1,) * (mask.ndim - 2)
         voyager.async_copy(
             mask,
@@ -243,11 +301,13 @@ class _FA3Pipeline(torch.nn.Module):
     def _matmul(self, *tiles):
         """The matrix unit's product of two tiles, ``a @ b``: ``(a, b)``, or
         under MX ``(a, a_scale, b, b_scale, a_code, b_code)`` -- each
-        operand's codes, then its block scales, then the codebooks."""
+        operand's codes, then its block scales, then the codebooks, which
+        a format without one (``fp4``) leaves out."""
         if self.block_size is None:
             a, b = tiles
             return torch.matmul(a, b)
-        a, a_scale, b, b_scale, a_code, b_code = tiles
+        a, a_scale, b, b_scale, *codes = tiles
+        a_code, b_code = codes or (None, None)
         return torch.ops.quantized_ops.matmul_mx(
             a,
             b,
@@ -351,6 +411,8 @@ class _FA3Pipeline(torch.nn.Module):
         index = self.operand_index
         q, k, v = (operands[index[n]] for n in ("query", "key", "value"))
         mask = operands[index["attn_mask"]] if "attn_mask" in index else None
+        if self.causal:
+            mask = self.causal_mask
         bs = self.block_size
         mx = bs is not None
         if mx:
@@ -359,8 +421,9 @@ class _FA3Pipeline(torch.nn.Module):
                 for n in ("query_scale", "key_scale", "value_scale")
             )
             codes = [
-                operands[index["input_code"]],
-                operands[index["weight_code"]],
+                operands[index[n]]
+                for n in ("input_code", "weight_code")
+                if n in index
             ]
             probs = tuple(
                 operands[index[n]] if n in index else None
@@ -374,7 +437,7 @@ class _FA3Pipeline(torch.nn.Module):
                 q_scale = q_scale.reshape(
                     (*self.q_fold_shape[:-1], q_scale.shape[-1])
                 )
-            if mask is not None:
+            if mask is not None and not self.causal:
                 mask = self._fold_mask(mask)
         grid, N, nb = self.grid, self.N, self.nb
         num_steps = self.num_steps
@@ -529,13 +592,17 @@ class _FA3Pipeline(torch.nn.Module):
             )
 
         # ---- prologue: prime the DMA and run step 0's [A] + [D] --------
+        # The walk's first two steps: the second is sweep 0's next block,
+        # or sweep 1's first when sweep 0 has a single block.
+        sweeps, basis = self.sweeps, grid[:-1]
         c0 = _unravel(0, grid)
+        sweep1 = int(self._kv_last(0) == 0)
+        c1 = (*_unravel(sweep1, basis), 1 - sweep1)
         load_q(0, c0)
         load_k(0, c0)
         if num_steps > 1:
-            c1 = _unravel(1, grid)
             load_k(1, c1)
-            if N == 1:
+            if sweep1:
                 # Step 0 is also its sweep's LAST step, so the uniform
                 # pattern's end-of-sweep Q prefetch belongs here too.
                 load_q(1, c1)
@@ -551,14 +618,23 @@ class _FA3Pipeline(torch.nn.Module):
         softmax(0, 0)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
-        def cond_fn(step):
+        # Carried beside the step: the (sweep, kv) pair it runs, which the
+        # walk advances (no step count maps back to its pair).
+        def cond_fn(step, sweep, kv):
             return step < num_steps
 
-        def body_fn(step):
-            cur = voyager.delinearize_index(step, grid)
-            prev = voyager.delinearize_index(step - 1, grid)
-            nxt = voyager.delinearize_index(step + 1, grid)
-            kv = cur[self.gkv]
+        def body_fn(step, sweep, kv):
+            cur = (*voyager.delinearize_index(sweep, basis), kv)
+            last = self._kv_last(cur[self.gq])
+            nxt_sweep = sweep + (kv + 1) // (last + 1)
+            nxt_kv = (kv + 1) % (last + 1)
+            nxt = (*voyager.delinearize_index(nxt_sweep, basis), nxt_kv)
+            # The sweep that just ended, whose output a boundary stores;
+            # wrapped so the index stays in range on sweep 0, whose own
+            # boundary was the prologue's.
+            prev = voyager.delinearize_index(
+                (sweep + sweeps - 1) % sweeps, basis
+            )
             cur_slot = step % 2
             nxt_slot = (step + 1) % 2
             torch._check(cur_slot < 2)
@@ -575,7 +651,7 @@ class _FA3Pipeline(torch.nn.Module):
             torch.cond(step + 1 < num_steps, k_fetch, lambda: 0)
             load_v(nxt_slot, cur)
 
-            next_sweep_slot = ((step + 1) // N) % 2
+            next_sweep_slot = nxt_sweep % 2
             torch._check(next_sweep_slot < 2)
 
             def q_fetch():
@@ -583,16 +659,16 @@ class _FA3Pipeline(torch.nn.Module):
                 return 1
 
             torch.cond(
-                (kv == N - 1) & (step + 1 < num_steps), q_fetch, lambda: 0
+                (kv == last) & (step + 1 < num_steps), q_fetch, lambda: 0
             )
 
             # [A] current block's scores on the matrix unit: its K (and mask)
             # load semaphores are per-step commit dependencies; Q's is too, but
-            # Q is loaded once per sweep, so its load posts N times (see
-            # _load_sweep) to balance the per-step consume.  V is not a
+            # Q is loaded once per sweep, so its load posts once per live step
+            # (see _load_sweep) to balance the per-step consume.  V is not a
             # dependency here — it feeds [B], so [A] issues while V's DMA is
             # in flight.  The sweep's parity picks its Q slot and its ``l``.
-            sweep_slot = (step // N) % 2
+            sweep_slot = sweep % 2
             torch._check(sweep_slot < 2)
             tiles, deps = qk_operands(sweep_slot, cur_slot)
             self._matmul_qk(tiles, get_slot(s_buf, cur_slot), sem_scores, deps)
@@ -622,7 +698,7 @@ class _FA3Pipeline(torch.nn.Module):
             # P@V into o, finalize (o / its l) to ITS rows, zero o for the
             # new tile.  After [D] so the vector unit is not held on sem_pv
             # before the softmax.
-            prev_sweep_slot = (step // N + 1) % 2
+            prev_sweep_slot = (sweep + 1) % 2
             torch._check(prev_sweep_slot < 2)
 
             def finalize():
@@ -630,7 +706,7 @@ class _FA3Pipeline(torch.nn.Module):
                 voyager.insert(o + pv_buf, o)
                 # Drain the previous boundary's store before overwriting
                 # the slot (no prior store exists at the first boundary).
-                _guarded_wait(get_slot(out_sem, 0), step >= 2 * N)
+                _guarded_wait(get_slot(out_sem, 0), sweep >= 2)
                 voyager.insert(
                     (o / get_slot(l, prev_sweep_slot)).to(self.out_dtype),
                     get_slot(out_slots, 0),
@@ -650,12 +726,13 @@ class _FA3Pipeline(torch.nn.Module):
                 return 1
 
             torch.cond(kv > 0, rescale, lambda: 0)
-            return (step + 1,)
+            return (step + 1, nxt_sweep, nxt_kv)
 
-        while_loop(cond_fn, body_fn, (1,))
+        while_loop(cond_fn, body_fn, (1, sweep1, 1 - sweep1))
 
         # ---- epilogue: the final tile's leftover P@V + finalize --------
-        c_last = _unravel(num_steps - 1, grid)
+        c_last = _unravel(sweeps - 1, basis)
+        c_last = (*c_last, self._kv_last(c_last[self.gq]))
         v_slot = num_steps % 2
         # [B] the final block's P@V on the matrix unit.
         tiles, deps = pv_operands((num_steps - 1) % 2, v_slot)
@@ -663,9 +740,9 @@ class _FA3Pipeline(torch.nn.Module):
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)
         voyager.insert(o + pv_buf, o)
-        if num_steps > N:  # a prior boundary store exists (static)
+        if sweeps > 1:  # a prior boundary store exists (static)
             voyager.async_wait(get_slot(out_sem, 0))
-        last_sweep_slot = ((num_steps - 1) // N) % 2
+        last_sweep_slot = (sweeps - 1) % 2
         voyager.insert(
             (o / get_slot(l, last_sweep_slot)).to(self.out_dtype),
             get_slot(out_slots, 0),
@@ -777,11 +854,8 @@ def build_attention_fa3(
             node.name,
             dropout_p,
         )
-    if is_causal:
-        raise NotImplementedError(
-            "is_causal attention is not supported yet; pass an explicit "
-            "additive attn_mask instead"
-        )
+    if is_causal and isinstance(mask_node, torch.fx.Node):
+        raise ValueError(f"{node.name}: is_causal with an explicit attn_mask")
 
     block_size = node.kwargs.get("block_size")  # None: unquantized
 
@@ -795,6 +869,11 @@ def build_attention_fa3(
     nb = q.ndim - 2
     Sq, d = q.shape[-2], q.shape[-1]
     Skv = k.shape[-2]
+    if is_causal and Skv < Sq:
+        raise ValueError(
+            f"{node.name}: is_causal over fewer keys ({Skv}) than queries "
+            f"({Sq})"
+        )
     if scale is None:
         scale = 1.0 / math.sqrt(d)
     acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
@@ -824,6 +903,11 @@ def build_attention_fa3(
         )
     num_q_blocks, num_kv_blocks = tiling
     tq, tkv = plan.sq_eff // num_q_blocks, Skv // num_kv_blocks
+    if is_causal and Sq % tq:
+        raise ValueError(
+            f"{node.name}: a {tq}-row query tile straddles a head of {Sq} "
+            "rows under is_causal"
+        )
     grid = kbatch + (num_q_blocks, num_kv_blocks)
     gq, gkv = nb, nb + 1
 
@@ -857,9 +941,10 @@ def build_attention_fa3(
         tkv=tkv,
         head_dim=d,
         scale=float(scale),
-        has_mask=mask_node is not None,
-        mask_is_bool=mask_is_bool,
+        has_mask=mask_node is not None or is_causal,
+        mask_is_bool=mask_is_bool or is_causal,
         mask_dyn=mask_dyn,
+        is_causal=is_causal,
         g_head=g_head,
         sq_orig=Sq,
         q_fold_shape=plan.q_fold_shape,

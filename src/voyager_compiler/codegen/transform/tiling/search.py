@@ -926,6 +926,11 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
         )
     elif acc_dtype != value.value.dtype:
         total += 2 * _tensor_bytes(value, (tq, tkv), config)
+    if get_arg_value(node, 5, "is_causal", False):
+        # The causal mask tiles stream through two slots like a mask's.
+        total += 2 * tensor_alloc_bytes(
+            tq * tkv, torch.bool, config.bank_width, config.vector_lanes
+        )
     return total
 
 
