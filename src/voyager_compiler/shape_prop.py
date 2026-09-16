@@ -318,9 +318,12 @@ class ShapeProp:
                 sub_g, *operands = node.args
                 result = self._subprop(sub_g.target, load_arg(list(operands)))
             elif node.op == "call_function":
-                result = run_op(
-                    node.target, load_arg(node.args), load_arg(node.kwargs)
-                )
+                try:
+                    result = run_op(
+                        node.target, load_arg(node.args), load_arg(node.kwargs)
+                    )
+                except RuntimeError as e:
+                    raise RuntimeError(f"{node.name}: {e}") from e
             elif node.op == "call_method":
                 self_obj, *rest = load_arg(node.args)
                 result = run_op(

@@ -473,6 +473,23 @@ def fuse_reshape_with_output(
     candidates: List[List[Node]],
     reshape_node: Node,
 ) -> bool:
+    """Fuse an MHA head permute into the GEMM group whose tile it stores.
+
+    The walk up from the permute crosses single-user nops and stops at a
+    GEMM or an elementwise op.  The permute joins the group only when a
+    GEMM is in it -- the op it stopped at, or the group that op's tail
+    belongs to.  Above any other producer the permute stays standalone: a
+    group anchored on an elementwise op has no tail to store the tile
+    through the permute, and its tiling does not see the permute.
+
+    Args:
+        graph: The graph the permute is in.
+        candidates: The fusion groups found so far, extended in place.
+        reshape_node: The node to try to fuse.
+
+    Returns:
+        Whether the permute joined a group.
+    """
     if not is_mha_qkv_permute(reshape_node):
         return False
 
@@ -494,6 +511,13 @@ def fuse_reshape_with_output(
     if len(curr_node.users) > 1:
         return False
 
+    group = search_group(curr_node, candidates)
+    if not is_gemm_op(curr_node) and (
+        group is None or not any(is_gemm_op(n) for n in group)
+    ):
+        logger.debug(f"Cannot fuse {reshape_node} with {curr_node}: no GEMM")
+        return False
+
     if not _tile_holds_whole_heads(curr_node, reshape_node):
         logger.debug(
             f"Cannot fuse {reshape_node} with {curr_node}: "
@@ -512,8 +536,6 @@ def fuse_reshape_with_output(
         and search_group(users[0], candidates) is None
     ):
         fused_nodes.append(users[0])
-
-    group = search_group(curr_node, candidates)
 
     if group is not None:
         group.extend(n for n in fused_nodes if n not in group)
