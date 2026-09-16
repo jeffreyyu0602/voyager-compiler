@@ -56,6 +56,13 @@ OP_PASSES = {
 # pass the Sphinx RTL measured.
 KERNEL_LAUNCH_OVERHEAD = 96
 
+# Cycles a read stream loses each time consecutive requests move to another
+# scratchpad bank.  The SoC's read masters take their responses in order, so
+# the fabric holds a request to a new bank until every outstanding response
+# from the previous one has returned -- one round trip, measured 8 cycles on
+# the Sphinx SoC (requests resume once the in-flight beats drain).
+BANK_SWITCH_CYCLES = 8
+
 
 def get_dtype_width(dtype) -> int:
     """Element width in bits, derived from the canonical ``dtype_byte_size``
@@ -106,15 +113,6 @@ def _node_dtype_bits(node, default: Optional[int] = None):
     return get_dtype_width(value.dtype)
 
 
-def bandwidth_utilization(bits, num_passes, vector_lanes, bytes_per_cycle):
-    """Fraction of peak a vector pass sustains: one ``vector_lanes``-wide
-    lane group per cycle at ``bits`` per element, fetched once per pass
-    over its data, against the scratchpad's ``bytes_per_cycle``."""
-    total_bytes = vector_lanes * bits / 8
-    fetch_cycles = num_passes * math.ceil(total_bytes / bytes_per_cycle)
-    return min(1.0, 1.0 / fetch_cycles)
-
-
 def _record_writes(record_bits: int, beat: int) -> float:
     """Write cycles per record of ``record_bits`` on a ``beat``-byte bus,
     averaged over the alignment cycle: one per beat-sized word, two where
@@ -154,36 +152,115 @@ def _output_writes(node, lanes: int, beat: int) -> float:
     return _record_writes(lanes * widths[data], beat) + len(widths) - 1
 
 
-def vector_op_utilization(
-    node, vector_lanes, bytes_per_cycle, ideal_cycles=None
-):
+def gemv_weight_bits(node, anchor) -> int:
+    """Element width of the buffer a fully-connected GEMM streams its weight
+    from (``weight_transforms``): a packed cache reaches the bank packed,
+    whatever a fused prologue decodes it into."""
+    submodule = node.meta.get("submodule")
+    bound = bound_operands(node, submodule)
+    weight = anchor.args[1]
+    if submodule is not None and weight.graph is submodule.graph:
+        weight = weight_transforms(weight)[0]
+    bits = _node_dtype_bits(bound.get(weight, weight))
+    return max(bits) if isinstance(bits, list) else bits
+
+
+def _logical_dtype(node):
+    """The compiler's tracked storage dtype of ``node`` if it has one, else
+    the dtype it was traced with."""
+    dtype = node.meta.get("dtype")
+    if dtype is not None:
+        return dtype
+    value = getattr(node, "value", None)
+    if value is None:
+        value = node.meta.get("val")
+    return value.dtype
+
+
+def gemv_lanes(anchor, config) -> int:
+    """Elements per cycle of the unit a fully-connected GEMM streams through:
+    the vector unit's lanes when its input is bfloat16 -- the toolchain maps
+    such an op onto the vector pipeline -- else the matrix-vector unit's."""
+    if str(_logical_dtype(anchor.args[0])).endswith("bfloat16"):
+        return config.vector_lanes
+    return config.matrix_vector_lanes
+
+
+def bank_walk(ranges, bank_size):
+    """Scratchpad bank switches a read stream makes walking ``ranges``, byte
+    ``(lo, hi)`` pairs in fetch order: one whenever a range starts in a bank
+    other than the one the previous range ended in, plus the boundaries a
+    range straddles.  Returns ``(switches, first bank, last bank)``."""
+    switches = 0
+    first = last = None
+    for lo, hi in ranges:
+        lo_bank, hi_bank = int(lo // bank_size), int((hi - 1) // bank_size)
+        switches += hi_bank - lo_bank
+        if last is not None and lo_bank != last:
+            switches += 1
+        if first is None:
+            first = lo_bank
+        last = hi_bank
+    return switches, first, last
+
+
+def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
+    """Cycles a matrix-vector tile loses to scratchpad bank switches,
+    ``BANK_SWITCH_CYCLES`` each.  The unit walks one ``chunk``-element piece
+    of every row of a ``pe_array_size[0]``-row block before the next chunk,
+    so when the row stride of a ``reduction``-wide tile spreads a block's
+    rows over several banks, every chunk column crosses them again.  The
+    tile buffer starts on a bank, where the planner puts it.  0 without
+    banking."""
+    if not config.bank_size:
+        return 0
+    block = config.pe_array_size[0]
+    row_bytes = reduction * weight_bits / 8
+    chunk_bytes = chunk * weight_bits / 8
+    ranges = []
+    for k in range(0, rows, block):
+        for c in range(math.ceil(reduction / chunk)):
+            for r in range(k, min(k + block, rows)):
+                lo = r * row_bytes + c * chunk_bytes
+                ranges.append((lo, lo + chunk_bytes))
+    switches, _, _ = bank_walk(ranges, config.bank_size)
+    return BANK_SWITCH_CYCLES * switches
+
+
+def vector_op_utilization(node, config, ideal_cycles=None, gemv_tile=None):
     """Fraction of peak a vector ``node`` sustains, bound by the bus.
 
-    Peak is one ``vector_lanes``-wide lane group per cycle.  Each pass over
-    the data (``OP_PASSES``; one for everything else) costs a lane group the
-    greater of its read cycles, the bus beats its widest streamed operand is
-    fetched in, and its write cycles, at ``bytes_per_cycle`` per beat: a
-    reduction pass writes one value per row, so it runs at the read rate,
-    and a record that ends mid-beat is split by the bus, so a sub-byte
-    output can take more write cycles than read cycles.  A fully-connected
-    GEMM streams its weight once per output and is sized by the buffer the
-    kernel loads (``weight_transforms``), not by what a fused prologue
-    decodes it into.  Given ``ideal_cycles``, the per-pass
-    ``KERNEL_LAUNCH_OVERHEAD`` is folded in so ``ideal_cycles / result`` is
-    the tile's whole cost.  The single copy of the formula:
-    ``reporting/cost.op_utilization`` calls it for its vector branch.
+    Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
+    pass over the data (``OP_PASSES``; one for everything else) costs a lane
+    group the greater of its read cycles, the bus beats its widest streamed
+    operand is fetched in, and its write cycles, at ``config.bytes_per_cycle``
+    per beat: a reduction pass writes one value per row, so it runs at the
+    read rate, and a record that ends mid-beat is split by the bus, so a
+    sub-byte output can take more write cycles than read cycles.  A
+    fully-connected GEMM streams its weight once per output through the
+    unit ``gemv_lanes`` names, a lane group being that unit's width, and is
+    sized by the buffer the kernel loads (``weight_transforms``), not by
+    what a fused prologue decodes it into; ``gemv_tile`` -- its ``(rows,
+    reduction)`` weight tile -- prices the scratchpad bank switches of that
+    stream (``gemv_bank_switch_cycles``).  Given ``ideal_cycles``, the per-pass
+    ``KERNEL_LAUNCH_OVERHEAD`` and the switches are folded in so
+    ``ideal_cycles / result`` is the tile's whole cost.  The single copy of
+    the formula: ``reporting/cost.op_utilization`` calls it for its vector
+    branch.
     """
     anchor = get_anchor_node(node) or node
+    lanes = config.vector_lanes
+    bytes_per_cycle = config.bytes_per_cycle
     beat = max(1, round(bytes_per_cycle))
+    switch_cycles = 0
     if is_fully_connected(anchor):
-        submodule = node.meta.get("submodule")
-        bound = bound_operands(node, submodule)
-        weight = anchor.args[1]
-        if submodule is not None and weight.graph is submodule.graph:
-            weight = weight_transforms(weight)[0]
-        bits = _node_dtype_bits(bound.get(weight, weight))
-        reads = {IN: max(bits) if isinstance(bits, list) else bits}
+        lanes = gemv_lanes(anchor, config)
+        reads = {IN: gemv_weight_bits(node, anchor)}
         profile = [(IN, None)]
+        rows, reduction = gemv_tile
+        switch_cycles = gemv_bank_switch_cycles(
+            rows, reduction, reads[IN], lanes, config
+        )
     elif anchor.target in OP_PASSES:
         profile = OP_PASSES[anchor.target]
         reads = {IN: _input_bits(node, anchor), MID: _node_dtype_bits(anchor)}
@@ -197,22 +274,19 @@ def vector_op_utilization(
         profile = [(IN, OUT)]
     cycles_per_group = 0.0
     for read, write in profile:
-        read_cycles = math.ceil(
-            vector_lanes * reads[read] / 8 / bytes_per_cycle
-        )
+        read_cycles = math.ceil(lanes * reads[read] / 8 / bytes_per_cycle)
         if write is None:
             write_cycles = 0.0
         elif write is MID:
-            write_cycles = _record_writes(vector_lanes * reads[MID], beat)
+            write_cycles = _record_writes(lanes * reads[MID], beat)
         else:
-            write_cycles = _output_writes(node, vector_lanes, beat)
+            write_cycles = _output_writes(node, lanes, beat)
         cycles_per_group += max(read_cycles, write_cycles)
     util = min(1.0, 1.0 / cycles_per_group)
     if not ideal_cycles:
         return util
-    return ideal_cycles / (
-        ideal_cycles / util + len(profile) * KERNEL_LAUNCH_OVERHEAD
-    )
+    overhead = len(profile) * KERNEL_LAUNCH_OVERHEAD + switch_cycles
+    return ideal_cycles / (ideal_cycles / util + overhead)
 
 
 def _operand_bytes(shape, node):
@@ -281,7 +355,7 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     lanes = config.vector_lanes
     bpc = config.bytes_per_cycle
     ideal = math.ceil(tile_ops / lanes)
-    util = vector_op_utilization(node, lanes, bpc, ideal)
+    util = vector_op_utilization(node, config, ideal)
     compute = math.ceil(ideal / util)
 
     lat = config.access_latency_cycles
@@ -550,10 +624,10 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     else:
         steps = math.prod(grid)
 
-    # The vector unit's passes, at the softmax's width (the output's).
-    util = bandwidth_utilization(
-        _node_dtype_bits(node), 1, config.vector_lanes, config.bytes_per_cycle
-    )
+    # The vector unit's passes, at the softmax's width (the output's): one
+    # lane group per cycle, bound by the beats its bytes take.
+    group_bytes = config.vector_lanes * _node_dtype_bits(node) / 8
+    util = min(1.0, 1.0 / math.ceil(group_bytes / config.bytes_per_cycle))
 
     def passes(count, elems):
         cycles = math.ceil(math.ceil(elems / config.vector_lanes) / util)
@@ -620,11 +694,13 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     four query heads is re-read once per head as soon as a dim inner to the
     head loop splits.
 
-    A GEMV runs on the vector unit, so a tile costs its MACs spread over the
-    lanes and de-rated by ``vector_op_utilization`` -- the same charge
+    A tile costs its MACs spread over the width of the unit the GEMV runs
+    on (``gemv_lanes``) and de-rated by ``vector_op_utilization``, the
+    weight stream's bank switches included -- the same charge
     ``reporting/cost.op_info`` gives the op, so the two models cannot
-    disagree.  Double-buffered the DRAM engine and the vector unit overlap
-    (``_sweep_cycles``); single-buffered they run back to back.
+    disagree.  Double-buffered the
+    DRAM engine and the vector unit overlap (``_sweep_cycles``);
+    single-buffered they run back to back.
 
     Args:
         node: The op to cost -- a fully-connected GEMM, or a fused
@@ -675,9 +751,10 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
         dmas.append((_transfer_cost(shape, n_bytes, lat, bpc), transfers))
         traffic += transfers * n_bytes
 
-    lanes = config.vector_lanes
+    lanes = gemv_lanes(anchor, config)
     ideal = math.ceil(math.prod(tile_sizes) / lanes)
-    util = vector_op_utilization(node, lanes, bpc, ideal)
+    _, c_tile, k_tile = tile_sizes
+    util = vector_op_utilization(node, config, ideal, (k_tile, c_tile))
     compute = math.ceil(ideal / util)
 
     steps = math.prod(grid)

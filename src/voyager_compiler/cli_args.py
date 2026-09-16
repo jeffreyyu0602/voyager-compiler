@@ -397,6 +397,12 @@ def add_compile_args(parser=None):
         default=None,
         help="Vector unit lane count; defaults to the PE array columns.",
     )
+    parser.add_argument(
+        "--matrix_vector_unit_width",
+        type=int,
+        default=None,
+        help="Matrix-vector unit width in elements; defaults to the PE array columns.",
+    )
 
     # -- tiling / lowering --------------------------------------------------
     parser.add_argument(

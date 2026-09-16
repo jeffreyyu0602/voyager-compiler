@@ -700,6 +700,11 @@ def _architecture(wb, result: ScheduleResult):
         ),
         ("vector_unit_width", maybe(cost.vector_unit_width, int)),
         ("vector_lanes", int(cost.vector_lanes)),
+        (
+            "matrix_vector_unit_width",
+            maybe(cost.matrix_vector_unit_width, int),
+        ),
+        ("matrix_vector_lanes", int(cost.matrix_vector_lanes)),
         ("frequency_ghz", float(cost.frequency)),
         ("-- L1 systolic buffers (elements) --", ""),
         ("input_buffer_size", maybe(cost.input_buffer_size, int)),

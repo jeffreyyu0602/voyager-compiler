@@ -22,7 +22,10 @@ from voyager_compiler.codegen.node_info import (
     is_gemm_op,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
-from voyager_compiler.codegen.transform.tiling.cost import vector_op_utilization
+from voyager_compiler.codegen.transform.tiling.cost import (
+    gemv_lanes,
+    vector_op_utilization,
+)
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 
@@ -110,7 +113,8 @@ def op_utilization(
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
     ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
-    case, which it sizes by the streamed weight.  ``ideal_cycles`` is one
+    case, which it sizes by the streamed weight and its bank switches over
+    the anchor's shape, the tile once bufferized.  ``ideal_cycles`` is one
     tile's, so it also folds in the per-launch overhead the tiling model
     charges, and the two cannot disagree on what a tile costs.
     """
@@ -120,9 +124,11 @@ def op_utilization(
             tiling[0], node.meta.get("bank_groups")
         )
         return min(1.0, ideal_cycles / per_tile)
-    return vector_op_utilization(
-        node, cost.vector_lanes, cost.bytes_per_cycle, ideal_cycles
-    )
+    anchor = get_anchor_node(node) or node
+    gemv_tile = None
+    if is_fully_connected(anchor):
+        gemv_tile = (_shape(anchor)[-1], _shape(anchor.args[0])[-1])
+    return vector_op_utilization(node, cost, ideal_cycles, gemv_tile)
 
 
 # --------------------------------------------------------------------------
@@ -181,10 +187,10 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         # (folds batch dims; works for linear / matmul / bmm).
         inp = _shape(anchor.args[0])
         macs = math.prod(out) * inp[-1]
-        # A fully-connected (matrix-vector) GEMM runs on the vector unit, so
-        # its throughput is the vector lane count, not the systolic MAC count.
+        # A fully-connected (matrix-vector) GEMM streams through the
+        # matrix-vector or the vector unit (``gemv_lanes``), not the array.
         fc = is_fully_connected(anchor)
-        divisor = vec_lanes if fc else mma_macs
+        divisor = gemv_lanes(anchor, cost) if fc else mma_macs
         ideal = math.ceil(macs / divisor)
         units = ("vector",) if fc else matrix_units
         return OpInfo(

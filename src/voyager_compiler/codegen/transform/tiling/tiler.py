@@ -40,10 +40,12 @@ from voyager_compiler.codegen.node_info import (
     weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
+    BANK_SWITCH_CYCLES,
     _node_dtype_bits,
     _step_classes,
     _sweep_cycles,
     attention_tile_latency,
+    bank_walk,
     get_dtype_width,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
@@ -67,13 +69,6 @@ le = interstellar.le
 # GEMMs) to 40 (ResNet18) vectors; either way the error is under ~60 cycles
 # per L3 step.
 OUTPUT_SLACK = 24
-
-# Cycles a read stream loses each time consecutive requests move to another
-# scratchpad bank.  The SoC's read masters take their responses in order, so
-# the fabric holds a request to a new bank until every outstanding response
-# from the previous one has returned -- one round trip, measured 8 cycles on
-# the Sphinx SoC (requests resume once the in-flight beats drain).
-BANK_SWITCH_CYCLES = 8
 
 # Cycles the SpMM unit spends per row of each PE-array-wide pass on top of
 # the row's outliers: it drains and restarts its accumulator ring between
@@ -758,60 +753,6 @@ class RuntimeCalculator:
     (``SPMM_ROW_CYCLES``) plus its outliers, at the L2 block's K depth; the
     outlier density is the layer's average, so a tile with more outliers
     than average runs longer than priced.
-
-    Args:
-        input_dtype_width: Input element width, bits.
-        weight_dtype_width: Weight element width, bits.
-        output_dtype_width: Output element width, bits.
-        accum_dtype_width: Partial-sum width, bits, while K accumulates.
-        double_buffered_accum_buffer: A finished tile that needs more than
-            one beat per vector parks in a bank the vector unit drains while
-            the next block computes (the hardware's ``should_use_direct_path``
-            rule), so only the sweep's last drain is charged; without it the
-            array back-pressures on every burst (``OUTPUT_SLACK``).
-        sram_bandwidth: Width of a scratchpad bank's port, bits per cycle
-            -- one bus word; every operand a bank holds queues on it.
-        dram_bandwidth: DRAM bandwidth, bytes per cycle (sizes are bytes).
-        dram_access_latency_cycles: Fixed latency, once per transfer.
-        double_buffered_l2: Overlap DRAM I/O with compute, so a grid step
-            costs ``max(dram, compute)`` and not their sum.
-        outlier_rate: Fraction of the input's elements that are outliers.
-            Each one gathers a full weight row on top of the dense weight
-            stream, so an L1 round's weight words grow by that many rows.
-        batch: Grid steps the builder loops *outside* the mapping -- a bmm's
-            leading dims, which share no operand.
-        weight_batch: Distinct weight tiles over those ``batch`` steps, fewer
-            when a group shares one -- eight KV heads reaching an attention
-            matmul as thirty-two.  ``None`` = one apiece.
-        has_tail: The node has a fused post-op, so a reduction drains through
-            the vector unit; a bare GEMM reduces in place and does not.
-        single_k_tail_extra_pass: The tail cannot ride a single
-            round's drain and runs as a pass of its own over the finished
-            tile.
-        split_k_tail_extra_pass: The tail cannot ride a split
-            reduction's last round and reads the finished tile back from
-            scratch; with one scratch region that pass runs bare on the
-            control stream, which then issues the next tile's loads only
-            after the matrix and vector passes both finish.
-        tail_keeps_shape: The tail's output has the anchor's tile shape, so
-            a single round's extra pass runs in place on the output slot
-            instead of through scratch.
-        tail_specs: The fused tail's own tiled operands as ``(dims, bits)``
-            pairs, from ``_fused_operand_specs``, in the order the bank
-            partition's ``("fused", i)`` roles name them; ``vector_cycles``
-            reads them from their banks and ``tail_tile_sizes`` sizes the
-            DRAM they stream per output tile.
-        input_scale_width: Input block-scale width, bits (0 = not microscaled).
-        weight_scale_width: Weight block-scale width, bits.
-        output_scale_width: Output block-scale width, bits -- a fused
-            ``quantize_mx`` tail stores the tile's scales next to its values.
-        scale_block_size: Elements per block scale.
-        bias_width: Bias element width, bits (0 = no bias); read once per
-            output tile.
-        stride: The conv's ``(row, column)`` stride, which sets how many
-            input rows one output tile walks.
-        bank_size: Scratchpad bank size, bytes; ``None`` = no banking, so
-            no bank switches (``BANK_SWITCH_CYCLES``).
     """
 
     def __init__(
@@ -840,6 +781,7 @@ class RuntimeCalculator:
         bias_width: int = 0,
         stride: Tuple[int, int] = (1, 1),
         bank_size: Optional[int] = None,
+        weight_transposed: bool = False,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
@@ -865,6 +807,7 @@ class RuntimeCalculator:
         self.bias_width = bias_width
         self.stride = stride
         self.bank_size = bank_size
+        self.weight_transposed = weight_transposed
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -896,6 +839,24 @@ class RuntimeCalculator:
         loose = [count for role, count in words.items() if role not in placed]
         return max([busiest, *loose])
 
+    def _request_words(self, requests, row_elems, bits, loop_bound):
+        """Bus words ``requests`` fetches of one ``row_elems``-element row
+        take.  A request is served in whole beats, so a row that is not a
+        multiple of the port costs more than its bytes.  The controller packs
+        the rows that fill whole beats into one request when the L1 loop
+        that walks them, of ``loop_bound`` steps, divides into that many
+        (the toolchain's ``get_packing_factor``); a ``loop_bound`` of 0 never
+        packs."""
+        if not bits or requests <= 0:
+            return 0
+        row_bits = row_elems * bits
+        pf = math.lcm(row_bits, self.sram_bandwidth) // row_bits
+        rows_per_request = pf if loop_bound and loop_bound % pf == 0 else 1
+        request_words = math.ceil(
+            rows_per_request * row_bits / self.sram_bandwidth
+        )
+        return math.ceil(requests / rows_per_request) * request_words
+
     def _bus_words(self, count, bits, bandwidth=None):
         """Bus words ``count`` elements of ``bits`` occupy at the bank's full
         width, or at ``bandwidth`` bytes per cycle."""
@@ -916,24 +877,41 @@ class RuntimeCalculator:
 
     def _load_words(self, mapping):
         """Bus words one L1 tile's every-round operands take, per role: the
-        input and its block scales, the weight and its scales.  An input
-        scale is delivered one per bus word however narrow it is; every
-        outlier in the input tile gathers one more weight row on top of the
-        dense weight tile."""
+        input and its block scales, the weight and its scales.  The input
+        and the weight arrive one PE-array row per request
+        (``_request_words``), packed several rows per request when the L1
+        loop that walks them allows it -- never for a transposed weight;
+        the weight scales one PE-array row of scales per request, never
+        packed.  An input scale is delivered one
+        per bus word however narrow it is; every outlier in the input tile
+        gathers one more weight row on top of the dense weight tile."""
         ext = lambda loop: self._extent(mapping, loop, 1)
         rows = ext(le.OX) * ext(le.OY) * ext(le.ON)
         depth = ext(le.IC)
         taps = ext(le.FX) * ext(le.FY)
         gathered_rows = rows * depth * self.outlier_rate
+        blockings = mapping.loop_blockings
+        ic_unroll = mapping.loop_partitionings[le.IC][0]
+        oc_unroll = mapping.loop_partitionings[le.OC][0]
+        weight_loop = 0 if self.weight_transposed else blockings[le.OC][1]
         words = {
-            "input": self._bus_words(rows * depth, self.input_dtype_width),
-            "weight": self._bus_words(
-                ext(le.OC) * (depth * taps + gathered_rows),
-                self.weight_dtype_width,
+            "input": self._request_words(
+                rows * depth / ic_unroll,
+                ic_unroll,
+                self.input_dtype_width,
+                blockings[le.IC][1],
             ),
-            "weight_scale": self._bus_words(
-                ext(le.OC) * depth * taps / self.scale_block_size,
+            "weight": self._request_words(
+                (depth * taps + gathered_rows) * ext(le.OC) / oc_unroll,
+                oc_unroll,
+                self.weight_dtype_width,
+                weight_loop,
+            ),
+            "weight_scale": self._request_words(
+                depth * taps / self.scale_block_size * ext(le.OC) / oc_unroll,
+                oc_unroll,
                 self.weight_scale_width,
+                0,
             ),
         }
         if self.input_scale_width:
@@ -998,16 +976,7 @@ class RuntimeCalculator:
         total = 0
         prev = first = None
         for idx in itertools.product(*(range(blockings[i][2]) for i in keys)):
-            inner = 0
-            start = end = None
-            for lo, hi in ranges_of(dict(zip(keys, idx))):
-                lo_bank, hi_bank = int(lo // size), int((hi - 1) // size)
-                inner += hi_bank - lo_bank
-                if end is not None and lo_bank != end:
-                    inner += 1
-                if start is None:
-                    start = lo_bank
-                end = hi_bank
+            inner, start, end = bank_walk(ranges_of(dict(zip(keys, idx))), size)
             if first is None:
                 first = start
             if prev is not None and start != prev:
@@ -1659,8 +1628,8 @@ def _prepare_search(node, tiler, constraint=None):
     # or the pipeline has no stage left for it: after the drain on a single
     # round, after the accumulate on a split one, which takes one more.
     breaks_stream = stream_breaking_quantize(sub_gm) is not None
-    single_k_tail_extra_pass = (
-        breaks_stream or not node.meta.get("single_k_tail_fusible", True)
+    single_k_tail_extra_pass = breaks_stream or not node.meta.get(
+        "single_k_tail_fusible", True
     )
     # The tail's own ``quantize_mx_outlier``, if it has one: this group is
     # then a CSR producer as well as (possibly) a consumer.
@@ -1683,10 +1652,9 @@ def _prepare_search(node, tiler, constraint=None):
         )
     # A single round's extra pass runs in place when the tail keeps the
     # tile's shape, else through scratch (``_gemm_scratch_and_kernel``).
-    tail_keeps_shape = (
-        not isinstance(node.value, (tuple, list))
-        and tuple(node.value.shape) == tuple(anchor.value.shape)
-    )
+    tail_keeps_shape = not isinstance(node.value, (tuple, list)) and tuple(
+        node.value.shape
+    ) == tuple(anchor.value.shape)
     # A split reduction's extra pass reads the tile back from scratch; a
     # second region lets it ride the finalize commit, except in a
     # CSR-producing nest, whose bare stores pin one (``_SparseGemm``).
@@ -1784,7 +1752,7 @@ def _prepare_search(node, tiler, constraint=None):
     batch = math.prod(anchor.value.shape[:-2]) if is_bmm(anchor) else 1
 
     weight = anchor.args[1]
-    repeat = weight_transforms(weight)[2]
+    transposed, repeat = weight_transforms(weight)[1:3]
     weight_repeat = (
         math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
     )
@@ -1814,6 +1782,7 @@ def _prepare_search(node, tiler, constraint=None):
         bias_width=_node_dtype_bits(get_arg_value(anchor, 2, "bias", None), 0),
         stride=(layer.hstd, layer.wstd),
         bank_size=tiler.config.bank_size,
+        weight_transposed=transposed,
     )
 
     # Built up front rather than per attempt: each one reads the node, which
