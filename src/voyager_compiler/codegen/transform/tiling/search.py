@@ -46,8 +46,9 @@ __all__ = [
 
 # How much longer than the best modeled runtime a tiling may take and still be
 # chosen; the least-traffic one among those wins.  0.0 = only the fastest.
-# Shared with the interstellar tiler, which selects the same way.
-DEFAULT_RUNTIME_TOLERANCE = 0.01
+# Shared with the interstellar tiler, which prefers the fewest grid steps among
+# those and then the least traffic.
+DEFAULT_RUNTIME_TOLERANCE = 0.02
 
 # Which ``(X, C, K)`` tile a GEMV's search sizes each interstellar loop by:
 # the rows, the input features (the reduction) and the output features.

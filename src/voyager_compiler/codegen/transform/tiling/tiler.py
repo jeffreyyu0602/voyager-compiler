@@ -727,32 +727,45 @@ def make_size_fn(
 class RuntimeCalculator:
     """Runtime cost model for a 4-level hierarchy (PE / L1 / L2 / DRAM).
 
-    Wraps the L0-L2 compute in the outer L3 grid loop (K included) and adds
-    its DRAM transfers.  A double-buffered step costs the slower of its DRAM
-    and its compute, framed by an unoverlapped prologue load and epilogue
-    store.
+    A mapping is priced in cycles as its L3 grid sweep.  With a
+    double-buffered L2 each step costs the slower of its DRAM transfers and
+    its compute, otherwise their sum, and the sweep is framed by the
+    un-overlapped first load and last store; a split reduction adds its
+    accumulate steps and the tail pass that finishes each output tile.  A
+    DRAM transfer costs its bytes at ``dram_bandwidth`` plus one access
+    latency, block scales being a transfer of their own, and the batch loop
+    outside the mapping shares a weight tile among the elements of one
+    group.  Energy is interstellar's cost model, not this one.
 
-    The store is charged on the step that issues it, not averaged over the
-    sweep -- a tile can outlast one step of compute, and averaging hides the
-    stall.
+    The compute of an L2 block is the busier of the matrix unit and the
+    scratchpad bus.  The matrix unit charges the systolic passes, each weight
+    tile costing the longer of its loading and the rows streamed through it,
+    plus the back-pressure of a single-buffered accumulator against
+    ``OUTPUT_SLACK`` of buffering.  The bus charges the words every operand
+    role moves, summed per bank group of the planner's partition with the
+    busiest bank setting the pace: input and weight rows in whole beats,
+    packed as the toolchain packs them, with the read interface's lost cycle
+    whenever an aligned request follows an unaligned one; block scales one
+    word each; the output, the fused tail operands, the bias and the
+    reduction scratch; and the round trip a stream pays when it changes bank
+    on its bank-aligned tile buffer.  A weight tile held across the spatial
+    loops is fetched once.  The SpMM unit adds a turnaround per row visit and
+    the outlier rows it gathers at the block's K depth, most of them a bank
+    switch when the weight tile spans several banks.  A tail pass of its own
+    costs the vector unit's lane rate or its bank words, whichever is
+    slower.  The ramps of a sweep, the first buffer fill, the systolic skew
+    and the last drain, are spread over the ops the sweep dispatches.
 
-    The model follows the trends that set a mapping's runtime -- the operand
-    bytes fetched and stored through the scratchpad banks, the systolic
-    passes, the DRAM transfers -- not the cycle-exact datapath.  Known
-    simplifications: a single-buffered accumulator's back-pressure on a
-    multi-beat tail is priced per output burst against a fixed
-    ``OUTPUT_SLACK`` of buffering; per-operation costs -- parameter load,
-    deserialisation, the start/done handshake, the pipeline drain between
-    uncommitted ops -- are left out; the systolic fill/skew is a constant of
-    the array dims; a stream-breaking ``quantize_mx`` tail is charged as a
-    staged region, not as a drained pass; a conv input tile is sized without
-    its halo; the bank port width is one number for every operand,
-    ``sram_bandwidth``, which the SoC is assumed to present as a single bus;
-    and a stream's bank switches (``BANK_SWITCH_CYCLES``) are counted on
-    bank-aligned tile buffers, ignoring the block scales.  The SpMM unit's cost is per row visit
-    (``SPMM_ROW_CYCLES``) plus its outliers, at the L2 block's K depth; the
-    outlier density is the layer's average, so a tile with more outliers
-    than average runs longer than priced.
+    Not modeled are the per-op costs (parameter load, deserialisation, the
+    start/done handshake, the drain between uncommitted ops, the host's
+    dispatch time), so an op that runs alone pays its ramps in full where
+    the spreading charges a share; the cycle-exact datapath, the systolic
+    skew being a constant of the array dims; a stream-breaking
+    ``quantize_mx`` tail, charged as a staged region rather than a drained
+    pass; a conv input tile's halo; more than one port width, every operand
+    moving at ``sram_bandwidth`` over one bus per bank; the block scales'
+    bank switches; and the outlier density of an individual tile, priced at
+    the layer's average.
     """
 
     def __init__(
@@ -839,14 +852,20 @@ class RuntimeCalculator:
         loose = [count for role, count in words.items() if role not in placed]
         return max([busiest, *loose])
 
-    def _request_words(self, requests, row_elems, bits, loop_bound):
+    def _request_words(self, requests, row_elems, bits, loop_bound, pitch):
         """Bus words ``requests`` fetches of one ``row_elems``-element row
         take.  A request is served in whole beats, so a row that is not a
         multiple of the port costs more than its bytes.  The controller packs
         the rows that fill whole beats into one request when the L1 loop
         that walks them, of ``loop_bound`` steps, divides into that many
         (the toolchain's ``get_packing_factor``); a ``loop_bound`` of 0 never
-        packs."""
+        packs.  Consecutive requests are ``pitch`` bytes apart, the row
+        pitch of the tile buffer.  The SoC's read interface flushes the tail
+        of a request that started inside a beat in a cycle of its own and
+        holds the next request's first beat when that one starts on a beat
+        boundary, so a pitch that is not a multiple of the beat cycles the
+        requests through the beat offsets and costs one cycle per aligned
+        request that follows an unaligned one."""
         if not bits or requests <= 0:
             return 0
         row_bits = row_elems * bits
@@ -855,7 +874,13 @@ class RuntimeCalculator:
         request_words = math.ceil(
             rows_per_request * row_bits / self.sram_bandwidth
         )
-        return math.ceil(requests / rows_per_request) * request_words
+        count = math.ceil(requests / rows_per_request)
+        beat = self.sram_bandwidth // 8
+        misalignment = rows_per_request * pitch % beat
+        flushes = 0
+        if misalignment:
+            flushes = count * math.gcd(misalignment, beat) / beat
+        return count * request_words + flushes
 
     def _bus_words(self, count, bits, bandwidth=None):
         """Bus words ``count`` elements of ``bits`` occupy at the bank's full
@@ -894,24 +919,34 @@ class RuntimeCalculator:
         ic_unroll = mapping.loop_partitionings[le.IC][0]
         oc_unroll = mapping.loop_partitionings[le.OC][0]
         weight_loop = 0 if self.weight_transposed else blockings[le.OC][1]
+        # The tile buffers are [rows, IC] for the input and [IC, OC] for the
+        # weight and its scales: a request walks one row of each.
+        ic3 = self._extent(mapping, le.IC, 2)
+        oc3 = self._extent(mapping, le.OC, 2)
+        input_pitch = ic3 * self.input_dtype_width // 8
+        weight_pitch = oc3 * self.weight_dtype_width // 8
+        scale_pitch = oc3 * self.weight_scale_width // 8
         words = {
             "input": self._request_words(
                 rows * depth / ic_unroll,
                 ic_unroll,
                 self.input_dtype_width,
                 blockings[le.IC][1],
+                input_pitch,
             ),
             "weight": self._request_words(
                 (depth * taps + gathered_rows) * ext(le.OC) / oc_unroll,
                 oc_unroll,
                 self.weight_dtype_width,
                 weight_loop,
+                weight_pitch,
             ),
             "weight_scale": self._request_words(
                 depth * taps / self.scale_block_size * ext(le.OC) / oc_unroll,
                 oc_unroll,
                 self.weight_scale_width,
                 0,
+                scale_pitch,
             ),
         }
         if self.input_scale_width:
@@ -925,16 +960,29 @@ class RuntimeCalculator:
         an L1 output tile, 2 = the whole L3 output tile), per role: the
         finished output with its block scales -- each scale leaves in a bus
         word of its own, however narrow, as the input scales arrive -- and
-        each fused operand over the output dims it is tiled along."""
+        each fused operand over the output dims it is tiled along.  The tail
+        rides on the array's output one vector (a row of ``oc_dim`` values)
+        at a time and fetches a fused operand in one unpacked request per
+        vector, so an operand narrower than a bus word still costs a word
+        per vector."""
         ext = lambda loop: self._extent(mapping, loop, level)
         out = ext(le.OC) * ext(le.OY) * ext(le.OX) * ext(le.ON)
         words = {"output": self._bus_words(out, self.output_dtype_width)}
         if self.output_scale_width:
             words["output"] += math.ceil(out / self.scale_block_size)
+        oc_dim = mapping.loop_partitionings[le.OC][0]
+        oc2 = self._extent(mapping, le.OC, 2)
         for i, (dims, bits) in enumerate(self.tail_specs):
-            words[("fused", i)] = self._bus_words(
-                math.prod(ext(dim) for dim in dims), bits
-            )
+            if le.OC in dims:
+                rows = math.prod(ext(dim) for dim in dims if dim != le.OC)
+                vectors = rows * math.ceil(ext(le.OC) / oc_dim)
+                words[("fused", i)] = self._request_words(
+                    vectors, oc_dim, bits, 0, math.ceil(oc2 * bits / 8)
+                )
+            else:
+                words[("fused", i)] = self._bus_words(
+                    math.prod(ext(dim) for dim in dims), bits
+                )
         return words
 
     def _stream_switches(self, mapping, key_loops, ranges_of, held_loops=()):
@@ -1071,7 +1119,7 @@ class RuntimeCalculator:
         turnaround plus that row's outliers, each gather a bank switch when
         the weight tile spans several banks -- plus the once-per-sweep
         overhead (buffer fill, systolic skew, the last parked tile's drain)
-        spread over the steps a double-buffered L2 overlaps it with.  Also
+        spread over the ops a double-buffered L2 overlaps it with.  Also
         the reporting model's per-tile utilization denominator.
 
         Args:
@@ -1084,7 +1132,7 @@ class RuntimeCalculator:
         partitionings = mapping.loop_partitionings
 
         # --- L1: weight-reuse tile timing ---
-        sa_weight_loading_time = partitionings[le.IC][0] + 2
+        sa_weight_loading_time = partitionings[le.IC][0]
 
         first_non_ox_oy_index = 6
         for i in range(le.NUM):
@@ -1261,8 +1309,10 @@ class RuntimeCalculator:
         if not self.double_buffered_l2:
             return steady + overhead
 
-        normalize_factor = self._l3_blocks(mapping) if num_k == 1 else num_k
-        return steady + overhead / normalize_factor
+        # Every op the sweep dispatches -- the L3 steps and the batch elements
+        # looped outside the mapping -- overlaps the ramps of its neighbours.
+        steps = self._l3_blocks(mapping) if num_k == 1 else num_k
+        return steady + overhead / (steps * self.batch)
 
     def vector_cycles(self, mapping, bank_groups):
         """Vector-unit cycles to finish one L3 output tile.  Charged on the grid
