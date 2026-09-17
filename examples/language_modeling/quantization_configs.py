@@ -28,14 +28,17 @@ MXNF4_VALUE_SPEC = f"nf4_6,{MICROSCALING},ax=-2"
 INT6_SPEC = f"int6,{MICROSCALING},ax=-1"
 INT6_VALUE_SPEC = f"int6,{MICROSCALING},ax=-2"
 
-# Plain integers and fp4 with the block scale a power of two (``fp8_e8m0``);
-# the arms in ``POWER_OF_TWO_SCALE`` build their quantizer with that flag.
+# Plain integers, fp4 and NormalFloat with the block scale a power of two
+# (``fp8_e8m0``); the arms in ``POWER_OF_TWO_SCALE`` build their quantizer
+# with that flag.
 INT8_SPEC = f"int8,{BLOCKING},ax=-1"
 INT8_VALUE_SPEC = f"int8,{BLOCKING},ax=-2"
 INT4_SPEC = f"int4,{BLOCKING},ax=-1"
 INT4_VALUE_SPEC = f"int4,{BLOCKING},ax=-2"
 FP4_SPEC = f"fp4_e2m1,{BLOCKING},ax=-1"
 FP4_VALUE_SPEC = f"fp4_e2m1,{BLOCKING},ax=-2"
+NF4_SPEC = f"nf4_6,{BLOCKING},ax=-1"
+NF4_VALUE_SPEC = f"nf4_6,{BLOCKING},ax=-2"
 
 # 8-bit integer activations beside 4-bit NormalFloat weights decoded to an
 # 8-bit integer codebook.
@@ -47,8 +50,9 @@ QUANTIZATION_CONFIGS = {}
 
 # Reference points.  ``bf16`` quantizes nothing; ``mxint8``, ``mxint4`` and
 # ``mxfp4`` are the plain MX deployments with power-of-two block scales
-# (``POWER_OF_TWO_SCALE``); ``mxnf4_int8`` keeps 4-bit weights through an
-# 8-bit codebook under 8-bit activations.
+# (``POWER_OF_TWO_SCALE``), and ``mxnf4_pot`` is ``mxnf4`` under that same
+# scale; ``mxnf4_int8`` keeps 4-bit weights through an 8-bit codebook under
+# 8-bit activations.
 QUANTIZATION_CONFIGS["bf16"] = {
     torch.nn.Linear: [None, None],
     torch.ops.aten.matmul.default: [None, None],
@@ -65,11 +69,15 @@ QUANTIZATION_CONFIGS["mxfp4"] = {
     torch.nn.Linear: [FP4_SPEC, FP4_SPEC],
     torch.ops.aten.matmul.default: [FP4_SPEC, FP4_VALUE_SPEC],
 }
+QUANTIZATION_CONFIGS["mxnf4_pot"] = {
+    torch.nn.Linear: [NF4_SPEC, NF4_SPEC],
+    torch.ops.aten.matmul.default: [NF4_SPEC, NF4_VALUE_SPEC],
+}
 QUANTIZATION_CONFIGS["mxnf4_int8"] = {
     torch.nn.Linear: [MXINT8_ACT_SPEC, MXNF4_INT8_SPEC],
     torch.ops.aten.matmul.default: [MXINT8_ACT_SPEC, MXINT8_VALUE_SPEC],
 }
-POWER_OF_TWO_SCALE = {"mxint8", "mxint4", "mxfp4"}
+POWER_OF_TWO_SCALE = {"mxint8", "mxint4", "mxfp4", "mxnf4_pot"}
 
 QUANTIZATION_CONFIGS["mxnf4"] = {
     torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
@@ -165,12 +173,29 @@ KIVI_BLOCK_SIZE = 64
 # KIVI's residual: how many positions of a cache stay in full precision
 # while their chunk fills.
 KIVI_RESIDUAL_LENGTH = 128
-KIVI_KEY_SPEC = (
-    f"uint2,bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,ax=-2,scale=fp8_e4m3"
-)
-KIVI_VALUE_SPEC = (
-    f"uint2,bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,ax=-1,scale=fp8_e4m3"
-)
+# Entry width of a KIVI cache.  2 is KIVI's own setting; 4 buys accuracy
+# back at twice the cache traffic, with the group geometry unchanged.
+KIVI_CACHE_BITS = 2
+
+
+def kivi_cache_spec(bits, role):
+    """The dtype string for one KIVI cache tensor.
+
+    Args:
+        bits: Entry width of the stored cache.
+        role: ``"key"``, grouped along the sequence (``ax=-2``), or
+            ``"value"``, grouped along the head dim (``ax=-1``).
+
+    Returns:
+        The spec string that quantizes that cache.
+    """
+    ax = -2 if role == "key" else -1
+    return (
+        f"uint{bits},bs={KIVI_BLOCK_SIZE},qs=group_wise_affine,"
+        f"ax={ax},scale=fp8_e4m3"
+    )
+
+
 # The attention matmuls under KIVI re-encode the main cache as int6
 # microscaling for the MXU.  It is decoded and re-encoded in one fused
 # dequantize, which needs the int6 scale constant across each affine block:
@@ -221,9 +246,9 @@ def set_kivi_attention_qconfig(quantizer):
     set_residual_attention_qconfig(quantizer)
 
 
-def annotate_kivi_cache(gm):
-    """Quantize the main KV caches of a split decode graph to KIVI's 2-bit
-    layout.
+def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
+    """Quantize the main KV caches of a split decode graph to KIVI's
+    grouped-affine layout.
 
     The observer sits on the main cache's read into the attention, so the
     whole buffer -- completed chunks and the zeros above them -- is
@@ -233,6 +258,7 @@ def annotate_kivi_cache(gm):
     Args:
         gm: Decode graph from ``convert_and_export_with_cache``, after
             ``split_kv_cache``; annotated in place.
+        bits: Entry width of the stored cache.
 
     Returns:
         The number of caches annotated.
@@ -241,8 +267,8 @@ def annotate_kivi_cache(gm):
         RuntimeError: A cache is still written directly, i.e. the graph was
             not split.
     """
-    key_qspec = QuantizationSpec.from_str(KIVI_KEY_SPEC)
-    value_qspec = QuantizationSpec.from_str(KIVI_VALUE_SPEC)
+    key_qspec = QuantizationSpec.from_str(kivi_cache_spec(bits, "key"))
+    value_qspec = QuantizationSpec.from_str(kivi_cache_spec(bits, "value"))
     count = 0
     for node in gm.graph.nodes:
         if node.op != "get_attr":
