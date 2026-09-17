@@ -39,6 +39,7 @@ import subprocess
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
 from typing import (
     Optional,
@@ -48,6 +49,7 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+from unittest.mock import patch
 
 import torch
 from datasets import load_dataset
@@ -57,6 +59,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
+    masking_utils,
 )
 from transformers.integrations.executorch import (
     convert_and_export_with_cache,
@@ -89,6 +92,7 @@ from voyager_compiler.codegen.reporting import (
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     plan_memory,
+    print_bufferized_graph,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
@@ -205,14 +209,17 @@ class SweepConfig:
     ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
     dequant / activation / requantize tail becomes separate kernels and the
     GQA KV repeat is materialised in memory instead of folding into the
-    block index.  ``quantize_attention_mask`` stores prefill's causal mask
-    as int1, the way ``test_codegen --quantize_attention_mask`` does; decode
-    rebuilds its mask every step and keeps bf16.
+    block index.  ``quantize_attention_mask`` stores eager prefill's causal
+    mask as int1, the way ``test_codegen --quantize_attention_mask`` does;
+    sdpa prefill runs ``is_causal`` with no mask tensor, and decode rebuilds
+    its mask every step and keeps bf16.
 
     ``calibration`` names a filled-in RTL calibration form (see
     ``write_calibration_form``) whose measured kernel cycles price the
     compute ops; ``calibration_rows_dir`` makes each point dump its kernel
-    rows there, the input for writing such a form."""
+    rows there, the input for writing such a form.  ``full_walk`` makes the
+    estimator walk every loop iteration instead of folding steady states;
+    the totals are the same either way."""
 
     model_id: str = DEFAULT_MODEL
     mode: str = "prefill"  # "prefill" | "decode"
@@ -243,6 +250,7 @@ class SweepConfig:
     dump_dir: Optional[str] = None
     calibration: Optional[str] = None
     calibration_rows_dir: Optional[str] = None
+    full_walk: bool = False
 
     @property
     def acc_config(self) -> AcceleratorConfig:
@@ -482,9 +490,35 @@ def _prompt_ids(cfg: SweepConfig, tokenizer, length: int):
     return ids
 
 
+@contextmanager
+def _sdpa_is_causal():
+    """Export sdpa attention with ``is_causal`` instead of a materialized
+    causal mask.  transformers builds the mask whenever it is tracing: it
+    refuses the ``is_causal`` skip, since a baked-in flag would be wrong for
+    a variable-length graph, and it cannot run the check that the batch
+    holds no packed sequences.  A fixed-length, single-sequence prefill
+    export wants the flag and has no packing."""
+
+    def skip(padding_mask, query_length, kv_length, *args, **kwargs):
+        return query_length == kv_length and (
+            padding_mask is None or bool(padding_mask.all())
+        )
+
+    with (
+        patch.object(masking_utils, "_ignore_causal_mask_sdpa", skip),
+        patch.object(
+            masking_utils, "find_packed_sequence_indices", lambda ids: None
+        ),
+    ):
+        yield
+
+
 def build_prefill(cfg: SweepConfig):
     """Export a prefill graph: the whole ``AutoModelForCausalLM`` fed
     ``input_ids`` of shape ``(batch, prompt_len)`` with ``use_cache=False``.
+    Under ``attn_implementation="sdpa"`` the attention runs ``is_causal``
+    with no mask tensor, so the flash-attention kernel skips the fully
+    masked tiles.
 
     ``logits_to_keep=1`` keeps only the last position's logits -- all that
     generation reads.  The graph then slices the hidden states before
@@ -505,7 +539,11 @@ def build_prefill(cfg: SweepConfig):
         "use_cache": False,
         "logits_to_keep": 1,
     }
-    gm = export_model(model, example_args, example_kwargs)
+    if cfg.attn_implementation == "sdpa":
+        with _sdpa_is_causal():
+            gm = export_model(model, example_args, example_kwargs)
+    else:
+        gm = export_model(model, example_args, example_kwargs)
     return gm, model, example_args, example_kwargs
 
 
@@ -749,10 +787,10 @@ def _frontend(cfg: SweepConfig):
 
     # KV-cache precision is applied by annotating the cache writes (KIVI); it
     # only exists in decode.  Prefill has no persistent cache, so kv_bits is
-    # not applicable there.
+    # not applicable there.  sdpa prefill has no mask tensor to annotate.
     if is_decode:
         _annotate_kv_cache(gm, cfg)
-    elif cfg.quantize_attention_mask:
+    elif cfg.quantize_attention_mask and cfg.attn_implementation != "sdpa":
         _annotate_attention_mask(gm)
 
     quantizer = build_quantizer(cfg)
@@ -802,7 +840,10 @@ def _frontend(cfg: SweepConfig):
 
 def _compile(cfg: SweepConfig):
     """Front end + whole-graph bufferize + memory plan for ``cfg``.
-    Returns ``(gm, model, plan)`` ready for ``estimate_schedule``."""
+    Returns ``(gm, model, plan)`` ready for ``estimate_schedule``.  With
+    ``dump_dir`` set, also writes the bufferized graph -- the emitted
+    program, nests and fused passes annotated with their memory spaces --
+    to ``<dump_dir>/<stem>.bufferized.txt`` beside the compute graph."""
     gm, model, tiler = _frontend(cfg)
     bufferize_graph(
         gm,
@@ -811,6 +852,10 @@ def _compile(cfg: SweepConfig):
         single_buffer_tail=cfg.single_buffer_tail,
     )
     plan = plan_memory(gm, cfg.acc_config)
+    if cfg.dump_dir is not None:
+        path = os.path.join(cfg.dump_dir, _cfg_stem(cfg) + ".bufferized.txt")
+        with open(path, "w") as f:
+            f.write(print_bufferized_graph(gm, to_string=True))
     return gm, model, plan
 
 
@@ -850,7 +895,10 @@ def run_design_point(cfg: SweepConfig) -> Metrics:
     ``cfg.calibration`` when one is given."""
     gm, model, plan = _compile(cfg)
     r = estimate_schedule(
-        gm, cfg.acc_config, calibration=_calibration(cfg.calibration)
+        gm,
+        cfg.acc_config,
+        full_walk=cfg.full_walk,
+        calibration=_calibration(cfg.calibration),
     )
     if cfg.calibration_rows_dir is not None:
         _dump_kernel_rows(cfg, r)
@@ -1137,7 +1185,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         single_buffer_tail=cfg.single_buffer_tail,
     )
     plan = plan_memory(sub, acc_config)
-    r = estimate_schedule(sub, acc_config)
+    r = estimate_schedule(sub, acc_config, full_walk=cfg.full_walk)
     compute, memory, overlap, stall = _time_split(r)
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
