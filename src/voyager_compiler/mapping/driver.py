@@ -32,7 +32,8 @@ def operation_key(operation):
 # Resolve only the options supported by the selected hardware evaluator
 def resolve_timing(target, options=None):
     from .models import sa
-    option_type = sa.TimingOptions
+    from .models.cim_timing import TimingOptions
+    option_type = TimingOptions if target.backend == "cim" else sa.TimingOptions
     if options is None or isinstance(options, dict):
         return option_type(**(options or {}))
     if type(options) is not option_type:

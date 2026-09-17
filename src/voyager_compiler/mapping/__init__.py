@@ -1,1 +1,1 @@
-from .target import SATarget, load_target
+from .target import SATarget, CIMTarget, load_target
