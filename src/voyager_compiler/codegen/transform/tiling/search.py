@@ -878,9 +878,21 @@ def _attention_tiles(node, tq, tkv):
         tiles[mask] = (tq, tkv)
     block_size = node.kwargs.get("block_size")
     if block_size is not None:
-        tiles[node.kwargs["query_scale"]] = (tq, head_dim // block_size)
-        tiles[node.kwargs["key_scale"]] = (head_dim // block_size, tkv)
+        # A block wider than the head is one truncated block; along the
+        # keys the tile is a whole number of blocks.
+        head_blocks = math.ceil(head_dim / block_size)
+        tiles[node.kwargs["query_scale"]] = (tq, head_blocks)
+        tiles[node.kwargs["key_scale"]] = (head_blocks, tkv)
         tiles[node.kwargs["value_scale"]] = (tkv // block_size, head_dim)
+    residual = get_arg_value(node, 7, "key_residual", None)
+    if residual is not None:
+        # The split cache's residual (``attention_v3``): its R
+        # positions whole, K transposed like the main key's.
+        length = residual.value.shape[-2]
+        tiles[get_arg_value(node, 6, "query_residual")] = (tq, head_dim)
+        tiles[residual] = (head_dim, length)
+        tiles[get_arg_value(node, 8, "value_residual")] = (length, head_dim)
+        tiles[get_arg_value(node, 9, "residual_mask")] = (tq, length)
     return tiles
 
 
@@ -892,7 +904,9 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
     the score tile at ``acc_dtype``, and the probabilities -- under MX
     their codes at the query's dtype plus their block scales, else a
     buffer at V's dtype when the softmax runs at a dtype other than the
-    operands' -- each sized the way ``plan_memory`` will place it.
+    operands' -- each sized the way ``plan_memory`` will place it.  A split
+    cache's residual adds its own score tile, product, max snapshot and,
+    at a dtype the matrix unit cannot take, probabilities.
 
     Args:
         node: The attention node.
@@ -932,6 +946,14 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
         total += 2 * tensor_alloc_bytes(
             tq * tkv, torch.bool, config.bank_width, config.vector_lanes
         )
+    residual = get_arg_value(node, 7, "key_residual", None)
+    if residual is not None:
+        length = tiles[residual][1]
+        total += acc_bytes((tq, length))
+        total += acc_bytes((tq, head_dim)) + acc_bytes((tq, 1))
+        value_residual = get_arg_value(node, 8, "value_residual")
+        if acc_dtype != value_residual.value.dtype:
+            total += _tensor_bytes(value_residual, (tq, length), config)
     return total
 
 

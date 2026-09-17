@@ -53,10 +53,27 @@ tkv)``; the table holds one tile per multiple from ``gcd - tq`` up to ``sq -
 tq``, a block wholly below the diagonal reading an all-true entry.  A Q tile
 must not straddle a head under the GQA fold (``tq`` divides ``sq``), so a
 row's position in its head is ``(q·tq) mod sq + r``.
+
+A decode step over a split KV cache (``split_kv_cache``) attends one more
+block per sweep: the chunk of the cache being filled, kept in full
+precision beside the quantized main cache and handed to the node as
+``key_residual`` / ``value_residual`` with ``query_residual`` (the query,
+unquantized) and ``residual_mask`` (the chunk's slice of the mask; the main
+mask drops the chunk's window).  An online softmax is additive over key
+blocks, so the residual is folded in at the sweep's boundary, after [E] has
+landed the sweep's last P@V and before the finalize: its QKᵀ, the softmax
+chain over the running state the sweep leaves -- its max snapshotted before
+[C] resets it for the next tile -- and P@V, then ``o = alpha·o + pv``.  Both
+products are plain matmuls, ``R`` (the residual's positions) wide, and the
+residual's P is not quantized.  The residual's tiles stream through slots
+of their own, one per sweep parity: a sweep's residual is fetched on its
+last step and consumed at the next sweep's boundary (or the epilogue),
+which under a single KV block is the same iteration as the next fetch.
 """
 
 import logging
 import math
+from types import SimpleNamespace
 
 import torch
 from torch._higher_order_ops.while_loop import while_loop
@@ -96,6 +113,14 @@ _ATTENTION_OPS = (
     torch.ops.quantized_ops.sdpa_mx.default,
 )
 _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
+# The optional positional operands of an attention node, by position.
+_OPTIONAL_OPERANDS = {
+    3: "attn_mask",
+    6: "query_residual",
+    7: "key_residual",
+    8: "value_residual",
+    9: "residual_mask",
+}
 _PRODUCT_OPS = (
     torch.ops.aten.matmul.default,
     torch.ops.quantized_ops.matmul_mx.default,
@@ -366,7 +391,7 @@ class _FA3Pipeline(torch.nn.Module):
         then one more pass quantizes it along the keys with the query's
         parameters -- ``probs``: the lookup table, the scale codebook and
         the midpoints -- into ``p_slot``'s codes and ``p_scale``."""
-        mx = self.block_size is not None
+        mx = probs is not None
         voyager.async_wait(sem_scores)
         voyager.insert(torch.amax(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(torch.maximum(m, row_tmp), row_tmp)
@@ -395,6 +420,167 @@ class _FA3Pipeline(torch.nn.Module):
         """[C]: the running max and sum a new Q tile starts from."""
         voyager.insert(torch.full_like(m, _MASK_FILL), m)
         voyager.insert(torch.zeros_like(l), l)
+
+    # --- the split cache's residual (module docstring) ------------------
+
+    def _residual_setup(self, operands, acc, q):
+        """The residual's operands and on-chip state, or ``None`` without
+        one.  ``q`` is the main query as folded: an unquantized attention
+        reads it as the residual query too (one operand serving both
+        names), and the kernel must not take two views of it."""
+        index = self.operand_index
+        if "key_residual" not in index:
+            return None
+        k, v, mask = (
+            operands[index[n]]
+            for n in ("key_residual", "value_residual", "residual_mask")
+        )
+        length = k.shape[-2]
+        if index["query_residual"] != index["query"]:
+            q = operands[index["query_residual"]]
+            if self.g_head > 1:
+                q = q.reshape(self.q_fold_shape)
+        if self.g_head > 1:
+            mask = fold_mask_tensor(
+                mask,
+                mask_broadcast=self.mask_broadcast,
+                sq_orig=self.sq_orig,
+                g_head=self.g_head,
+                mask_fold_shape=(*self.mask_fold_shape[:-1], length),
+            )
+        unit = (1,) * self.nb
+        tq, d = self.tq, self.d
+
+        def stream(src, tile):
+            slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
+            return slots, voyager.zeros([], torch.int64, num_slots=2)
+
+        q_slots, q_sem = stream(q, (tq, d))
+        k_slots, k_sem = stream(k, (d, length))
+        v_slots, v_sem = stream(v, (length, d))
+        munit = (1,) * (mask.ndim - 2)
+        m_slots = voyager.alloc([*munit, tq, length], mask.dtype, _SRAM, 2)
+        m_sem = voyager.zeros([], torch.int64, num_slots=2)
+        s = voyager.alloc([*unit, tq, length], acc, _SRAM)
+        p = s
+        if acc != v.dtype:
+            p = voyager.alloc([*unit, tq, length], v.dtype, _SRAM)
+        return SimpleNamespace(
+            q=q,
+            k=k,
+            v=v,
+            mask=mask,
+            length=length,
+            q_slots=q_slots,
+            q_sem=q_sem,
+            k_slots=k_slots,
+            k_sem=k_sem,
+            v_slots=v_slots,
+            v_sem=v_sem,
+            m_slots=m_slots,
+            m_sem=m_sem,
+            s=s,
+            p=p,
+            pv=voyager.alloc([*unit, tq, d], acc, _SRAM),
+            m_prev=voyager.alloc([*unit, tq, 1], acc, _SRAM),
+            sem_scores=voyager.zeros([1], torch.int64),
+            sem_pv=voyager.zeros([1], torch.int64),
+        )
+
+    def _residual_prefetch(self, res, slot, coords):
+        """DMA the residual's tiles of the sweep at ``coords`` into slot
+        ``slot``: the query tile like Q's, K and V whole (K transposed),
+        and the mask's block, whole along the keys."""
+        unit = (1,) * self.nb
+        tq, d, length = self.tq, self.d, res.length
+        dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
+        voyager.async_copy(
+            res.q,
+            get_slot(res.q_slots, slot),
+            idx,
+            unit + (tq, d),
+            get_slot(res.q_sem, slot),
+            dims,
+        )
+        dims, idx = self._block_address(coords, self.gkv, 1)
+        voyager.async_copy(
+            res.k,
+            get_slot(res.k_slots, slot),
+            idx,
+            unit + (length, d),
+            get_slot(res.k_sem, slot),
+            dims,
+            transposed=True,
+        )
+        voyager.async_copy(
+            res.v,
+            get_slot(res.v_slots, slot),
+            idx,
+            unit + (length, d),
+            get_slot(res.v_sem, slot),
+            dims,
+        )
+        dyn = [(j, g) for j, g in self.mask_dyn if g != self.gkv]
+        munit = (1,) * (res.mask.ndim - 2)
+        voyager.async_copy(
+            res.mask,
+            get_slot(res.m_slots, slot),
+            [coords[g] for _, g in dyn],
+            munit + (tq, length),
+            get_slot(res.m_sem, slot),
+            [j for j, _ in dyn],
+        )
+
+    def _residual_snapshot(self, res, m):
+        voyager.insert(m.clone(), res.m_prev)
+
+    def _residual_step(self, res, slot, l_slot, o, row_tmp, alpha):
+        """Fold the residual block of the sweep that just ended into its
+        state: S = (q @ Kᵀ)·scale + mask on the matrix unit, the softmax
+        chain from the snapshotted max, P @ V, then ``o = alpha·o + pv``."""
+        scale = self.scale
+
+        def scores(q, k, mask, s):
+            voyager.insert(torch.matmul(q, k) * scale + mask, s)
+
+        commit(
+            scores,
+            [
+                get_slot(res.q_slots, slot),
+                get_slot(res.k_slots, slot),
+                get_slot(res.m_slots, slot),
+                res.s,
+            ],
+            dependencies=[
+                get_slot(res.q_sem, slot),
+                get_slot(res.k_sem, slot),
+                get_slot(res.m_sem, slot),
+            ],
+            post=res.sem_scores,
+        )
+        self._softmax(
+            res.s,
+            res.p,
+            res.m_prev,
+            l_slot,
+            row_tmp,
+            alpha,
+            res.sem_scores,
+            None,
+            None,
+        )
+
+        def context(p, v, pv):
+            voyager.insert(torch.matmul(p, v), pv)
+
+        commit(
+            context,
+            [res.p, get_slot(res.v_slots, slot), res.pv],
+            dependencies=[get_slot(res.v_sem, slot)],
+            post=res.sem_pv,
+        )
+        voyager.async_wait(res.sem_pv)
+        voyager.insert(alpha * o + res.pv, o)
 
     def _fold_mask(self, mask):
         return fold_mask_tensor(
@@ -443,6 +629,9 @@ class _FA3Pipeline(torch.nn.Module):
         num_steps = self.num_steps
         unit = (1,) * nb
         tq, tkv, d = self.tq, self.tkv, self.d
+        # The head's block scales: a block wider than the head is one
+        # truncated block.
+        d_blocks = math.ceil(d / bs) if mx else None
         out = voyager.alloc(self.out_shape, self.out_dtype)
 
         # SRAM slots (2 slots each) + per-slot DMA semaphores; under MX each
@@ -456,8 +645,8 @@ class _FA3Pipeline(torch.nn.Module):
         k_slots, k_sem = stream(k, (d, tkv))
         v_slots, v_sem = stream(v, (tkv, d))
         if mx:
-            q_scale_slots, q_scale_sem = stream(q_scale, (tq, d // bs))
-            k_scale_slots, k_scale_sem = stream(k_scale, (d // bs, tkv))
+            q_scale_slots, q_scale_sem = stream(q_scale, (tq, d_blocks))
+            k_scale_slots, k_scale_sem = stream(k_scale, (d_blocks, tkv))
             v_scale_slots, v_scale_sem = stream(v_scale, (tkv // bs, d))
         if self.has_mask:
             munit = (1,) * (mask.ndim - 2)
@@ -492,6 +681,7 @@ class _FA3Pipeline(torch.nn.Module):
         alpha = voyager.alloc([*unit, tq, 1], acc, _SRAM)
         sem_scores = voyager.zeros([1], torch.int64)
         sem_pv = voyager.zeros([1], torch.int64)
+        res = self._residual_setup(operands, acc, q)
 
         # The three DMA streams, each with its scales under MX.  K's DRAM
         # block (and its scales') is transposed by the DMA into the Kᵀ tile
@@ -505,7 +695,7 @@ class _FA3Pipeline(torch.nn.Module):
                     slot,
                     q_scale_sem,
                     coords,
-                    (tq, d // bs),
+                    (tq, d_blocks),
                 )
 
         def load_k(slot, coords):
@@ -517,7 +707,7 @@ class _FA3Pipeline(torch.nn.Module):
                     slot,
                     k_scale_sem,
                     coords,
-                    (tkv, d // bs),
+                    (tkv, d_blocks),
                     True,
                 )
             if self.has_mask:
@@ -606,6 +796,8 @@ class _FA3Pipeline(torch.nn.Module):
                 # Step 0 is also its sweep's LAST step, so the uniform
                 # pattern's end-of-sweep Q prefetch belongs here too.
                 load_q(1, c1)
+        if sweep1 and res is not None:
+            self._residual_prefetch(res, 0, c0)
         # V's stream runs one step behind K's: block 0 lands in the slot
         # step 1 reads (slot 1); nothing is fetched for step 0, which
         # consumes no V.
@@ -662,14 +854,22 @@ class _FA3Pipeline(torch.nn.Module):
                 (kv == last) & (step + 1 < num_steps), q_fetch, lambda: 0
             )
 
+            sweep_slot = sweep % 2
+            torch._check(sweep_slot < 2)
+            if res is not None:
+                # The sweep's residual, consumed at the next boundary.
+                def res_fetch():
+                    self._residual_prefetch(res, sweep_slot, cur)
+                    return 1
+
+                torch.cond(kv == last, res_fetch, lambda: 0)
+
             # [A] current block's scores on the matrix unit: its K (and mask)
             # load semaphores are per-step commit dependencies; Q's is too, but
             # Q is loaded once per sweep, so its load posts once per live step
             # (see _load_sweep) to balance the per-step consume.  V is not a
             # dependency here — it feeds [B], so [A] issues while V's DMA is
             # in flight.  The sweep's parity picks its Q slot and its ``l``.
-            sweep_slot = sweep % 2
-            torch._check(sweep_slot < 2)
             tiles, deps = qk_operands(sweep_slot, cur_slot)
             self._matmul_qk(tiles, get_slot(s_buf, cur_slot), sem_scores, deps)
 
@@ -685,6 +885,8 @@ class _FA3Pipeline(torch.nn.Module):
             # tile.  The tile that just ended keeps its sum in the other l
             # slot for the finalize, which waits until after [D].
             def reset():
+                if res is not None:
+                    self._residual_snapshot(res, m)
                 self._reset(m, get_slot(l, sweep_slot))
                 return 1
 
@@ -704,6 +906,15 @@ class _FA3Pipeline(torch.nn.Module):
             def finalize():
                 voyager.async_wait(sem_pv)
                 voyager.insert(o + pv_buf, o)
+                if res is not None:
+                    self._residual_step(
+                        res,
+                        prev_sweep_slot,
+                        get_slot(l, prev_sweep_slot),
+                        o,
+                        row_tmp,
+                        alpha,
+                    )
                 # Drain the previous boundary's store before overwriting
                 # the slot (no prior store exists at the first boundary).
                 _guarded_wait(get_slot(out_sem, 0), sweep >= 2)
@@ -740,9 +951,19 @@ class _FA3Pipeline(torch.nn.Module):
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)
         voyager.insert(o + pv_buf, o)
+        last_sweep_slot = (sweeps - 1) % 2
+        if res is not None:
+            self._residual_snapshot(res, m)
+            self._residual_step(
+                res,
+                last_sweep_slot,
+                get_slot(l, last_sweep_slot),
+                o,
+                row_tmp,
+                alpha,
+            )
         if sweeps > 1:  # a prior boundary store exists (static)
             voyager.async_wait(get_slot(out_sem, 0))
-        last_sweep_slot = (sweeps - 1) % 2
         voyager.insert(
             (o / get_slot(l, last_sweep_slot)).to(self.out_dtype),
             get_slot(out_slots, 0),
@@ -763,9 +984,10 @@ def _operand_index(node):
         "key": node.args[1],
         "value": node.args[2],
     }
-    mask = get_arg_value(node, 3, "attn_mask", None)
-    if isinstance(mask, torch.fx.Node):
-        operands["attn_mask"] = mask
+    for position, name in _OPTIONAL_OPERANDS.items():
+        operand = get_arg_value(node, position, name, None)
+        if isinstance(operand, torch.fx.Node):
+            operands[name] = operand
     operands.update(
         (name, n)
         for name, n in node.kwargs.items()
@@ -789,18 +1011,19 @@ def _stamp_probs_dtypes(gm, dtypes):
                 _stamp_probs_dtypes(sub, dtypes)
 
 
-def _stamp_product_tilings(gm, products, tkv):
+def _stamp_product_tilings(gm, products, keys):
     """Copy the products' mapping metadata (``attention_op_tiling``) onto
     every kernel of ``gm`` that runs one -- the bare product op or the
     fused ``call_module`` around it, at every nesting level -- the way the
     GEMM builder stamps its nest, so the emitter and the reporting model
-    see the mapping the kernel runs.  A product is told by its output: the
-    scores are ``tkv`` wide, the context ``head_dim`` wide."""
+    see the mapping the kernel runs.  ``keys`` names each product by
+    ``(under MX, contraction, output width)``, which tells the scores from
+    the context and the main products from a residual's."""
     named = dict(gm.named_modules())
     for n in gm.graph.nodes:
         sub = named.get(str(n.target)) if n.op != "call_function" else None
         if n.op == "get_attr" and isinstance(sub, torch.fx.GraphModule):
-            _stamp_product_tilings(sub, products, tkv)
+            _stamp_product_tilings(sub, products, keys)
             continue
         if n.op == "call_function" and n.target in _PRODUCT_OPS:
             anchor = n
@@ -812,7 +1035,13 @@ def _stamp_product_tilings(gm, products, tkv):
             anchor = None
         if anchor is None:
             continue
-        which = "scores" if anchor.value.shape[-1] == tkv else "context"
+        which = keys[
+            (
+                anchor.target is _PRODUCT_OPS[1],
+                anchor.args[0].value.shape[-1],
+                anchor.value.shape[-1],
+            )
+        ]
         n.meta.update(products[which])
 
 
@@ -982,5 +1211,12 @@ def build_attention_fa3(
         )
     products = node.meta.get("product_tilings")
     if products is not None:
-        _stamp_product_tilings(gm, products, tkv)
+        mx = block_size is not None
+        keys = {(mx, d, tkv): "scores", (mx, tkv, d): "context"}
+        residual = get_arg_value(node, 7, "key_residual", None)
+        if residual is not None:
+            length = residual.value.shape[-2]
+            keys.setdefault((False, d, length), "residual_scores")
+            keys.setdefault((False, length, d), "residual_context")
+        _stamp_product_tilings(gm, products, keys)
     return gm

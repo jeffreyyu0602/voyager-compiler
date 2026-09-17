@@ -353,6 +353,14 @@ def _replay(target_fn, value, ops):
 
 _MATMUL = torch.ops.aten.matmul.default
 _COND = torch.ops.higher_order.cond
+_SDPA = torch.ops.aten.scaled_dot_product_attention.default
+_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
+_ATTENTION_OPS = (_SDPA, _SDPA_MX)
+_REPEAT_OPS = (
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.expand.default,
+    *_REGROUP_OPS,
+)
 
 # The KV-cache buffers of a Hugging Face static-cache decode export, and the
 # residual buffers ``split_kv_cache`` puts beside them.
@@ -395,26 +403,32 @@ def _axis_through(node: Node, axis: int):
 
 
 def _attention_cone(idx: Node):
-    """``(relayouts, matmul)``: the relayout ops from cache write ``idx`` down
-    to the one ``aten.matmul`` that reads the cache as its right operand, in
-    graph order; ``(None, None)`` if the write reaches anything else."""
-    relayouts, frontier, matmuls, seen = [], [idx], [], {idx}
+    """``(relayouts, consumer)``: the relayout ops from cache write ``idx``
+    down to the one op that reads the cache -- an ``aten.matmul`` as its
+    right operand, or an attention node as its key or value -- in graph
+    order; ``(None, None)`` if the write reaches anything else."""
+    relayouts, frontier, consumers, seen = [], [idx], [], {idx}
     while frontier:
         for user in frontier.pop().users:
             if user in seen:
                 continue
             seen.add(user)
-            if user.target is _MATMUL:
-                matmuls.append(user)
+            if user.target is _MATMUL or user.target in _ATTENTION_OPS:
+                consumers.append(user)
             elif _is_relayout(user):
                 relayouts.append(user)
                 frontier.append(user)
             else:
                 return None, None
-    if len(matmuls) != 1 or matmuls[0].args[1] not in seen:
+    if len(consumers) != 1:
+        return None, None
+    consumer = consumers[0]
+    operands = consumer.args[1:3] if consumer.target is not _MATMUL else ()
+    operands = operands or (consumer.args[1],)
+    if not any(a in seen for a in operands):
         return None, None
     order = {n: i for i, n in enumerate(idx.graph.nodes)}
-    return sorted(relayouts, key=order.__getitem__), matmuls[0]
+    return sorted(relayouts, key=order.__getitem__), consumer
 
 
 def _stamp_fake(node: Node, fake_mode) -> None:
@@ -456,33 +470,37 @@ def _split_one_cache(
     if matmul is None:
         raise ValueError(
             f"{cache.target}: the cache write does not reach a single "
-            "attention matmul through relayout ops"
+            "attention matmul or attention node through relayout ops"
         )
     dim = dim % len(_shape_of(idx))
+    attention = matmul.target in _ATTENTION_OPS
 
     # Follow the written axis down to the matmul's right operand: reaching
     # its last dim makes the residual's scores replace a window of the main
-    # scores; reaching the reduction dim makes them add.
-    axis_of = {idx: dim}
-    for n in relayouts:
-        src = next(a for a in n.all_input_nodes if a in axis_of)
-        axis_of[n] = _axis_through(n, axis_of[src])
-        if axis_of[n] is None:
+    # scores; reaching the reduction dim makes them add.  An attention node
+    # takes the residual as operands and joins it itself.
+    join = None
+    if not attention:
+        axis_of = {idx: dim}
+        for n in relayouts:
+            src = next(a for a in n.all_input_nodes if a in axis_of)
+            axis_of[n] = _axis_through(n, axis_of[src])
+            if axis_of[n] is None:
+                raise ValueError(
+                    f"{cache.target}: {n} loses the cache's position axis"
+                )
+        weight = matmul.args[1]
+        weight_rank = len(_shape_of(weight))
+        if axis_of[weight] == weight_rank - 1:
+            join = "scores"
+        elif axis_of[weight] == weight_rank - 2:
+            join = "sum"
+        else:
             raise ValueError(
-                f"{cache.target}: {n} loses the cache's position axis"
+                f"{cache.target}: position axis {axis_of[weight]} of the "
+                "attention matmul's operand is neither its output nor its "
+                "reduction axis"
             )
-    weight = matmul.args[1]
-    weight_rank = len(_shape_of(weight))
-    if axis_of[weight] == weight_rank - 1:
-        join = "scores"
-    elif axis_of[weight] == weight_rank - 2:
-        join = "sum"
-    else:
-        raise ValueError(
-            f"{cache.target}: position axis {axis_of[weight]} of the "
-            "attention matmul's operand is neither its output nor its "
-            "reduction axis"
-        )
 
     # Split the contents: completed chunks stay, zeros above them; the tail
     # moves into the residual buffer.
@@ -564,6 +582,18 @@ def _split_one_cache(
     idx.update_arg(2, slots)
     _stamp_fake(idx, fake_mode)
 
+    if attention:
+        joined = _split_attention_operand(
+            model, matmul, cache, idx, relayouts, offsets, fake_mode
+        )
+        _fold_chunk(model, cache, dim, idx, offsets, pred, joined, fake_mode)
+        logger.info(
+            f"Split {cache.target}: {done} positions in completed chunks, "
+            f"{context_len - done} in the {length}-slot residual; the "
+            "attention takes the residual as an operand"
+        )
+        return
+
     # The residual half: the same relayouts and matmul, over the residual's
     # ``R`` positions, right after the main matmul so the quantizer counts
     # them main, residual, main, residual within the layer.  The main half
@@ -614,16 +644,37 @@ def _split_one_cache(
     matmul.replace_all_uses_with(
         joined, delete_user_cb=lambda u: u is not joined
     )
+    _fold_chunk(model, cache, dim, idx, offsets, pred, joined, fake_mode)
+    logger.info(
+        f"Split {cache.target}: {done} positions in completed chunks, "
+        f"{context_len - done} in the {length}-slot residual; residual "
+        f"{'replaces a window of' if join == 'scores' else 'adds to'} the "
+        "main attention"
+    )
 
-    # The fold, after the attention has read the main cache: on the step
-    # that completes a chunk, copy the residual into it.  Spelled without a
-    # branch -- chunk ``c`` is rewritten every step, with the residual on
-    # the completing step and with what it already holds otherwise -- so
-    # the graph stays plain tensor ops (a CUDA graph can replay it) and the
-    # lowering turns the pattern into a real conditional.  The cache is
-    # reached through its own ``get_attr`` so that an observer on the read
-    # never sits between the fold and the buffer.
-    with graph.inserting_before(joined.next):
+
+def _fold_chunk(model, cache, dim, idx, offsets, pred, after, fake_mode):
+    """The fold, after the attention has read the main cache: on the step
+    that completes a chunk, copy the residual into it.  Spelled without a
+    branch -- chunk ``c`` is rewritten every step, with the residual on
+    the completing step and with what it already holds otherwise -- so
+    the graph stays plain tensor ops (a CUDA graph can replay it) and the
+    lowering turns the pattern into a real conditional.  The cache is
+    reached through its own ``get_attr`` so that an observer on the read
+    never sits between the fold and the buffer.
+
+    Args:
+        model: The graph module.
+        cache: The main cache's ``get_attr``.
+        dim: The cache's position axis.
+        idx: The residual write, whose value is the residual buffer.
+        offsets: The chunk's positions in the cache.
+        pred: Whether this step completes the chunk.
+        after: The node that reads the main cache; the fold follows it.
+        fake_mode: The graph's fake mode, for ``_stamp_fake``.
+    """
+    graph = model.graph
+    with graph.inserting_before(after.next):
         handle = graph.get_attr(cache.target)
         _stamp_fake(handle, fake_mode)
         window = graph.call_function(
@@ -636,12 +687,129 @@ def _split_one_cache(
         for n in (window, folded, fold):
             _copy_scope(n, idx)
             _stamp_fake(n, fake_mode)
-    logger.info(
-        f"Split {cache.target}: {done} positions in completed chunks, "
-        f"{context_len - done} in the {length}-slot residual; residual "
-        f"{'replaces a window of' if join == 'scores' else 'adds to'} the "
-        "main attention"
+
+
+def _additive_mask(graph, mask, dtype, fake_mode):
+    """A bool mask as the additive one the attention kernel adds to its
+    scores: zero where the mask keeps, the dtype's minimum elsewhere."""
+    zeros = graph.call_function(
+        torch.ops.aten.zeros_like.default, (mask,), {"dtype": dtype}
     )
+    dropped = graph.call_function(torch.ops.aten.logical_not.default, (mask,))
+    filled = graph.call_function(
+        torch.ops.aten.masked_fill.Scalar,
+        (zeros, dropped, torch.finfo(dtype).min),
+    )
+    for n in (zeros, dropped, filled):
+        _stamp_fake(n, fake_mode)
+    return filled
+
+
+def _split_attention_operand(
+    model, node, cache, idx, relayouts, offsets, fake_mode
+):
+    """Hand attention ``node`` the residual of the cache it reads as its key
+    or value: the operand becomes a view of the cache buffer -- a GQA
+    repeat between the two is dropped for ``enable_gqa``, so the kernel
+    folds the head group; a view rather than the buffer itself, so the
+    quantizer's convert sees an activation and emits the dynamic quantize
+    the fold pass bakes into the cache, not a parameter it would quantize
+    once -- and the residual write ``idx`` goes onto its ``sdpa_mx`` twin
+    as ``key_residual`` / ``value_residual``.  The first cache split
+    retargets the node and gives it the query as ``query_residual`` (read
+    unquantized) and its masks: the main mask with the chunk's window
+    dropped, and ``residual_mask``, the window's own slice.  Both are
+    additive (``_additive_mask``).  The residual operands are positional,
+    as the quantizer requires.
+
+    Returns:
+        The attention node, retargeted.
+
+    Raises:
+        ValueError: Relayouts other than a GQA repeat sit between the cache
+            and the attention.
+    """
+    graph = model.graph
+    position = next(
+        i for i in (1, 2) if node.args[i] is cache or node.args[i] in relayouts
+    )
+    operand = node.args[position]
+    residual_position = position + 6  # query_residual leads at 6
+    kwargs = dict(node.kwargs)
+    if operand is not cache:
+        # ``repeat_kv``: unsqueeze -> expand -> reshape, multiplying the
+        # head dim and nothing else, head ``h`` reading KV head ``h // g``.
+        b, hkv, *rest = _shape_of(cache)
+        b_out, heads, *rest_out = _shape_of(operand)
+        if (
+            any(n.target not in _REPEAT_OPS for n in relayouts)
+            or (b_out, rest_out) != (b, rest)
+            or heads % hkv
+        ):
+            raise ValueError(
+                f"{cache.target}: {operand} between the cache and {node} is "
+                "not a GQA repeat"
+            )
+        kwargs["enable_gqa"] = True
+    args = list(node.args)
+    with graph.inserting_before(node):
+        args[position] = graph.call_function(
+            torch.ops.aten.view.default, (cache, list(_shape_of(cache)))
+        )
+        _copy_scope(args[position], node)
+        _stamp_fake(args[position], fake_mode)
+    if node.target is _SDPA_MX:
+        args[residual_position] = idx
+        node.args = tuple(args)
+        node.kwargs = kwargs
+        _stamp_fake(node, fake_mode)
+        return node
+
+    query = args[0]
+    dtype = query.meta["val"].dtype
+    mask = get_arg_value(node, 3, "attn_mask", None)
+    with graph.inserting_before(node):
+        # The residual reads the query unquantized: a view of its own, so
+        # the observer the quantizer puts on the query does not cover it.
+        residual_query = graph.call_function(
+            torch.ops.aten.view.default, (query, list(_shape_of(query)))
+        )
+        _copy_scope(residual_query, node)
+        _stamp_fake(residual_query, fake_mode)
+        if mask is None:
+            rows, keys = _shape_of(query)[-2], _shape_of(cache)[-2]
+            mask = graph.call_function(
+                torch.ops.aten.ones.default,
+                ((1, 1, rows, keys),),
+                {"dtype": torch.bool, "device": _shape_device(query)},
+            )
+            _stamp_fake(mask, fake_mode)
+        main = graph.call_function(
+            torch.ops.aten.index_fill.int_Scalar, (mask, -1, offsets, False)
+        )
+        window = graph.call_function(
+            torch.ops.aten.index_select.default, (mask, -1, offsets)
+        )
+        _stamp_fake(main, fake_mode)
+        _stamp_fake(window, fake_mode)
+        main = _additive_mask(graph, main, dtype, fake_mode)
+        window = _additive_mask(graph, window, dtype, fake_mode)
+        # (query, key, value, attn_mask, dropout_p, is_causal, then the
+        # residual's query, key, value and mask)
+        dropout_p = get_arg_value(node, 4, "dropout_p", 0.0)
+        is_causal = get_arg_value(node, 5, "is_causal", False)
+        args = args[:3] + [main, dropout_p, is_causal, residual_query]
+        args += [None, None]
+        args.append(window)
+        args[residual_position] = idx
+        kwargs.pop("dropout_p", None)
+        kwargs.pop("is_causal", None)
+        new = graph.call_function(_SDPA_MX, tuple(args), kwargs)
+        _copy_scope(new, node)
+        _stamp_fake(new, fake_mode)
+    node.replace_all_uses_with(new)
+    graph.erase_node(node)
+    return new
 
 
 def _shape_device(node: Node):
@@ -708,6 +876,7 @@ def split_kv_cache(
             continue
         _split_one_cache(model, idx, residual_length, context_len, fake_mode)
         count += 1
+    graph.eliminate_dead_code()
     graph.lint()
     model.recompile()
     return count

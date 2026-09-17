@@ -21,6 +21,9 @@ from voyager_compiler.quantization.quantizer.quantizer import (
 )
 
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
+# ``split_kv_cache`` spells a decode graph's attention as the twin, with its
+# residual operands; it takes the same annotation.
+_SDPA_OPS = (_SDPA, torch.ops.quantized_ops.sdpa_mx.default)
 
 
 # In the absence of better name, just winging it with QuantizationConfig
@@ -252,7 +255,7 @@ def _annotate_sdpa(
         replace(weight_qspec, ch_axis=-1) if weight_qspec is not None else None
     )
     for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target != _SDPA:
+        if node.op != "call_function" or node.target not in _SDPA_OPS:
             continue
         if filter_fn and not filter_fn(node):
             continue

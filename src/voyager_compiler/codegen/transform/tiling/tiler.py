@@ -46,6 +46,7 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     _sweep_cycles,
     attention_tile_latency,
     bank_walk,
+    gemv_compute_cycles,
     get_dtype_width,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
@@ -2462,9 +2463,11 @@ def _attention_products(node, tq, tkv):
         codes = scores_scales = context_scales = ()
     else:
         codes = (kw.get("input_code"), kw.get("weight_code"))
+        # A block wider than the head is one truncated block.
+        head_blocks = math.ceil(head_dim / block_size)
         scores_scales = (
-            ((tq, head_dim // block_size), kw["query_scale"]),
-            ((head_dim // block_size, tkv), kw["key_scale"]),
+            ((tq, head_blocks), kw["query_scale"]),
+            ((head_blocks, tkv), kw["key_scale"]),
         )
         context_scales = (
             ((tq, tkv // block_size), kw["query_scale"]),
@@ -2488,18 +2491,49 @@ def _attention_products(node, tq, tkv):
         context_scales,
         codes,
     )
-    return {"scores": scores, "context": context}
+    products = {"scores": scores, "context": context}
+    residual = get_arg_value(node, 7, "key_residual", None)
+    if residual is not None:
+        # The split cache's residual: plain products over its R positions,
+        # the probabilities at the residual query's dtype.
+        length = residual.value.shape[-2]
+        query_residual = get_arg_value(node, 6, "query_residual")
+        products["residual_scores"] = _product_node(
+            f"attention_residual_scores_{tq}x{length}",
+            out_dtype,
+            ((tq, head_dim), query_residual),
+            ((head_dim, length), residual),
+            None,
+            (),
+            (),
+        )
+        products["residual_context"] = _product_node(
+            f"attention_residual_context_{tq}x{length}",
+            out_dtype,
+            ((tq, length), query_residual),
+            ((length, head_dim), get_arg_value(node, 8, "value_residual")),
+            None,
+            (),
+            (),
+        )
+    return products
 
 
 def _product_cycles(node, tiler):
-    """The matrix unit's cycles for the whole product ``node`` -- mapped as
-    one on-chip tile (``attention_op_tiling`` pins it so) -- and the
-    mapping metadata the kernel running it is stamped with (what
-    ``get_tiling`` leaves on a GEMM), or ``None`` when interstellar maps
-    nothing."""
+    """The cycles for the whole product ``node`` -- mapped as one on-chip
+    tile (``attention_op_tiling`` pins it so) -- and the mapping metadata
+    the kernel running it is stamped with (what ``get_tiling`` leaves on a
+    GEMM), or ``None`` when interstellar maps nothing.  A one-row product
+    is matrix-vector: ``get_tiling`` sizes it with the GEMV search, which
+    leaves no mapping, and its compute is priced the way that search
+    prices it."""
     counts, _ = get_tiling(node, tiler)
     if counts is None or math.prod(counts) != 1:
         return None
+    if is_fully_connected(node):
+        m, k = node.args[0].value.shape
+        n = node.args[1].value.shape[-1]
+        return gemv_compute_cycles(node, (m, k, n), tiler.config), {}
     tiling = node.meta["tiling"]
     mapping, _ = tiling["interstellar_tiling"]
     cycles = tiling["runtime_calculator"].matrix_cycles(
@@ -2545,12 +2579,6 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
     # Under MX the query and key block along head_dim, the value and the
     # probabilities along the keys, so a key tile holds whole blocks.
     block_size = node.kwargs.get("block_size")
-    if block_size is not None and head_dim % block_size:
-        raise ValueError(
-            f"{node}: head_dim {head_dim} is not a multiple of the "
-            f"{block_size}-element MX block"
-        )
-
     logger.info(f"Running L2 tiling for attention: {node}")
 
     unit = max(config.pe_array_size)
@@ -2613,7 +2641,7 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
             tiles,
             tuple(kv_batch) + blocks,
             config,
-            (priced["scores"][0], priced["context"][0]),
+            {name: cycles for name, (cycles, _) in priced.items()},
         )
         scored.append(
             (latency, traffic, blocks, {k: v[1] for k, v in priced.items()})

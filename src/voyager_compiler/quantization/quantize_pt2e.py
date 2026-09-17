@@ -130,6 +130,7 @@ def get_microscaling_quantizer(
         .set_object_type(torch.ops.aten.linear.default, qconfig_linear)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
         .set_object_type(_SDPA, qconfig_matmul)
+        .set_object_type(MX_OP_MAPPING[_SDPA], qconfig_matmul)
     )
 
 

@@ -733,7 +733,9 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     time.  The scores product runs first; the context product then runs on
     the matrix unit while the vector unit runs the softmax chain, which had
     to wait for the scores -- so a step costs the scores plus the busier of
-    the two, then the rescale that folds the context in.  A query block's
+    the two, then the rescale that folds the context in.  A one-row query
+    tile makes the products matrix-vector, run on the vector unit like any
+    (``gemv_compute_cycles``), so its step is the plain sum.  A query block's
     first step is a boundary: the vector unit resets its state, runs the
     softmax, then finalizes the previous block once that block's context has
     landed, so the finalize takes the rescale's place beside the context.
@@ -744,15 +746,20 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     reload on each step, and the DMAs overlap compute the way
     ``_sweep_cycles`` prices a double-buffered sweep.  Under ``is_causal``
     only the live pairs are steps (``attention_kv_last``) and the mask
-    tiles stream from the kernel's table, one per step.
+    tiles stream from the kernel's table, one per step.  A split cache's
+    residual (``bufferize/attention_v3.py``) runs serially at each boundary --
+    its two products around a softmax over its R positions, then the
+    rescale of the output -- and its operands move once per boundary.
 
     Args:
         node: The attention node being tiled.
         tiles: Operand FX node -> its SRAM tile shape (``_attention_tiles``).
         grid: The FA3 loop grid, ``(*kv_batch, num_q_blocks, num_kv_blocks)``.
         config (AcceleratorConfig): The hardware description.
-        matrix: ``(scores, context)`` -- the matrix unit's cycles for one
-            step's two products.
+        matrix: The matrix unit's cycles per product, keyed as
+            ``_attention_products`` names them: ``scores`` and ``context``
+            for one step's two, plus ``residual_scores`` and
+            ``residual_context`` under a residual.
 
     Returns:
         ``(cycles, DRAM bytes)``; the bytes break a latency tie.
@@ -790,9 +797,20 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     softmax += passes(4, rows)
     rescale = passes(1, out)
     boundary = passes(3, out) + passes(2, rows)
-    scores, context = matrix
-    interior = scores + max(context, softmax) + rescale
-    boundary_step = scores + max(context, softmax + boundary)
+    residual = get_arg_value(node, 7, "key_residual", None)
+    if residual is not None:
+        length = tiles[residual][-1]
+        boundary += matrix["residual_scores"] + matrix["residual_context"]
+        boundary += passes(3, tq * length) + passes(4, rows) + rescale
+    scores, context = matrix["scores"], matrix["context"]
+    if tq == 1:
+        # One query row: the products are matrix-vector and run on the
+        # vector unit beside the softmax, so nothing overlaps.
+        interior = scores + context + softmax + rescale
+        boundary_step = scores + context + softmax + boundary
+    else:
+        interior = scores + max(context, softmax) + rescale
+        boundary_step = scores + max(context, softmax + boundary)
 
     lat = config.access_latency_cycles
     bpc = config.bytes_per_cycle
@@ -808,6 +826,10 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
         (node.kwargs.get("query_scale"), boundaries),
         (node.kwargs.get("key_scale"), steps),
         (node.kwargs.get("value_scale"), steps),
+        (get_arg_value(node, 6, "query_residual", None), boundaries),
+        (residual, boundaries),
+        (get_arg_value(node, 8, "value_residual", None), boundaries),
+        (get_arg_value(node, 9, "residual_mask", None), boundaries),
     ):
         if not isinstance(operand, Node):
             continue
@@ -827,6 +849,17 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
         latency += steps * interior
     latency += boundaries * (boundary_step - interior)
     return latency, traffic
+
+
+def gemv_compute_cycles(node, tile_sizes, config):
+    """The vector unit's cycles for one ``(X, C, K)`` tile of a
+    matrix-vector GEMM: its MACs over the unit's lanes (``gemv_lanes``),
+    de-rated by ``vector_op_utilization``."""
+    lanes = gemv_lanes(get_anchor_node(node), config)
+    ideal = math.ceil(math.prod(tile_sizes) / lanes)
+    _, c_tile, k_tile = tile_sizes
+    util = vector_op_utilization(node, config, ideal, (k_tile, c_tile))
+    return math.ceil(ideal / util)
 
 
 def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
@@ -897,11 +930,7 @@ def gemv_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
         dmas.append((_transfer_cost(shape, n_bytes, lat, bpc), transfers))
         traffic += transfers * n_bytes
 
-    lanes = gemv_lanes(anchor, config)
-    ideal = math.ceil(math.prod(tile_sizes) / lanes)
-    _, c_tile, k_tile = tile_sizes
-    util = vector_op_utilization(node, config, ideal, (k_tile, c_tile))
-    compute = math.ceil(ideal / util)
+    compute = gemv_compute_cycles(node, tile_sizes, config)
 
     steps = math.prod(grid)
     if config.double_buffered_l2:

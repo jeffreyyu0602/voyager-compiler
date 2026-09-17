@@ -584,7 +584,9 @@ def _dequantize_mx(input, scale, code, block_size):
 
 quantized_ops_lib.define(
     "sdpa_mx(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, "
-    "float dropout_p=0., bool is_causal=False, *, float? scale=None, "
+    "float dropout_p=0., bool is_causal=False, Tensor? query_residual=None, "
+    "Tensor? key_residual=None, Tensor? value_residual=None, "
+    "Tensor? residual_mask=None, *, float? scale=None, "
     "bool enable_gqa=False, Tensor? query_scale=None, Tensor? key_scale=None, "
     "Tensor? value_scale=None, int? block_size=None, Tensor? input_code=None, "
     "Tensor? weight_code=None, Tensor? probs_qmap=None, "
@@ -601,6 +603,10 @@ def sdpa_mx(
     attn_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
+    query_residual: Optional[torch.Tensor] = None,
+    key_residual: Optional[torch.Tensor] = None,
+    value_residual: Optional[torch.Tensor] = None,
+    residual_mask: Optional[torch.Tensor] = None,
     *,
     scale: Optional[float] = None,
     enable_gqa: bool = False,
@@ -628,6 +634,13 @@ def sdpa_mx(
     ``dropout_p`` is ignored; ``is_causal`` masks every key past a query's
     own position, as aten does, and excludes an explicit mask.
 
+    A split KV cache (``split_kv_cache``) adds a residual: ``key_residual``
+    / ``value_residual`` hold the chunk being filled in full precision and
+    are attended after the main keys, ``query_residual`` (the unquantized
+    query) against them under ``residual_mask``, in one softmax with the
+    main keys.  Their probabilities are not quantized.  They are positional
+    because the quantizer's observer insertion takes no tensor kwargs.
+
     Returns:
         The attention output, in the codebooks' dtype.
     """
@@ -636,10 +649,14 @@ def sdpa_mx(
     query = _dequantize_mx(query, query_scale, input_code, block_size)
     key = _dequantize_mx(key, key_scale, weight_code, block_size)
     value = _dequantize_mx(value, value_scale, weight_code, block_size)
+    residual = key_residual is not None
     if enable_gqa:
         group = query.shape[-3] // key.shape[-3]
         key = key.repeat_interleave(group, dim=-3)
         value = value.repeat_interleave(group, dim=-3)
+        if residual:
+            key_residual = key_residual.repeat_interleave(group, dim=-3)
+            value_residual = value_residual.repeat_interleave(group, dim=-3)
     if scale is None:
         scale = 1.0 / math.sqrt(query.shape[-1])
 
@@ -648,12 +665,14 @@ def sdpa_mx(
         attn_mask = torch.ones(
             scores.shape[-2:], dtype=torch.bool, device=scores.device
         ).tril()
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            scores = scores.masked_fill(~attn_mask, float("-inf"))
-        else:
-            scores = scores + attn_mask
+    scores = _masked(scores, attn_mask)
+    keys = scores.shape[-1]
+    if residual:
+        residual_scores = query_residual @ key_residual.transpose(-1, -2)
+        residual_scores = _masked(residual_scores * scale, residual_mask)
+        scores = torch.cat([scores, residual_scores], dim=-1)
     probs = torch.softmax(scores, dim=-1)
+    probs, residual_probs = probs[..., :keys], probs[..., keys:]
     if probs_qmap is not None:
         probs_scale, probs = quantize_mx(
             probs,
@@ -666,7 +685,20 @@ def sdpa_mx(
             probs_code,
         )
         probs = _dequantize_mx(probs, probs_scale, input_code, block_size)
-    return torch.matmul(probs, value)
+    out = torch.matmul(probs, value)
+    if residual:
+        out = out + torch.matmul(residual_probs, value_residual)
+    return out
+
+
+def _masked(scores, mask):
+    """``scores`` under ``mask``: a bool mask keeps where true, a float one
+    adds; ``None`` masks nothing."""
+    if mask is None:
+        return scores
+    if mask.dtype == torch.bool:
+        return scores.masked_fill(~mask, float("-inf"))
+    return scores + mask
 
 
 @torch.library.register_fake("quantized_ops::sdpa_mx")
@@ -677,6 +709,10 @@ def _(
     attn_mask: Optional[torch.Tensor] = None,
     dropout_p: float = 0.0,
     is_causal: bool = False,
+    query_residual: Optional[torch.Tensor] = None,
+    key_residual: Optional[torch.Tensor] = None,
+    value_residual: Optional[torch.Tensor] = None,
+    residual_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     return query.new_empty(*query.shape[:-1], value.shape[-1])
