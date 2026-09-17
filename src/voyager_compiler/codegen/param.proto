@@ -43,6 +43,14 @@ message Argument {
   }
 }
 
+// Original and padded channel domains for useful-work accounting
+message MappingChannels {
+  int32 input_channels = 1;
+  int32 output_channels = 2;
+  int32 padded_input_channels = 3;
+  int32 padded_output_channels = 4;
+}
+
 // Represents an operation, without fusion information
 message OpOverload {
   string name = 1;            // Unique name of the node
@@ -50,6 +58,7 @@ message OpOverload {
   string target = 3;          // Target function/module name
   repeated Argument args = 4; // Positional arguments
   map<string, Argument> kwargs = 5; // Keyword arguments
+  optional MappingChannels mapping_channels = 6;
 }
 
 // Represents a fused operation

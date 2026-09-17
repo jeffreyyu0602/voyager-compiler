@@ -164,6 +164,14 @@ def pad_matrix_op_dimensions(
     Returns:
         torch.fx.GraphModule: The transformed FX graph module.
     """
+    # Snapshot all operations before padding a shared weight or propagated output
+    for node in model.graph.nodes:
+        if is_gemm_op(node):
+            weight = node.args[1]
+            ic = weight.shape[-2] if is_matmul(node) else weight.shape[1]
+            oc = weight.shape[-1] if is_matmul(node) else weight.shape[0]
+            node.meta.setdefault("mapping_channels", (ic, oc, ic, oc))
+
     for node in list(model.graph.nodes):
         if not is_gemm_op(node):
             continue
@@ -250,6 +258,9 @@ def pad_matrix_op_dimensions(
                 bias_param = fetch_attr(model, bias.target)
                 bias_param.data = F.pad(bias_param.data, [0, pad_K])
                 propagate_shape(bias, model)
+
+        logical_ic, logical_oc, _, _ = node.meta["mapping_channels"]
+        node.meta["mapping_channels"] = (logical_ic, logical_oc, C_in + pad_C, C_out + pad_K)
 
         propagate_shape(node)
 

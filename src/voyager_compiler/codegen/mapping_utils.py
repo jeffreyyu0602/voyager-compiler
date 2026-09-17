@@ -269,6 +269,13 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
     if "l2_tiling" in node.meta:
         op_overload.kwargs["l2_tiling"].int_list.values.extend(node.meta["l2_tiling"])
 
+    if "mapping_channels" in node.meta:
+        ic, oc, padded_ic, padded_oc = node.meta["mapping_channels"]
+        op_overload.mapping_channels.input_channels = ic
+        op_overload.mapping_channels.output_channels = oc
+        op_overload.mapping_channels.padded_input_channels = padded_ic
+        op_overload.mapping_channels.padded_output_channels = padded_oc
+
     return op_overload
 
 

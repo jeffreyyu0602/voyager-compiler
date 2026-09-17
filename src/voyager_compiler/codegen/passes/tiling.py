@@ -22,6 +22,7 @@ from ..mapping import (
 )
 from ..mapping_utils import (
     is_conv2d,
+    is_gemm_op,
     is_bmm,
     is_depthwise_conv,
     is_elementwise_op,
@@ -400,8 +401,19 @@ def _decompose_conv2d_node(model, node, tile_sizes, tiled_shapes, configs):
     value_remap = {}
     output = replace_node_with_graph_module(model, node, gm, value_remap)
 
+    # Pair each emitted convolution with its explicit contiguous IC slice
+    channel_configs = iter(configs)
+    for tiled_op in value_remap.values():
+        if tiled_op is not None and tiled_op.target == node.target:
+            cfg = next(channel_configs)
+            if "mapping_channels" in node.meta:
+                logical_ic, logical_oc, _, padded_oc = node.meta["mapping_channels"]
+                start, end = cfg["c_tile"]
+                tiled_op.meta["mapping_channels"] = (
+                    max(0, min(end, logical_ic) - start), logical_oc, end - start, padded_oc)
+
     # Update metadata on new nodes in the graph
-    for n in list(value_remap.values()):
+    for n in (value for value in value_remap.values() if value is not None):
         if n.target == torch.ops.aten.slice.Tensor and n.args[0].op == "get_attr":
             c_start, c_end = n.args[2], n.args[3]
             with model.graph.inserting_before(n):
@@ -932,7 +944,20 @@ def split_gemm_node(model, node, tile_sizes, tiled_shapes):
     value_remap = {}
     replace_node_with_graph_module(model, node_to_replace, gm, value_remap)
 
-    for n in list(value_remap.values()):
+    # Export emits one matrix operation per contiguous IC slice in traversal order
+    if "mapping_channels" in node.meta:
+        logical_ic, logical_oc, _, padded_oc = node.meta["mapping_channels"]
+        channel_start = 0
+        for tiled_op in value_remap.values():
+            if tiled_op is not None and is_gemm_op(tiled_op):
+                extent = min(c_tiled, C - channel_start)
+                tiled_op.meta["mapping_channels"] = (
+                    max(0, min(extent, logical_ic - channel_start)), logical_oc, extent, padded_oc)
+                channel_start += extent
+        if channel_start != C:
+            raise ValueError("reduction slicing did not preserve mapping channel metadata")
+
+    for n in (value for value in value_remap.values() if value is not None):
         if n.target == torch.ops.aten.slice.Tensor:
             if n.args[0].op == "get_attr":
                 c_start = get_arg_value(n, 2, "start", None)
