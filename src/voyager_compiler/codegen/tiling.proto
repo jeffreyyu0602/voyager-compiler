@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package voyager;
+
+enum Loop {
+  FX = 0;
+  FY = 1;
+  OX = 2;
+  OY = 3;
+  OC = 4;
+  IC = 5;
+  ON = 6;
+};
+
+message LoopBound {
+  Loop loop = 1;
+  int32 bound = 2;
+};
+
+message LevelTiling {
+  repeated LoopBound loop_bounds = 1;
+};
+
+message LevelAccessCount {
+  uint64 input_access_count = 1;
+  uint64 output_access_count = 2;
+  uint64 weight_access_count = 3;
+};
+
+message Tiling {
+  string name = 1;
+  repeated LevelTiling level_tilings = 2;
+  repeated LevelAccessCount level_access_counts = 3;
+  // Logical channels before compiler padding; ratios cover repeated L2 slices
+  repeated int32 logical_channels = 4;
+  repeated int32 padded_channels = 5;
+};
+
+message ModelTiling {
+  repeated Tiling tilings = 1;
+  string backend = 2;
+  reserved 3, 4;
+  // Canonical JSON with the resolved target parameters
+  string target_configuration = 5;
+};

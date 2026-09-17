@@ -40,3 +40,5 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "voyager_compiler" = ["*.txt", "*.json"]
+
+"voyager_compiler.codegen" = ["*.proto"]
