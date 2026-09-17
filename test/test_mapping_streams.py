@@ -1,7 +1,5 @@
 # Exercise shared vector service and effective buffering through both mapping backends
 from dataclasses import replace
-import json
-from pathlib import Path
 import unittest
 from voyager_compiler.codegen import param_pb2
 from voyager_compiler.mapping.models.cim import evaluate
@@ -41,16 +39,16 @@ class MappingStreamTests(unittest.TestCase):
     def test_historical_mapping_ranking(self):
         target = replace(small_target(), ch_in=64, tile_output_axis_elements=8, b_sets=18,
                          input_buffer_words=1024, accum_buffer_words=1024, ic_port_bits=512, oc_port_bits=512,
-                         vector_config=dict(lanes=64, output_fifo_packets=8))
-        profile = json.loads((Path(__file__).parents[1] / 'examples/timing/vector-64-bf16.json').read_text())
-        options = TimingOptions(output_cycles_per_vector=2, **profile)
+                         vector_config=dict(lanes=64), output_storage=dict(matrix_results=512, accumulation_metadata=128,
+                                             accumulation_writeback=64, matrix_output=512, vector_pipeline=0))
+        options = TimingOptions(output_cycles_per_vector=2)
         workload = Workload(1024, 1, 128, 128, output_to_memory=False)
         old = evaluate(target, Schedule(TemporalLevel.make(OX=32, IC=2), TemporalLevel.make(OX=32, OC=2)), workload, options=options)
         new = evaluate(target, Schedule(TemporalLevel.make(OX=64, OC=2), TemporalLevel.make(order=('IC', 'OX'), IC=2, OX=16)), workload, options=options)
         self.assertTrue(old.legal, old.reasons)
         self.assertTrue(new.legal, new.reasons)
         self.assertEqual(old.timing.readiness['output_stall_cycles'], 0)
-        self.assertEqual(new.timing.readiness['output_stall_cycles'], 16 * (128 - 2 * 24))
+        self.assertEqual(new.timing.readiness['output_stall_cycles'], 16 * (128 - 2 * 19))
         self.assertGreater(new.runtime_cycles, old.runtime_cycles)
 
 

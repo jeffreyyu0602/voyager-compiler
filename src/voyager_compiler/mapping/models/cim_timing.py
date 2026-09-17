@@ -8,21 +8,16 @@ from ..timing.transfer import ceil_div, transfer_cycles, stream_fill
 from ..timing.buffers import buffer_completion
 from .output import OutputOptions, output_timing
 
-# Configure manually assumed pipeline delays and external service rates
+# Configure external service and optional SRAM feedback constraints
 @dataclass(frozen=True)
 class TimingOptions(OutputOptions):
     memory_request_latency: int = 0
     output_cycles_per_vector: int = 1
-    # TODO: Calibrate these assumed stage delays against the selected HLS build
-    input_handoff_cycles: int = 1
-    result_return_cycles: int = 5
-    output_pipeline_cycles: int = 4
     # Zero leaves SRAM feedback safety unvalidated until an HLS latency is supplied
     accumulation_feedback_cycles: int = 0
 
     # Require a positive consumer service rate
     def __post_init__(self):
-        super().__post_init__()
         if type(self.output_cycles_per_vector) is not int or self.output_cycles_per_vector <= 0:
             raise ValueError("output_cycles_per_vector must be a positive integer")
 
@@ -45,7 +40,7 @@ class TimingEstimate:
         "one beat per cycle plus specified request latency; double-buffered input prefetch",
         "result-slot capacity bounds average issue rate; final-reduction bursts use a bandwidth and effective-capacity envelope",
         "output bursts preserve backlog with a bandwidth and effective-capacity equation; loop repetitions compose algebraically",
-        "without an explicit output capacity only the exported FIFO contributes elasticity",
+        "output capacity counts exported design-defined storage; HLS-inserted registers and unspecified stage delays are omitted",
         "SRAM reads and writes overlap accumulation at one vector per cycle per port; no dependency waits",
         "schedule and local contexts must cover SRAM feedback latency; RAW safety is not validated",
         "non-transposed weight streams sustain pipelined loads with explicit first-pass readiness and final-use release",
@@ -72,7 +67,7 @@ def feedback_spacing(schedule):
 # Overlap independent stage totals and bound issue rate by result-slot capacity
 def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic, inputs):
     interval = target.issue_interval
-    latency = target.macro_result_latency + options.result_return_cycles
+    latency = target.macro_result_latency
     compute = traffic.a_beats * interval
     # A result occupies a slot until the modeled capture/return latency elapses
     issue_interval = max(interval, ceil_div(latency, target.result_slots_per_output_lane))
@@ -97,7 +92,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     # II=1 accumulation overlaps independent DualPortBuffer reads and writes
     # Feedback spacing is a schedule assumption, not a hardware dependency stall
     total_accumulation_cycles = max(traffic.a_beats, sram_reads, sram_writes)
-    startup = max(inputs.first_fill_cycles, first_weight) + options.input_handoff_cycles
+    startup = max(inputs.first_fill_cycles, first_weight)
     sequence_sets = policy.sequence_sets if policy.fits else 1
     replays = policy.compute_replays if policy.fits else 1
     sequence_count = policy.sequence_count if policy.fits else policy.full_set_loads
@@ -130,7 +125,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     output_readiness = {}
     if not banked:
         loops = tuple((loop, level.bound(loop)) for level in (schedule.l1, schedule.l2) for loop in level.order)
-        stream, output_readiness = output_timing(target, options, loops, output_cycles_per_vector,
+        stream, output_readiness = output_timing(target, loops, output_cycles_per_vector,
                                                interval=issue_interval, direct=workload.output_to_memory)
         resource_cycles['issue'] = max(resource_cycles['issue'], stream.producer_cycles)
     if banked:
@@ -139,7 +134,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
             1, 1, blocks, 2, traffic.a_beats // blocks * issue_interval,
             0, final_vectors * output_cycles_per_vector, 0)
         resource_cycles['output'] = max(resource_cycles['output'], bank_finish - final_output)
-    drain = latency + options.output_pipeline_cycles + final_output
+    drain = latency + final_output
     runtime = startup + max(resource_cycles.values()) + drain
     ideal = traffic.useful_scalar_macs * interval / (target.k * target.n)
     return TimingEstimate(

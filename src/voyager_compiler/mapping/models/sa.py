@@ -75,7 +75,7 @@ class Evaluator:
             runtime = startup + matrix_cycles + vector_cycles
         else:
             stream, output_readiness = output_timing(
-                target, self.options, levels[0] + levels[1], output_cycles, direct=self.vector_timing.direct,
+                target, levels[0] + levels[1], output_cycles, direct=self.vector_timing.direct,
                 prefix_at=first_weight_loop, prefix_cycles=prefix_cycles)
             runtime = startup + max(matrix_cycles, stream.producer_cycles)
         pack = packing_factor(target.k * workload.input_bits, target.ic_port_bits, l1.bound("IC"))

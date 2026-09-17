@@ -10,7 +10,7 @@ from voyager_compiler.mapping.operations import evaluate_epilogue
 class VectorTimingTests(unittest.TestCase):
     # Use the same descriptor for either matrix backend
     def setUp(self):
-        self.target = SimpleNamespace(n=64, accum_bits=24, oc_port_bits=512, hardware_options={}, vector_config=dict(lanes=64, output_fifo_packets=8))
+        self.target = SimpleNamespace(n=64, accum_bits=24, oc_port_bits=512, hardware_options={}, vector_config=dict(lanes=64))
         self.output = param_pb2.Tensor(dtype='bfloat16', shape=[1, 64])
 
 

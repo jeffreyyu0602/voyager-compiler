@@ -18,7 +18,9 @@ def small_sa():
     return SATarget(k=8, n=8, input_buffer_words=256, weight_buffer_words=256,
                     accum_buffer_words=32, double_buffered_accum=False,
                     ic_port_bits=64, oc_port_bits=64, input_bits=8, weight_bits=8,
-                    accum_bits=24, datatype="INT8", vector_config=dict(lanes=8, output_fifo_packets=8))
+                    accum_bits=24, datatype="INT8", vector_config=dict(lanes=8),
+                    output_storage=dict(matrix_results=24, accumulation_metadata=0,
+                                        accumulation_writeback=8, matrix_output=64, vector_pipeline=0))
 
 
 # Prepare a model from the same operation conversion used by the driver

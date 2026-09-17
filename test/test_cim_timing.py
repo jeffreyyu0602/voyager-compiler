@@ -21,8 +21,16 @@ def small_target(**changes):
         result_slots_per_output_lane=8, local_accum_contexts=4,
         input_buffer_words=256, accum_buffer_words=32,
         double_buffered_accum=False, ic_port_bits=64, oc_port_bits=64,
-        accumulation_policy="loop-lifetime-prefix", vector_config=dict(lanes=8, output_fifo_packets=8))
-    return replace(target, **changes)
+        accumulation_policy="loop-lifetime-prefix", vector_config=dict(lanes=8),
+        output_storage=dict(matrix_results=64, accumulation_metadata=16,
+                            accumulation_writeback=8, matrix_output=64, vector_pipeline=0))
+    target = replace(target, **changes)
+    if "output_storage" not in changes:
+        target = replace(target, output_storage=dict(
+            matrix_results=target.n * target.result_slots_per_output_lane,
+            accumulation_metadata=target.n * 2, accumulation_writeback=target.n,
+            matrix_output=target.n * 8, vector_pipeline=0))
+    return target
 
 
 # Check feedback throughput independently of SRAM access energy
@@ -51,7 +59,7 @@ class AccumulationTimingTests(unittest.TestCase):
         few_slots = evaluate(small_target(result_slots_per_output_lane=2), schedule, workload)
         self.assertGreater(slow_output.runtime_cycles, baseline.runtime_cycles)
         self.assertGreater(few_slots.runtime_cycles, baseline.runtime_cycles)
-        self.assertEqual(few_slots.timing.resource_cycles["result_slots"], 512)
+        self.assertEqual(few_slots.timing.resource_cycles["result_slots"], 256)
 
 
 # Distinguish isolated load latency from sustained multi-set transfer service
@@ -64,7 +72,7 @@ class WeightTimingTests(unittest.TestCase):
         self.assertTrue(result.legal, result.reasons)
         self.assertEqual(result.traffic.full_set_loads, 4)
         self.assertEqual(result.timing.resource_cycles["weight"], 32)
-        self.assertEqual(result.timing.startup_cycles, 10)
+        self.assertEqual(result.timing.startup_cycles, 9)
         narrow = evaluate(small_target(oc_port_bits=32), schedule, workload)
         self.assertTrue(narrow.legal, narrow.reasons)
         self.assertEqual(narrow.timing.resource_cycles["weight"], 64)

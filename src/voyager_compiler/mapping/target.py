@@ -20,6 +20,7 @@ class MappingTarget:
     ic_port_bits: int
     oc_port_bits: int
     vector_config: dict
+    output_storage: dict
     hardware_options: dict = field(default_factory=dict)
 
     # Validate shared hardware facts before backend-specific constraints
@@ -29,6 +30,7 @@ class MappingTarget:
         if type(self.double_buffered_accum) is not bool:
             raise ValueError("double_buffered_accum must be boolean")
         validate_vector_config(self.vector_config)
+        validate_output_storage(self.output_storage)
 
     # Apply the same positive-integer rule to shared and backend-specific dimensions
     def _validate_positive(self, *names):
@@ -80,8 +82,16 @@ def load_target(path):
 
 # Require complete exported vector geometry
 def validate_vector_config(config):
-    if set(config) != {"lanes", "output_fifo_packets"} or any(type(n) is not int or n <= 0 for n in config.values()):
-        raise ValueError("vector configuration requires positive lanes and output_fifo_packets")
+    if set(config) != {"lanes"} or any(type(n) is not int or n <= 0 for n in config.values()):
+        raise ValueError("vector configuration requires positive lanes")
+
+
+# Require explicit storage capacities in logical result elements rather than payload bits
+def validate_output_storage(storage):
+    names = {"matrix_results", "accumulation_metadata", "accumulation_writeback",
+             "matrix_output", "vector_pipeline"}
+    if set(storage) != names or any(type(n) is not int or n < 0 for n in storage.values()):
+        raise ValueError("output storage requires all five nonnegative element capacities")
 
 # Describe one effective current-hardware instance in resolved units
 @dataclass(frozen=True)

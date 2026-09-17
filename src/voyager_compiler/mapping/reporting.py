@@ -172,12 +172,15 @@ def layer_report(operation, target, tilings=None):
     output_ready = timing.get("readiness", {}) or op.get("output_timing", {})
     if "output_stall_cycles" in output_ready:
         lines += [f"Finite output buffering adds **{number(output_ready['output_stall_cycles'])} producer stall cycles**. "
-                  f"Effective capacity: {number(output_ready['output_capacity_vectors'])} result vectors of "
+                  f"Explicit storage capacity: {number(output_ready['output_capacity_vectors'])} result vectors of "
                   f"{number(output_ready['output_elements_per_vector'])} elements; output processing time: "
                   f"{number(output_ready['output_cycles_per_vector'])} cycles per result vector. "
                   f"Remaining consumer work: {number(output_ready['output_backlog_cycles'])} cycles.", ""]
-        if not output_ready["output_capacity_explicit"]:
-            lines += ["Effective capacity uses only the exported output FIFO; additional elasticity is unspecified.", ""]
+        storage = "; ".join(f"{name.replace('_', ' ')}: {number(elements)} elements"
+                            for name, elements in output_ready["output_storage_elements"].items() if elements)
+        lines += [storage + ".", "",
+                  "Capacity counts exported result storage. HLS-inserted pipeline registers, "
+                  "control-only queues, and partial-sum contexts are excluded.", ""]
     policy = evaluation.get("policy")
     if policy:
         lines += [f"Resident weight sequence: {policy['sequence_sets']} sets / {target['b_sets']} available; "
