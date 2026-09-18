@@ -191,15 +191,21 @@ def layer_report(operation, target, tilings=None):
     output_ready = timing.get("readiness", {}) or op.get("output_timing", {})
     if "output_stall_cycles" in output_ready:
         lines += [f"Finite output buffering adds **{number(output_ready['output_stall_cycles'])} producer stall cycles**. "
-                  f"Explicit storage capacity: {number(output_ready['output_capacity_vectors'])} result vectors of "
+                  f"Final-output storage capacity: {number(output_ready['output_capacity_vectors'])} result vectors of "
                   f"{number(output_ready['output_elements_per_vector'])} elements; output processing time: "
                   f"{number(output_ready['output_cycles_per_vector'])} cycles per result vector. "
                   f"Remaining consumer work: {number(output_ready['output_backlog_cycles'])} cycles.", ""]
         storage = "; ".join(f"{name.replace('_', ' ')}: {number(elements)} elements"
                             for name, elements in output_ready["output_storage_elements"].items() if elements)
-        lines += [storage + ".", "",
-                  "Capacity counts exported result storage. HLS-inserted pipeline registers, "
-                  "control-only queues, and partial-sum contexts are excluded.", ""]
+        lines += [storage + ".", ""]
+        if output_ready.get('output_pipeline_profiled'):
+            lines += [f"Pipeline transit: {number(output_ready['output_forward_cycles'])} cycles; "
+                      f"forward plus credit-return delay: {number(output_ready['output_credit_delay_cycles'])} cycles. "
+                      f"Usable burst headroom: {number(output_ready['output_headroom_cycles'])} output processing cycles.", ""]
+        else:
+            lines += ["No applicable output timing profile: HLS-inserted registers and stage delays are omitted.", ""]
+        lines += ["Intermediate-reduction storage, control-only queues, and partial-sum contexts "
+                  "are excluded from final-output capacity.", ""]
     policy = evaluation.get("policy")
     if policy:
         lines += [f"Resident weight sequence: {policy['sequence_sets']} sets / {target['b_sets']} available; "

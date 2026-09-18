@@ -10,7 +10,7 @@ from ..timing.overlap import BufferSlots, OverlapTiming, TimingBudgetExceeded
 from .bias import bias_timing
 from .output import OutputOptions, output_timing
 
-# Configure external service and optional SRAM feedback constraints
+# Configure interface timing and optional SRAM feedback constraints
 @dataclass(frozen=True)
 class TimingOptions(OutputOptions):
     memory_request_latency: int = 0
@@ -22,10 +22,12 @@ class TimingOptions(OutputOptions):
     weight_release_cycles: int = 3
     weight_ready_cycles: int = 3
 
-    # Require a positive consumer service rate
+    # Require a positive cycles per output vector
     def __post_init__(self):
+        super().__post_init__()
         if type(self.output_cycles_per_vector) is not int or self.output_cycles_per_vector <= 0:
             raise ValueError("output_cycles_per_vector must be a positive integer")
+
 
 # Report aggregate stage demand separately from modeled elapsed runtime
 @dataclass(frozen=True)
@@ -46,7 +48,8 @@ class TimingEstimate:
         "one beat per cycle plus specified request latency; double-buffered input prefetch",
         "result-slot capacity bounds average issue rate; final-reduction bursts use a bandwidth and effective-capacity envelope",
         "output bursts preserve backlog with a bandwidth and effective-capacity equation; loop repetitions compose algebraically",
-        "output capacity counts exported design-defined storage; HLS-inserted registers and unspecified stage delays are omitted",
+        "output capacity begins at accumulation output; intermediate-reduction buffers are not final-output credits",
+        "optional shared output profiles supply HLS storage and forward/credit-return latency; unprofiled stages remain omitted",
         "SRAM reads and writes overlap accumulation at one vector per cycle per port; no dependency waits",
         "schedule and local contexts must cover SRAM feedback latency; RAW safety is not validated",
         "weight fills keep steady transfer throughput; explicit release and ready delays model resident-slot turnaround",
@@ -62,6 +65,7 @@ class TimingEstimate:
         "excludes command serialization and unprofiled HLS stages; fused epilogue timing is derived from scheduled vector passes",
     )
 
+
 # Count intervening output updates before the innermost active reduction advances
 def feedback_spacing(schedule):
     spacing = 1
@@ -72,6 +76,7 @@ def feedback_spacing(schedule):
                 return spacing
             spacing *= bound
     return 0
+
 
 # Overlap independent stage totals and bound issue rate by result-slot capacity
 def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic, inputs):
@@ -144,7 +149,8 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     if not banked:
         loops = tuple((loop, level.bound(loop)) for level in (schedule.l1, schedule.l2) for loop in level.order)
         stream, output_readiness = output_timing(target, loops, output_cycles_per_vector,
-                                               interval=issue_interval, direct=workload.output_to_memory)
+                                               interval=issue_interval, direct=workload.output_to_memory,
+                                               options=options)
         resource_cycles['issue'] = max(resource_cycles['issue'], stream.producer_cycles)
     if banked:
         blocks = outputs // final_vectors
@@ -152,7 +158,8 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
             1, 1, blocks, 2, traffic.a_beats // blocks * issue_interval,
             0, final_vectors * output_cycles_per_vector, 0)
         resource_cycles['output'] = max(resource_cycles['output'], bank_finish - final_output)
-    drain = latency + final_output
+    output_forward = output_readiness.get('output_forward_cycles', 0)
+    drain = latency + final_output + output_forward
     runtime = startup + max(resource_cycles.values()) + drain
     if not banked:
         # Include the same queued output drain on both the independent and coupled paths
@@ -167,7 +174,8 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         coupled = coupled_timing(target, schedule, policy, inputs, interval=issue_interval,
                                  fill=weight_fill_cycles, load_start=max(0, first_weight - weight_fill_cycles),
                                  output_cycles_per_vector=output_cycles_per_vector, output_capacity_vectors=output_readiness['output_capacity_vectors'],
-                                 options=options, has_bias=workload.has_bias)
+                                 options=options, has_bias=workload.has_bias,
+                                 output_credit_delay=output_readiness['output_credit_delay_cycles'])
         coupled_readiness['coupled_timing_limit'] = coupled is None
         if coupled is None:
             # Unknown overlap must not give an unfinished candidate an optimistic ranking
@@ -176,6 +184,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                           + output_readiness['output_backlog_cycles'] + latency)
         else:
             finish, output_finish, waits, steps = coupled
+            output_finish += output_forward
             runtime = max(runtime, finish + drain, output_finish + latency)
             coupled_readiness.update(coupled_burst_steps=steps,
                                      coupled_weight_wait_cycles=waits[0], coupled_input_wait_cycles=waits[1],
@@ -206,15 +215,16 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                        output_bank_serialized_bound=output_bound),
     )
 
-
 # Cache active loops as (bound, reduction, resident replay, bias reuse)
 @lru_cache(maxsize=4096)
 def _completion(l1, l2, reuse, bias_requests, interval, output_cycles_per_vector, output_capacity_vectors,
-                capacity, fill, ready, release, load_start, input_fill, input_first, bias_cycles_per_vector):
+                capacity, fill, ready, release, load_start, input_fill, input_first, bias_cycles_per_vector,
+                output_credit_delay=0):
     try:
         weights = BufferSlots(capacity, fill, ready_delay=ready, release_delay=release, load_start=load_start)
         inputs = BufferSlots(2, input_fill, first_fill_cycles=input_first)
-        pipeline = OverlapTiming((weights, inputs), output_cycles_per_vector, output_capacity_vectors)
+        pipeline = OverlapTiming((weights, inputs), output_cycles_per_vector, output_capacity_vectors,
+                                 output_credit_delay=output_credit_delay)
         loops = l1 + ((0, False, False, False),) + l2
 
         # Split only first/final reduction and resident-replay phases; repeat the middle algebraically
@@ -258,7 +268,7 @@ def _completion(l1, l2, reuse, bias_requests, interval, output_cycles_per_vector
 
 # Collapse consecutive spatial reuse into one burst and mark input-bank and residency boundaries
 def coupled_timing(target, schedule, policy, inputs, *, interval, fill, load_start,
-                   output_cycles_per_vector, output_capacity_vectors, options, has_bias):
+                   output_cycles_per_vector, output_capacity_vectors, options, has_bias, output_credit_delay=0):
     l1, l2 = schedule.l1, schedule.l2
     active_weights = [loop for loop in ('IC', 'OC', 'FX', 'FY') if l1.bound(loop) > 1]
     reuse = {loop for loop in ('OX', 'OY') if all(l1.inside(loop, weight) for weight in active_weights)}
@@ -276,4 +286,4 @@ def coupled_timing(target, schedule, policy, inputs, *, interval, fill, load_sta
                        min(target.b_sets, policy.full_set_loads), fill,
                        options.weight_ready_cycles, options.weight_release_cycles, load_start,
                        inputs.max_fill_cycles, inputs.first_fill_cycles,
-                       bias_cycles_per_vector + options.memory_request_latency)
+                       bias_cycles_per_vector + options.memory_request_latency, output_credit_delay)

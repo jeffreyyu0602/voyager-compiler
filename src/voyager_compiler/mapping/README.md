@@ -51,3 +51,8 @@ Timing calculations use bounded repetition. The CIM model reports a conservative
 fallback when interacting waits exceed the explicit timing budget. Model input
 values describe hardware rates and delays; detailed RTL handshakes are outside
 this analytical model.
+
+Output timing profiles use `elements_per_vector` and a list of stages with
+`elements`, `forward_cycles`, and `feedback_cycles`. Report fields use
+`output_capacity_vectors` and `output_cycles_per_vector`. Hardware target JSON
+and the tiling protobuf retain their existing fields.

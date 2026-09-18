@@ -220,7 +220,7 @@ def prepare_search(target, workload, *, vector_timing=None, write_output_to_accu
         options = options or cim.TimingOptions()
         if vector_timing is not None:
             write_output_to_accum_buffer = target.double_buffered_accum and vector_timing.port_cycles_per_vector > 1
-            options = replace(options,
+            options = replace(options.for_vector(target, vector_timing),
                               output_cycles_per_vector=max(options.output_cycles_per_vector, vector_timing.cycles_per_vector))
         model = cim.Evaluator(target, workload, options=options)
         resource = interstellar.Resource([[0]] * 3, None, None,

@@ -14,7 +14,7 @@ class Evaluator:
     def __init__(self, target, workload, vector_timing, *, options=OutputOptions()):
         self.target, self.workload = target, workload
         self.vector_timing = vector_timing
-        self.options = options
+        self.options = options.for_vector(target, vector_timing)
         self.input_cache = {}
         self.useful_fraction = workload.useful_work_fraction
 
@@ -81,8 +81,8 @@ class Evaluator:
         else:
             stream, output_readiness = output_timing(
                 target, levels[0] + levels[1], output_cycles, direct=self.vector_timing.direct,
-                prefix_at=first_weight_loop, prefix_cycles=prefix_cycles)
-            runtime = startup + max(matrix_cycles, stream.producer_cycles)
+                options=self.options, prefix_at=first_weight_loop, prefix_cycles=prefix_cycles)
+            runtime = startup + max(matrix_cycles + output_readiness['output_forward_cycles'], stream.consumer_cycles)
         pack = packing_factor(target.k * workload.input_bits, target.ic_port_bits, l1.bound("IC"))
         input_loading = dict(asdict(inputs), element_bits=workload.input_bits, lane_elements=target.k,
             pack_factor=pack, port_bits=target.ic_port_bits,
