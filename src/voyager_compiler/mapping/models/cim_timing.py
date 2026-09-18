@@ -154,6 +154,9 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         resource_cycles['output'] = max(resource_cycles['output'], bank_finish - final_output)
     drain = latency + final_output
     runtime = startup + max(resource_cycles.values()) + drain
+    if not banked:
+        # Include the same queued output drain on both the independent and coupled paths
+        runtime = max(runtime, startup + stream.consumer_cycles + latency)
     coupled_readiness = {}
     interacting = sum(wait > 0 for wait in (
         weight_issue - total_issue_cycles, input_issue - total_issue_cycles,

@@ -61,6 +61,21 @@ class AccumulationTimingTests(unittest.TestCase):
         self.assertGreater(few_slots.runtime_cycles, baseline.runtime_cycles)
         self.assertEqual(few_slots.timing.resource_cycles["result_slots"], 256)
 
+    # Final queued output still drains when no other resource requires coupled timing
+    def test_final_output_drain_without_operand_waits(self):
+        target = small_target(accum_buffer_words=128)
+        result = evaluate(target, Schedule(TemporalLevel.make(OX=64), TemporalLevel.make(IC=2)),
+                          Workload(64, 1, 16, 8, output_to_memory=False),
+                          options=TimingOptions(output_cycles_per_vector=2))
+        self.assertTrue(result.legal, result.reasons)
+        readiness = result.timing.readiness
+        self.assertEqual(readiness['weight_wait_cycles'], 0)
+        self.assertEqual(readiness['input_wait_cycles'], 0)
+        self.assertNotIn('coupled_burst_steps', readiness)
+        self.assertEqual(result.runtime_cycles, result.timing.startup_cycles
+                         + readiness['output_consumer_finish_cycles'] + target.macro_result_latency)
+        self.assertEqual(result.runtime_cycles, 260)
+
 
 # Distinguish isolated load latency from sustained multi-set transfer service
 class WeightTimingTests(unittest.TestCase):
