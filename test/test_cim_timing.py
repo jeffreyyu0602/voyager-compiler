@@ -64,7 +64,7 @@ class AccumulationTimingTests(unittest.TestCase):
 
 # Distinguish isolated load latency from sustained multi-set transfer service
 class WeightTimingTests(unittest.TestCase):
-    # Four eight-row sets stream at eight cycles per set with one startup tail
+    # Four eight-row sets stream at eight cycles per set with separate startup and ready delays
     def test_streaming_weight_service(self):
         schedule = Schedule(TemporalLevel.make(OX=1, IC=4))
         workload = Workload(1, 1, 32, 8, output_to_memory=False)
@@ -72,7 +72,7 @@ class WeightTimingTests(unittest.TestCase):
         self.assertTrue(result.legal, result.reasons)
         self.assertEqual(result.traffic.full_set_loads, 4)
         self.assertEqual(result.timing.resource_cycles["weight"], 32)
-        self.assertEqual(result.timing.startup_cycles, 9)
+        self.assertEqual(result.timing.startup_cycles, 9 + TimingOptions().weight_ready_cycles)
         narrow = evaluate(small_target(oc_port_bits=32), schedule, workload)
         self.assertTrue(narrow.legal, narrow.reasons)
         self.assertEqual(narrow.timing.resource_cycles["weight"], 64)
@@ -104,7 +104,11 @@ class BufferReadinessTests(unittest.TestCase):
         narrow = evaluate(small_target(ic_port_bits=8), schedule, workload)
         self.assertTrue(narrow.legal, narrow.reasons)
         self.assertGreater(narrow.runtime_cycles, wide.runtime_cycles)
-        self.assertEqual(narrow.timing.readiness["input_wait_cycles"], 20)
+        # The three-cycle weight-ready delay allows the input loader to get further ahead
+        self.assertEqual(narrow.timing.readiness["input_wait_cycles"], 17)
+        no_ready_delay = evaluate(small_target(ic_port_bits=8), schedule, workload,
+                                  options=TimingOptions(weight_ready_cycles=0))
+        self.assertEqual(no_ready_delay.timing.readiness["input_wait_cycles"], 20)
         self.assertFalse(narrow.timing.readiness["input_max_fill_bound"])
 
     # SRAM spacing constrains legality only when feedback latency is explicitly supplied

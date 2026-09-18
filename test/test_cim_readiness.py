@@ -1,6 +1,6 @@
 # Check collapsed resident timing against small event-by-event reference schedules
 import unittest
-from voyager_compiler.mapping.timing.buffers import buffer_completion
+from voyager_compiler.mapping.timing.buffers import buffer_completion, MAX_SEQUENCE_STEPS
 
 
 # Schedule a tiny fixed sequence with explicit load and replay events for reference only
@@ -35,6 +35,21 @@ class ReadinessTests(unittest.TestCase):
                             finish, steps, bounded = buffer_completion(*args)
                             self.assertFalse(bounded)
                             self.assertEqual(finish, reference(*args))
+
+
+    # Two slots expose a six-cycle ownership round trip every other 64-cycle use
+    def test_slot_turnaround_preserves_fill_throughput(self):
+        count = 576
+        for capacity, expected_wait in ((2, 287 * 6), (8, 0)):
+            finish, steps, bounded = buffer_completion(1, 1, count, capacity, 64, 3, 64, 0,
+                                                       release_delay=3, load_start=1)
+            self.assertEqual(finish, 68 + count * 64 + expected_wait)
+            self.assertFalse(bounded)
+            self.assertLess(steps, MAX_SEQUENCE_STEPS)
+        # Longer uses cover the same release and ready delays with two slots
+        finish, _, _ = buffer_completion(1, 1, count, 2, 64, 3, 128, 0,
+                                        release_delay=3, load_start=1)
+        self.assertEqual(finish, 68 + count * 128)
 
 
 if __name__ == "__main__":

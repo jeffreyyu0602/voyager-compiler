@@ -135,6 +135,11 @@ def layer_report(operation, target, tilings=None):
             lines += [f"Weight readiness adds {number(readiness['weight_wait_cycles'])} cycles to MAC issue time; "
                       f"input-bank readiness adds {number(readiness['input_wait_cycles'])}. "
                       "These overlapping constraints are not additive.", ""]
+            if "weight_fill_cycles" in readiness:
+                lines += [f"Resident weight-set fill time: {number(readiness['weight_fill_cycles'])} cycles; "
+                          f"release-to-reuse delay: {number(readiness['weight_release_cycles'])}; "
+                          f"fill-to-ready delay: {number(readiness['weight_ready_cycles'])}. "
+                          "Control delays are explicit timing assumptions.", ""]
             if readiness.get("input_max_fill_bound"):
                 lines += ["Input timing uses a maximum-fill bound for variable boundary tiles.", ""]
             if any(readiness.get(key) for key in ("weight_serialized_bound", "input_serialized_bound", "output_bank_serialized_bound")):

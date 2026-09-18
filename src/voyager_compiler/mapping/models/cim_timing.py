@@ -16,6 +16,10 @@ class TimingOptions(OutputOptions):
     output_cycles_per_vector: int = 1
     # Zero leaves SRAM feedback safety unvalidated until an HLS latency is supplied
     accumulation_feedback_cycles: int = 0
+    # Current II=1 controller: three cycles from release to reuse and fill to first issue
+    # These are scheduled control delays, independently overridable through timing_options
+    weight_release_cycles: int = 3
+    weight_ready_cycles: int = 3
 
     # Require a positive consumer service rate
     def __post_init__(self):
@@ -44,7 +48,9 @@ class TimingEstimate:
         "output capacity counts exported design-defined storage; HLS-inserted registers and unspecified stage delays are omitted",
         "SRAM reads and writes overlap accumulation at one vector per cycle per port; no dependency waits",
         "schedule and local contexts must cover SRAM feedback latency; RAW safety is not validated",
-        "non-transposed weight streams sustain pipelined loads with explicit first-pass readiness and final-use release",
+        "weight fills keep steady transfer throughput; explicit release and ready delays model resident-slot turnaround",
+        "default weight control delays describe the current synthesized controller and can be overridden",
+        "bias bandwidth follows first-reduction demand and one complete prefetched vector",
         "transposed weight sets gather then emit; single-set loads serialize with compute",
         "input bank reuse uses repeated two-bank timing; variable fills use the reported maximum-fill bound",
         "SRAM feedback spacing is reported; a supplied feedback latency identifies unsafe schedules",
@@ -93,20 +99,22 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     # II=1 accumulation overlaps independent DualPortBuffer reads and writes
     # Feedback spacing is a schedule assumption, not a hardware dependency stall
     total_accumulation_cycles = max(traffic.a_beats, sram_reads, sram_writes)
-    startup = max(inputs.first_fill_cycles, first_weight)
+    first_weight_ready = first_weight + options.weight_ready_cycles
+    startup = max(inputs.first_fill_cycles, first_weight_ready)
     sequence_sets = policy.sequence_sets if policy.fits else 1
     replays = policy.compute_replays if policy.fits else 1
     sequence_count = policy.sequence_count if policy.fits else policy.full_set_loads
     weight_finish, weight_steps, weight_bound = buffer_completion(
         sequence_sets, replays, sequence_count, target.b_sets, weight_fill_cycles,
-        max(0, first_weight - weight_fill_cycles), policy.macs_per_set_use * issue_interval,
-        inputs.first_fill_cycles)
-    weight_issue = weight_finish - max(inputs.first_fill_cycles, first_weight)
+        options.weight_ready_cycles, policy.macs_per_set_use * issue_interval,
+        inputs.first_fill_cycles, release_delay=options.weight_release_cycles,
+        load_start=max(0, first_weight - weight_fill_cycles))
+    weight_issue = weight_finish - startup
     # Uniform bank fills are exact here; irregular boundaries use a visible maximum-fill bound
     input_finish, input_steps, input_bound = buffer_completion(
         1, 1, inputs.fills, 2, inputs.max_fill_cycles, 0,
-        traffic.a_beats // inputs.fills * issue_interval, max(first_weight, inputs.first_fill_cycles))
-    input_issue = input_finish - max(inputs.first_fill_cycles, first_weight)
+        traffic.a_beats // inputs.fills * issue_interval, startup)
+    input_issue = input_finish - startup
     spacing = feedback_spacing(schedule) * issue_interval if traffic.buffer_accum_reads else 0
     feedback_safe = (True if not traffic.buffer_accum_reads else
                      spacing >= options.accumulation_feedback_cycles
@@ -156,6 +164,9 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                             accumulation_sram_reads=sram_reads, accumulation_sram_writes=sram_writes),
         startup_cycles=startup, drain_cycles=drain, options=options,
         readiness=dict(**output_readiness, **bias_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
+                       weight_fill_cycles=weight_fill_cycles,
+                       weight_ready_cycles=options.weight_ready_cycles,
+                       weight_release_cycles=options.weight_release_cycles,
                        weight_sequence_steps=weight_steps, weight_serialized_bound=weight_bound,
                        input_wait_cycles=max(0, input_issue - total_issue_cycles),
                        input_sequence_steps=input_steps,
