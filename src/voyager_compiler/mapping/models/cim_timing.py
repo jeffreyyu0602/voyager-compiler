@@ -158,9 +158,11 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         # Include the same queued output drain on both the independent and coupled paths
         runtime = max(runtime, startup + stream.consumer_cycles + latency)
     coupled_readiness = {}
+    output_wait = max(output_readiness.get('output_stall_cycles', 0),
+                      output_readiness.get('output_backlog_cycles', 0))
     interacting = sum(wait > 0 for wait in (
         weight_issue - total_issue_cycles, input_issue - total_issue_cycles,
-        bias_readiness.get('bias_wait_cycles', 0), output_readiness.get('output_stall_cycles', 0))) > 1
+        bias_readiness.get('bias_wait_cycles', 0), output_wait)) > 1
     if not banked and interacting:
         coupled = coupled_timing(target, schedule, policy, inputs, interval=issue_interval,
                                  fill=weight_fill_cycles, load_start=max(0, first_weight - weight_fill_cycles),
@@ -172,7 +174,8 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
             runtime = max(runtime, finish + drain, output_finish + latency)
             coupled_readiness.update(coupled_burst_steps=steps,
                                      coupled_weight_wait_cycles=waits[0], coupled_input_wait_cycles=waits[1],
-                                     coupled_bias_wait_cycles=waits[2], coupled_output_stall_cycles=waits[3])
+                                     coupled_bias_wait_cycles=waits[2], coupled_output_stall_cycles=waits[3],
+                                     coupled_output_backlog_cycles=output_finish - finish)
     ideal = traffic.useful_scalar_macs * interval / (target.k * target.n)
     return TimingEstimate(
         runtime_cycles=runtime, ideal_cycles=ideal, compute_cycles=compute,

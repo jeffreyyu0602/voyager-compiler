@@ -76,6 +76,24 @@ class AccumulationTimingTests(unittest.TestCase):
                          + readiness['output_consumer_finish_cycles'] + target.macro_result_latency)
         self.assertEqual(result.runtime_cycles, 260)
 
+    # Operand waits can shift the last consumer work even when output never backpressures issue
+    def test_output_backlog_after_operand_waits(self):
+        target = small_target(b_sets=2, accum_buffer_words=128)
+        schedule = Schedule(TemporalLevel.make(order=('OX', 'IC'), OX=4, IC=2),
+                            TemporalLevel.make(order=('OX', 'IC'), OX=16, IC=2))
+        result = evaluate(target, schedule, Workload(64, 1, 32, 8, output_to_memory=False),
+                          options=TimingOptions(output_cycles_per_vector=2))
+        self.assertTrue(result.legal, result.reasons)
+        readiness = result.timing.readiness
+        self.assertEqual(readiness['output_stall_cycles'], 0)
+        self.assertGreater(readiness['weight_wait_cycles'], 0)
+        self.assertGreater(readiness['coupled_output_backlog_cycles'], 0)
+        issue = result.timing.resource_cycles['result_slots']
+        waits = sum(readiness[f'coupled_{name}_wait_cycles'] for name in ('weight', 'input', 'bias'))
+        self.assertEqual(result.runtime_cycles, result.timing.startup_cycles + issue + waits
+                         + readiness['coupled_output_stall_cycles']
+                         + readiness['coupled_output_backlog_cycles'] + target.macro_result_latency)
+
 
 # Distinguish isolated load latency from sustained multi-set transfer service
 class WeightTimingTests(unittest.TestCase):
