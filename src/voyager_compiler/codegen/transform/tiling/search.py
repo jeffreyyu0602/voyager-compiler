@@ -896,6 +896,15 @@ def _attention_tiles(node, tq, tkv):
     return tiles
 
 
+def attention_head_pad(head_dim, config):
+    """The head dim the FA3 kernel holds its tiles at: ``head_dim`` rounded
+    up to a multiple of both PE-array dims, since the scores product
+    contracts over it and the context product emits it.  The pad is zeros
+    the kernel writes on chip; DRAM keeps the real head."""
+    unit = math.lcm(*config.pe_array_size)
+    return math.ceil(head_dim / unit) * unit
+
+
 def _attention_sram_bytes(node, tiles, acc_dtype, config):
     """Bytes the FA3 kernel's SRAM allocations take under ``tiles``.
 
@@ -904,23 +913,46 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
     the score tile at ``acc_dtype``, and the probabilities -- under MX
     their codes at the query's dtype plus their block scales, else a
     buffer at V's dtype when the softmax runs at a dtype other than the
-    operands' -- each sized the way ``plan_memory`` will place it.  A split
-    cache's residual adds its own score tile, product, max snapshot and,
-    at a dtype the matrix unit cannot take, probabilities.
+    operands' -- each sized the way ``plan_memory`` will place it.  The
+    operand tiles and the P@V product hold the head at
+    ``attention_head_pad``: the query's, value's and their scales' last
+    dim, the transposed key's and its scales' first.  A split cache's
+    residual adds its own score tile, product, max snapshot and, at a
+    dtype the matrix unit cannot take, probabilities.
 
     Args:
         node: The attention node.
-        tiles: Operand FX node -> its tile shape (``_attention_tiles``).
+        tiles: Operand FX node -> its DRAM tile shape
+            (``_attention_tiles``).
         acc_dtype: The accumulation dtype of the softmax state.
         config (AcceleratorConfig): The hardware description.
     """
-    query, value = node.args[0], node.args[2]
+    query, key, value = node.args[0], node.args[1], node.args[2]
     tq, head_dim = tiles[query]
     tkv = tiles[value][0]
+    head_pad = attention_head_pad(head_dim, config)
+    kw = node.kwargs
+    block_size = kw.get("block_size")
+    grown = {query: (-1, head_pad), key: (0, head_pad), value: (-1, head_pad)}
+    if block_size is not None:
+        head_blocks = math.ceil(head_pad / block_size)
+        grown[kw["query_scale"]] = (-1, head_blocks)
+        grown[kw["key_scale"]] = (0, head_blocks)
+        grown[kw["value_scale"]] = (-1, head_pad)
+    residual = get_arg_value(node, 7, "key_residual", None)
+    if residual is not None:
+        grown[get_arg_value(node, 6, "query_residual")] = (-1, head_pad)
+        grown[residual] = (0, head_pad)
+        grown[get_arg_value(node, 8, "value_residual")] = (-1, head_pad)
+    padded = dict(tiles)
+    for operand, (dim, size) in grown.items():
+        shape = list(tiles[operand])
+        shape[dim] = size
+        padded[operand] = tuple(shape)
 
     total = sum(
         (1 if operand is node else 2) * _tensor_bytes(operand, shape, config)
-        for operand, shape in tiles.items()
+        for operand, shape in padded.items()
     )
 
     def acc_bytes(shape):
@@ -931,7 +963,7 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
     # m, row_tmp, alpha and the two slots of l; o, pv_buf; the
     # double-buffered s_buf.
     total += 5 * acc_bytes((tq, 1))
-    total += 2 * acc_bytes((tq, head_dim))
+    total += acc_bytes((tq, head_dim)) + acc_bytes((tq, head_pad))
     total += 2 * acc_bytes((tq, tkv))
     block_size = node.kwargs.get("block_size")
     if block_size is not None:
@@ -946,11 +978,10 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
         total += 2 * tensor_alloc_bytes(
             tq * tkv, torch.bool, config.bank_width, config.vector_lanes
         )
-    residual = get_arg_value(node, 7, "key_residual", None)
     if residual is not None:
         length = tiles[residual][1]
         total += acc_bytes((tq, length))
-        total += acc_bytes((tq, head_dim)) + acc_bytes((tq, 1))
+        total += acc_bytes((tq, head_pad)) + acc_bytes((tq, 1))
         value_residual = get_arg_value(node, 8, "value_residual")
         if acc_dtype != value_residual.value.dtype:
             total += _tensor_bytes(value_residual, (tq, length), config)

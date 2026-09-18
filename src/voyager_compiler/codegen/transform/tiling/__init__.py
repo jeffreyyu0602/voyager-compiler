@@ -15,6 +15,7 @@ from voyager_compiler.codegen.transform.tiling.cost import (
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     DEFAULT_RUNTIME_TOLERANCE,
+    attention_head_pad,
     gemv_op_tiling,
     pool_op_tiling,
     vector_op_tiling,
@@ -41,6 +42,7 @@ __all__ = [
     "GEMM_L3_ORDER",
     "TileConstraint",
     "TilerContext",
+    "attention_head_pad",
     "attention_kv_last",
     "attention_op_tiling",
     "attention_tile_latency",

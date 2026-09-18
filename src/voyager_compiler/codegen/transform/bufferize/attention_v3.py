@@ -69,6 +69,18 @@ residual's P is not quantized.  The residual's tiles stream through slots
 of their own, one per sweep parity: a sweep's residual is fetched on its
 last step and consumed at the next sweep's boundary (or the epilogue),
 which under a single KV block is the same iteration as the next fetch.
+
+A head narrower than the PE array is padded on chip to the width the
+products need (``attention_head_pad``): Q, K, V and their block scales are
+held at the padded head and the products run at it, DRAM keeping the real
+head.  The pad is zeros.  A column-padded tile (Q, V, their scales, the
+residual's Q and V) is zero-filled by its own DMA (``async_copy``'s
+``pad``, the read clipped at the source's edge); a transposed tile (Kᵀ, its
+scales, the residual's Kᵀ) is row-padded, so its DMA lands the block in the
+slot's top rows and the pad rows are zeroed once, before the first load.
+P@V's pad columns come out zero and are never read: the accumulate, rescale
+and finalize run on the product's real columns, so ``o`` and the output
+tile keep the real head.
 """
 
 import logging
@@ -101,6 +113,7 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     voyager,
 )
 from voyager_compiler.codegen.transform.tiling import (
+    attention_head_pad,
     attention_kv_last,
     attention_op_tiling,
 )
@@ -164,6 +177,7 @@ class _FA3Pipeline(torch.nn.Module):
         tq,
         tkv,
         head_dim,
+        head_pad,
         scale,
         has_mask,
         mask_is_bool,
@@ -209,6 +223,9 @@ class _FA3Pipeline(torch.nn.Module):
         self.nb = len(grid) - 2
         self.gq, self.gkv = self.nb, self.nb + 1
         self.tq, self.tkv, self.d = tq, tkv, head_dim
+        # The head the tiles hold on chip (module docstring); DRAM keeps
+        # ``head_dim``.
+        self.d_pad = head_pad
         self.scale = scale
         self.has_mask = has_mask
         self.mask_is_bool = mask_is_bool
@@ -258,13 +275,14 @@ class _FA3Pipeline(torch.nn.Module):
             idx.append(coords[grid_dim])
         return dims, idx
 
-    def _load_sweep(self, src, slots, slot, sem, coords, tile):
+    def _load_sweep(self, src, slots, slot, sem, coords, tile, pad=False):
         """DMA ``src``'s ``tile`` at ``coords``' query block into
         ``slots[slot]``.  The block is loaded once per sweep but read on
         every one of the sweep's live steps, so its semaphore posts once
         per step to balance the per-step [A] consume -- exactly, or a
         stale post would let a later sweep's [A] run before its tile
-        landed."""
+        landed.  ``pad`` has the DMA zero-fill what ``tile`` extends past
+        the source's edge (a column-padded head)."""
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         voyager.async_copy(
             src,
@@ -273,23 +291,43 @@ class _FA3Pipeline(torch.nn.Module):
             (1,) * self.nb + tuple(tile),
             get_slot(sem, slot),
             dims,
+            pad=[0] * (self.nb + len(tile)) if pad else None,
             post_count=self._kv_last(coords[self.gq]) + 1,
         )
 
-    def _load_step(self, src, slots, slot, sem, coords, tile, transposed):
+    def _load_step(
+        self,
+        src,
+        slots,
+        slot,
+        sem,
+        coords,
+        tile,
+        transposed,
+        pad=False,
+        rows=None,
+    ):
         """DMA ``src``'s ``tile`` at ``coords``' key block into
         ``slots[slot]``.  ``tile`` is the DRAM block in the buffer's own
         order; ``transposed`` has the DMA ``.mT`` it into the slot (the Kᵀ
-        tiles, as ``PipelinedKernel._load_tile`` does)."""
+        tiles, as ``PipelinedKernel._load_tile`` does).  ``pad`` has the
+        DMA zero-fill what ``tile`` extends past the source's edge (a
+        column-padded head); ``rows`` lands the block in the slot's top
+        ``rows`` rows (a row-padded head, whose pad rows are zeroed
+        once)."""
         dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
+        dst = get_slot(slots, slot)
+        if rows is not None:
+            dst = self._rows(dst, rows)
         voyager.async_copy(
             src,
-            get_slot(slots, slot),
+            dst,
             idx,
             (1,) * self.nb + tuple(tile),
             get_slot(sem, slot),
             dims,
             transposed=transposed,
+            pad=[0] * (self.nb + len(tile)) if pad else None,
         )
 
     def _load_mask(self, mask, slots, slot, sem, coords):
@@ -319,6 +357,25 @@ class _FA3Pipeline(torch.nn.Module):
         unit = (1,) * self.nb
         voyager.async_copy(
             tile, out, idx, unit + (self.tq, self.d), get_slot(sem, 0), dims
+        )
+
+    @staticmethod
+    def _rows(tile, rows):
+        """The top ``rows`` rows of an SRAM ``tile``, as a subview."""
+        shape = list(tile.shape)
+        return voyager.subview(
+            tile,
+            [0] * len(shape),
+            shape[:-2] + [rows, shape[-1]],
+            [1] * len(shape),
+        )
+
+    @staticmethod
+    def _cols(tile, cols):
+        """The first ``cols`` columns of an SRAM ``tile``, as a subview."""
+        shape = list(tile.shape)
+        return voyager.subview(
+            tile, [0] * len(shape), shape[:-1] + [cols], [1] * len(shape)
         )
 
     # --- compute helpers (shared by prologue / loop / epilogue) ---------
@@ -449,15 +506,15 @@ class _FA3Pipeline(torch.nn.Module):
                 mask_fold_shape=(*self.mask_fold_shape[:-1], length),
             )
         unit = (1,) * self.nb
-        tq, d = self.tq, self.d
+        tq, d_pad = self.tq, self.d_pad
 
         def stream(src, tile):
             slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
             return slots, voyager.zeros([], torch.int64, num_slots=2)
 
-        q_slots, q_sem = stream(q, (tq, d))
-        k_slots, k_sem = stream(k, (d, length))
-        v_slots, v_sem = stream(v, (length, d))
+        q_slots, q_sem = stream(q, (tq, d_pad))
+        k_slots, k_sem = stream(k, (d_pad, length))
+        v_slots, v_sem = stream(v, (length, d_pad))
         munit = (1,) * (mask.ndim - 2)
         m_slots = voyager.alloc([*munit, tq, length], mask.dtype, _SRAM, 2)
         m_sem = voyager.zeros([], torch.int64, num_slots=2)
@@ -481,7 +538,7 @@ class _FA3Pipeline(torch.nn.Module):
             m_sem=m_sem,
             s=s,
             p=p,
-            pv=voyager.alloc([*unit, tq, d], acc, _SRAM),
+            pv=voyager.alloc([*unit, tq, d_pad], acc, _SRAM),
             m_prev=voyager.alloc([*unit, tq, 1], acc, _SRAM),
             sem_scores=voyager.zeros([1], torch.int64),
             sem_pv=voyager.zeros([1], torch.int64),
@@ -492,20 +549,25 @@ class _FA3Pipeline(torch.nn.Module):
         ``slot``: the query tile like Q's, K and V whole (K transposed),
         and the mask's block, whole along the keys."""
         unit = (1,) * self.nb
-        tq, d, length = self.tq, self.d, res.length
+        tq, d, d_pad, length = self.tq, self.d, self.d_pad, res.length
+        pad = [0] * (self.nb + 2) if d_pad != d else None
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
         voyager.async_copy(
             res.q,
             get_slot(res.q_slots, slot),
             idx,
-            unit + (tq, d),
+            unit + (tq, d_pad),
             get_slot(res.q_sem, slot),
             dims,
+            pad=pad,
         )
         dims, idx = self._block_address(coords, self.gkv, 1)
+        k_tile = get_slot(res.k_slots, slot)
+        if d_pad != d:
+            k_tile = self._rows(k_tile, d)
         voyager.async_copy(
             res.k,
-            get_slot(res.k_slots, slot),
+            k_tile,
             idx,
             unit + (length, d),
             get_slot(res.k_sem, slot),
@@ -516,9 +578,10 @@ class _FA3Pipeline(torch.nn.Module):
             res.v,
             get_slot(res.v_slots, slot),
             idx,
-            unit + (length, d),
+            unit + (length, d_pad),
             get_slot(res.v_sem, slot),
             dims,
+            pad=pad,
         )
         dyn = [(j, g) for j, g in self.mask_dyn if g != self.gkv]
         munit = (1,) * (res.mask.ndim - 2)
@@ -580,7 +643,8 @@ class _FA3Pipeline(torch.nn.Module):
             post=res.sem_pv,
         )
         voyager.async_wait(res.sem_pv)
-        voyager.insert(alpha * o + res.pv, o)
+        pv = self._cols(res.pv, self.d) if self.d_pad != self.d else res.pv
+        voyager.insert(alpha * o + pv, o)
 
     def _fold_mask(self, mask):
         return fold_mask_tensor(
@@ -628,10 +692,14 @@ class _FA3Pipeline(torch.nn.Module):
         grid, N, nb = self.grid, self.N, self.nb
         num_steps = self.num_steps
         unit = (1,) * nb
-        tq, tkv, d = self.tq, self.tkv, self.d
+        tq, tkv, d, d_pad = self.tq, self.tkv, self.d, self.d_pad
+        padded = d_pad != d
         # The head's block scales: a block wider than the head is one
-        # truncated block.
+        # truncated block.  ``d_blocks`` is DRAM's, ``d_blocks_pad`` the
+        # tile's.
         d_blocks = math.ceil(d / bs) if mx else None
+        d_blocks_pad = math.ceil(d_pad / bs) if mx else None
+        blocks_padded = mx and d_blocks_pad != d_blocks
         out = voyager.alloc(self.out_shape, self.out_dtype)
 
         # SRAM slots (2 slots each) + per-slot DMA semaphores; under MX each
@@ -641,13 +709,13 @@ class _FA3Pipeline(torch.nn.Module):
             slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
             return slots, voyager.zeros([], torch.int64, num_slots=2)
 
-        q_slots, q_sem = stream(q, (tq, d))
-        k_slots, k_sem = stream(k, (d, tkv))
-        v_slots, v_sem = stream(v, (tkv, d))
+        q_slots, q_sem = stream(q, (tq, d_pad))
+        k_slots, k_sem = stream(k, (d_pad, tkv))
+        v_slots, v_sem = stream(v, (tkv, d_pad))
         if mx:
-            q_scale_slots, q_scale_sem = stream(q_scale, (tq, d_blocks))
-            k_scale_slots, k_scale_sem = stream(k_scale, (d_blocks, tkv))
-            v_scale_slots, v_scale_sem = stream(v_scale, (tkv // bs, d))
+            q_scale_slots, q_scale_sem = stream(q_scale, (tq, d_blocks_pad))
+            k_scale_slots, k_scale_sem = stream(k_scale, (d_blocks_pad, tkv))
+            v_scale_slots, v_scale_sem = stream(v_scale, (tkv // bs, d_pad))
         if self.has_mask:
             munit = (1,) * (mask.ndim - 2)
             m_slots = voyager.alloc([*munit, tq, tkv], mask.dtype, _SRAM, 2)
@@ -676,7 +744,7 @@ class _FA3Pipeline(torch.nn.Module):
             p_buf = voyager.alloc([*unit, tq, tkv], v.dtype, _SRAM, 2)
         else:
             p_buf = s_buf
-        pv_buf = voyager.alloc([*unit, tq, d], acc, _SRAM)
+        pv_buf = voyager.alloc([*unit, tq, d_pad], acc, _SRAM)
         row_tmp = voyager.alloc([*unit, tq, 1], acc, _SRAM)
         alpha = voyager.alloc([*unit, tq, 1], acc, _SRAM)
         sem_scores = voyager.zeros([1], torch.int64)
@@ -687,7 +755,9 @@ class _FA3Pipeline(torch.nn.Module):
         # block (and its scales') is transposed by the DMA into the Kᵀ tile
         # the product reads; the mask block rides with K.
         def load_q(slot, coords):
-            self._load_sweep(q, q_slots, slot, q_sem, coords, (tq, d))
+            self._load_sweep(
+                q, q_slots, slot, q_sem, coords, (tq, d_pad), pad=padded
+            )
             if mx:
                 self._load_sweep(
                     q_scale,
@@ -695,11 +765,21 @@ class _FA3Pipeline(torch.nn.Module):
                     slot,
                     q_scale_sem,
                     coords,
-                    (tq, d_blocks),
+                    (tq, d_blocks_pad),
+                    pad=blocks_padded,
                 )
 
         def load_k(slot, coords):
-            self._load_step(k, k_slots, slot, k_sem, coords, (tkv, d), True)
+            self._load_step(
+                k,
+                k_slots,
+                slot,
+                k_sem,
+                coords,
+                (tkv, d),
+                True,
+                rows=d if padded else None,
+            )
             if mx:
                 self._load_step(
                     k_scale,
@@ -709,12 +789,15 @@ class _FA3Pipeline(torch.nn.Module):
                     coords,
                     (tkv, d_blocks),
                     True,
+                    rows=d_blocks if blocks_padded else None,
                 )
             if self.has_mask:
                 self._load_mask(mask, m_slots, slot, m_sem, coords)
 
         def load_v(slot, coords):
-            self._load_step(v, v_slots, slot, v_sem, coords, (tkv, d), False)
+            self._load_step(
+                v, v_slots, slot, v_sem, coords, (tkv, d_pad), False, pad=padded
+            )
             if mx:
                 self._load_step(
                     v_scale,
@@ -722,8 +805,9 @@ class _FA3Pipeline(torch.nn.Module):
                     slot,
                     v_scale_sem,
                     coords,
-                    (tkv // bs, d),
+                    (tkv // bs, d_pad),
                     False,
+                    pad=padded,
                 )
 
         # The tiles each product reads at the given slots, and the load
@@ -768,6 +852,12 @@ class _FA3Pipeline(torch.nn.Module):
                 tiles = [p_tile, v_tile]
             return tiles, deps
 
+        def pv_real():
+            """What the accumulate reads of ``pv_buf``: its real columns.
+            Taken where it is read -- a view captured beside its buffer
+            would alias a ``while_loop`` input."""
+            return self._cols(pv_buf, d) if padded else pv_buf
+
         def softmax(slot, sweep_slot):
             self._softmax(
                 get_slot(s_buf, slot),
@@ -788,6 +878,17 @@ class _FA3Pipeline(torch.nn.Module):
         c0 = _unravel(0, grid)
         sweep1 = int(self._kv_last(0) == 0)
         c1 = (*_unravel(sweep1, basis), 1 - sweep1)
+        # The row-padded Kᵀ tiles' pad rows, zeroed once before any load
+        # lands in the slots (module docstring).
+        row_padded = [k_slots] if padded else []
+        if blocks_padded:
+            row_padded.append(k_scale_slots)
+        if padded and res is not None:
+            row_padded.append(res.k_slots)
+        for slots in row_padded:
+            for slot in range(2):
+                tile = get_slot(slots, slot)
+                voyager.insert(torch.zeros_like(tile), tile)
         load_q(0, c0)
         load_k(0, c0)
         if num_steps > 1:
@@ -905,7 +1006,7 @@ class _FA3Pipeline(torch.nn.Module):
 
             def finalize():
                 voyager.async_wait(sem_pv)
-                voyager.insert(o + pv_buf, o)
+                voyager.insert(o + pv_real(), o)
                 if res is not None:
                     self._residual_step(
                         res,
@@ -933,7 +1034,7 @@ class _FA3Pipeline(torch.nn.Module):
             # isn't blocked on sem_pv before the softmax.
             def rescale():
                 voyager.async_wait(sem_pv)
-                voyager.insert(alpha * (o + pv_buf), o)
+                voyager.insert(alpha * (o + pv_real()), o)
                 return 1
 
             torch.cond(kv > 0, rescale, lambda: 0)
@@ -950,7 +1051,7 @@ class _FA3Pipeline(torch.nn.Module):
         self._matmul_pv(tiles, pv_buf, sem_pv, deps)
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)
-        voyager.insert(o + pv_buf, o)
+        voyager.insert(o + pv_real(), o)
         last_sweep_slot = (sweeps - 1) % 2
         if res is not None:
             self._residual_snapshot(res, m)
@@ -1066,7 +1167,9 @@ def build_attention_fa3(
     dtype when the two differ.  The block counts
     ``(num_q_blocks, num_kv_blocks)`` come from ``node.meta['l2_tiling']``
     when set, else ``attention_op_tiling`` chooses them under
-    ``tiler.config``.
+    ``tiler.config``, which also sets the head the tiles are padded to
+    (``attention_head_pad``); a node tiled by a padding tiler is built
+    with that tiler, so the kernel's products match the ones it mapped.
     """
     if node.op != "call_function" or node.target not in _ATTENTION_OPS:
         return None
@@ -1106,6 +1209,7 @@ def build_attention_fa3(
     if scale is None:
         scale = 1.0 / math.sqrt(d)
     acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
+    head_pad = attention_head_pad(d, tiler.config) if tiler is not None else d
 
     # GQA folds the head group into the query rows so K/V load once per KV head
     # and reuse across the group (see ``plan_gqa_fold``); ``forward`` applies
@@ -1169,6 +1273,7 @@ def build_attention_fa3(
         tq=tq,
         tkv=tkv,
         head_dim=d,
+        head_pad=head_pad,
         scale=float(scale),
         has_mask=mask_node is not None or is_causal,
         mask_is_bool=mask_is_bool or is_causal,
@@ -1212,11 +1317,14 @@ def build_attention_fa3(
     products = node.meta.get("product_tilings")
     if products is not None:
         mx = block_size is not None
-        keys = {(mx, d, tkv): "scores", (mx, tkv, d): "context"}
+        keys = {
+            (mx, head_pad, tkv): "scores",
+            (mx, tkv, head_pad): "context",
+        }
         residual = get_arg_value(node, 7, "key_residual", None)
         if residual is not None:
             length = residual.value.shape[-2]
-            keys.setdefault((False, d, length), "residual_scores")
-            keys.setdefault((False, length, d), "residual_context")
+            keys.setdefault((False, head_pad, length), "residual_scores")
+            keys.setdefault((False, length, head_pad), "residual_context")
         _stamp_product_tilings(gm, products, keys)
     return gm

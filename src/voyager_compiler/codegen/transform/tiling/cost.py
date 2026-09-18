@@ -739,17 +739,18 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     first step is a boundary: the vector unit resets its state, runs the
     softmax, then finalizes the previous block once that block's context has
     landed, so the finalize takes the rescale's place beside the context.
-    The products are priced by their interstellar mappings (``matrix``);
-    each vector pass at the bandwidth-bound rate
-    ``vector_op_utilization`` charges, plus its launch.  Query and output
-    move once per query block, while key, value, mask and every block scale
-    reload on each step, and the DMAs overlap compute the way
-    ``_sweep_cycles`` prices a double-buffered sweep.  Under ``is_causal``
-    only the live pairs are steps (``attention_kv_last``) and the mask
-    tiles stream from the kernel's table, one per step.  A split cache's
-    residual (``bufferize/attention_v3.py``) runs serially at each boundary --
-    its two products around a softmax over its R positions, then the
-    rescale of the output -- and its operands move once per boundary.
+    The products are priced by their interstellar mappings (``matrix``, at
+    the head ``attention_head_pad`` pads to); each vector pass at the
+    bandwidth-bound rate ``vector_op_utilization`` charges, plus its
+    launch.  Query and output move once per query block, while key, value,
+    mask and every block scale reload on each step, and the DMAs overlap
+    compute the way ``_sweep_cycles`` prices a double-buffered sweep.
+    Under ``is_causal`` only the live pairs are steps
+    (``attention_kv_last``) and the mask tiles stream from the kernel's
+    table, one per step.  A split cache's residual
+    (``bufferize/attention_v3.py``) runs serially at each boundary -- its
+    two products around a softmax over its R positions, then the rescale
+    of the output -- and its operands move once per boundary.
 
     Args:
         node: The attention node being tiled.

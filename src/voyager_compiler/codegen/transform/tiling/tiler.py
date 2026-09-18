@@ -55,6 +55,7 @@ from voyager_compiler.codegen.transform.tiling.search import (
     _attention_tiles,
     _divisors_descending,
     _operand_placeholders,
+    attention_head_pad,
     gemv_op_tiling,
 )
 from voyager_compiler.ops.layout import NCHW_TO_NHWC, OIHW_TO_HWIO, unproject
@@ -2448,14 +2449,15 @@ def _product_node(name, out_dtype, left, right, block_size, scales, codes):
     return node
 
 
-def _attention_products(node, tq, tkv):
+def _attention_products(node, tq, tkv, head_pad):
     """The two products a ``(tq, tkv)`` attention tile runs, as bare 2-D
     GEMM nodes of the tile shapes (``_product_node``): ``"scores"``, the
     query tile times the transposed key tile, and ``"context"``, the
     probabilities times the value tile.  The probabilities take the query's
-    dtype and scales, as the kernel quantizes them so."""
+    dtype and scales, as the kernel quantizes them so.  The products hold
+    the head at ``head_pad`` (``attention_head_pad``), the kernel's tile
+    width."""
     query, key, value = node.args[0], node.args[1], node.args[2]
-    head_dim = query.value.shape[-1]
     block_size = node.kwargs.get("block_size")
     out_dtype = node.value.dtype
     kw = node.kwargs
@@ -2464,20 +2466,20 @@ def _attention_products(node, tq, tkv):
     else:
         codes = (kw.get("input_code"), kw.get("weight_code"))
         # A block wider than the head is one truncated block.
-        head_blocks = math.ceil(head_dim / block_size)
+        head_blocks = math.ceil(head_pad / block_size)
         scores_scales = (
             ((tq, head_blocks), kw["query_scale"]),
             ((head_blocks, tkv), kw["key_scale"]),
         )
         context_scales = (
             ((tq, tkv // block_size), kw["query_scale"]),
-            ((tkv // block_size, head_dim), kw["value_scale"]),
+            ((tkv // block_size, head_pad), kw["value_scale"]),
         )
     scores = _product_node(
         f"attention_scores_{tq}x{tkv}",
         out_dtype,
-        ((tq, head_dim), query),
-        ((head_dim, tkv), key),
+        ((tq, head_pad), query),
+        ((head_pad, tkv), key),
         block_size,
         scores_scales,
         codes,
@@ -2486,7 +2488,7 @@ def _attention_products(node, tq, tkv):
         f"attention_context_{tq}x{tkv}",
         out_dtype,
         ((tq, tkv), query),
-        ((tkv, head_dim), value),
+        ((tkv, head_pad), value),
         block_size,
         context_scales,
         codes,
@@ -2501,8 +2503,8 @@ def _attention_products(node, tq, tkv):
         products["residual_scores"] = _product_node(
             f"attention_residual_scores_{tq}x{length}",
             out_dtype,
-            ((tq, head_dim), query_residual),
-            ((head_dim, length), residual),
+            ((tq, head_pad), query_residual),
+            ((head_pad, length), residual),
             None,
             (),
             (),
@@ -2511,7 +2513,7 @@ def _attention_products(node, tq, tkv):
             f"attention_residual_context_{tq}x{length}",
             out_dtype,
             ((tq, length), query_residual),
-            ((length, head_dim), get_arg_value(node, 8, "value_residual")),
+            ((length, head_pad), get_arg_value(node, 8, "value_residual")),
             None,
             (),
             (),
@@ -2549,7 +2551,8 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
     Enumerates the query / key tile lengths that divide the (GQA-folded)
     query rows and the key rows in whole PE-array widths, keeps those whose
     FA3 SRAM footprint fits the scratchpad, maps each one's two products
-    (``_attention_products``) through interstellar -- ``get_tiling``, so
+    (``_attention_products``, the head padded to the array by
+    ``attention_head_pad``) through interstellar -- ``get_tiling``, so
     identical shapes share one search, run concurrently by
     ``prefetch_tilings`` -- and ranks the candidates by
     ``attention_tile_latency`` the way ``_search_tiling`` ranks a vector
@@ -2607,8 +2610,9 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
             f"{node}: no tiling of its operands fits the scratchpad"
         )
 
+    head_pad = attention_head_pad(query.value.shape[-1], config)
     products = {
-        (tq, tkv): _attention_products(node, tq, tkv)
+        (tq, tkv): _attention_products(node, tq, tkv, head_pad)
         for tq, tkv, _ in candidates
     }
     # The kernel holds each product's operands whole on chip, so its L2 tile
