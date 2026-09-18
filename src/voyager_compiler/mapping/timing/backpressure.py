@@ -1,6 +1,7 @@
-# Model bandwidth mismatch with one backlog, measured in consumer service cycles
-# For B vectors produced in T cycles, s cycles/group and capacity E vectors:
-# stall = max(0, backlog + B*s - T - E*s)
+# Model bandwidth mismatch with one backlog, measured in consumer work cycles
+# For B vectors produced in T cycles, s cycles/vector and capacity E vectors:
+# headroom = max(0, E*s - L), where L is forward plus credit-return latency
+# stall = max(0, backlog + B*s - T - headroom)
 # next_backlog = max(0, backlog + B*s - T - stall)
 from dataclasses import dataclass
 
@@ -51,9 +52,11 @@ class StreamSummary:
 
 
 # Express the backlog equation as two elapsed-time constraints for a constant-rate burst
-def burst(vectors, cycles, cycles_per_vector, capacity_vectors):
-    demand, capacity = vectors * cycles_per_vector, capacity_vectors * cycles_per_vector
-    # p' = max(p+T, d+B*s-E*s), d' = max(p', d+B*s)
+def burst(vectors, cycles, cycles_per_vector, capacity_vectors, *, credit_delay_cycles=0):
+    demand = vectors * cycles_per_vector
+    capacity = max(0, capacity_vectors * cycles_per_vector - credit_delay_cycles)
+    # The consumer clock tracks processing work; its forward latency belongs to final drain
+    # p' = max(p+T, d+B*s-headroom), d' = max(p', d+B*s)
     return StreamSummary(cycles, (cycles, demand - capacity, cycles, demand))
 
 

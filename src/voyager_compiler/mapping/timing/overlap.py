@@ -24,7 +24,7 @@ class BufferSlots:
         self.first_fill_cycles = fill_cycles if first_fill_cycles is None else first_fill_cycles
         self.free, self.ready = [0] * capacity, [0] * capacity
 
-    # Normalize irrelevant idle producer_at while retaining enough lead to prefill every slot
+    # Normalize expired timestamps while retaining enough lead to prefill every slot
     def state(self, producer_at):
         self.loader_at = max(self.loader_at, producer_at - self.capacity * self.fill_cycles - self.ready_delay)
         self.free = [max(t, self.loader_at) for t in self.free]
@@ -42,9 +42,10 @@ class BufferSlots:
 # Compose producer bursts, operand waits and draining output backlog
 class OverlapTiming:
     # Counters distinguish the waits remaining after their actual overlap
-    def __init__(self, buffers, output_cycles_per_vector, output_capacity_vectors):
+    def __init__(self, buffers, output_cycles_per_vector, output_capacity_vectors, *, output_credit_delay=0):
         self.buffers = buffers
         self.output_cycles_per_vector, self.output_capacity_vectors = output_cycles_per_vector, output_capacity_vectors
+        self.output_credit_delay = output_credit_delay
         self.producer_at = self.consumer_at = self.operand_ready_at = self.steps = 0
         self.started = False
         self.waits = [0] * (len(buffers) + 2)
@@ -81,7 +82,8 @@ class OverlapTiming:
             start = max(start, self.operand_ready_at)
             work += (requests - 1) * max(0, request_cycles - spacing)
             self.waits[-2] += start - self.producer_at + work - cycles
-        summary = burst(output_vectors, work, self.output_cycles_per_vector, self.output_capacity_vectors)
+        summary = burst(output_vectors, work, self.output_cycles_per_vector, self.output_capacity_vectors,
+                        credit_delay_cycles=self.output_credit_delay)
         timing = summary.timing(max(0, self.consumer_at - start))
         self.producer_at, self.consumer_at = start + timing.producer_cycles, start + timing.consumer_cycles
         self.waits[-1] += timing.stall_cycles
