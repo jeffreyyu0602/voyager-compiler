@@ -143,6 +143,12 @@ def layer_report(operation, target, tilings=None):
             if spacing:
                 safety = "checked against the supplied latency" if readiness.get("accumulation_feedback_safe") else "not checked: SRAM feedback latency is unspecified"
                 lines += [f"Minimum SRAM feedback spacing: {number(spacing)} cycles; {safety}.", ""]
+    bias = timing.get("readiness", {}) if timing else op.get("bias_timing", {})
+    if "bias_wait_cycles" in bias:
+        lines += ["### Bias loading", "",
+                  f"One bias vector needs {number(bias['bias_cycles_per_vector'])} transfer cycles; "
+                  f"{number(bias['bias_prefetch_vectors'])} complete vector can be prefetched. "
+                  f"First-reduction demand adds {number(bias['bias_wait_cycles'])} wait cycles.", ""]
     inputs = op.get("input_loading")
     if inputs:
         lines += ["### Input loading", "",

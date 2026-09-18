@@ -4,6 +4,7 @@ from math import prod
 from ..schedule import LOOPS, spatial_factor
 from ..timing.transfer import transfer_cycles, packing_factor
 from ..timing.buffers import buffer_completion
+from .bias import bias_timing
 from .input import input_tile_shape, input_bank_traffic
 from .output import OutputOptions, output_timing
 from .evaluation import Evaluation, TimingEstimate
@@ -71,6 +72,10 @@ class Evaluator:
         levels = tuple(tuple((loop, level.bound(loop)) for loop in level.order) for level in (l1, l2))
         prefix_cycles = max(0, sa_weight_loading_cycles - reuse_vectors)
         bias_readiness, output_readiness = {}, {}
+        if workload.has_bias:
+            bias, bias_readiness = bias_timing(target, *levels, prefix_at=first_weight_loop,
+                                               prefix_cycles=prefix_cycles)
+            matrix_cycles = max(matrix_cycles, bias.producer_cycles)
         if banked:
             runtime = startup + matrix_cycles + vector_cycles
         else:

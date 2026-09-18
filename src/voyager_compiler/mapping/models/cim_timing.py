@@ -6,6 +6,7 @@ from typing import Tuple
 from ..schedule import REDUCTIONS
 from ..timing.transfer import ceil_div, transfer_cycles, stream_fill
 from ..timing.buffers import buffer_completion
+from .bias import bias_timing
 from .output import OutputOptions, output_timing
 
 # Configure external service and optional SRAM feedback constraints
@@ -116,6 +117,13 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         accumulation=total_accumulation_cycles,
         bias=total_bias_cycles,
     )
+    bias_readiness = {}
+    if workload.has_bias:
+        levels = tuple(tuple((loop, level.bound(loop)) for loop in level.order)
+                       for level in (schedule.l1, schedule.l2))
+        bias, bias_readiness = bias_timing(target, *levels, interval=issue_interval,
+                                          request_latency=options.memory_request_latency)
+        resource_cycles['bias'] = max(total_bias_cycles, bias.producer_cycles)
     # Keep the last output vector or completed bank in the non-overlapped drain
     banked = target.double_buffered_accum and schedule.write_output_to_accum_buffer
     final_vectors = prod(schedule.l1.bound(loop) for loop in ("OX", "OY", "OC")) if banked else 1
@@ -147,7 +155,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                             accumulation=total_accumulation_cycles, output=total_output_cycles, bias=total_bias_cycles,
                             accumulation_sram_reads=sram_reads, accumulation_sram_writes=sram_writes),
         startup_cycles=startup, drain_cycles=drain, options=options,
-        readiness=dict(**output_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
+        readiness=dict(**output_readiness, **bias_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
                        weight_sequence_steps=weight_steps, weight_serialized_bound=weight_bound,
                        input_wait_cycles=max(0, input_issue - total_issue_cycles),
                        input_sequence_steps=input_steps,
