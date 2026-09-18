@@ -1,6 +1,6 @@
 # Check coupled timing with small explicit schedules and very large repeated bursts
 import unittest
-from voyager_compiler.mapping.timing.overlap import BufferSlots, OverlapTiming
+from voyager_compiler.mapping.timing.overlap import BufferSlots, OverlapTiming, MAX_BURST_STEPS
 
 
 # Verify overlap independently of the mapping search and hardware signal names
@@ -45,6 +45,17 @@ class PipelineTimingTests(unittest.TestCase):
                     body()
             results.append((pipeline.producer_at, pipeline.consumer_at, pipeline.waits))
         self.assertEqual(*results)
+
+    # Separate resident phases each need a short warm-up before their steady state repeats
+    def test_nested_resident_phases(self):
+        from voyager_compiler.mapping.models.cim_timing import _completion
+        timing = _completion(((2, True, False, False),),
+                             ((128, False, True, False), (4, True, False, False),
+                              (2, False, False, False)),
+                             8, 1, 1, 2, 19, 8, 64, 3, 3, 1, 16, 17, 3)
+        self.assertIsNotNone(timing)
+        self.assertEqual(timing[1] + 3, 16519)
+        self.assertLess(timing[3], MAX_BURST_STEPS)
 
 
 if __name__ == '__main__':

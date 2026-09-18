@@ -1,7 +1,8 @@
 # Couple reusable operand storage and output bandwidth at whole-burst boundaries
 from .backpressure import burst
 
-MAX_BURST_STEPS = 512
+# Bound the entire candidate, including distinct replay and reduction warm-up phases
+MAX_BURST_STEPS = 2048
 MAX_BUFFER_SLOTS = 64
 
 
