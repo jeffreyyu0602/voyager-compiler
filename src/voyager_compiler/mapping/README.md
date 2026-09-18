@@ -47,7 +47,7 @@ total work per resource. These totals overlap and must not be summed as runtime.
 `resource_cycles_per_vector` contains vector-path work for one result vector.
 A buffer sequence and a resident-weight sequence are separate from result vectors.
 
-Timing calculations use bounded repetition. The CIM model reports a
+Timing calculations use bounded repetition. The CIM model reports a conservative
 fallback when interacting waits exceed the explicit timing budget. Model input
 values describe hardware rates and delays; detailed RTL handshakes are outside
 this analytical model.

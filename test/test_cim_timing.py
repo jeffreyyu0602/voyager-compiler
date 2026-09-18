@@ -94,6 +94,26 @@ class AccumulationTimingTests(unittest.TestCase):
                          + readiness['coupled_output_stall_cycles']
                          + readiness['coupled_output_backlog_cycles'] + target.macro_result_latency)
 
+    # Hitting the work budget retains separate waits instead of assuming their overlap
+    def test_coupled_limit_uses_conservative_waits(self):
+        from unittest.mock import patch
+        target = small_target(b_sets=2, accum_buffer_words=128)
+        schedule = Schedule(TemporalLevel.make(order=('OX', 'IC'), OX=4, IC=2),
+                            TemporalLevel.make(order=('OX', 'IC'), OX=16, IC=2))
+        workload = Workload(64, 1, 32, 8, output_to_memory=False)
+        options = TimingOptions(output_cycles_per_vector=2)
+        exact = evaluate(target, schedule, workload, options=options)
+        with patch('voyager_compiler.mapping.models.cim_timing.coupled_timing', return_value=None):
+            bounded = evaluate(target, schedule, workload, options=options)
+        self.assertTrue(bounded.timing.readiness['coupled_timing_limit'])
+        self.assertGreaterEqual(bounded.runtime_cycles, exact.runtime_cycles)
+        waits = sum(bounded.timing.readiness.get(name, 0) for name in
+                    ('weight_wait_cycles', 'input_wait_cycles', 'bias_wait_cycles',
+                     'output_stall_cycles', 'output_backlog_cycles'))
+        self.assertEqual(bounded.runtime_cycles, bounded.timing.startup_cycles
+                         + bounded.timing.resource_cycles['result_slots'] + waits
+                         + target.macro_result_latency)
+
 
 # Distinguish isolated load latency from sustained multi-set transfer service
 class WeightTimingTests(unittest.TestCase):

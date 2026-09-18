@@ -57,7 +57,7 @@ class TimingEstimate:
         "SRAM feedback spacing is reported; a supplied feedback latency identifies unsafe schedules",
         "banked output drain uses repeated two-bank timing",
         "interacting operand waits and output backlog compose at burst and loop boundaries",
-        "bounded schedule evaluation falls back to independent envelopes for unrecognized long transients",
+        "unrecognized long transients use a reported conservative sum of separate wait bounds",
         "useful work excludes convolution and channel padding; repeated L2 slices use mean useful work",
         "excludes command serialization and unprofiled HLS stages; fused epilogue timing is derived from scheduled vector passes",
     )
@@ -160,16 +160,21 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
     coupled_readiness = {}
     output_wait = max(output_readiness.get('output_stall_cycles', 0),
                       output_readiness.get('output_backlog_cycles', 0))
-    interacting = sum(wait > 0 for wait in (
-        weight_issue - total_issue_cycles, input_issue - total_issue_cycles,
-        bias_readiness.get('bias_wait_cycles', 0), output_wait)) > 1
+    operand_waits = (max(0, weight_issue - total_issue_cycles), max(0, input_issue - total_issue_cycles),
+                     bias_readiness.get('bias_wait_cycles', 0))
+    interacting = sum(wait > 0 for wait in (*operand_waits, output_wait)) > 1
     if not banked and interacting:
         coupled = coupled_timing(target, schedule, policy, inputs, interval=issue_interval,
                                  fill=weight_fill_cycles, load_start=max(0, first_weight - weight_fill_cycles),
                                  output_cycles_per_vector=output_cycles_per_vector, output_capacity_vectors=output_readiness['output_capacity_vectors'],
                                  options=options, has_bias=workload.has_bias)
         coupled_readiness['coupled_timing_limit'] = coupled is None
-        if coupled is not None:
+        if coupled is None:
+            # Unknown overlap must not give an unfinished candidate an optimistic ranking
+            waits = sum(operand_waits) + output_readiness['output_stall_cycles']
+            runtime = max(runtime, startup + total_issue_cycles + waits
+                          + output_readiness['output_backlog_cycles'] + latency)
+        else:
             finish, output_finish, waits, steps = coupled
             runtime = max(runtime, finish + drain, output_finish + latency)
             coupled_readiness.update(coupled_burst_steps=steps,
