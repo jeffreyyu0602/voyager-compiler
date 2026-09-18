@@ -140,6 +140,14 @@ def layer_report(operation, target, tilings=None):
                           f"release-to-reuse delay: {number(readiness['weight_release_cycles'])}; "
                           f"fill-to-ready delay: {number(readiness['weight_ready_cycles'])}. "
                           "Control delays are explicit timing assumptions.", ""]
+            if "coupled_burst_steps" in readiness:
+                lines += [f"Coupled schedule waits: weights {number(readiness['coupled_weight_wait_cycles'])}, "
+                          f"input banks {number(readiness['coupled_input_wait_cycles'])}, "
+                          f"bias {number(readiness['coupled_bias_wait_cycles'])}, "
+                          f"output {number(readiness['coupled_output_stall_cycles'])} cycles. "
+                          "These waits account for overlap at burst boundaries.", ""]
+            if readiness.get("coupled_timing_limit"):
+                lines += ["Coupled timing reached its work limit; the estimate uses independent readiness envelopes.", ""]
             if readiness.get("input_max_fill_bound"):
                 lines += ["Input timing uses a maximum-fill bound for variable boundary tiles.", ""]
             if any(readiness.get(key) for key in ("weight_serialized_bound", "input_serialized_bound", "output_bank_serialized_bound")):

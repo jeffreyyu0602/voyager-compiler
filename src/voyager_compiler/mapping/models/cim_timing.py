@@ -6,6 +6,7 @@ from typing import Tuple
 from ..schedule import REDUCTIONS
 from ..timing.transfer import ceil_div, transfer_cycles, stream_fill
 from ..timing.buffers import buffer_completion
+from ..timing.overlap import BufferSlots, OverlapTiming, TimingBudgetExceeded
 from .bias import bias_timing
 from .output import OutputOptions, output_timing
 
@@ -55,7 +56,8 @@ class TimingEstimate:
         "input bank reuse uses repeated two-bank timing; variable fills use the reported maximum-fill bound",
         "SRAM feedback spacing is reported; a supplied feedback latency identifies unsafe schedules",
         "banked output drain uses repeated two-bank timing",
-        "independent readiness envelopes overlap by maximum; cross-interface stall phasing is approximate",
+        "interacting operand waits and output backlog compose at burst and loop boundaries",
+        "bounded schedule evaluation falls back to independent envelopes for unrecognized long transients",
         "useful work excludes convolution and channel padding; repeated L2 slices use mean useful work",
         "excludes command serialization and unprofiled HLS stages; fused epilogue timing is derived from scheduled vector passes",
     )
@@ -152,6 +154,22 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
         resource_cycles['output'] = max(resource_cycles['output'], bank_finish - final_output)
     drain = latency + final_output
     runtime = startup + max(resource_cycles.values()) + drain
+    coupled_readiness = {}
+    interacting = sum(wait > 0 for wait in (
+        weight_issue - total_issue_cycles, input_issue - total_issue_cycles,
+        bias_readiness.get('bias_wait_cycles', 0), output_readiness.get('output_stall_cycles', 0))) > 1
+    if not banked and interacting:
+        coupled = coupled_timing(target, schedule, policy, inputs, interval=issue_interval,
+                                 fill=weight_fill_cycles, load_start=max(0, first_weight - weight_fill_cycles),
+                                 output_cycles_per_vector=output_cycles_per_vector, output_capacity_vectors=output_readiness['output_capacity_vectors'],
+                                 options=options, has_bias=workload.has_bias)
+        coupled_readiness['coupled_timing_limit'] = coupled is None
+        if coupled is not None:
+            finish, output_finish, waits, steps = coupled
+            runtime = max(runtime, finish + drain, output_finish + latency)
+            coupled_readiness.update(coupled_burst_steps=steps,
+                                     coupled_weight_wait_cycles=waits[0], coupled_input_wait_cycles=waits[1],
+                                     coupled_bias_wait_cycles=waits[2], coupled_output_stall_cycles=waits[3])
     ideal = traffic.useful_scalar_macs * interval / (target.k * target.n)
     return TimingEstimate(
         runtime_cycles=runtime, ideal_cycles=ideal, compute_cycles=compute,
@@ -163,7 +181,7 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                             accumulation=total_accumulation_cycles, output=total_output_cycles, bias=total_bias_cycles,
                             accumulation_sram_reads=sram_reads, accumulation_sram_writes=sram_writes),
         startup_cycles=startup, drain_cycles=drain, options=options,
-        readiness=dict(**output_readiness, **bias_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
+        readiness=dict(**output_readiness, **bias_readiness, **coupled_readiness, weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
                        weight_fill_cycles=weight_fill_cycles,
                        weight_ready_cycles=options.weight_ready_cycles,
                        weight_release_cycles=options.weight_release_cycles,
@@ -176,3 +194,75 @@ def estimate_cycles(target, schedule, workload, fetch, options, policy, traffic,
                        accumulation_feedback_safe=feedback_safe,
                        output_bank_serialized_bound=output_bound),
     )
+
+
+# Cache active loops as (bound, reduction, resident replay, bias reuse)
+@lru_cache(maxsize=4096)
+def _completion(l1, l2, reuse, bias_requests, interval, output_cycles_per_vector, output_capacity_vectors,
+                capacity, fill, ready, release, load_start, input_fill, input_first, bias_cycles_per_vector):
+    try:
+        weights = BufferSlots(capacity, fill, ready_delay=ready, release_delay=release, load_start=load_start)
+        inputs = BufferSlots(2, input_fill, first_fill_cycles=input_first)
+        pipeline = OverlapTiming((weights, inputs), output_cycles_per_vector, output_capacity_vectors)
+        loops = l1 + ((0, False, False, False),) + l2
+
+        # Split only first/final reduction and resident-replay phases; repeat the middle algebraically
+        def visit(depth, first=True, final=True, load=True, release=True, bias_first=True):
+            if depth < 0:
+                slot = pipeline.acquire(0, load=load)
+                pipeline.produce(reuse * interval, reuse if final else 0,
+                                 requests=bias_requests if first and bias_first else 0,
+                                 request_cycles=bias_cycles_per_vector)
+                if release:
+                    pipeline.release(0, slot)
+                return
+            bound, reduction, replay, bias_reuse = loops[depth]
+            if bound == 0:
+                slot = pipeline.acquire(1)
+                visit(depth - 1, first, final, load, release, bias_first)
+                pipeline.release(1, slot)
+                return
+            position = weights.position
+
+            # A replay traverses the same resident slots while time and other streams advance
+            def body(at_first=True, at_last=True):
+                if replay:
+                    weights.position = position
+                visit(depth - 1, first and (not reduction or at_first), final and (not reduction or at_last),
+                      load and (not replay or at_first), release and (not replay or at_last),
+                      bias_first and (not bias_reuse or at_first))
+
+            if reduction or replay or bias_reuse:
+                body(True, False)
+                pipeline.repeat(bound - 2, lambda: body(False, False))
+                body(False, True)
+            else:
+                pipeline.repeat(bound, body)
+
+        visit(len(loops) - 1)
+        return pipeline.producer_at, pipeline.consumer_at, tuple(pipeline.waits), pipeline.steps
+    except TimingBudgetExceeded:
+        return None
+
+
+# Collapse consecutive spatial reuse into one burst and mark input-bank and residency boundaries
+def coupled_timing(target, schedule, policy, inputs, *, interval, fill, load_start,
+                   output_cycles_per_vector, output_capacity_vectors, options, has_bias):
+    l1, l2 = schedule.l1, schedule.l2
+    active_weights = [loop for loop in ('IC', 'OC', 'FX', 'FY') if l1.bound(loop) > 1]
+    reuse = {loop for loop in ('OX', 'OY') if all(l1.inside(loop, weight) for weight in active_weights)}
+    bias_reuse = {loop for loop in ('OX', 'OY') if l1.inside(loop, 'OC')}
+    levels = []
+    for index, (level, reader) in enumerate(((l1, policy.reader_l1), (l2, policy.reader_l2))):
+        levels.append(tuple((level.bound(loop), loop in ('IC', 'FX', 'FY'),
+                             policy.fits and reader.bound(loop) != level.bound(loop),
+                             index == 0 and loop in bias_reuse)
+                            for loop in level.order if level.bound(loop) > 1 and not (index == 0 and loop in reuse)))
+    output_vectors_per_burst = prod(l1.bound(loop) for loop in reuse)
+    bias_requests = prod(l1.bound(loop) for loop in reuse - bias_reuse) if has_bias else 0
+    bias_cycles_per_vector = (target.n * target.accum_bits + target.oc_port_bits - 1) // target.oc_port_bits
+    return _completion(*levels, output_vectors_per_burst, bias_requests, interval, output_cycles_per_vector, output_capacity_vectors,
+                       min(target.b_sets, policy.full_set_loads), fill,
+                       options.weight_ready_cycles, options.weight_release_cycles, load_start,
+                       inputs.max_fill_cycles, inputs.first_fill_cycles,
+                       bias_cycles_per_vector + options.memory_request_latency)
