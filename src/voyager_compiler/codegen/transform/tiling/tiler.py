@@ -1103,6 +1103,93 @@ class RuntimeCalculator:
             ),
         }
 
+    def _tail_stall(self, mapping, bank_groups, words, compute, bank):
+        """Cycles the array loses to the tail's burst on a bank that feeds
+        one of its every-round buffers.
+
+        Those buffers ping-pong per L1 sweep (``blockings[IC][2]`` sweeps
+        to a block), so each sweep's fetch must land inside the sweep before
+        it.  The tail's words on such a bank do not spread over the block:
+        they arrive together, and the bank's round-robin port lets them
+        through at the tail's beats per request round for every grant of a
+        stream that is always pending, or in the sweep's free cycles when
+        the stream idles between its requests.  The sweeps the burst lands
+        on are priced one by one, and what they cost beyond the block's
+        price is the stall.  A tail buffer meets the stream's bank only on
+        the steps whose ping-pong slots agree: every step when the stream
+        is refetched with it, else every other.
+        """
+        if not bank_groups:
+            return 0
+        sweeps = mapping.loop_blockings[le.IC][2]
+        steps = self._l3_blocks(mapping)
+        if sweeps == 1 or steps == 1:
+            return 0
+        sweep_compute = compute / sweeps
+        vectors = 1
+        for loop in [le.OC, le.OY, le.OX]:
+            vectors *= mapping.loop_blockings[loop][1]
+        stream_dims = {
+            "input": _IF_DIMS,
+            "input_scale": _IF_DIMS,
+            "weight": _FL_DIMS,
+            "weight_scale": _FL_DIMS,
+        }
+        stall = 0.0
+        for roles in bank_groups:
+            streams = [role for role in roles if role in stream_dims]
+            tails = []
+            for role in roles:
+                is_fused = isinstance(role, tuple) and role[0] == "fused"
+                if (role == "output" or is_fused) and words.get(role, 0):
+                    tails.append(role)
+            if not streams or not tails:
+                continue
+            others = [
+                role
+                for role in roles
+                if role not in streams and role not in tails
+            ]
+            stream_words = [words.get(role, 0) / sweeps for role in streams]
+            busiest = max(stream_words)
+            pending = sum(stream_words)
+            spread = sum(words.get(role, 0) for role in others) / sweeps
+            tail_words = sum(words[role] for role in tails)
+            # The output's beats and its scales leave on two requesters,
+            # every beat and every scale a request of its own; a fused
+            # operand is fetched once per output vector.
+            oc_dim = mapping.loop_partitionings[le.OC][0]
+            requests = []
+            for role in tails:
+                if role == "output":
+                    out = vectors * oc_dim
+                    stores = self._bus_words(out, self.output_dtype_width)
+                    requests.append(stores)
+                    if self.output_scale_width:
+                        requests.append(math.ceil(out / self.scale_block_size))
+                elif le.OC in self.tail_specs[role[1]][0]:
+                    requests.append(vectors)
+                else:
+                    requests.append(words[role])
+            beats_per_grant = tail_words / max(requests)
+            remaining = tail_words
+            priced = 0.0
+            for sweep in range(sweeps):
+                free = max(0.0, sweep_compute - pending - spread)
+                landed = min(remaining, max(beats_per_grant * busiest, free))
+                if sweep == sweeps - 1:
+                    landed = remaining
+                remaining -= landed
+                priced += max(sweep_compute, pending + spread + landed)
+            refetched = [
+                self._l3_loads(mapping, stream_dims[role]) == steps
+                for role in streams
+            ]
+            fraction = 1.0 if any(refetched) else 0.5
+            excess = max(0.0, priced - max(compute, bank))
+            stall = max(stall, fraction * excess)
+        return stall
+
     def matrix_cycles(self, mapping, bank_groups):
         """Cycles of one L3 grid step: the L2 sweep of weight-reuse tiles,
         each costing the busier of the matrix unit -- its systolic passes,
@@ -1112,7 +1199,9 @@ class RuntimeCalculator:
         the accumulator read back and rewritten while the reduction is
         split, the finished tile and the tail's operands when it is not,
         the round trips a stream idles for when it changes bank, each
-        summed with whatever shares its bank -- and, for an outlier GEMM,
+        summed with whatever shares its bank -- plus the stall the tail's
+        burst inflicts where it shares a bank with one of the array's
+        every-round buffers (``_tail_stall``) -- and, for an outlier GEMM,
         the SpMM unit, which must deliver the block's sparse correction
         before the vector pipeline releases any of its rows: per 64-column
         pass it walks every row of the block, paying ``SPMM_ROW_CYCLES`` of
@@ -1168,6 +1257,10 @@ class RuntimeCalculator:
             self.accum_dtype_width if num_k > 1 else self.output_dtype_width
         )
         store_cycles = math.ceil(output_width * oc_dim / self.sram_bandwidth)
+        if num_k == 1 and self.output_scale_width:
+            # The block scales leave on a requester of their own, one beat
+            # per vector, on the output's bank.
+            store_cycles += 1
         vector_beats = store_cycles
         if num_k == 1 and not self.single_k_tail_extra_pass:
             for dims, bits in self.tail_specs:
@@ -1187,8 +1280,16 @@ class RuntimeCalculator:
         # tile -- and the tail drains them at ``vector_beats`` apiece.  The
         # path absorbs ``OUTPUT_SLACK`` of them; past that the array runs at
         # the tail's pace for the rest of the burst.  A double-buffered
-        # accumulator parks any tile that would need this, so it never pays.
-        if not self.double_buffered_accum_buffer:
+        # accumulator parks a tile whose tail moves more than a bus word per
+        # vector on some port (the toolchain's ``should_use_direct_path``);
+        # a narrower tail rides the pass and pays like a single-buffered one.
+        parked = self.double_buffered_accum_buffer
+        if parked:
+            widths = [output_width * oc_dim]
+            for dims, bits in self.tail_specs:
+                widths.append(bits * (oc_dim if le.OC in dims else 1))
+            parked = max(widths) > self.sram_bandwidth
+        if not parked:
             burst_vectors = weight_reuse_tile_size
             burst_cycles = weight_reuse_tile_time
             bursts = blockings[le.OC][1]
@@ -1259,8 +1360,13 @@ class RuntimeCalculator:
         # The matrix unit and the vector unit are pipelined -- one drains a
         # tile while the other computes the next -- so a block costs the
         # busier of the two.
-        block_time = max(
-            computation_l1_time, self._bank_cycles(words, bank_groups)
+        bank = self._bank_cycles(words, bank_groups)
+        block_time = max(computation_l1_time, bank)
+        # The tail's words do not spread over the block: they land as a
+        # burst on a few of its sweeps, and on a bank that feeds one of the
+        # array's ping-pong buffers they can outrun the sweeps they land on.
+        block_time += self._tail_stall(
+            mapping, bank_groups, words, computation_l1_time, bank
         )
 
         # The SpMM unit runs the block alongside and the vector pipeline
@@ -1298,11 +1404,7 @@ class RuntimeCalculator:
         # is already in its blocks' own time.
         buffer_fill = self._bank_cycles(loads, bank_groups)
         skew = partitionings[le.IC][0] + partitionings[le.OC][0] - 2
-        drain = (
-            output_size * vector_beats
-            if self.double_buffered_accum_buffer
-            else 0
-        )
+        drain = output_size * vector_beats if parked else 0
         overhead = buffer_fill + skew + drain
         steady = l2_blocks * block_time
 
