@@ -18,6 +18,7 @@ from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_conv2d,
+    is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
 )
@@ -158,10 +159,12 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     matrix_units = ("mma", "vector") if fused else ("mma",)
 
     if is_conv2d(anchor):
-        # MACs = prod(out) * C * kh * kw; the channel / kernel dims sit at
-        # different positions per layout (transposed => HWIO, else OIHW).
         w = _shape(anchor.args[1])
-        if anchor.meta.get("transposed", False):  # HWIO = [kh, kw, C, K]
+        nhwc = (
+            anchor.target is torch.ops.quantized_ops.conv2d.default
+            or anchor.kwargs.get("layout") == "nhwc"
+        )
+        if nhwc and not is_depthwise_conv(anchor):  # HWIO = [kh, kw, C, K]
             kh, kw, c = w[0], w[1], w[2]
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
