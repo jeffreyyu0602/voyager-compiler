@@ -53,7 +53,8 @@ MODEL_SIZES = [
     ("meta-llama/Llama-2-13b-hf", "13B"),
 ]
 
-# (label, weight_bits, act_bits) -- KV is fixed BF16.
+# (label, weight_bits, act_bits).  The decode KV cache follows ``act_bits``
+# unless ``--kv-bits`` asks for a KIVI width.
 QUANT_CONFIGS = [
     ("W16A16", 16, 16),
     ("W8A8", 8, 8),

@@ -15,16 +15,28 @@ bit-width:
 
 * 16 -> BF16 (unquantized, runs on a bf16 PE array)
 * 8  -> MXINT8 with a power-of-two block scale (the baseline)
-* 4  -> MXFP4 (``fp4_e2m1`` element, ``fp8_e4m3`` block scale)
+* 4  -> MXFP4 (``fp4_e2m1`` element, ``fp8_e5m3`` block scale)
 
 The MX group (block) size is not a free knob -- it must match the PE array, so
 ``group = max(pe)``.
 
-The KV cache is kept BF16 (unquantized) for now: microscaling a stored KV cache
-is unsupported (it feeds a repeat_kv slice, not an MXU op).  A 16-bit cache uses
-the simple HF export; the KIVI split-cache + ``group_wise_affine`` machinery for
-quantized KV is kept (see ``build_decode`` / ``_annotate_kv_cache``) but off
-until the bufferizer can lower an in-place cache-write cone.
+Decode always runs over a split KV cache (``build_decode`` ->
+``split_kv_cache``): the main cache holds whole chunks of ``group`` positions,
+a full-precision residual holds the chunk being filled, and the residual halves
+of the attention stay unquantized.  ``quant_folding`` bakes the main cache in
+the format its read is quantized to and quantizes each chunk as it completes;
+``kv_bits`` picks that format:
+
+* 16    -> the cache takes the attention matmuls' operand spec, i.e.
+  ``act_bits``' MX format, and is bf16 only when ``act_bits`` is 16
+* 4 / 2 -> KIVI: ``_annotate_kv_cache`` annotates the read ``uint4`` / ``uint2``
+  ``group_wise_affine``, keys grouped along the sequence and values along the
+  head dim, scale and zero point in ``fp8_e4m3``
+
+The attention matmuls re-encode a KIVI cache to ``act_bits``' MX format in
+square ``group`` x ``group`` blocks, which keep the re-encode's scale constant
+across each key and each value group (``build_quantizer``).  Prefill has no
+persistent cache, so ``kv_bits`` does not apply to it.
 """
 
 import argparse
@@ -202,7 +214,9 @@ class SweepConfig:
     ``mode`` selects the graph shape: ``"prefill"`` feeds the whole model an
     ``input_ids`` of length ``prompt_len`` (``use_cache=False``); ``"decode"``
     measures one token over a KIVI split cache whose main cache holds ``kv_len``
-    entries.  Bit-widths are each one of {16, 8, 4} (and 2 for KV only).
+    entries.  ``weight_bits`` and ``act_bits`` are each one of {16, 8, 4};
+    ``kv_bits`` is 16, where the cache follows ``act_bits``, or a KIVI width,
+    4 or 2.
 
     ``pipelined`` and ``fuse_operators`` are the two lowering switches: off,
     ``pipelined`` single-buffers every L2 tile (no prefetch overlap) and
@@ -377,24 +391,34 @@ def dtype_spec(bits: int, group: int) -> Optional[str]:
     if bits == 8:
         return f"int8,qs=microscaling,bs={group}"
     if bits == 4:
-        return f"fp4_e2m1,qs=microscaling,bs={group}"
+        return f"fp4_e2m1,qs=microscaling,bs={group},scale=fp8_e5m3"
     raise ValueError(f"unsupported weight/activation bits: {bits}")
 
 
-def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
-    """The dtype string for a KV-cache tensor at ``bits``.  KIVI
-    quantizes keys per-channel (``ax=-2``) and values per-token (``ax=-1``) of
-    the ``(N, H, S, D)`` cache.  Returns ``None`` for 16-bit (full precision).
+def _kv_cache_spec(bits: int, group: int, role: str) -> str:
+    """The KIVI dtype string for one main KV cache at ``bits``.
+
+    KIVI quantizes the ``(N, H, S, D)`` cache group-wise affine: keys per
+    channel, in groups along the sequence (``ax=-2``), and values per token,
+    in groups along the head dim (``ax=-1``).  Scale and zero point are both
+    stored as ``fp8_e4m3``.
+
+    Args:
+        bits: Entry width of the stored cache, 4 or 2.
+        group: Entries per affine group.
+        role: ``"key"`` or ``"value"``.
+
+    Returns:
+        The spec string that quantizes that cache.
+
+    Raises:
+        ValueError: ``bits`` is not a KIVI width.
     """
     ax = -2 if role == "key" else -1
-    if bits == 16:
-        return None
-    if bits == 8:
-        return f"int8,qs=microscaling,bs={group},ax={ax}"
     if bits == 4:
-        return f"fp4_e2m1,qs=microscaling,bs={group},ax={ax},scale=fp8_e4m3"
+        return f"uint4,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e4m3"
     if bits == 2:
-        return f"uint2,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e5m3"
+        return f"uint2,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e4m3"
     raise ValueError(f"unsupported kv bits: {bits}")
 
 
@@ -438,17 +462,27 @@ def _cfg_stem(cfg: SweepConfig) -> str:
 
 
 def build_quantizer(cfg: SweepConfig):
-    """A quantizer for ``cfg``'s weight / activation precision (microscaling for
-    8/4-bit, unquantized bf16 for 16-bit).  The rotary embedding's matmul is
-    exempted by the scope ``cfg.mode``'s export records for it.  KV-cache
-    precision is *not* set here -- it is applied by annotating the cache
-    writes in ``_annotate_kv_cache``.
+    """A quantizer for ``cfg``'s weight / activation precision.
+
+    Weights and activations are microscaling at 8 / 4 bits and unquantized
+    bf16 at 16.  The rotary embedding's matmul is exempted by the scope
+    ``cfg.mode``'s export records for it.  In decode the residual halves of
+    the attention stay unquantized, and over a KIVI cache the main halves
+    take their cache operand in square ``group`` x ``group`` blocks of
+    ``act_bits``' format.  The cache's stored format is not set here:
+    ``_annotate_kv_cache`` annotates its read.
+
+    Args:
+        cfg: The design point.
+
+    Returns:
+        The configured quantizer.
     """
     group = cfg.group
     quantizer = get_default_quantizer(
         input_activation=dtype_spec(cfg.act_bits, group),
         weight=dtype_spec(cfg.weight_bits, group),
-        force_scale_power_of_two=True,
+        force_scale_power_of_two=min(cfg.act_bits, cfg.weight_bits) >= 8,
     )
     quantizer.set_module_name_object_type_order(
         _ROTARY_SCOPE_BY_MODE[cfg.mode],
@@ -463,6 +497,22 @@ def build_quantizer(cfg: SweepConfig):
             quantizer.set_module_name_object_type_order(
                 "self_attn", torch.ops.aten.matmul.default, order, None
             )
+        if cfg.kv_bits != 16 and cfg.act_bits != 16:
+            # A KIVI cache is decoded and re-encoded to the matmul's MX format
+            # in one fused dequantize, which needs the MX scale constant across
+            # each affine group.  Square blocks on the main halves' cache
+            # operand (orders 0 and 2) cover both the keys' groups along the
+            # sequence and the values' along the head dim.  A bf16 attention
+            # has no re-encode.
+            default = quantizer.object_type_config[
+                torch.ops.aten.matmul.default
+            ]
+            cache = replace(default.weight, ch_axis=(-2, -1))
+            main = replace(default, weight=cache)
+            for order in (0, 2):
+                quantizer.set_module_name_object_type_order(
+                    "self_attn", torch.ops.aten.matmul.default, order, main
+                )
     return quantizer
 
 
@@ -591,7 +641,7 @@ def build_decode(cfg: SweepConfig):
     return gm, model, (), example_kwargs
 
 
-# The exported KV-cache buffers (``key_cache_0`` ...); their writes carry the
+# The exported KV-cache buffers (``key_cache_0`` ...); their reads carry the
 # KIVI spec.
 _KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
 
@@ -785,7 +835,7 @@ def _frontend(cfg: SweepConfig):
         gm, model.model.layers[0].input_layernorm, (example_input,)
     )
 
-    # KV-cache precision is applied by annotating the cache writes (KIVI); it
+    # KV-cache precision is applied by annotating the cache reads (KIVI); it
     # only exists in decode.  Prefill has no persistent cache, so kv_bits is
     # not applicable there.  sdpa prefill has no mask tensor to annotate.
     if is_decode:
