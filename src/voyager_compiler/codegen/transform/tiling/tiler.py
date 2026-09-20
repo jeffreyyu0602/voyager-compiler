@@ -45,9 +45,9 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     _step_classes,
     _sweep_cycles,
     attention_tile_latency,
-    bank_walk,
     gemv_compute_cycles,
     get_dtype_width,
+    strided_bank_walk,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
     DEFAULT_RUNTIME_TOLERANCE,
@@ -210,7 +210,7 @@ def build_interstellar_tiler(
         bank_size_list=[None, None, config.bank_size, None],
     )
 
-    # The L1 order is pinned to ... > FY > FX > OY > OX (IC/OC free above).
+    # L1 IC is outermost; the inner order is pinned to FY > FX > OY > OX.
     # OX/OY innermost is never slower -- the L1 sweep costs
     # ``max(loading, reused_tile) * remaining``, monotone in the reused
     # tile -- and the arrangement of the loops above them ties on both
@@ -987,107 +987,124 @@ class RuntimeCalculator:
                 )
         return words
 
-    def _stream_switches(self, mapping, key_loops, ranges_of, held_loops=()):
-        """Scratchpad bank switches one L3 step's read stream makes.
+    def _stream_switches(self, mapping, key_loops, walk_of, held_loops=()):
+        """Compose L1 bank walks in the emitted L2 loop order.
 
-        A stream switches banks whenever the byte ranges it walks for one
-        L2 block straddle a bank boundary of its (bank-aligned) tile buffer,
-        and whenever a block starts in a bank other than the one the
-        previous block ended in.
-
-        ``key_loops`` are the L2 loops that move the stream's ranges;
-        ``ranges_of(idx)`` gives the ``(lo, hi)`` byte ranges walked, in
-        order, for their indices ``idx`` (a dict; a loop not in it is at 0).
-        Every other L2 loop repeats the same ranges, refetching them unless
-        it is in ``held_loops``, so the key sweep is walked once and the
-        repeats are folded in: a loop inside the innermost key loop repeats
-        each block back to back (a straddling block then switches once more
-        per repeat), a loop outside the outermost repeats the whole sweep
-        (one more switch per repeat when the sweep ends in another bank
-        than it starts in).  A loop nested between key loops is counted as
-        an inner repeat.
+        ``walk_of(idx)`` returns ``(switches, first_bank, last_bank)`` for
+        one L1 request nest. Key loops change its addresses; other loops
+        repeat it, unless the controller holds the operand across them.
+        Fold repeats at their actual nesting depth, including loops between
+        two key loops, so both rewinds and inter-block transitions survive.
         """
         blockings, orders = mapping.loop_blockings, mapping.loop_orders
-        nest = [i for i in range(le.NUM) if blockings[i][2] > 1]
-        keys = sorted(
-            (i for i in nest if i in key_loops), key=lambda i: -orders[i][2]
+        nest = sorted(
+            (
+                i
+                for i in range(le.NUM)
+                if blockings[i][2] > 1 and i not in held_loops
+            ),
+            key=lambda i: -orders[i][2],
         )
-        outer = max((orders[i][2] for i in keys), default=-1)
-        m_outer = m_inner = 1
-        for i in nest:
-            if i in key_loops or i in held_loops:
-                continue
-            if orders[i][2] > outer:
-                m_outer *= blockings[i][2]
-            else:
-                m_inner *= blockings[i][2]
 
-        size = self.bank_size
-        total = 0
-        prev = first = None
-        for idx in itertools.product(*(range(blockings[i][2]) for i in keys)):
-            inner, start, end = bank_walk(ranges_of(dict(zip(keys, idx))), size)
-            if first is None:
-                first = start
-            if prev is not None and start != prev:
-                total += 1
-            total += inner + (m_inner - 1) * (inner + (end != start))
-            prev = end
-        if m_outer > 1:
-            total = m_outer * total + (m_outer - 1) * (first != prev)
-        return total
+        def walk(depth, idx):
+            if depth == len(nest):
+                return walk_of(idx)
+            loop = nest[depth]
+            count = blockings[loop][2]
+            if loop not in key_loops:
+                inner, start, end = walk(depth + 1, idx)
+                return count * inner + (count - 1) * (start != end), start, end
+            total = 0
+            first = last = None
+            for index in range(count):
+                idx[loop] = index
+                inner, start, end = walk(depth + 1, idx)
+                total += inner + (last is not None and start != last)
+                if first is None:
+                    first = start
+                last = end
+            return total, first, last
+
+        return walk(0, {})[0]
 
     def _bank_switch_cycles(self, mapping):
         """Cycles one L3 step's input and weight streams lose to bank
         switches, per role (``BANK_SWITCH_CYCLES`` each).
 
-        The ranges are those of the tile buffers the planner allocates on
-        whole banks: the input tile is ``[Y_in, X_in, IC]`` rows (halo
-        included), of which an L2 block walks its own output rows' input
-        rows at one IC block's offset; the weight tile is ``[FY*FX*IC, OC]``
-        rows, of which a block walks one IC block's rows under each tap at
-        its OC block's columns.  The block scales are a few bytes a row and
-        never straddle.  A weight tile held across the spatial loops (no L2
-        reduction, OC outside them) is not refetched by them.
+        Follow the mapping's L1 input order and the weight FY/FX/IC/OC scan.
+        Packing combines adjacent channel groups into a request exactly
+        when the toolchain permits it, matching _request_words. Buffers
+        start on banks; input scales are not included.
+        A weight tile held across spatial loops is not refetched by them.
         """
         if not self.bank_size:
             return {}
         b = mapping.loop_blockings
         orders = mapping.loop_orders
-        ic3, oc3 = self._extent(mapping, le.IC, 2), self._extent(
-            mapping, le.OC, 2
-        )
-        ic1, oc1 = self._extent(mapping, le.IC, 1), self._extent(
-            mapping, le.OC, 1
-        )
+        ic3 = self._extent(mapping, le.IC, 2)
+        oc3 = self._extent(mapping, le.OC, 2)
+        ic1 = self._extent(mapping, le.IC, 1)
+        oc1 = self._extent(mapping, le.OC, 1)
         fy, fx = b[le.FY][1], b[le.FX][1]
         oy1, ox1 = b[le.OY][1], b[le.OX][1]
         hs, ws = self.stride
+        y_in = (oy1 * b[le.OY][2] - 1) * hs + fy
         x_in = (ox1 * b[le.OX][2] - 1) * ws + fx
         pitch_in = ic3 * self.input_dtype_width / 8
-        beat_in = ic1 * self.input_dtype_width / 8
+        ic_dim = mapping.loop_partitionings[le.IC][0]
+        oc_dim = mapping.loop_partitionings[le.OC][0]
 
-        def input_ranges(idx):
+        def packed_width(lanes, bits, count):
+            row_bits = lanes * bits
+            factor = math.lcm(row_bits, self.sram_bandwidth) // row_bits
+            return lanes * (factor if count and count % factor == 0 else 1)
+
+        input_chunk = packed_width(ic_dim, self.input_dtype_width, b[le.IC][1])
+        input_order = sorted((le.IC, le.OY, le.OX), key=lambda i: -orders[i][1])
+
+        def input_walk(idx):
             y0 = idx.get(le.OY, 0) * oy1 * hs
             x0 = idx.get(le.OX, 0) * ox1 * ws
-            first = y0 * x_in + x0
-            last = (y0 + (oy1 - 1) * hs + fy - 1) * x_in + x0
-            last += (ox1 - 1) * ws + fx - 1
-            return [(first * pitch_in, last * pitch_in + beat_in)]
+            # Filter taps expand the spatial fetch; the controller disables
+            # its separate L1 FX/FY/OC loops. Clip the last halo to the tile.
+            sy, sx = (hs if fy == 1 else 1), (ws if fx == 1 else 1)
+            ny = min(
+                oy1 if fy == 1 else oy1 * hs + fy - 1, (y_in - 1 - y0) // sy + 1
+            )
+            nx = min(
+                ox1 if fx == 1 else ox1 * ws + fx - 1, (x_in - 1 - x0) // sx + 1
+            )
+            width = input_chunk * self.input_dtype_width / 8
+            scans = {
+                le.IC: (ic1 // input_chunk, width),
+                le.OY: (ny, sy * x_in * pitch_in),
+                le.OX: (nx, sx * pitch_in),
+            }
+            loops = tuple(scans[i] for i in input_order)
+            offset = (y0 * x_in + x0) * pitch_in
+            offset += idx.get(le.IC, 0) * ic1 * self.input_dtype_width / 8
+            return strided_bank_walk(loops, width, self.bank_size, offset)
 
         pitch_w = oc3 * self.weight_dtype_width / 8
         beat_w = oc1 * self.weight_dtype_width / 8
+        weight_chunk = packed_width(
+            oc_dim,
+            self.weight_dtype_width,
+            0 if self.weight_transposed else b[le.OC][1],
+        )
 
-        def weight_ranges(idx):
+        def weight_walk(idx):
             c0 = idx.get(le.IC, 0) * ic1
             k_off = idx.get(le.OC, 0) * beat_w
-            return [
-                (
-                    (tap * ic3 + c0) * pitch_w + k_off,
-                    (tap * ic3 + c0 + ic1 - 1) * pitch_w + k_off + beat_w,
-                )
-                for tap in range(fy * fx)
-            ]
+            width = weight_chunk * self.weight_dtype_width / 8
+            loops = (
+                (fy * fx, ic3 * pitch_w),
+                (ic1, pitch_w),
+                (oc1 // weight_chunk, width),
+            )
+            return strided_bank_walk(
+                loops, width, self.bank_size, c0 * pitch_w + k_off
+            )
 
         held = ()
         if b[le.IC][2] == 1:
@@ -1098,12 +1115,66 @@ class RuntimeCalculator:
             )
         return {
             "input": BANK_SWITCH_CYCLES
-            * self._stream_switches(mapping, (le.OX, le.OY), input_ranges),
+            * self._stream_switches(mapping, (le.OX, le.OY, le.IC), input_walk),
             "weight": BANK_SWITCH_CYCLES
-            * self._stream_switches(
-                mapping, (le.OC, le.IC), weight_ranges, held
-            ),
+            * self._stream_switches(mapping, (le.OC, le.IC), weight_walk, held),
         }
+
+    def _tail_bank_switch_cycles(self, mapping, tiled):
+        """Fused-operand read latency, charged only on a finishing pass.
+
+        A riding tail uses MatrixOps' filtered L2/L1 output loops. A
+        separate vector pass scans the finished output tile in storage
+        order. Broadcast dimensions have zero address stride. Multi-beat
+        requests overlap part of the bank-switch drain (two beats lose
+        seven cycles, versus eight for one), as in pool_bank_switch_cycles.
+        """
+        if not self.bank_size:
+            return {}
+        b, orders = mapping.loop_blockings, mapping.loop_orders
+        dims_out = (le.ON, le.OY, le.OX, le.OC)
+        oc_dim = mapping.loop_partitionings[le.OC][0]
+        l1_order = sorted(dims_out, key=lambda i: -orders[i][1])
+        result = {}
+        for i, (dims, bits) in enumerate(self.tail_specs):
+            strides = {}
+            pitch = bits / 8
+            for dim in reversed(dims_out):
+                strides[dim] = pitch if dim in dims else 0
+                if dim in dims:
+                    pitch *= self._extent(mapping, dim, 2)
+            lanes = oc_dim if le.OC in dims else 1
+            width = math.ceil(lanes * bits / 8)
+
+            def tile_walk(idx):
+                offset = sum(
+                    idx.get(d, 0) * self._extent(mapping, d, 1) * strides[d]
+                    for d in dims_out
+                )
+                loops = tuple(
+                    (b[d][1], strides[d] * mapping.loop_partitionings[d][0])
+                    for d in l1_order
+                )
+                return strided_bank_walk(loops, width, self.bank_size, offset)
+
+            if tiled:
+                switches = self._stream_switches(
+                    mapping, dims, tile_walk, (le.IC, le.FX, le.FY)
+                )
+            else:
+                loops = tuple(
+                    (
+                        b[d][1] * b[d][2],
+                        strides[d] * mapping.loop_partitionings[d][0],
+                    )
+                    for d in dims_out
+                )
+                switches = strided_bank_walk(loops, width, self.bank_size)[0]
+            beats = math.ceil(width * 8 / self.sram_bandwidth)
+            result[("fused", i)] = switches * max(
+                1, BANK_SWITCH_CYCLES + 1 - beats
+            )
+        return result
 
     def _tail_stall(self, mapping, bank_groups, words, compute, bank):
         """Cycles the array loses to the tail's burst on a bank that feeds
@@ -1357,7 +1428,16 @@ class RuntimeCalculator:
             words.update(self._tail_words(mapping, 1))
         # A stream that changes bank idles its port for a round trip each
         # time; spread the step's switches over its output blocks.
-        for role, cycles in self._bank_switch_cycles(mapping).items():
+        switches = self._bank_switch_cycles(mapping)
+        if num_k == 1 and (
+            not self.single_k_tail_extra_pass or self.tail_keeps_shape
+        ):
+            switches.update(
+                self._tail_bank_switch_cycles(
+                    mapping, tiled=not self.single_k_tail_extra_pass
+                )
+            )
+        for role, cycles in switches.items():
             words[role] += cycles / l2_blocks
         # The matrix unit and the vector unit are pipelined -- one drains a
         # tile while the other computes the next -- so a block costs the
@@ -1440,6 +1520,10 @@ class RuntimeCalculator:
         lane_bytes = max(widths) / 8 * oc_dim
         lanes = output_size * math.ceil(lane_bytes / self.dram_bandwidth)
         words = self._tail_words(mapping, 2)
+        for role, cycles in self._tail_bank_switch_cycles(
+            mapping, tiled=False
+        ).items():
+            words[role] += cycles
         if blockings[le.IC][3] > 1 or (
             self.single_k_tail_extra_pass and not self.tail_keeps_shape
         ):

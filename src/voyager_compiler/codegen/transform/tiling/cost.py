@@ -327,6 +327,47 @@ def bank_walk(ranges, bank_size):
     return switches, first, last
 
 
+@functools.lru_cache(maxsize=16384)
+def strided_bank_walk(loops, width, bank_size, offset=0):
+    """Bank walk of an affine request nest, without expanding every fetch.
+
+    ``loops`` contains ``(count, byte_stride)`` pairs, outermost first;
+    each leaf fetches ``width`` bytes. Preserve rewinds, broadcasts and
+    strides that skip banks. A monotone nest can collapse to one range
+    only when consecutive requests cannot skip an entire bank. Cache the
+    summaries because tiling candidates repeatedly use the same geometry.
+    """
+    span = width
+    monotone = True
+    for count, stride in reversed(loops):
+        if count > 1:
+            monotone &= span <= stride < span + bank_size
+            span += (count - 1) * stride
+    first = int(offset // bank_size)
+    last = int((offset + span - 1) // bank_size)
+    if first == last or monotone:
+        return last - first, first, last
+
+    count, stride = loops[0]
+    if stride == 0:
+        switches, first, last = strided_bank_walk(
+            loops[1:], width, bank_size, offset
+        )
+        return count * switches + (count - 1) * (first != last), first, last
+
+    switches = 0
+    first = last = None
+    for i in range(count):
+        inner, start, end = strided_bank_walk(
+            loops[1:], width, bank_size, offset + i * stride
+        )
+        switches += inner + (last is not None and last != start)
+        if first is None:
+            first = start
+        last = end
+    return switches, first, last
+
+
 def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
     """Cycles a matrix-vector tile loses to scratchpad bank switches,
     ``BANK_SWITCH_CYCLES`` each.  The unit walks one ``chunk``-element piece
