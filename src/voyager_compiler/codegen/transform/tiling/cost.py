@@ -14,6 +14,8 @@ runs the other way -- ``reporting/cost.op_utilization`` imports
 copy of that formula (and of ``OP_PASSES``).
 """
 
+import functools
+import itertools
 import math
 from typing import Optional
 
@@ -22,6 +24,7 @@ from torch.fx import Node
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
+    _pair,
     bound_operands,
     dtype_byte_size,
     get_anchor_node,
@@ -29,8 +32,14 @@ from voyager_compiler.codegen.node_info import (
     get_node_to_key_map,
     is_fully_connected,
     is_gemm_op,
+    is_pooling,
     require_allocation,
     weight_transforms,
+)
+from voyager_compiler.ops.layout import (
+    NCHW_TO_NHWC,
+    NHWC_OP_VARIANTS,
+    unproject,
 )
 
 le = interstellar.le
@@ -152,6 +161,120 @@ def _output_writes(node, lanes: int, beat: int) -> float:
     return _record_writes(lanes * widths[data], beat) + len(widths) - 1
 
 
+def pool_taps(anchor) -> int:
+    """Input lane groups a pool fetches per output group: its window's taps
+    (test/toolchain/Pooling.h runs the fetch reduce_count = kH * kW times per
+    output).  An adaptive pool's window is its input over its output."""
+    if "adaptive" in str(anchor.target):
+        return math.prod(anchor.args[0].shape) // math.prod(anchor.shape)
+    kernel = get_arg_value(anchor, 1, "kernel_size")
+    kh, kw = (kernel, kernel) if isinstance(kernel, int) else kernel
+    return kh * kw
+
+
+def _pool_window(anchor, in_hw, out_hw):
+    """``(kernel, stride, dilation)`` pairs of a pool whose input and output
+    span ``in_hw`` and ``out_hw``.  An adaptive pool's window and stride are
+    its input extent over its output's."""
+    if "adaptive" in str(anchor.target):
+        kernel = (in_hw[0] // out_hw[0], in_hw[1] // out_hw[1])
+        return kernel, kernel, (1, 1)
+    kernel = _pair(get_arg_value(anchor, 1, "kernel_size"))
+    stride = get_arg_value(anchor, 2, "stride", [])
+    stride = _pair(stride) if stride else kernel
+    dilation = (1, 1)
+    if "max_pool" in str(anchor.target):
+        dilation = _pair(get_arg_value(anchor, 4, "dilation", 1))
+    return kernel, stride, dilation
+
+
+def _element_strides(shape):
+    """Element strides of a contiguous tensor of ``shape``, per dimension."""
+    strides = []
+    for dim in range(len(shape)):
+        strides.append(math.prod(shape[dim + 1 :]))
+    return tuple(strides)
+
+
+def _pool_fetch_ranges(tile, strides, out_hw, window, chunk, bits):
+    """Byte ranges a pool tile's fetches read, in the order the vector unit
+    issues them: output position, then channel chunk, then the window row by
+    row (``get_pool2d_tiling`` in test/common/Tiling.cc).  ``tile`` and
+    ``strides`` are per logical ``(N, C, H, W)`` axis, the strides in
+    elements of the tile's own layout.  A chunk is one read where channels
+    are innermost (NHWC, the layout the hardware runs); in any other layout
+    its channels are read one by one."""
+    batch, channels, _, _ = tile
+    s_n, s_c, s_h, s_w = strides
+    h_out, w_out = out_hw
+    (kh, kw), (sh, sw), (dh, dw) = window
+    for n, oy, ox, c0, ky, kx in itertools.product(
+        range(batch),
+        range(h_out),
+        range(w_out),
+        range(0, channels, chunk),
+        range(kh),
+        range(kw),
+    ):
+        y = oy * sh + ky * dh
+        x = ox * sw + kx * dw
+        first = n * s_n + c0 * s_c + y * s_h + x * s_w
+        width = min(chunk, channels - c0)
+        if s_c == 1:
+            reads = [(first, width)]
+        else:
+            reads = [(first + c * s_c, 1) for c in range(width)]
+        for element, count in reads:
+            lo = element * bits // 8
+            yield lo, lo + math.ceil(count * bits / 8)
+
+
+@functools.lru_cache(maxsize=None)
+def _pool_bank_switches(tile, strides, out_hw, window, chunk, bits, bank_size):
+    """Bank switches of ``_pool_fetch_ranges``, cached: the tiling search
+    and the report price the same tile geometries again and again."""
+    ranges = _pool_fetch_ranges(tile, strides, out_hw, window, chunk, bits)
+    switches, _, _ = bank_walk(ranges, bank_size)
+    return switches
+
+
+def pool_bank_switch_cycles(node, anchor, in_tile, config):
+    """Cycles a pool tile loses to scratchpad bank switches.  The vector unit
+    fetches ``config.accumulator_lanes`` channels at a time and walks a
+    chunk's whole window before the next chunk (``_pool_fetch_ranges``), so a
+    window that straddles a bank boundary switches banks twice per chunk.
+    ``in_tile`` is the input tile in the op's layout -- NHWC for the layout
+    twin, NCHW for the aten op -- and starts on a bank, where the planner
+    puts it.  A switch costs the ``BANK_SWITCH_CYCLES`` round trip less the
+    fetch's beats after its first, which the drain overlaps: 7 on Sphinx, as
+    measured.  0 without banking."""
+    if not config.bank_size:
+        return 0
+    nhwc = anchor.target in NHWC_OP_VARIANTS.values()
+    dims = NCHW_TO_NHWC if nhwc else None
+    tile = unproject(tuple(in_tile), dims)
+    strides = unproject(_element_strides(in_tile), dims)
+    out_hw = unproject(tuple(anchor.shape), dims)[2:]
+    kernel, stride, dilation = _pool_window(anchor, tile[2:], out_hw)
+    h_out = (tile[2] - dilation[0] * (kernel[0] - 1) - 1) // stride[0] + 1
+    w_out = (tile[3] - dilation[1] * (kernel[1] - 1) - 1) // stride[1] + 1
+    bits = _input_bits(node, anchor)
+    chunk = config.accumulator_lanes
+    switches = _pool_bank_switches(
+        tile,
+        strides,
+        (h_out, w_out),
+        (kernel, stride, dilation),
+        chunk,
+        bits,
+        config.bank_size,
+    )
+    beat = max(1, round(config.bytes_per_cycle))
+    fetch_beats = math.ceil(chunk * bits / 8 / beat)
+    per_switch = max(1, BANK_SWITCH_CYCLES + 1 - fetch_beats)
+    return per_switch * switches
+
+
 def gemv_weight_bits(node, anchor) -> int:
     """Element width of the buffer a fully-connected GEMM streams its weight
     from (``weight_transforms``): a packed cache reaches the bank packed,
@@ -227,7 +350,7 @@ def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
     return BANK_SWITCH_CYCLES * switches
 
 
-def vector_op_utilization(node, config, ideal_cycles=None, gemv_tile=None):
+def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
     """Fraction of peak a vector ``node`` sustains, bound by the bus.
 
     Peak is one ``config.vector_lanes``-wide lane group per cycle.  Each
@@ -240,27 +363,42 @@ def vector_op_utilization(node, config, ideal_cycles=None, gemv_tile=None):
     fully-connected GEMM streams its weight once per output through the
     unit ``gemv_lanes`` names, a lane group being that unit's width, and is
     sized by the buffer the kernel loads (``weight_transforms``), not by
-    what a fused prologue decodes it into; ``gemv_tile`` -- its ``(rows,
-    reduction)`` weight tile -- prices the scratchpad bank switches of that
-    stream (``gemv_bank_switch_cycles``).  Given ``ideal_cycles``, the per-pass
-    ``KERNEL_LAUNCH_OVERHEAD`` and the switches are folded in so
-    ``ideal_cycles / result`` is the tile's whole cost.  The single copy of
-    the formula: ``reporting/cost.op_utilization`` calls it for its vector
-    branch.
+    what a fused prologue decodes it into.  A pool fetches one lane group
+    per window tap, the taps being its callers' work, and its output leaves
+    on a port of its own behind the fetch.  ``tile`` is the tile being
+    priced, which ``node`` cannot name while a tiling is still being
+    searched, and prices the scratchpad bank switches of the op's stream: a
+    fully-connected GEMM's ``(rows, reduction)`` weight tile
+    (``gemv_bank_switch_cycles``), a pool's input tile
+    (``pool_bank_switch_cycles``); other ops ignore it.  Given
+    ``ideal_cycles``, the per-pass ``KERNEL_LAUNCH_OVERHEAD`` and the
+    switches are folded in so ``ideal_cycles / result`` is the tile's whole
+    cost.  The single copy of the formula:
+    ``reporting/cost.op_utilization`` calls it for its vector branch.
     """
     anchor = get_anchor_node(node) or node
     lanes = config.vector_lanes
     bytes_per_cycle = config.bytes_per_cycle
     beat = max(1, round(bytes_per_cycle))
     switch_cycles = 0
+    cycles_per_group = 0.0
     if is_fully_connected(anchor):
         lanes = gemv_lanes(anchor, config)
         reads = {IN: gemv_weight_bits(node, anchor)}
         profile = [(IN, None)]
-        rows, reduction = gemv_tile
+        rows, reduction = tile
         switch_cycles = gemv_bank_switch_cycles(
             rows, reduction, reads[IN], lanes, config
         )
+    elif is_pooling(anchor):
+        # One lane group fetched per window tap (test/toolchain/Pooling.h);
+        # the output is written on another port while the fetch runs.
+        profile = []
+        cycles_per_group = math.ceil(
+            lanes * _input_bits(node, anchor) / 8 / bytes_per_cycle
+        )
+        if tile is not None:
+            switch_cycles = pool_bank_switch_cycles(node, anchor, tile, config)
     elif anchor.target in OP_PASSES:
         profile = OP_PASSES[anchor.target]
         reads = {IN: _input_bits(node, anchor), MID: _node_dtype_bits(anchor)}
@@ -272,7 +410,6 @@ def vector_op_utilization(node, config, ideal_cycles=None, gemv_tile=None):
         ]
         reads = {IN: max(widths, default=16)}
         profile = [(IN, OUT)]
-    cycles_per_group = 0.0
     for read, write in profile:
         read_cycles = math.ceil(lanes * reads[read] / 8 / bytes_per_cycle)
         if write is None:
@@ -285,7 +422,7 @@ def vector_op_utilization(node, config, ideal_cycles=None, gemv_tile=None):
     util = min(1.0, 1.0 / cycles_per_group)
     if not ideal_cycles:
         return util
-    overhead = len(profile) * KERNEL_LAUNCH_OVERHEAD + switch_cycles
+    overhead = max(1, len(profile)) * KERNEL_LAUNCH_OVERHEAD + switch_cycles
     return ideal_cycles / (ideal_cycles / util + overhead)
 
 
@@ -351,11 +488,20 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
         (_tile_elems(s) for n, s in tiled_shapes.items() if n is not node),
         default=0,
     )
-    tile_ops = max(_tile_elems(out_shape), in_elems)
+    anchor = get_anchor_node(node) or node
+    tile = None
+    if is_pooling(anchor):
+        tile_ops = _tile_elems(out_shape) * pool_taps(anchor)
+        # The halo the kernel loads, keyed the way ``_pool_shapes`` keys it.
+        bound = bound_operands(node, node.meta.get("submodule"))
+        halo = bound.get(anchor.args[0], anchor.args[0])
+        tile = tiled_shapes.get(halo)
+    else:
+        tile_ops = max(_tile_elems(out_shape), in_elems)
     lanes = config.vector_lanes
     bpc = config.bytes_per_cycle
     ideal = math.ceil(tile_ops / lanes)
-    util = vector_op_utilization(node, config, ideal)
+    util = vector_op_utilization(node, config, ideal, tile)
     compute = math.ceil(ideal / util)
 
     lat = config.access_latency_cycles

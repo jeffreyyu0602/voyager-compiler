@@ -55,6 +55,7 @@ class AcceleratorConfig:
     pe_array_size: Tuple[int, int] = DEFAULT_PE_ARRAY_SIZE
     vector_unit_width: Optional[int] = None  # None -> pe_array_size[1]
     matrix_vector_unit_width: Optional[int] = None  # None -> pe_array_size[1]
+    accumulator_width: Optional[int] = None  # None -> vector_lanes
     frequency: float = DEFAULT_FREQUENCY_GHZ  # accelerator clock
     # L1 systolic buffers (# elements)
     input_buffer_size: Optional[int] = DEFAULT_INPUT_BUFFER_SIZE
@@ -119,6 +120,14 @@ class AcceleratorConfig:
         return self.pe_array_size[1]
 
     @property
+    def accumulator_lanes(self) -> int:
+        """Channels one vector-unit fetch of a pool covers (the accelerator's
+        ACCUMULATOR_WIDTH): its own width, else the vector unit's lanes."""
+        if self.accumulator_width is not None:
+            return self.accumulator_width
+        return self.vector_lanes
+
+    @property
     def dram_energy_per_byte(self) -> float:
         """DRAM access energy in joules per byte, from the pJ/bit figure."""
         return self.dram_energy_per_bit * 8 * 1e-12
@@ -168,6 +177,7 @@ class AcceleratorConfig:
             pe_array_size=args.pe_array_size,
             vector_unit_width=args.vector_unit_width,
             matrix_vector_unit_width=args.matrix_vector_unit_width,
+            accumulator_width=args.accumulator_width,
             frequency=args.frequency,
             input_buffer_size=args.input_buffer_size,
             weight_buffer_size=args.weight_buffer_size,

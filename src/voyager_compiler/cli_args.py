@@ -403,6 +403,13 @@ def add_compile_args(parser=None):
         default=None,
         help="Matrix-vector unit width in elements; defaults to the PE array columns.",
     )
+    parser.add_argument(
+        "--accumulator_width",
+        type=int,
+        default=None,
+        help="Channels the vector unit fetches per pooling request "
+        "(ACCUMULATOR_WIDTH); defaults to the vector unit lane count.",
+    )
 
     # -- tiling / lowering --------------------------------------------------
     parser.add_argument(

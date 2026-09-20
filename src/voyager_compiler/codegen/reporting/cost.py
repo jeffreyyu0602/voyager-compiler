@@ -21,10 +21,12 @@ from voyager_compiler.codegen.node_info import (
     is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
+    is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_lanes,
+    pool_taps,
     vector_op_utilization,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
@@ -115,9 +117,10 @@ def op_utilization(
     with the vector L2-tiling cost model) charges it, at
     ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
     case, which it sizes by the streamed weight and its bank switches over
-    the anchor's shape, the tile once bufferized.  ``ideal_cycles`` is one
-    tile's, so it also folds in the per-launch overhead the tiling model
-    charges, and the two cannot disagree on what a tile costs.
+    the anchor's shape, the tile once bufferized, and a pool, whose fetch it
+    walks for bank switches over the anchor's input tile.  ``ideal_cycles``
+    is one tile's, so it also folds in the per-launch overhead the tiling
+    model charges, and the two cannot disagree on what a tile costs.
     """
     tiling = node.meta.get("interstellar_tiling")
     if "mma" in units and tiling is not None and ideal_cycles > 0:
@@ -126,10 +129,12 @@ def op_utilization(
         )
         return min(1.0, ideal_cycles / per_tile)
     anchor = get_anchor_node(node) or node
-    gemv_tile = None
+    tile = None
     if is_fully_connected(anchor):
-        gemv_tile = (_shape(anchor)[-1], _shape(anchor.args[0])[-1])
-    return vector_op_utilization(node, cost, ideal_cycles, gemv_tile)
+        tile = (_shape(anchor)[-1], _shape(anchor.args[0])[-1])
+    elif is_pooling(anchor):
+        tile = _shape(anchor.args[0])
+    return vector_op_utilization(node, cost, ideal_cycles, tile)
 
 
 # --------------------------------------------------------------------------
@@ -218,6 +223,9 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     in_nodes = anchor.all_input_nodes
     in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
+    if is_pooling(anchor):
+        # A pool's work is one fetched lane group per window tap and output.
+        ops = math.prod(out) * pool_taps(anchor)
     ideal = math.ceil(ops / vec_lanes)
     return OpInfo(
         node.name,
