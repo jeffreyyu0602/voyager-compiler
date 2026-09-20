@@ -45,8 +45,11 @@ data, K's transposed by the DMA like K.  Both products are ``matmul_mx``.
 one more vector pass quantizes them along the keys with the query's
 parameters into P's codes (``p_buf``) and block scales (``p_scale``).
 
-``is_causal`` (no mask tensor): [A] still masks with a bool tile, read from
-``causal_mask``, a constant table of every tile a live pair can need.  A
+``is_causal`` (no mask tensor): [A] adds a mask tile read from
+``causal_mask``, a constant table of every tile a live pair can need --
+under ``bool_mask`` int1 codes (0 keeps, -1 drops) that a per-tensor scale
+dequantizes to the fill in the same pass, as the eager path's quantized
+mask is added, else the fill itself at the accumulation dtype.  A
 pair's tile depends only on how far its Q tile's first row sits past its KV
 block's first key, ``(q·tq) mod sq - kv·tkv``, a multiple of ``gcd(tq,
 tkv)``; the table holds one tile per multiple from ``gcd - tq`` up to ``sq -
@@ -180,9 +183,9 @@ class _FA3Pipeline(torch.nn.Module):
         head_pad,
         scale,
         has_mask,
-        mask_is_bool,
         mask_dyn,
         is_causal,
+        bool_mask,
         out_shape,
         out_dtype,
         acc_dtype,
@@ -228,7 +231,6 @@ class _FA3Pipeline(torch.nn.Module):
         self.d_pad = head_pad
         self.scale = scale
         self.has_mask = has_mask
-        self.mask_is_bool = mask_is_bool
         # Mask: list of (dram_dim, grid_dim) pairs for its dynamic dims
         # (broadcast batch dims are pinned static-0 and never appear).
         self.mask_dyn = mask_dyn
@@ -244,11 +246,23 @@ class _FA3Pipeline(torch.nn.Module):
         # mask tiles come from ``causal_mask``.
         self.causal = is_causal
         self.sweeps = math.prod(self.grid[:-1])
+        # The causal table's tiles are added to the scores (module
+        # docstring): int1 codes with the fill as their scale, or the fill.
+        self.mask_scaled = is_causal and bool_mask
         if is_causal:
             self.causal_gcd = math.gcd(tq, tkv)
-            self.register_buffer(
-                "causal_mask", _causal_mask_table(tq, tkv, sq_orig)
-            )
+            keep = _causal_mask_table(tq, tkv, sq_orig)
+            if bool_mask:
+                codes = torch.where(keep, 0.0, -1.0).to(acc_dtype)
+                self.register_buffer("causal_mask", codes)
+                self.register_buffer(
+                    "mask_scale", torch.tensor(-_MASK_FILL, dtype=acc_dtype)
+                )
+            else:
+                self.register_buffer(
+                    "causal_mask",
+                    torch.where(keep, 0.0, _MASK_FILL).to(acc_dtype),
+                )
         self.num_steps = math.prod(self.grid[: self.gq]) * sum(
             self._kv_last(q) + 1 for q in range(self.grid[self.gq])
         )
@@ -403,23 +417,24 @@ class _FA3Pipeline(torch.nn.Module):
     def _matmul_qk(self, operands, s_slot, sem_scores, deps):
         """[A]: commit S = (Q @ Kᵀ)·scale (+ mask) -> s_slot.  ``operands``
         are the product's tiles (``_matmul``), then the mask tile when
-        there is one; ``deps`` the load semaphores it waits on.  It posts
-        ``sem_scores`` when the matmul retires.  The body branches on
-        ``has_mask`` at build time, so the traced subgraph carries no
-        runtime cond."""
+        there is one and, for int1 codes, its scale, which a dequantize in
+        the same pass turns into the additive fill; ``deps`` the load
+        semaphores it waits on.  It posts ``sem_scores`` when the matmul
+        retires.  The body branches on ``has_mask`` at build time, so the
+        traced subgraph carries no runtime cond."""
         scale, has_mask = self.scale, self.has_mask
-        mask_is_bool, matmul = self.mask_is_bool, self._matmul
+        mask_scaled, matmul = self.mask_scaled, self._matmul
 
         def body(*args):
             *tiles, s = args
-            if has_mask:
+            if mask_scaled:
+                *tiles, mask, mask_scale = tiles
+                mask = torch.ops.quantized_ops.dequantize(mask, mask_scale)
+            elif has_mask:
                 *tiles, mask = tiles
             out = matmul(*tiles) * scale
             if has_mask:
-                if mask_is_bool:
-                    out = torch.where(mask, out, _MASK_FILL)
-                else:
-                    out = out + mask
+                out = out + mask
             voyager.insert(out, s)
 
         commit(body, [*operands, s_slot], dependencies=deps, post=sem_scores)
@@ -833,6 +848,8 @@ class _FA3Pipeline(torch.nn.Module):
             if self.has_mask:
                 tiles.append(get_slot(m_slots, k_slot))
                 deps.append(get_slot(m_sem, k_slot))
+            if self.mask_scaled:
+                tiles.append(self.mask_scale)
             return tiles, deps
 
         def pv_operands(p_slot, v_slot):
@@ -1151,6 +1168,7 @@ def build_attention_fa3(
     *,
     accumulate_fp32: bool = False,
     tiler=None,
+    bool_mask: bool = True,
 ):
     """FA3-style pipeline builder for an
     ``aten.scaled_dot_product_attention`` node, or its ``sdpa_mx`` twin
@@ -1170,6 +1188,9 @@ def build_attention_fa3(
     ``tiler.config``, which also sets the head the tiles are padded to
     (``attention_head_pad``); a node tiled by a padding tiler is built
     with that tiler, so the kernel's products match the ones it mapped.
+    The kernel adds its mask: an explicit ``attn_mask`` must be additive,
+    and under ``is_causal`` the kernel's own table is int1 codes plus a
+    scale (``bool_mask``) or the additive fill at the accumulation dtype.
     """
     if node.op != "call_function" or node.target not in _ATTENTION_OPS:
         return None
@@ -1233,6 +1254,7 @@ def build_attention_fa3(
             sq_eff=plan.sq_eff,
             kv_batch=kbatch,
             acc_dtype=acc_dtype,
+            bool_mask=bool_mask,
         )
     num_q_blocks, num_kv_blocks = tiling
     tq, tkv = plan.sq_eff // num_q_blocks, Skv // num_kv_blocks
@@ -1247,11 +1269,14 @@ def build_attention_fa3(
     # Mask [*mbatch, Sq, Skv]: dynamic dims are the >1-block batch dims (a
     # size-1 batch dim broadcasts, pinned to block 0) plus the q / kv dims when
     # tiled.  Under the fold the mask's batch dims are the folded ones.
-    mask_is_bool = False
     mask_dyn = []
     if isinstance(mask_node, torch.fx.Node):
         mask = mask_node.value
-        mask_is_bool = mask.dtype == torch.bool
+        if mask.dtype == torch.bool:
+            raise ValueError(
+                f"{node.name}: a bool attn_mask is not lowered; the kernel "
+                "adds its mask, so pass an additive one"
+            )
         mb = tuple(mask.shape[:-2])
         if g_head > 1:
             mb = plan.mask_fold_shape[:-2]
@@ -1276,9 +1301,9 @@ def build_attention_fa3(
         head_pad=head_pad,
         scale=float(scale),
         has_mask=mask_node is not None or is_causal,
-        mask_is_bool=mask_is_bool or is_causal,
         mask_dyn=mask_dyn,
         is_causal=is_causal,
+        bool_mask=bool_mask,
         g_head=g_head,
         sq_orig=Sq,
         q_fold_shape=plan.q_fold_shape,
@@ -1314,6 +1339,12 @@ def build_attention_fa3(
                 q_node.meta.get("dtype"),
             ),
         )
+    if is_causal and bool_mask:
+        # The table's int1 codes ride a float buffer; its tiles are sized
+        # and emitted as int1 (the bufferizer carries the dtype to the slot).
+        for n in gm.graph.nodes:
+            if n.op == "get_attr" and str(n.target).endswith("causal_mask"):
+                n.meta["dtype"] = "int1"
     products = node.meta.get("product_tilings")
     if products is not None:
         mx = block_size is not None

@@ -859,6 +859,7 @@ def bufferize_graph(
     tiler=None,
     single_buffer_tail: bool = False,
     flash_attention_v3: bool = True,
+    bool_mask: bool = True,
 ) -> GraphModule:
     """Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
 
@@ -876,6 +877,9 @@ def bufferize_graph(
         flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
+        bool_mask: Store an ``is_causal`` attention's mask table as int1 codes
+          plus a scale, the way the eager path quantizes its mask; off => the
+          additive fill at the accumulation dtype.
     """
     graph = model.graph
     num_slots = 2 if pipelined else 1
@@ -951,7 +955,7 @@ def bufferize_graph(
                 sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
             elif anchor.target in (_SDPA, _SDPA_MX):
                 sub_gm = (
-                    build_attention_fa3(node, tiler=tiler)
+                    build_attention_fa3(node, tiler=tiler, bool_mask=bool_mask)
                     if flash_attention_v3
                     else build_attention(
                         node, num_slots=num_slots, tiler=tiler

@@ -123,6 +123,10 @@ def replace_node_with_graph_module(
                     value_remap[n] = create_getattr_from_value(
                         model, graph, n.target, attr, n.meta.get("producer")
                     )
+                    if "dtype" in n.meta:
+                        # The same tensor keeps its logical dtype (a
+                        # kernel's int1 mask table).
+                        value_remap[n].meta["dtype"] = n.meta["dtype"]
             elif n.op == "call_module":
                 # A fused compute submodule (the attention builders run
                 # _fuse_passes, leaving top-level fused call_modules): register

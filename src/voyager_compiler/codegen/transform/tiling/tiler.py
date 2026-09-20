@@ -2544,7 +2544,9 @@ def _product_cycles(node, tiler):
     return cycles, tiling
 
 
-def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
+def attention_op_tiling(
+    node, tiler, *, sq_eff, kv_batch, acc_dtype, bool_mask=True
+):
     """Block counts for a flash-attention node, ``(num_q_blocks,
     num_kv_blocks)``.
 
@@ -2602,7 +2604,10 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
             if block_size is not None and tkv % block_size:
                 continue
             tiles = _attention_tiles(node, tq, tkv)
-            if _attention_sram_bytes(node, tiles, acc_dtype, config) > budget:
+            if (
+                _attention_sram_bytes(node, tiles, acc_dtype, config, bool_mask)
+                > budget
+            ):
                 continue
             candidates.append((tq, tkv, tiles))
     if not candidates:
@@ -2646,6 +2651,7 @@ def attention_op_tiling(node, tiler, *, sq_eff, kv_batch, acc_dtype):
             tuple(kv_batch) + blocks,
             config,
             {name: cycles for name, (cycles, _) in priced.items()},
+            bool_mask,
         )
         scored.append(
             (latency, traffic, blocks, {k: v[1] for k, v in priced.items()})

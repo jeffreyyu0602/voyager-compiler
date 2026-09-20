@@ -905,7 +905,7 @@ def attention_head_pad(head_dim, config):
     return math.ceil(head_dim / unit) * unit
 
 
-def _attention_sram_bytes(node, tiles, acc_dtype, config):
+def _attention_sram_bytes(node, tiles, acc_dtype, config, bool_mask):
     """Bytes the FA3 kernel's SRAM allocations take under ``tiles``.
 
     Mirrors the allocations ``_FA3Pipeline.forward`` makes: two slots of
@@ -926,6 +926,8 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
             (``_attention_tiles``).
         acc_dtype: The accumulation dtype of the softmax state.
         config (AcceleratorConfig): The hardware description.
+        bool_mask: Whether the causal table's tiles are int1 codes rather
+            than the additive fill at ``acc_dtype``.
     """
     query, key, value = node.args[0], node.args[1], node.args[2]
     tq, head_dim = tiles[query]
@@ -976,7 +978,10 @@ def _attention_sram_bytes(node, tiles, acc_dtype, config):
     if get_arg_value(node, 5, "is_causal", False):
         # The causal mask tiles stream through two slots like a mask's.
         total += 2 * tensor_alloc_bytes(
-            tq * tkv, torch.bool, config.bank_width, config.vector_lanes
+            tq * tkv,
+            torch.bool if bool_mask else acc_dtype,
+            config.bank_width,
+            config.vector_lanes,
         )
     if residual is not None:
         length = tiles[residual][1]

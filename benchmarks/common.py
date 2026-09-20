@@ -209,10 +209,10 @@ class SweepConfig:
     ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
     dequant / activation / requantize tail becomes separate kernels and the
     GQA KV repeat is materialised in memory instead of folding into the
-    block index.  ``quantize_attention_mask`` stores eager prefill's causal
-    mask as int1, the way ``test_codegen --quantize_attention_mask`` does;
-    sdpa prefill runs ``is_causal`` with no mask tensor, and decode rebuilds
-    its mask every step and keeps bf16.
+    block index.  ``bool_mask`` stores prefill's causal mask as int1, the
+    way ``test_codegen --quantize_attention_mask`` does: eager's mask
+    tensor, or under sdpa the flash-attention kernel's own causal table;
+    decode rebuilds its mask every step and keeps bf16.
 
     ``calibration`` names a filled-in RTL calibration form (see
     ``write_calibration_form``) whose measured kernel cycles price the
@@ -242,7 +242,7 @@ class SweepConfig:
     attn_implementation: str = "eager"
     pipelined: bool = True
     fuse_operators: bool = True
-    quantize_attention_mask: bool = True
+    bool_mask: bool = True
     single_buffer_tail: bool = False
     num_layers_override: Optional[int] = None
 
@@ -790,7 +790,7 @@ def _frontend(cfg: SweepConfig):
     # not applicable there.  sdpa prefill has no mask tensor to annotate.
     if is_decode:
         _annotate_kv_cache(gm, cfg)
-    elif cfg.quantize_attention_mask and cfg.attn_implementation != "sdpa":
+    elif cfg.bool_mask and cfg.attn_implementation != "sdpa":
         _annotate_attention_mask(gm)
 
     quantizer = build_quantizer(cfg)
@@ -850,6 +850,7 @@ def _compile(cfg: SweepConfig):
         pipelined=cfg.pipelined,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
+        bool_mask=cfg.bool_mask,
     )
     plan = plan_memory(gm, cfg.acc_config)
     if cfg.dump_dir is not None:
@@ -1183,6 +1184,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         pipelined=cfg.pipelined,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
+        bool_mask=cfg.bool_mask,
     )
     plan = plan_memory(sub, acc_config)
     r = estimate_schedule(sub, acc_config, full_walk=cfg.full_walk)

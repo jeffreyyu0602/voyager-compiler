@@ -726,7 +726,7 @@ def attention_kv_last(q_block, tq, tkv, sq):
     return ((q_block * tq) % sq + tq - 1) // tkv
 
 
-def attention_tile_latency(node, tiles, grid, config, matrix):
+def attention_tile_latency(node, tiles, grid, config, matrix, bool_mask):
     """Latency and DRAM traffic of a flash-attention node under a tiling.
 
     Prices the FA3 schedule (``bufferize/attention_v3.py``) a step at a
@@ -747,7 +747,8 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
     compute the way ``_sweep_cycles`` prices a double-buffered sweep.
     Under ``is_causal`` only the live pairs are steps
     (``attention_kv_last``) and the mask tiles stream from the kernel's
-    table, one per step.  A split cache's residual
+    table, one per step, as int1 codes under ``bool_mask`` and else at the
+    scores' width.  A split cache's residual
     (``bufferize/attention_v3.py``) runs serially at each boundary -- its
     two products around a softmax over its R positions, then the rescale
     of the output -- and its operands move once per boundary.
@@ -761,6 +762,7 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
             ``_attention_products`` names them: ``scores`` and ``context``
             for one step's two, plus ``residual_scores`` and
             ``residual_context`` under a residual.
+        bool_mask: Whether the causal table's tiles are int1 codes.
 
     Returns:
         ``(cycles, DRAM bytes)``; the bytes break a latency tie.
@@ -839,7 +841,8 @@ def attention_tile_latency(node, tiles, grid, config, matrix):
         dmas.append((_transfer_cost(shape, operand_bytes, lat, bpc), transfers))
         traffic += transfers * operand_bytes
     if causal:
-        mask_bytes = math.ceil(tq * tkv / 8)
+        mask_bits = 1 if bool_mask else _node_dtype_bits(node)
+        mask_bytes = math.ceil(tq * tkv * mask_bits / 8)
         dmas.append((_transfer_cost((tq, tkv), mask_bytes, lat, bpc), steps))
         traffic += steps * mask_bytes
 
