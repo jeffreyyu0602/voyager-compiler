@@ -14,6 +14,11 @@ each element becomes its own window.  A select on an extent-1 dim and a
 whole-extent slice are already nops (``is_nop``); a non-contiguous one
 stays an op.
 
+``aten.split_with_sizes`` / ``aten.chunk`` (read side): each piece is a
+window of its size at the running offset along the split dim.  A subview
+windows every dim, so the pieces need no extent-1 dims ahead of the split
+one.
+
 ``aten.cat`` / ``aten.stack`` (write side): when every dim before the join
 dim has extent 1, each source occupies one contiguous window of the
 result -- ``stack`` joining along a dim its sources do not carry, so its
@@ -43,6 +48,10 @@ _INSERT = torch.ops.voyager.insert.default
 _RESHAPE = torch.ops.aten.reshape.default
 _SELECT = torch.ops.aten.select.int
 _SLICE = torch.ops.aten.slice.Tensor
+_SPLITS = (
+    torch.ops.aten.split_with_sizes.default,
+    torch.ops.aten.chunk.default,
+)
 _STACK = torch.ops.aten.stack.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _UNBIND = torch.ops.aten.unbind.int
@@ -50,9 +59,10 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 
 
 def lower_views(model: GraphModule) -> GraphModule:
-    """Rewrite foldable ``select`` / ``slice`` / ``cat`` / ``stack`` nodes
-    into subview windows.  A window carries the logical (quantized) dtype of
-    the buffer it views, so its bytes are sized like the buffer's."""
+    """Rewrite foldable ``select`` / ``slice`` / ``unbind`` / ``split`` /
+    ``cat`` / ``stack`` nodes into subview windows.  A window carries the
+    logical (quantized) dtype of the buffer it views, so its bytes are sized
+    like the buffer's."""
     for node in list(model.graph.nodes):
         if node.op != "call_function":
             continue
@@ -62,6 +72,8 @@ def lower_views(model: GraphModule) -> GraphModule:
             _fold_slice(model, node)
         elif node.target is _UNBIND:
             _fold_unbind(model, node)
+        elif node.target in _SPLITS:
+            _fold_split(model, node)
         elif node.target in (_CAT, _STACK):
             _fold_join(model, node)
     model.graph.lint()
@@ -138,6 +150,44 @@ def _fold_unbind(model: GraphModule, node: Node) -> None:
                 _SUBVIEW,
                 (source, offsets, sizes, [1] * len(shape)),
                 {"squeeze_dim": [dim]},
+            )
+        set_node_value(subview, user.value)
+        subview.meta["dtype"] = source.meta.get("dtype")
+        user.replace_all_uses_with(subview)
+        graph.erase_node(user)
+    graph.erase_node(node)
+
+
+def _fold_split(model: GraphModule, node: Node) -> None:
+    source = node.args[0]
+    dim = get_arg_value(node, 2, "dim", 0)
+    value = getattr(source, "value", None)
+    if not isinstance(value, torch.Tensor):
+        return
+    shape = list(value.shape)
+    dim = dim + len(shape) if dim < 0 else dim
+    # The pieces' own extents, so one rule serves explicit sizes and chunks.
+    split_sizes = [piece.shape[dim] for piece in node.value]
+    # The pieces are reached one at a time; a split consumed whole (a list
+    # handed to another op) names no single window.
+    users = list(node.users)
+    if any(
+        u.op != "call_function" or u.target is not operator.getitem
+        for u in users
+    ):
+        return
+
+    graph = model.graph
+    for user in users:
+        index = user.args[1]
+        index = index + len(split_sizes) if index < 0 else index
+        offsets = [0] * len(shape)
+        offsets[dim] = sum(split_sizes[:index])
+        sizes = list(shape)
+        sizes[dim] = split_sizes[index]
+        with graph.inserting_before(user):
+            subview = graph.call_function(
+                _SUBVIEW, (source, offsets, sizes, [1] * len(shape))
             )
         set_node_value(subview, user.value)
         subview.meta["dtype"] = source.meta.get("dtype")
