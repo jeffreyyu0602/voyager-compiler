@@ -67,6 +67,7 @@ FAMILY_MODELS = [
     ("mistralai/Mistral-7B-v0.3", "Mistral"),
     ("Qwen/Qwen2.5-7B", "Qwen 2.5"),
     ("google/gemma-2-9b", "Gemma 2"),
+    ("Qwen/Qwen3-VL-8B-Instruct", "Qwen3-VL"),
 ]
 
 PE_ARRAYS = [(16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]

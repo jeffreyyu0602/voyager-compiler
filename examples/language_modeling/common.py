@@ -15,7 +15,13 @@ import torch
 from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.utils._pytree import register_pytree_node
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoTokenizer,
+    GenerationConfig,
+)
 from transformers.cache_utils import DynamicCache
 from transformers.integrations.executorch import convert_and_export_with_cache
 
@@ -109,15 +115,18 @@ def add_inference_args(parser):
 
 
 def load_model_and_tokenizer(model_id, torch_dtype, **from_pretrained_kwargs):
-    """Load a causal LM and its tokenizer with the transformers API.
+    """Load a text-generation model and its tokenizer.
+
+    A vision-language checkpoint registers only under the
+    image-text-to-text auto class, so it is loaded through that one and
+    driven text-only; everything else goes through the causal-LM class.
 
     Args:
         model_id: Hub id or local path of the checkpoint.
         torch_dtype: ``"auto"`` or the name of a torch dtype, as given on
             the command line.
-        **from_pretrained_kwargs: Forwarded to
-            ``AutoModelForCausalLM.from_pretrained`` (``device_map``,
-            ``attn_implementation``, ...).
+        **from_pretrained_kwargs: Forwarded to ``from_pretrained``
+            (``device_map``, ``attn_implementation``, ...).
 
     Returns:
         ``(model, tokenizer)``.
@@ -125,7 +134,13 @@ def load_model_and_tokenizer(model_id, torch_dtype, **from_pretrained_kwargs):
     dtype = (
         torch_dtype if torch_dtype == "auto" else getattr(torch, torch_dtype)
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(model_id)
+    auto_class = (
+        AutoModelForCausalLM
+        if type(config) in AutoModelForCausalLM._model_mapping
+        else AutoModelForImageTextToText
+    )
+    model = auto_class.from_pretrained(
         model_id, dtype=dtype, **from_pretrained_kwargs
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -318,13 +333,13 @@ def rewrite_for_compiler(gm, model, seq):
     """Apply the graph rewrites the compiler's Llama path makes before
     quantizing: the softmax in bf16, RMSNorm as the layer-norm op."""
     remove_softmax_dtype_cast(gm)
-    hidden = model.config.hidden_size
+    # get_decoder() is the text decoder, wherever the model nests it.
+    layernorm = model.get_decoder().layers[0].input_layernorm
+    hidden = layernorm.weight.shape[-1]
     example = torch.randn(
         1, seq, hidden, dtype=model.dtype, device=model.device
     )
-    replace_rmsnorm_with_layer_norm(
-        gm, model.model.layers[0].input_layernorm, (example,)
-    )
+    replace_rmsnorm_with_layer_norm(gm, layernorm, (example,))
 
 
 def build_prefill(model, quantizer, quantized, max_tokens):
@@ -337,8 +352,9 @@ def build_prefill(model, quantizer, quantized, max_tokens):
         quantized: Apply ``rewrite_for_compiler``.
         max_tokens: Longest prompt the graph accepts.
     """
+    vocab_size = model.config.get_text_config().vocab_size
     example = torch.randint(
-        0, model.config.vocab_size, (1, 2 * SEQ_BLOCK), device=model.device
+        0, vocab_size, (1, 2 * SEQ_BLOCK), device=model.device
     )
     kwargs = {"use_cache": True}
     chunk = torch.export.Dim("chunk", min=2, max=max_tokens // SEQ_BLOCK)
@@ -386,7 +402,7 @@ def build_decode(model, quantizer, quantized, split, kivi, cache_len):
         split_kv_cache(gm, split, 0)
     if kivi:
         caches = annotate_kivi_cache(gm)
-        expected = 2 * model.config.num_hidden_layers
+        expected = 2 * model.config.get_text_config().num_hidden_layers
         if caches != expected:
             raise RuntimeError(
                 f"annotated {caches} KV caches, expected {expected}"

@@ -69,6 +69,7 @@ from torch._export.utils import _disable_aten_to_metadata_assertions
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     GenerationConfig,
     masking_utils,
@@ -424,15 +425,11 @@ def _kv_cache_spec(bits: int, group: int, role: str) -> str:
 
 NON_DESIGN_FIELDS = ("dump_dir", "calibration_rows_dir")
 _UNUSED_BY_MODE = {"prefill": "kv_len", "decode": "prompt_len"}
-# The scope each export records for LlamaRotaryEmbedding.  The decode wrapper
-# nests the model one level deeper than the prefill export, the same way it
-# nests the layers (``model_model_layers_0_`` against ``model_layers_0_``), so
-# one name cannot serve both -- and a name matching nothing exempts nothing,
+# The rotary embedding's scope.  A regex, because the nesting above it varies:
+# the decode wrapper adds a ``model.`` level and a vision-language model a
+# ``language_model.`` one -- and a name matching nothing exempts nothing,
 # silently.
-_ROTARY_SCOPE_BY_MODE = {
-    "prefill": "model.rotary_emb",
-    "decode": "model.model.rotary_emb",
-}
+_ROTARY_SCOPE = r"model\.rotary_emb"
 _PROBE_FIELDS = ("num_layers_override",)
 
 
@@ -482,10 +479,10 @@ def build_quantizer(cfg: SweepConfig):
     quantizer = get_default_quantizer(
         input_activation=dtype_spec(cfg.act_bits, group),
         weight=dtype_spec(cfg.weight_bits, group),
-        force_scale_power_of_two=min(cfg.act_bits, cfg.weight_bits) >= 8,
+        force_scale_power_of_two=max(cfg.act_bits, cfg.weight_bits) >= 8,
     )
     quantizer.set_module_name_object_type_order(
-        _ROTARY_SCOPE_BY_MODE[cfg.mode],
+        _ROTARY_SCOPE,
         torch.ops.aten.matmul.default,
         0,
         None,
@@ -520,14 +517,22 @@ def build_quantizer(cfg: SweepConfig):
 # Model / graph builders
 # -------------------------------------------------------------------------
 def _load_model(cfg: SweepConfig):
-    extra = {}
+    """Load ``cfg.model_id``, truncated to ``cfg.num_layers_override`` decoder
+    layers when set.  A vision-language checkpoint registers only under the
+    image-text-to-text auto class, and is driven text-only."""
+    config = AutoConfig.from_pretrained(cfg.model_id)
     if cfg.num_layers_override is not None:
-        extra["num_hidden_layers"] = cfg.num_layers_override
-    return AutoModelForCausalLM.from_pretrained(
+        config.get_text_config().num_hidden_layers = cfg.num_layers_override
+    auto_class = (
+        AutoModelForCausalLM
+        if type(config) in AutoModelForCausalLM._model_mapping
+        else AutoModelForImageTextToText
+    )
+    return auto_class.from_pretrained(
         cfg.model_id,
+        config=config,
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.attn_implementation,
-        **extra,
     ).eval()
 
 
@@ -828,12 +833,13 @@ def _frontend(cfg: SweepConfig):
 
     remove_softmax_dtype_cast(gm)
 
-    hidden = model.model.layers[0].input_layernorm.weight.shape[-1]
+    # get_decoder() is the text decoder, wherever the model nests it.
+    layernorm = model.get_decoder().layers[0].input_layernorm
     seq = 1 if is_decode else 128
-    example_input = torch.randn(1, seq, hidden, dtype=model.dtype)
-    replace_rmsnorm_with_layer_norm(
-        gm, model.model.layers[0].input_layernorm, (example_input,)
+    example_input = torch.randn(
+        1, seq, layernorm.weight.shape[-1], dtype=model.dtype
     )
+    replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
 
     # KV-cache precision is applied by annotating the cache reads (KIVI); it
     # only exists in decode.  Prefill has no persistent cache, so kv_bits is
@@ -961,7 +967,7 @@ def run_design_point(cfg: SweepConfig) -> Metrics:
         dram_activation_bytes=r.dram_activation_bytes,
         dram_kv_bytes=r.dram_kv_bytes,
         scratchpad_bytes=plan.scratchpad_bytes,
-        num_layers=model.config.num_hidden_layers,
+        num_layers=model.config.get_text_config().num_hidden_layers,
         num_params=_num_params(model),
     )
 
@@ -980,7 +986,8 @@ def run_design_point_fast(
         raise ValueError(
             f"probe_layers must satisfy 0 < k1 < k2, got {probe_layers}"
         )
-    n = AutoConfig.from_pretrained(cfg.model_id).num_hidden_layers
+    config = AutoConfig.from_pretrained(cfg.model_id)
+    n = config.get_text_config().num_hidden_layers
     m1 = run_design_point(replace(cfg, num_layers_override=k1))
     m2 = run_design_point(replace(cfg, num_layers_override=k2))
 
@@ -1251,7 +1258,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         dram_activation_bytes=r.dram_activation_bytes,
         dram_kv_bytes=r.dram_kv_bytes,
         scratchpad_bytes=plan.scratchpad_bytes,
-        num_layers=model.config.num_hidden_layers,
+        num_layers=model.config.get_text_config().num_hidden_layers,
         num_params=_num_params(model),
         compute=compute,
         memory=memory,
@@ -1272,7 +1279,7 @@ def report_per_module(cfg, layer, dump_dir=None):
     repeats identically in every layer), 1 for a tail block (norm / lm_head).
     With ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
     gm, model, tiler = _frontend(cfg)
-    n_layers = model.config.num_hidden_layers
+    n_layers = model.config.get_text_config().num_hidden_layers
     acc_config = cfg.acc_config
     rows = []
     for node in _layer_block_nodes(gm, layer):

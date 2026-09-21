@@ -1926,16 +1926,16 @@ def _prepare_search(node, tiler, constraint=None):
     out_outlier_pct = 0.0
     if out_quant is not None:
         out_outlier_pct = get_arg_value(out_quant, 9, "max_pct", 0.01)
-        vals = getattr(node, "value", None)
-        if isinstance(vals, (list, tuple)):
-            tracked = (
-                out_dtype
-                if isinstance(out_dtype, (list, tuple))
-                else [None] * len(vals)
-            )
-            out_dtype = [
-                d if d is not None else v.dtype for d, v in zip(tracked, vals)
-            ]
+    vals = getattr(node, "value", None)
+    if isinstance(vals, (list, tuple)):
+        tracked = (
+            out_dtype
+            if isinstance(out_dtype, (list, tuple))
+            else [None] * len(vals)
+        )
+        out_dtype = [
+            d if d is not None else v.dtype for d, v in zip(tracked, vals)
+        ]
 
     key = _layer_cache_key(anchor) + (
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,

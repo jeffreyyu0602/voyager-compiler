@@ -86,9 +86,8 @@ def setup_quantized_model(
     if device is not None:
         model.to(device)
 
-    input_ids = torch.randint(
-        0, model.config.vocab_size, (1, max_length), device=device
-    )
+    vocab_size = model.config.get_text_config().vocab_size
+    input_ids = torch.randint(0, vocab_size, (1, max_length), device=device)
     labels = input_ids.clone()
     example_args = (input_ids,)
     example_kwargs = {"labels": labels, "use_cache": False}

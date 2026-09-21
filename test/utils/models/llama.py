@@ -24,7 +24,9 @@ from torch._export.utils import _disable_aten_to_metadata_assertions
 from torch.utils._pytree import tree_flatten
 from torchao.quantization.pt2e.quantizer.utils import annotate_output_qspec
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     GenerationConfig,
     StaticCache,
@@ -97,23 +99,36 @@ _KV_CACHE = re.compile(r"^(key|value)_cache_\d+$")
 
 
 def load_model(args):
-    """Load the causal LM (its first ``--num_hidden_layers`` decoder layers,
-    when given) and its tokenizer."""
+    """Load the language model (its first ``--num_hidden_layers`` decoder
+    layers, when given) and its tokenizer.
+
+    A vision-language checkpoint registers only under the
+    image-text-to-text auto class, so it is loaded through that one and
+    driven text-only; everything else goes through the causal-LM class.
+    """
     if args.model_name_or_path is None:
         args.model_name_or_path = DEFAULT_MODEL
 
+    config = AutoConfig.from_pretrained(args.model_name_or_path)
+    text_config = config.get_text_config()
     n = getattr(args, "num_hidden_layers", None)
-    extra = {"num_hidden_layers": n} if n else {}
-    model = AutoModelForCausalLM.from_pretrained(
+    if n:
+        text_config.num_hidden_layers = n
+        # StaticCache sizes itself from layer_types, which num_hidden_layers
+        # does not truncate (Qwama-0.5B: 2 layers, 24 cache entries).
+        if getattr(text_config, "layer_types", None):
+            text_config.layer_types = text_config.layer_types[:n]
+    auto_class = (
+        AutoModelForCausalLM
+        if type(config) in AutoModelForCausalLM._model_mapping
+        else AutoModelForImageTextToText
+    )
+    model = auto_class.from_pretrained(
         args.model_name_or_path,
+        config=config,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float16,
         attn_implementation=args.attn_implementation,
-        **extra,
     ).eval()
-    # StaticCache sizes itself from layer_types, which num_hidden_layers
-    # does not truncate (Qwama-0.5B: 2 layers, 24 cache entries).
-    if n and getattr(model.config, "layer_types", None):
-        model.config.layer_types = model.config.layer_types[:n]
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     return model, tokenizer
 
@@ -346,12 +361,13 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
 
     remove_softmax_dtype_cast(gm)
 
-    hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
+    # get_decoder() is the text decoder, wherever the model nests it.
+    layernorm = model.get_decoder().layers[0].input_layernorm
     seq = tokens if is_decode else 128
-    example_input = torch.randn(1, seq, hidden_size, dtype=model.dtype)
-    replace_rmsnorm_with_layer_norm(
-        gm, model.model.layers[0].input_layernorm, (example_input,)
+    example_input = torch.randn(
+        1, seq, layernorm.weight.shape[-1], dtype=model.dtype
     )
+    replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
 
     quantizer.set_module_name_object_type_order(
         _ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
