@@ -46,7 +46,6 @@ import multiprocessing
 import operator
 import os
 import re
-import signal
 import subprocess
 import time
 import traceback
@@ -374,7 +373,7 @@ def config_from_args(args, **overrides) -> "SweepConfig":
     """Build a SweepConfig from parsed args; ``overrides`` win."""
     names = {f.name for f in fields(SweepConfig)}
     kw = {k: v for k, v in vars(args).items() if k in names}
-    kw["dump_dir"] = args.log_dir or args.out
+    kw["dump_dir"] = os.path.join(args.log_dir or args.out, "graphs")
     kw.update(overrides)
     if isinstance(kw.get("pe"), list):
         kw["pe"] = tuple(kw["pe"])
@@ -867,21 +866,7 @@ def _frontend(cfg: SweepConfig):
     if cfg.dump_dir is not None:
         os.makedirs(cfg.dump_dir, exist_ok=True)
         path = os.path.join(cfg.dump_dir, _cfg_stem(cfg))
-
-        # gen_compute_graph shells out to graphviz, which can hang on a large
-        # graph; cap it so a stuck render never stalls the sweep.
-        def _timeout(signum, frame):
-            raise TimeoutError
-
-        old = signal.signal(signal.SIGALRM, _timeout)
-        signal.alarm(60)
-        try:
-            gen_compute_graph(gm, path)
-        except TimeoutError:
-            print(f"  [skip] compute graph dump timed out: {path}", flush=True)
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old)
+        gen_compute_graph(gm, path, timeout=60)
 
     flat_args, _ = torch.utils._pytree.tree_flatten(
         (example_args, example_kwargs)
@@ -1277,9 +1262,13 @@ def report_per_module(cfg, layer, dump_dir=None):
     Each block's additive metrics are scaled to their whole-model contribution
     by its ``count`` -- ``num_hidden_layers`` for a decoder-layer block (it
     repeats identically in every layer), 1 for a tail block (norm / lm_head).
-    With ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
+    Only ``layer + 2`` decoder layers are compiled: every layer lowers alike,
+    and the one after ``layer`` bounds its blocks off the tail's.  With
+    ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
+    config = AutoConfig.from_pretrained(cfg.model_id)
+    n_layers = config.get_text_config().num_hidden_layers
+    cfg = replace(cfg, num_layers_override=layer + 2)
     gm, model, tiler = _frontend(cfg)
-    n_layers = model.config.get_text_config().num_hidden_layers
     acc_config = cfg.acc_config
     rows = []
     for node in _layer_block_nodes(gm, layer):

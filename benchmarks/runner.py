@@ -41,6 +41,8 @@ from dataclasses import astuple
 
 import common
 import latency_dram_chart as ldc
+import plot_model_size_scaling
+import plot_results_mpl
 
 # -- axis definitions (moved from the individual sweep scripts) ---------------
 CONTEXT_LENGTHS = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -345,7 +347,7 @@ def main():
         [unique[k] for k in keys],
         args.jobs,
         args.threads_per_job,
-        args.log_dir or args.out,
+        os.path.join(args.log_dir or args.out, "logs"),
         fast=args.fast,
         probe_layers=args.probe_layers,
         tag="sweep",
@@ -373,6 +375,12 @@ def main():
         f"\nwrote {os.path.abspath(path)}  "
         f"({len(sheets)} sheets: {', '.join(s.name for s in sheets)})"
     )
+
+    fig_dir = os.path.join(args.out, "figures")
+    written = plot_results_mpl.plot_workbook(path, fig_dir)
+    if any(s.name == plot_model_size_scaling.SHEET for s in sheets):
+        written += plot_model_size_scaling.plot_params_scaling(path, fig_dir)
+    print(f"wrote {len(written)} figures to {fig_dir}")
 
 
 if __name__ == "__main__":

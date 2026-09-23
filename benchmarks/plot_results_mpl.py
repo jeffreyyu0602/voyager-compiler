@@ -649,20 +649,35 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    wb = load_workbook(args.workbook)
-    os.makedirs(args.out, exist_ok=True)
+def plot_workbook(workbook, out, only=None, log=False):
+    """Redraw every figure in an aggregate ``results.xlsx``.
 
-    names = args.only or wb.sheetnames
+    Args:
+        workbook: Path of the aggregate workbook.
+        out: Directory the figures are written to; created if missing.
+        only: Sheet names to restrict to, or ``None`` for all.
+        log: Log-scale the value axes.
+
+    Returns:
+        The paths written.
+    """
+    wb = load_workbook(workbook)
+    os.makedirs(out, exist_ok=True)
+
+    names = only or wb.sheetnames
     written = []
     for name in names:
         if name not in BASELINE_SHEETS:
-            written += plot_metric_sheet(wb[name], args.log, args.out)
+            written += plot_metric_sheet(wb[name], log, out)
     baselines = [wb[n] for n in BASELINE_SHEETS if n in names]
     if baselines:
-        written += plot_baseline_pair(baselines, args.log, args.out)
+        written += plot_baseline_pair(baselines, log, out)
+    return written
 
+
+def main():
+    args = parse_args()
+    written = plot_workbook(args.workbook, args.out, args.only, args.log)
     for path in written:
         print(path)
     print(f"\nwrote {len(written)} files to {os.path.abspath(args.out)}")

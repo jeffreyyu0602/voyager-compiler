@@ -227,36 +227,48 @@ def _points(rows, table, mode):
     )
 
 
-def main():
-    args = parse_args()
-    rows = sweep_rows(args.workbook)
-    table = model_table(rows)
-    if args.verify:
-        verify(table)
-        print()
+def plot_params_scaling(workbook, out, logx=False):
+    """Draw the model-size sweep against parameter count.
 
-    os.makedirs(args.out, exist_ok=True)
+    Args:
+        workbook: Path of the aggregate workbook; must hold the model-size
+            sheet.
+        out: Directory the figure is written to; created if missing.
+        logx: Log-scale the size axis.
+
+    Returns:
+        The paths written.
+    """
+    rows = sweep_rows(workbook)
+    table = model_table(rows)
+    os.makedirs(out, exist_ok=True)
 
     # Parameter scaling: prefill over decode, both vs #params, one shared
     # x-axis.
-    written = style.draw_pair(
+    return style.draw_pair(
         [
             functools.partial(
                 _draw_axis,
                 points=_points(rows, table, mode),
                 xlabel="Parameters (B)",
                 title=mode.capitalize(),
-                logx=args.logx,
+                logx=logx,
             )
             for mode in style.MODES
         ],
         "Latency and DRAM Traffic vs. Parameters",
         style.FIGSIZE,
-        args.out,
+        out,
         "params_scaling",
     )
 
-    for path in written:
+
+def main():
+    args = parse_args()
+    if args.verify:
+        verify(model_table(sweep_rows(args.workbook)))
+        print()
+    for path in plot_params_scaling(args.workbook, args.out, args.logx):
         print(path)
 
 

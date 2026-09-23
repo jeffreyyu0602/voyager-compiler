@@ -9,7 +9,6 @@ parallelism to be factors of the layer size
 import itertools
 import copy
 from operator import mul
-import math
 import pickle
 from functools import reduce
 
@@ -1005,13 +1004,11 @@ def opt_mapping_point_generator_function(
     Mapping point generator.
 
     Keeps every candidate no other candidate beats on both runtime and energy
-    -- the ``(runtime, energy)`` Pareto frontier -- and, among those whose
-    runtime is within ``(1 + runtime_tolerance)`` of the best, picks the one
-    with the fewest grid steps, then the least energy.  Each grid step is an
-    op the host dispatches, a cost the runtime model does not see, so where
+    -- the ``(runtime, energy)`` Pareto frontier -- and picks the least-energy
+    one whose runtime is within ``(1 + runtime_tolerance)`` of the best.  Where
     tilings are equally fast -- a compute-bound GEMM keeps the array busy
-    either way -- fewer ops decide, then energy (mostly DRAM traffic),
-    instead of whatever residue the runtime model leaves behind.
+    either way -- energy (mostly DRAM traffic) decides, instead of whatever
+    residue the runtime model leaves behind.
 
     Args:
         runtime_tolerance: How much longer than the best runtime a mapping may
@@ -1070,14 +1067,10 @@ def opt_mapping_point_generator_function(
 
     best_runtime = min(fr for fr, _, _ in frontier)
     threshold = best_runtime * (1.0 + runtime_tolerance)
-    # Fewest grid steps among those fast enough, then least energy, then
-    # lower runtime.
-    def grid_steps(mapping_point):
-        return math.prod(b[-1] for b in mapping_point.loop_blockings)
-
+    # Least energy among those fast enough; ties broken by lower runtime.
     smallest_runtime, smallest_cost, best_mapping_point = min(
         ((fr, fc, mp) for fr, fc, mp in frontier if fr <= threshold),
-        key=lambda e: (grid_steps(e[2]), e[1], e[0]),
+        key=lambda e: (e[1], e[0]),
     )
 
     _, utilized = partitioned_loop_string(
