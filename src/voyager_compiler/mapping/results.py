@@ -39,16 +39,10 @@ def serialize(name, target, mapping, inputs):
     result = evaluation.metadata
     schedule = result.schedule
     tiling = tiling_pb2.Tiling(name=name)
-    if target.backend == "sa":
-        for level in (1, 2):
-            output = tiling.level_tilings.add()
-            for loop in sorted(range(7), key=lambda loop: mapping.loop_orders[loop][level]):
-                output.loop_bounds.add(loop=loop, bound=mapping.loop_blockings[loop][level])
-    else:
-        for level in (schedule.l1, schedule.l2):
-            output = tiling.level_tilings.add()
-            for loop in level.order:
-                output.loop_bounds.add(loop=getattr(tiling_pb2, loop), bound=level.bound(loop))
+    for level in (schedule.l1, schedule.l2):
+        output = tiling.level_tilings.add()
+        for loop in level.order:
+            output.loop_bounds.add(loop=getattr(tiling_pb2, loop), bound=level.bound(loop))
     traffic = result.traffic
     if target.backend == "cim":
         buffer_outputs = (traffic.buffer_accum_reads + traffic.buffer_accum_intermediate_writes

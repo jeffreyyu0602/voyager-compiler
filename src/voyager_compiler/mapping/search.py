@@ -75,6 +75,8 @@ def _level(orders, blocking, partitioning, level):
 def schedule_from_mapping(target: MappingTarget, mapping, *,
                           write_output_to_accum_buffer: bool) -> Schedule:
     if target.backend == "sa":
+        if any(mapping.loop_blockings[le.ON][level] != 1 or mapping.loop_partitionings[le.ON][level] != 1 for level in range(3)):
+            raise ValueError("SA tilings require a unit batch loop")
         levels = [TemporalLevel.make(
             order=tuple(le.table[loop] for loop in sorted(range(le.NUM), key=lambda i: mapping.loop_orders[i][level]) if loop != le.ON),
             **{loop: mapping.loop_blockings[le.loop_table[loop]][level] for loop in LOOPS}) for level in range(3)]
