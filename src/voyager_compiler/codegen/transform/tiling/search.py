@@ -1,3 +1,4 @@
+import itertools
 import logging
 import math
 from functools import partial
@@ -65,12 +66,14 @@ def get_valid_tiling(
     order: Optional[Tuple[int, ...]] = None,
     last_dim: Optional[int] = None,
     pinned: Optional[dict] = None,
+    exhaustive: bool = False,
 ) -> Generator[Tuple[Tuple[int, ...], Tuple[int, ...]], None, None]:
     """Yield tile shapes from the full shape downwards.
 
     Reduces one dimension at a time to its next valid size, in ``order``,
-    leaving the dimensions already reduced at their smallest.  A size is valid
-    when it divides the dimension and is a multiple of ``multiple_of``.
+    leaving the dimensions already reduced at their smallest; ``exhaustive``
+    instead yields every combination of valid sizes.  A size is valid when it
+    divides the dimension and is a multiple of ``multiple_of``.
 
     Args:
         input_shape: The shape being tiled.
@@ -81,6 +84,7 @@ def get_valid_tiling(
         last_dim: Dims from here onwards stay at full size.
         pinned: ``{dim: size}`` tiles held at one size while the other dims
             reduce; nothing is yielded when a pinned size is not valid.
+        exhaustive: Yield the whole grid of valid sizes, ignoring ``order``.
 
     Yields:
         ``(tile_shape, tiling_factors)``, largest tile first.
@@ -121,6 +125,11 @@ def get_valid_tiling(
         if input_shape[dim] % size or size % multiples[dim]:
             return
         sizes[dim] = [size]
+
+    if exhaustive:
+        for tile in itertools.product(*(sizes[dim] for dim in range(ndim))):
+            yield tile, tuple(e // t for e, t in zip(input_shape, tile))
+        return
 
     tile = [sizes[dim][0] for dim in range(ndim)]
 
@@ -344,16 +353,17 @@ def _search_tiling(
     merged while they outnumber the banks).  ``pinned`` holds dims at one
     tile size (``get_valid_tiling``).
 
-    ``get_valid_tiling`` yields candidates largest -> smallest.  Without
-    ``cost_fn`` the first tiling that fits one slot wins (the largest fitting
-    tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
-    tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every fitting candidate
-    is scored and the one moving the fewest bytes wins among those within
-    ``(1 + tolerance)`` of the best latency.  Latency alone is not enough: a
-    compute-bound op is equally fast however its operands are diced, so the
-    residue the model leaves behind would buy any amount of traffic for a
-    rounding error.  This is how the interstellar tiler picks a mapping too
-    (``mapping_point_generator``, with energy in place of bytes).
+    Without ``cost_fn`` the first tiling along ``order`` that fits one slot
+    wins (the largest fitting tile).  With ``cost_fn`` -- ``cost_fn(node,
+    tile_sizes, tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every
+    valid tiling is tried, ``order`` aside, since a larger tile is not always
+    a faster one; each that fits is scored and the one moving the fewest
+    bytes wins among those within ``(1 + tolerance)`` of the best latency.
+    Latency alone is not enough: a compute-bound op is equally fast however
+    its operands are diced, so the residue the model leaves behind would buy
+    any amount of traffic for a rounding error.  This is how the interstellar
+    tiler picks a mapping too (``mapping_point_generator``, with energy in
+    place of bytes).
 
     Returns:
         ``(tile_sizes, groups, runtime)`` -- the winning tile, its bank
@@ -376,6 +386,7 @@ def _search_tiling(
             order=order,
             last_dim=last_dim,
             pinned=pinned,
+            exhaustive=cost_fn is not None,
         ):
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
@@ -677,8 +688,7 @@ def gemv_op_tiling(node, config, constraint=None):
 
     logger.info(f"Running L2 tiling for GEMV: {node}")
 
-    search = partial(
-        _search_tiling,
+    found = _search_tiling(
         node=node,
         full_shape=(X, C, K),
         multiple_of=tuple(multiple),
@@ -692,15 +702,6 @@ def gemv_op_tiling(node, config, constraint=None):
         tolerance=DEFAULT_RUNTIME_TOLERANCE,
         pinned=pinned,
     )
-
-    # C whole leaves the input vector loop-invariant, so its guarded load
-    # fetches it once however many output tiles there are: tile K alone if any
-    # such tile fits.  Failing that, split C as far as it takes to buy the
-    # largest K tile, since the input is then re-read once per output tile.
-    # ``get_valid_tiling`` reduces in ``order``, leaving what it already
-    # reduced at its smallest, so C whole is only ever reachable from the first
-    # pass -- the cost function ranks within one, it cannot cross them.
-    found = search(order=(2,)) or search(order=(1, 2))
     if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
