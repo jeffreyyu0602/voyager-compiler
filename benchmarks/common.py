@@ -151,23 +151,15 @@ DECODE_MAX_GEN = 128
 
 
 # -------------------------------------------------------------------------
-# Operator-fusion pipeline (copied verbatim from test_llama_report.py): fold
-# each MXU op's trailing dequant / activation / requantization into one fused
+# Operator-fusion pipeline (copied verbatim from test_codegen.py): fold each
+# MXU op's trailing dequant / activation / requantization into one fused
 # kernel.  Stages that match no node are skipped.
 # -------------------------------------------------------------------------
-def _is_spmm(node):
-    return node.kwargs.get("A_data") is not None
-
-
-def _is_bf16_fc(node):
-    # bf16 FCs run on the vector unit and thus cannot be fused.
-    if hasattr(node, "value") and is_fully_connected(node):
-        return node.args[0].meta.get("dtype") is None
-    return False
-
-
 def _can_fuse(node):
-    return not _is_spmm(node) and not _is_bf16_fc(node)
+    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
+    if hasattr(node, "value") and is_fully_connected(node):
+        return node.args[0].meta.get("dtype") is not None
+    return True
 
 
 def _is_constant_div(node):
@@ -180,7 +172,18 @@ def _is_constant_div(node):
 
 
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
+QUANT_OPS = [
+    "quantize",
+    "quantize_mx",
+    "quantize_mx_outlier",
+    "quantize_affine",
+]
+# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
+# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
+# own column tile, which pins every consumer's reduction tile to it.  The
+# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
+# op, and its slice width follows the consumers.
+GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
 
 FUSION_PIPELINE = [
     [
@@ -189,13 +192,13 @@ FUSION_PIPELINE = [
         OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*QUANT_OPS),
+        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*QUANT_OPS),
+        OpMatcher(*GEMM_QUANT_OPS),
     ],
     [
         OpMatcher("layer_norm", "softmax"),
@@ -227,6 +230,8 @@ class SweepConfig:
     way ``test_codegen --quantize_attention_mask`` does: eager's mask
     tensor, or under sdpa the flash-attention kernel's own causal table;
     decode rebuilds its mask every step and keeps bf16.
+    ``double_buffered_accum_buffer`` gives the PE array a second accumulator
+    bank to park a finished output tile in while it drains.
 
     ``calibration`` names a filled-in RTL calibration form (see
     ``write_calibration_form``) whose measured kernel cycles price the
@@ -249,6 +254,7 @@ class SweepConfig:
     scratchpad_size: int = BASELINE_SCRATCHPAD_SIZE
     num_banks: int = BASELINE_NUM_BANKS
     bank_width: Optional[int] = None
+    double_buffered_accum_buffer: bool = True
     frequency_ghz: float = BASELINE_FREQUENCY_GHZ
     dram_bandwidth_gbs: float = BASELINE_DRAM_BANDWIDTH_GBS
     dram_access_latency_ns: float = BASELINE_DRAM_ACCESS_LATENCY_NS
@@ -283,6 +289,7 @@ class SweepConfig:
             input_buffer_size=1024,
             weight_buffer_size=1024,
             accum_buffer_size=1024,
+            double_buffered_accum_buffer=self.double_buffered_accum_buffer,
             double_buffered_l2=self.pipelined,
             dram_size=64.0,
             dram_bandwidth=self.dram_bandwidth_gbs,
