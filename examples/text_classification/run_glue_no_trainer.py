@@ -348,6 +348,7 @@ def main(args):
         config=config,
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         trust_remote_code=args.trust_remote_code,
+        attn_implementation="eager",
     )
 
     if args.lora_rank > 0:

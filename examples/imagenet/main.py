@@ -262,7 +262,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     quantizer = get_default_quantizer(
         input_activation=args.activation,
-        output_activation=args.output_activation,
         weight=args.weight,
         bias=args.bias,
         force_scale_power_of_two=args.force_scale_power_of_two,

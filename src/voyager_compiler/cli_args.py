@@ -70,17 +70,18 @@ def add_quantization_args(parser=None):
         ),
     )
     parser.add_argument(
-        "--output_activation",
-        default=None,
-        help=(
-            "Output activation quantization specification. Format same as "
-            "activation."
-        ),
-    )
-    parser.add_argument(
         "--weight",
         default=None,
         help=("Weight quantization specification. Format same as activation."),
+    )
+    parser.add_argument(
+        "--error",
+        default=None,
+        help=(
+            "Gradient quantization spec, in the activation's format. Setting "
+            "it quantizes the backward pass too: the backward GEMMs of every "
+            "quantized linear and matmul (not yet convolution)."
+        ),
     )
     parser.add_argument(
         "--bias",
@@ -91,14 +92,6 @@ def add_quantization_args(parser=None):
         "--residual",
         default=None,
         help="Residual quantization specification. Format same as activation.",
-    )
-    parser.add_argument(
-        "--error",
-        default=None,
-        help=(
-            "Activation gradient quantization data type and configurations. "
-            "Format same as activation."
-        ),
     )
     parser.add_argument(
         "--force_scale_power_of_two",

@@ -13,7 +13,6 @@ from voyager_compiler.quantization.fake_quantize import fake_quantize_class
 from voyager_compiler.quantization.qspec import QScheme, parse_spec_fields
 
 __all__ = [
-    "ErrorQuantizationSpec",
     "QuantizationSpec",
 ]
 
@@ -76,15 +75,3 @@ class DerivedQuantizationSpec(QuantizationSpecBase):
     quant_min: Optional[int] = None
     quant_max: Optional[int] = None
     qscheme: Optional[QScheme] = None
-
-
-@dataclass(eq=True)
-class ErrorQuantizationSpec(QuantizationSpecBase):
-    """Quantization spec for an op output whose gradient is quantized too.
-
-    ``forward`` quantizes the output value as an output spec does, or is
-    None to leave it; ``error`` quantizes the gradient reaching the output.
-    """
-
-    forward: Optional[QuantizationSpec]
-    error: QuantizationSpec

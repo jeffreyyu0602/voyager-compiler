@@ -285,7 +285,6 @@ def main(args):
         spec is not None
         for spec in (
             args.activation,
-            args.output_activation,
             args.weight,
             args.error,
         )

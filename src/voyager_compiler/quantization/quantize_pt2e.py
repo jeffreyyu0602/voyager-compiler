@@ -30,7 +30,6 @@ from voyager_compiler.export_utils import (
 )
 from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
-    ErrorFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
     _DerivedObserverOrFakeQuantize,
@@ -39,7 +38,6 @@ from voyager_compiler.quantization.fake_quantize import (
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
-    ErrorQuantizationSpec,
     QScheme,
     QuantizationSpec,
 )
@@ -48,6 +46,7 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
 )
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
+    _set_ch_axis,
 )
 from voyager_compiler.shape_prop import fetch_attr
 
@@ -75,15 +74,6 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
         obs_or_fqs = [obs_or_fq_map[k] for k in edge_or_nodes]
         kwargs["obs_or_fqs"] = obs_or_fqs
         return _DerivedObserverOrFakeQuantize.with_args(**kwargs)()
-    if isinstance(quantization_spec, ErrorQuantizationSpec):
-        return ErrorFakeQuantize(
-            _create_obs_or_fq_from_qspec(
-                quantization_spec.forward, obs_or_fq_map, is_qat
-            ),
-            _create_obs_or_fq_from_qspec(
-                quantization_spec.error, obs_or_fq_map, is_qat
-            ),
-        )
 
     assert isinstance(quantization_spec, QuantizationSpec)
     observer_or_fake_quant_ctr = quantization_spec.observer_or_fake_quant_ctr
@@ -117,12 +107,6 @@ def _get_obs_or_fq_map(
     return obs_or_fq_map
 
 
-def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
-    if qspec is None:
-        return None
-    return replace(qspec, ch_axis=ch_axis)
-
-
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
 # Dropouts, each taking ``(input, p, train)``.
 _DROPOUTS = (
@@ -136,20 +120,29 @@ _DROPOUTS = (
 def get_microscaling_quantizer(
     activation: Optional[QuantizationSpec],
     weight: Optional[QuantizationSpec],
-    output: Optional[ErrorQuantizationSpec] = None,
+    error: Optional[QuantizationSpec] = None,
 ):
     # Microscaling performs quantization along the reduction dimension
     act_qspec = _set_ch_axis(activation, 1)
     weight_qspec = _set_ch_axis(weight, 1)
-    qconfig_conv2d = QuantizationConfig(act_qspec, output, weight_qspec, None)
+    qconfig_conv2d = QuantizationConfig(act_qspec, None, weight_qspec, None)
 
     act_qspec = _set_ch_axis(activation, -1)
     weight_qspec = _set_ch_axis(weight, -1)
-    qconfig_linear = QuantizationConfig(act_qspec, output, weight_qspec, None)
+    qconfig_linear = QuantizationConfig(
+        act_qspec, None, weight_qspec, None, error=error
+    )
 
     act0_qspec = _set_ch_axis(activation, -1)
     act1_qspec = _set_ch_axis(activation, -2)
-    qconfig_matmul = QuantizationConfig(act0_qspec, output, act1_qspec, None)
+    # With an error spec, training GEMMs pick specs by operand type.
+    qconfig_matmul = QuantizationConfig(
+        act0_qspec,
+        None,
+        act1_qspec if error is None else weight,
+        None,
+        error=error,
+    )
 
     return (
         XNNPACKQuantizer()
@@ -207,61 +200,69 @@ def derive_bias_qparams_fn(
     return act_scale * weight_scale.flatten()
 
 
-def get_default_quantizer(
-    input_activation: Optional[QuantizationSpec] = None,
-    output_activation: Optional[QuantizationSpec] = None,
-    weight: Optional[QuantizationSpec] = None,
-    bias: Optional[QuantizationSpec] = None,
-    force_scale_power_of_two: bool = False,
-    error: Optional[str] = None,
-    **kwargs: Any,
-) -> XNNPACKQuantizer:
-    """
-    Create a quantizer for the given activation and weight quantization
-    specifications.
+def make_spec(
+    spec_str: str, force_scale_power_of_two: bool
+) -> QuantizationSpec:
+    """Parse ``spec_str`` into a spec whose fake-quant takes the scale rule.
 
-    Parameters:
-    - activation: The quantization spec for activations.
-    - weight: The quantization spec for weights.
-    - force_scale_power_of_two: Whether to force the scaling factor to be a
-      power of two.
-    - error: The quantization spec for gradients, applied in the backward
-      pass to the gradient reaching each conv2d, linear and matmul output,
-      and each attention output under microscaling.
+    Args:
+        spec_str: Comma-separated spec string, e.g. ``int8,qs=microscaling``.
+        force_scale_power_of_two: Whether the fake-quant rounds each scale
+            to a power of two.
 
     Returns:
-    - A configured XNNPACKQuantizer.
+        The parsed spec.
     """
+    spec = QuantizationSpec.from_str(spec_str)
+    spec.observer_or_fake_quant_ctr = spec.observer_or_fake_quant_ctr.with_args(
+        force_scale_power_of_two=force_scale_power_of_two,
+    )
+    return spec
 
-    def make_spec(spec_str):
-        spec = QuantizationSpec.from_str(spec_str)
-        spec.observer_or_fake_quant_ctr = (
-            spec.observer_or_fake_quant_ctr.with_args(
-                force_scale_power_of_two=force_scale_power_of_two,
-            )
-        )
-        return spec
 
+def get_default_quantizer(
+    input_activation: Optional[str] = None,
+    output_activation: Optional[str] = None,
+    weight: Optional[str] = None,
+    bias: Optional[str] = None,
+    error: Optional[str] = None,
+    force_scale_power_of_two: bool = False,
+    **kwargs: Any,
+) -> XNNPACKQuantizer:
+    """Build a quantizer for conv2d, linear and matmul from spec strings.
+
+    Args:
+        input_activation: Spec for GEMM inputs, or None.
+        output_activation: Spec for GEMM outputs, or None.
+        weight: Spec for weights, or None.
+        bias: Dtype the bias is quantized to, with the product of its GEMM's
+            input and weight scales; required with non-microscaling input
+            and weight specs.
+        error: Spec for gradients, or None.  Setting it builds the quantizer
+            of ``prepare_training``, whose GEMM configs give each operand
+            the spec of its type.
+        force_scale_power_of_two: Whether every scale is a power of two.
+        **kwargs: Ignored.
+
+    Returns:
+        The configured quantizer.
+    """
     qschemes = []
     if input_activation is not None:
-        input_activation = make_spec(input_activation)
+        input_activation = make_spec(input_activation, force_scale_power_of_two)
         qschemes.append(input_activation.qscheme)
 
     if output_activation is not None:
-        output_activation = make_spec(output_activation)
+        output_activation = make_spec(
+            output_activation, force_scale_power_of_two
+        )
 
     if weight is not None:
-        weight = make_spec(weight)
+        weight = make_spec(weight, force_scale_power_of_two)
         qschemes.append(weight.qscheme)
 
     if error is not None:
-        error = make_spec(error)
-
-    def with_error(output):
-        """``output``, with the gradient quantized too when ``error`` is."""
-        if error is None:
-            return output
-        return ErrorQuantizationSpec(output, error)
+        error = make_spec(error, force_scale_power_of_two)
 
     qschemes = [qs for qs in qschemes if qs is not None]
     if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
@@ -283,9 +284,7 @@ def get_default_quantizer(
         assert (
             len(set(qschemes)) == 1
         ), f"Quantization scheme {qschemes[0]} does not work with {qschemes[1]}"
-        return get_microscaling_quantizer(
-            input_activation, weight, with_error(None)
-        )
+        return get_microscaling_quantizer(input_activation, weight, error)
 
     if weight is not None and weight.qscheme == QScheme.PER_CHANNEL_SYMMETRIC:
         assert weight.ch_axis == 0, (
@@ -297,17 +296,20 @@ def get_default_quantizer(
         input_activation is not None
         and input_activation.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
     ):
-        if error is not None:
-            raise ValueError("Per-channel activations quantize no gradients")
         return get_per_channel_act_quantizer(
             input_activation, output_activation, weight, bias
         )
 
     qconfig = QuantizationConfig(
-        input_activation, with_error(output_activation), weight, bias
+        input_activation, output_activation, weight, bias, error=error
     )
+    # With an error spec, training GEMMs pick specs by operand type.
     qconfig_matmul = QuantizationConfig(
-        input_activation, with_error(output_activation), input_activation, None
+        input_activation,
+        output_activation,
+        input_activation if error is None else weight,
+        None,
+        error=error,
     )
     return (
         XNNPACKQuantizer()
@@ -445,71 +447,6 @@ def set_training(model: GraphModule, training: bool) -> None:
             dropout_p = node.meta.setdefault("dropout_p", node.args[4])
             node.update_arg(4, dropout_p if training else 0.0)
     set_batch_norm_training(model, training)
-
-
-def disable_observers(model: torch.nn.Module) -> None:
-    """Fix every fake-quant's scale except the gradients', which keep moving.
-
-    Args:
-        model: Prepared graph.
-    """
-    for module in model.modules():
-        if isinstance(module, FakeQuantizeBase):
-            module.disable_observer()
-    for module in model.modules():
-        if isinstance(module, ErrorFakeQuantize):
-            module.error_fq.enable_observer()
-
-
-def prepare_from_args(
-    model: torch.nn.Module,
-    args,
-    example_args: Tuple[Any, ...] = (),
-    example_kwargs: Optional[Dict[str, Any]] = None,
-    dynamic_shapes=None,
-) -> GraphModule:
-    """Export ``model`` and prepare it as the quantization flags ask.
-
-    The flags are the ones ``add_quantization_args`` defines.  The model is
-    exported in training mode, so the graph can be trained as well as
-    evaluated: each conv-BN pair trains through the simulated fold, and
-    ``train()`` and ``eval()`` switch its dropouts and batch norms.
-
-    Args:
-        model: Float model.
-        args: Parsed command-line arguments.
-        example_args: Positional inputs to export with.
-        example_kwargs: Keyword inputs to export with.
-        dynamic_shapes: Dynamic dimensions of the inputs.
-
-    Returns:
-        The prepared graph.
-    """
-    if args.bf16:
-        model.bfloat16()
-    quantizer = get_default_quantizer(
-        input_activation=args.activation,
-        output_activation=args.output_activation,
-        weight=args.weight,
-        bias=args.bias,
-        force_scale_power_of_two=args.force_scale_power_of_two,
-        error=args.error,
-    )
-    exported = export_model(
-        model.train(),
-        example_args,
-        example_kwargs,
-        dynamic_shapes=dynamic_shapes,
-    )
-    model = prepare_qat_pt2e(exported, quantizer)
-
-    def train(self, mode=True):
-        set_training(self, mode)
-        return self
-
-    model.train = types.MethodType(train, model)
-    model.eval = types.MethodType(torch.nn.Module.eval, model)
-    return model
 
 
 def _get_module(
@@ -1546,19 +1483,6 @@ def convert_pt2e(
         )
 
     fold_conv_bn_qat(model)
-
-    # Gradient quantization has no counterpart in inference: an error
-    # fake-quant keeps only its forward part.
-    modules = dict(model.named_modules())
-    for node in list(model.graph.nodes):
-        module = _get_module(node, modules)
-        if not isinstance(module, ErrorFakeQuantize):
-            continue
-        if module.forward_fq is None:
-            node.replace_all_uses_with(node.args[0])
-            model.graph.erase_node(node)
-        else:
-            model.set_submodule(node.target, module.forward_fq)
 
     modules = dict(model.named_modules(remove_duplicate=False))
 

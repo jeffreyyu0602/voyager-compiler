@@ -7,7 +7,10 @@ import torch
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import Quantizer
 
-from voyager_compiler.export_utils import get_node_name_to_scope
+from voyager_compiler.export_utils import (
+    get_module_stack,
+    get_node_name_to_scope,
+)
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     OP_TO_ANNOTATOR,
     QuantizationConfig,
@@ -37,8 +40,7 @@ def _get_module_name_filter(module_name: str):
         #    'L__self___sub': ("L['self'].sub", <class '....Sub'>),
         #    'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
         # }
-        # get_attr nodes doesn't have nn_module_stack?
-        nn_module_stack = n.meta.get("nn_module_stack", {})
+        nn_module_stack = get_module_stack(n)
 
         def _normalize_path(n):
             prefix = 0
@@ -75,7 +77,7 @@ def _get_module_type_filter(tp: Callable):
         #     'L__self___sub': ("L['self'].sub", <class '....Sub'>),
         #     'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
         # }
-        nn_module_stack = n.meta.get("nn_module_stack", {})
+        nn_module_stack = get_module_stack(n)
         types = []
         for _, t in nn_module_stack.values():
             # export() returns str, but older APIs (e.g. capture_pre_autograd_graph)

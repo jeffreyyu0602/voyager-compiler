@@ -830,7 +830,10 @@ def calculate_mx_qparam(
         )
 
         # Offset the max exponent by the largest representable exponent
-        # in the element data format
+        # in the element data format.  This rounds the scale down, as the
+        # OCP MX spec suggests, so a block's largest elements can saturate.
+        # Transformer Engine, cuBLAS and Blackwell's ``cvt.rp`` round it up
+        # instead, 2**ceil(log2(amax / max)), which never saturates.
         shared_exp = shared_exp - math.floor(math.log2(quant_max))
 
         for axis in reversed(axes):

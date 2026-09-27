@@ -1,10 +1,10 @@
 """Capture an FX graph, add to one, and read what capture recorded.
 
 ``export_model`` / ``get_aten_graph_module`` turn eager code into a
-``GraphModule``; ``create_getattr_from_value`` materialises a tensor into an
-existing graph as a buffer; ``get_node_name_to_scope`` /
-``print_node_scope_tabular`` read the ``nn_module_stack`` provenance that
-export stamps on every node.
+``GraphModule``; ``create_getattr_from_value`` materialises a tensor into
+an existing graph as a buffer; ``get_module_stack``,
+``get_node_name_to_scope`` and ``print_node_scope_tabular`` read the module
+provenance capture stamps on every node.
 """
 
 import logging
@@ -22,6 +22,7 @@ __all__ = [
     "export_model",
     "get_aten_graph_module",
     "get_conv_bn_layers",
+    "get_module_stack",
     "get_node_name_to_scope",
     "print_node_scope_tabular",
 ]
@@ -81,11 +82,10 @@ def get_conv_bn_layers(model: torch.nn.Module) -> List[List[str]]:
                     for conv, bn in conv_bn_pairs
                 ]
             )
-        elif (
-            isinstance(model._modules[name], torch.nn.BatchNorm2d)
-            and isinstance(model._modules[module_names[k - 1]], torch.nn.Conv2d)
-        ):
-            layers.append([module_names[k - 1], name])
+        elif isinstance(model._modules[name], torch.nn.BatchNorm2d):
+            previous = model._modules[module_names[k - 1]]
+            if isinstance(previous, torch.nn.Conv2d):
+                layers.append([module_names[k - 1], name])
     return layers
 
 
@@ -185,24 +185,43 @@ def derived_producer(
     return GraphModule(src, graph)
 
 
+def get_module_stack(node: Node) -> Dict[str, Tuple[str, Any]]:
+    """The module stack capture recorded for ``node``.
+
+    A node of an AOTAutograd backward pass has the stack of the forward op
+    it differentiates.  A node traced outside any module has none.
+
+    Args:
+        node: Node of an exported or AOTAutograd graph.
+
+    Returns:
+        The stack, outermost module first; empty if there is none.
+    """
+    return (
+        node.meta.get("nn_module_stack")
+        or node.meta.get("fwd_nn_module_stack")
+        or {}
+    )
+
+
 def get_node_name_to_scope(
     model: GraphModule,
 ) -> Dict[str, Tuple[str, type, int]]:
-    """Map each node's name to the module scope export recorded for it.
+    """Map each node's name to the module scope capture recorded for it.
 
     Args:
-        model: Exported graph module.
+        model: Exported or AOTAutograd graph module.
 
     Returns:
         ``node.name`` -> ``(module_path, module_type, call_index)`` taken from
-        the innermost frame of the node's ``nn_module_stack``.
+        the innermost frame of the node's module stack.
     """
     node_name_to_scope: Dict[str, Tuple[str, type]] = {}
     submodule_to_object_type_to_cur_idx: Dict[str, Dict[Callable, int]] = (
         defaultdict(lambda: defaultdict(int))
     )
     for n in model.graph.nodes:
-        if (nn_module_stack := n.meta.get("nn_module_stack", None)) is None:
+        if not (nn_module_stack := get_module_stack(n)):
             node_name_to_scope[n.name] = [("", type(None))]
             continue
 

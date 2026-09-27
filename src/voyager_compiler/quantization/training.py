@@ -1,0 +1,607 @@
+"""Training with fake-quantized GEMMs, forward only or backward too.
+
+``prepare_from_args`` picks the mode from the flags.  Without an error spec
+it is QAT: the export is prepared as ``prepare_qat_pt2e`` prepares it, and
+only the forward pass is quantized.  With one, ``prepare_training``
+quantizes the backward pass too.
+
+``capture_training`` hands ``prepare_training`` AOTAutograd's joint graph of
+the forward and backward passes before splitting it.  There each GEMM is
+renamed back to the op the model wrote -- a forward GEMM to its ``linear``
+or ``matmul``, a backward one to ``matmul`` -- and each GEMM operand is
+tagged with its type: an error is computed from an incoming gradient, a
+weight views a parameter, and anything else is an activation.  The
+quantizer annotates the joint graph as it annotates an export, a tagged
+operand taking its type's spec blocked along its GEMM's contraction axis,
+and ``prepare`` inserts the fake-quants.  Everything but the GEMM operands
+stays in high precision, the bias gradient included.
+
+A tensor several GEMMs read, as it is or transposed, with the same spec
+whose values do not depend on the axis -- per-tensor, a plain cast, or
+blocks spanning both axes -- is quantized once: every such GEMM reads one
+fake-quant's output, which the split saves when the backward reads it.
+"""
+
+import types
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
+
+import torch
+from torch import nn
+from torch._functorch import config as functorch_config
+from torch._functorch._aot_autograd.descriptors import (
+    ParamAOTInput,
+    TangentAOTInput,
+)
+from torch._functorch.aot_autograd import (
+    aot_module_simplified,
+    make_boxed_func,
+)
+from torch._functorch.partitioners import default_partition
+from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.export._unlift import _check_inputs_match
+from torch.fx import CodeGen, GraphModule, Node
+from torch.utils import _pytree as pytree
+from torchao.quantization.pt2e import FakeQuantizeBase
+from torchao.quantization.pt2e import prepare as torchao_prepare
+from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
+
+from voyager_compiler.export_utils import export_model
+from voyager_compiler.quantization.quantize_pt2e import (
+    _get_obs_or_fq_map,
+    get_default_quantizer,
+    prepare_qat_pt2e,
+    set_training,
+)
+from voyager_compiler.quantization.quantizer.quantizer import (
+    QScheme,
+    QuantizationSpec,
+)
+from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
+    XNNPACKQuantizer,
+)
+
+__all__ = [
+    "TrainingQuantizers",
+    "capture_training",
+    "disable_observers",
+    "prepare_from_args",
+    "prepare_training",
+]
+
+aten = torch.ops.aten
+
+# The GEMMs AOTAutograd lowers linear and matmul to.
+_GEMMS = (aten.mm.default, aten.addmm.default, aten.bmm.default)
+# The ops the quantizer annotates as GEMMs.
+_OPS = (aten.linear.default, aten.matmul.default)
+# Ops that only view a tensor: an operand read through them is still the
+# tensor they start from.
+_VIEWS = {
+    aten.view.default,
+    aten._unsafe_view.default,
+    aten.reshape.default,
+    aten.t.default,
+    aten.transpose.int,
+    aten.permute.default,
+    aten.expand.default,
+    aten.alias.default,
+    aten.unsqueeze.default,
+    aten.squeeze.dim,
+}
+# Schemes whose scales belong to blocks along an axis.
+_BLOCKS = (QScheme.MICROSCALING, QScheme.GROUP_WISE_AFFINE)
+
+
+def _quantized_once(spec: QuantizationSpec) -> bool:
+    """Whether ``spec`` gives a tensor the same values whatever the axis.
+
+    A per-tensor scale, a plain cast, or blocks spanning both of a matrix's
+    axes quantize a matrix and its transpose alike, so one quantization
+    serves every GEMM reading the tensor.
+    """
+    if spec.qscheme in _BLOCKS:
+        return isinstance(spec.ch_axis, tuple) and len(spec.ch_axis) > 1
+    return spec.qscheme in (None, QScheme.PER_TENSOR_SYMMETRIC)
+
+
+def _fake_quantize(fake_quant: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply ``fake_quant`` to ``x``.
+
+    The graph node calling a fake-quant: AOTAutograd's split keeps a
+    ``call_function``, where it drops a ``call_module``.
+    """
+    return fake_quant(x)
+
+
+class TrainingQuantizers(nn.Module):
+    """The fake-quants of a quantized training run.
+
+    Held by the model, the fake-quants move with it and are saved in its
+    state dict.  ``disable_observers`` leaves the ones named in
+    ``gradients``, which quantize gradients, observing.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gradients = set()
+
+
+def _rename_gemms(joint: GraphModule, export: GraphModule) -> None:
+    """Rename the joint graph's GEMMs back to the ops the model wrote.
+
+    A forward GEMM becomes the ``linear`` or ``matmul`` of the export it was
+    traced from; a backward one becomes ``matmul``.  A forward GEMM traced
+    from any other op, such as an einsum, is left as it is.
+
+    Args:
+        joint: AOTAutograd's joint graph, rewritten in place.
+        export: The graph AOTAutograd traced.
+    """
+    ops = {n.name: n.target for n in export.graph.nodes}
+    graph = joint.graph
+    for gemm in list(graph.nodes):
+        if gemm.op != "call_function" or gemm.target not in _GEMMS:
+            continue
+        op = aten.matmul.default
+        if gemm.meta.get("partitioner_tag") != "is_backward":
+            op = ops.get(gemm.meta["from_node"][-1].name)
+        if op not in _OPS:
+            continue
+        if gemm.target is aten.addmm.default:
+            bias, a, b = gemm.args
+        else:
+            (a, b), bias = gemm.args, None
+        if op is aten.linear.default and gemm.target is not aten.bmm.default:
+            # A linear's lowering reads its weight transposed.
+            args = (a, b.args[0]) if bias is None else (a, b.args[0], bias)
+        else:
+            op, args = aten.matmul.default, (a, b)
+        with graph.inserting_before(gemm):
+            node = graph.call_function(op, args)
+        node.meta = gemm.meta
+        gemm.replace_all_uses_with(node)
+        graph.erase_node(gemm)
+    joint.recompile()
+
+
+def _tag_operands(joint: GraphModule) -> Set[Node]:
+    """Tag each linear and matmul operand of the joint graph with its type.
+
+    ``meta["operand_types"]`` holds a GEMM's two operand types: an error is
+    computed from an incoming gradient (a tangent input), a weight views a
+    parameter, and anything else is an activation.
+
+    Args:
+        joint: AOTAutograd's joint graph, tagged in place.
+
+    Returns:
+        The nodes computed from incoming gradients.
+    """
+    errors = set()
+    for node in joint.graph.nodes:
+        if isinstance(
+            node.meta.get("desc"), TangentAOTInput
+        ) or not errors.isdisjoint(node.all_input_nodes):
+            errors.add(node)
+    for gemm in joint.graph.nodes:
+        if gemm.target not in _OPS:
+            continue
+        kinds = []
+        for operand in gemm.args[:2]:
+            source = operand
+            while source.target in _VIEWS:
+                source = source.args[0]
+            if operand in errors:
+                kinds.append("error")
+            elif isinstance(source.meta.get("desc"), ParamAOTInput):
+                kinds.append("weight")
+            else:
+                kinds.append("activation")
+        gemm.meta["operand_types"] = tuple(kinds)
+    return errors
+
+
+def _is_transpose(node: Node) -> bool:
+    """Whether ``node`` swaps the last two axes of its input."""
+    if node.op != "call_function":
+        return False
+    if node.target is aten.t.default:
+        return True
+    if node.target is not aten.transpose.int:
+        return False
+    ndim = node.meta["val"].dim()
+    return {d % ndim for d in node.args[1:3]} == {ndim - 2, ndim - 1}
+
+
+def _share_quantized_transposes(joint: GraphModule) -> None:
+    """Quantize once a tensor that one GEMM reads and another transposes.
+
+    ``prepare`` gives a tensor's readers with the same spec one fake-quant.
+    A GEMM operand that transposes a tensor another GEMM reads, both with
+    the same spec quantizing once, becomes such a reader: its transposes
+    are rebuilt to take the tensor through that fake-quant.
+
+    Args:
+        joint: Annotated joint graph, rewritten in place.
+    """
+    graph = joint.graph
+    for gemm in list(graph.nodes):
+        annotation = gemm.meta.get("quantization_annotation")
+        if annotation is None:
+            continue
+        for operand, spec in list(annotation.input_qspec_map.items()):
+            if spec is None or not _quantized_once(spec):
+                continue
+            chain, source, shared = [], operand, False
+            while not shared and _is_transpose(source):
+                chain.append(source)
+                source = source.args[0]
+                shared = any(
+                    user.meta["quantization_annotation"].input_qspec_map.get(
+                        source
+                    )
+                    == spec
+                    for user in source.users
+                    if "quantization_annotation" in user.meta
+                )
+            if not shared:
+                continue
+            copies = {source: source}
+            with graph.inserting_before(gemm):
+                for node in reversed(chain):
+                    copies[node] = graph.node_copy(node, copies.__getitem__)
+                    # The split places a node by its tag.
+                    copies[node].meta["partitioner_tag"] = gemm.meta[
+                        "partitioner_tag"
+                    ]
+            copies[chain[-1]].meta["quantization_annotation"] = (
+                QuantizationAnnotation(
+                    input_qspec_map={source: spec}, _annotated=True
+                )
+            )
+            gemm.replace_input_with(operand, copies[operand])
+            del annotation.input_qspec_map[operand]
+    joint.recompile()
+
+
+def capture_training(
+    model: torch.nn.Module,
+    args: Tuple[Any, ...],
+    kwargs: Optional[Dict[str, Any]],
+    dynamic_shapes: Optional[Dict[str, Any]],
+    make_transform: Callable[
+        [GraphModule], Callable[[GraphModule], GraphModule]
+    ],
+    hidden: Sequence[str],
+) -> None:
+    """Run ``model`` through the graphs AOTAutograd derives from its export.
+
+    ``model``, in training mode, is exported once with the example inputs.
+    AOTAutograd traces the export's forward and backward into one joint
+    graph, which ``make_transform(export)`` rewrites before AOTAutograd
+    splits it into the forward graph and the backward graph that
+    differentiates it; ``model.forward.graphs`` holds the two, and
+    ``model``'s forward is replaced to run them.  Parameters stay the
+    model's own, so optimizers, checkpoints and ``train()`` / ``eval()``
+    work as on the eager model: ``eval()`` switches the graphs' dropouts
+    off, and under ``torch.no_grad()`` the outputs come back detached.
+    Moving or casting the model, and choosing which parameters require
+    grad, must come before this call.  If capture fails, ``model`` is left
+    as it was.  A deep copy of a captured model still runs the original's
+    graphs, and pickling one fails.
+
+    Args:
+        model: Module to capture, in training mode.
+        args: Positional example inputs.
+        kwargs: Keyword example inputs.
+        dynamic_shapes: Dynamic-shape spec forwarded to ``torch.export``.
+        make_transform: Called with the export graph; returns the rewrite of
+            the joint graph.
+        hidden: Names of ``model``'s submodules to detach while exporting,
+            so that state the forward never reads stays out of the graphs.
+
+    Raises:
+        ValueError: ``model`` is in eval mode.
+        NotImplementedError: The forward graph has a batch norm or a fused
+            attention dropout, which cannot switch between training and
+            eval in place.
+    """
+    if not model.training:
+        raise ValueError("Capture the model in training mode")
+    detached = {name: model._modules.pop(name) for name in hidden}
+    try:
+        gm = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
+    finally:
+        model._modules.update(detached)
+    transform = make_transform(gm)
+    in_spec, out_spec = gm._in_spec, gm._out_spec
+    inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
+    # AOTAutograd takes flat inputs and a tuple of outputs.
+    gm.graph._codegen = CodeGen()
+    output = next(n for n in gm.graph.nodes if n.op == "output")
+    output.args = (tuple(output.args[0]),)
+    gm.recompile()
+    graphs = {}
+    joints = []
+
+    def partition(joint, joint_inputs, **kwargs):
+        joints.append(transform(joint))
+        return default_partition(joints[0], joint_inputs, **kwargs)
+
+    def compile_forward(graph, _):
+        graphs["forward"] = graph
+        return make_boxed_func(graph)
+
+    def compile_backward(graph, _):
+        # AOTAutograd hands over a deep copy; the backward calls the joint
+        # graph's submodules, as the forward does.
+        for name, _ in list(graph.named_children()):
+            setattr(graph, name, getattr(joints[0], name))
+        # Drop the partitioner's dead copies of random forward ops, which
+        # dead-code elimination otherwise keeps as impure.
+        graph.graph.eliminate_dead_code(
+            is_impure_node=lambda n: n.is_impure(impure_random=False)
+        )
+        graph.recompile()
+        graphs["backward"] = graph
+        return make_boxed_func(graph)
+
+    # The backward is compiled now, not at the first backward call.
+    with (
+        torch.enable_grad(),
+        functorch_config.patch(force_non_lazy_backward_lowering=True),
+    ):
+        run = aot_module_simplified(
+            gm,
+            inputs,
+            fw_compiler=compile_forward,
+            bw_compiler=compile_backward,
+            partition_fn=partition,
+        )
+    for node in graphs["forward"].graph.nodes:
+        schema = getattr(node.target, "_schema", None)
+        if schema is None:
+            continue
+        names = [a.name for a in schema.arguments]
+        dropout_p = 0.0
+        if "dropout_p" in names:
+            index = names.index("dropout_p")
+            dropout_p = (
+                node.args[index]
+                if index < len(node.args)
+                else node.kwargs.get("dropout_p", 0.0)
+            )
+        if "batch_norm" in schema.name or dropout_p:
+            raise NotImplementedError(
+                f"{node.target} cannot switch between training and eval"
+            )
+
+    def visible(name):
+        return name.split(".")[0] not in hidden
+
+    requires_grad = [
+        p.requires_grad for n, p in model.named_parameters() if visible(n)
+    ]
+    training = [True]
+
+    def forward(*call_args, **call_kwargs):
+        if [
+            p.requires_grad for n, p in model.named_parameters() if visible(n)
+        ] != requires_grad:
+            raise RuntimeError(
+                "Which parameters require grad changed after capture"
+            )
+        if model.training != training[0]:
+            training[0] = model.training
+            # Out of training a dropout passes its input and gradient
+            # through.
+            for graph in graphs.values():
+                for node in graph.graph.nodes:
+                    if node.target == torch.ops.aten.native_dropout.default:
+                        node.update_arg(2, model.training)
+                    elif (
+                        node.target
+                        == torch.ops.aten.native_dropout_backward.default
+                    ):
+                        scale = node.meta.setdefault("scale", node.args[2])
+                        node.update_arg(2, scale if model.training else 1.0)
+                graph.recompile()
+        flat = _check_inputs_match(call_args, call_kwargs, in_spec)
+        outputs = list(run(*(leaf for _, leaf in flat)))
+        # AOTAutograd records the backward even under no_grad.
+        if not torch.is_grad_enabled():
+            outputs = [
+                o.detach() if isinstance(o, torch.Tensor) else o
+                for o in outputs
+            ]
+        return pytree.tree_unflatten(outputs, out_spec)
+
+    forward.graphs = graphs
+    model.forward = forward
+
+
+def prepare_training(
+    model: nn.Module,
+    quantizer: XNNPACKQuantizer,
+    example_args: Tuple[Any, ...],
+    example_kwargs: Optional[Dict[str, Any]],
+    dynamic_shapes,
+) -> nn.Module:
+    """Quantize ``model``'s GEMMs in the forward and the backward pass.
+
+    ``model`` keeps its parameters, names and ``train()`` / ``eval()``; its
+    forward runs the graphs ``capture_training`` captures.  The fake-quants
+    are held by ``model.training_quantizers``.
+
+    Args:
+        model: Float model, in training mode.
+        quantizer: Annotates which GEMMs are quantized and how; its GEMM
+            configs carry the error spec.
+        example_args: Positional inputs to export with.
+        example_kwargs: Keyword inputs to export with.
+        dynamic_shapes: Dynamic dimensions of the inputs.
+
+    Returns:
+        ``model``.
+
+    Raises:
+        NotImplementedError: The quantizer would quantize an op other than
+            a linear or matmul, or a GEMM output; or the model has a batch
+            norm or a fused attention dropout.
+        ValueError: A spec is per-channel, or ``model`` is in eval mode.
+    """
+    model.training_quantizers = quantizers = TrainingQuantizers()
+
+    def make_transform(export):
+        quantizer.annotate(export)
+        for node in export.graph.nodes:
+            annotation = node.meta.pop("quantization_annotation", None)
+            if (
+                annotation is not None
+                and node.target not in _OPS
+                and any(
+                    spec is not None
+                    for spec in annotation.input_qspec_map.values()
+                )
+            ):
+                raise NotImplementedError(
+                    f"Quantized training does not support {node.target} yet"
+                )
+
+        def transform(joint):
+            _rename_gemms(joint, export)
+            errors = _tag_operands(joint)
+            quantizer.annotate(joint)
+            for node in joint.graph.nodes:
+                annotation = node.meta.get("quantization_annotation")
+                if annotation is None:
+                    continue
+                if annotation.output_qspec is not None:
+                    raise NotImplementedError(
+                        "GEMM outputs are not quantized in quantized training"
+                    )
+                if any(
+                    getattr(spec, "qscheme", None)
+                    == QScheme.PER_CHANNEL_SYMMETRIC
+                    for spec in annotation.input_qspec_map.values()
+                ):
+                    raise ValueError(
+                        "Per-channel specs have no contraction axis to "
+                        "quantize along; use per-tensor or block specs"
+                    )
+            _share_quantized_transposes(joint)
+            torchao_prepare._get_obs_or_fq_map = _get_obs_or_fq_map
+            with unset_fake_temporarily():
+                prepared = torchao_prepare.prepare(joint, {}, True)
+            graph = prepared.graph
+            for node in list(graph.nodes):
+                if node.op != "call_module":
+                    continue
+                (operand,) = node.args
+                fake_quant = prepared.get_submodule(node.target)
+                with unset_fake_temporarily():
+                    fake_quant.to(operand.meta["val"].device)
+                quantizers.add_module(node.target, fake_quant)
+                if operand in errors:
+                    quantizers.gradients.add(node.target)
+                with graph.inserting_before(node):
+                    call = graph.call_function(
+                        _fake_quantize, (graph.get_attr(node.target), operand)
+                    )
+                call.meta["val"] = operand.meta["val"]
+                node.replace_all_uses_with(call)
+                graph.erase_node(node)
+            prepared.recompile()
+            return prepared
+
+        return transform
+
+    try:
+        capture_training(
+            model,
+            example_args,
+            example_kwargs,
+            dynamic_shapes,
+            make_transform,
+            hidden=("training_quantizers",),
+        )
+    except Exception:
+        del model.training_quantizers
+        raise
+    return model
+
+
+def disable_observers(model: nn.Module) -> None:
+    """Fix every fake-quant's scale except the gradients', which keep moving.
+
+    Args:
+        model: Prepared graph, or a model prepared by ``prepare_training``.
+    """
+    for module in model.modules():
+        if isinstance(module, FakeQuantizeBase):
+            module.disable_observer()
+    for module in model.modules():
+        if isinstance(module, TrainingQuantizers):
+            for name in module.gradients:
+                getattr(module, name).enable_observer()
+
+
+def prepare_from_args(
+    model: nn.Module,
+    args,
+    example_args: Tuple[Any, ...] = (),
+    example_kwargs: Optional[Dict[str, Any]] = None,
+    dynamic_shapes=None,
+) -> nn.Module:
+    """Prepare ``model`` for training as the quantization flags ask.
+
+    The flags are the ones ``add_quantization_args`` defines.  With
+    ``--error``, ``prepare_training`` quantizes the forward and backward
+    passes.  Without it the model is exported in training mode and
+    prepared for QAT: each conv-BN pair trains through the simulated fold,
+    and ``train()`` and ``eval()`` switch the graph's dropouts and batch
+    norms.
+
+    Args:
+        model: Float model.
+        args: Parsed command-line arguments.
+        example_args: Positional inputs to export with.
+        example_kwargs: Keyword inputs to export with.
+        dynamic_shapes: Dynamic dimensions of the inputs.
+
+    Returns:
+        The prepared model: ``model`` itself with ``--error``, otherwise
+        the prepared graph.
+    """
+    if args.bf16:
+        model.bfloat16()
+    quantizer = get_default_quantizer(
+        input_activation=args.activation,
+        weight=args.weight,
+        bias=args.bias,
+        error=args.error,
+        force_scale_power_of_two=args.force_scale_power_of_two,
+    )
+    if args.error is not None:
+        return prepare_training(
+            model.train(),
+            quantizer,
+            example_args,
+            example_kwargs,
+            dynamic_shapes,
+        )
+    exported = export_model(
+        model.train(),
+        example_args,
+        example_kwargs,
+        dynamic_shapes=dynamic_shapes,
+    )
+    model = prepare_qat_pt2e(exported, quantizer)
+
+    def train(self, mode=True):
+        set_training(self, mode)
+        return self
+
+    model.train = types.MethodType(train, model)
+    model.eval = types.MethodType(nn.Module.eval, model)
+    return model

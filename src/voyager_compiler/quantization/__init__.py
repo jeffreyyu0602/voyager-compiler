@@ -1,12 +1,13 @@
 """Quantization: choose a spec per node, observe, then bake in quant/dequant.
 
-Everything runs through PT2E (``quantize_pt2e``), QAT included, configured
-with the comma-separated spec strings ``QuantizationSpec.from_str`` parses.
+Everything runs through PT2E (``quantize_pt2e``), configured with the
+comma-separated spec strings ``QuantizationSpec.from_str`` parses.
+Training -- QAT, or with the backward pass quantized too -- is set up by
+``training``.
 """
 
 from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
-    ErrorFakeQuantize,
     FusedAmaxObsFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
@@ -30,12 +31,11 @@ from voyager_compiler.quantization.qspec import QScheme, parse_codebook_dtype
 from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
-    disable_observers,
     fold_conv_bn_qat,
     freeze_cache_reads,
     freeze_weights,
     get_default_quantizer,
-    prepare_from_args,
+    make_spec,
     prepare_pt2e,
     prepare_qat_pt2e,
     set_batch_norm_training,
@@ -43,9 +43,15 @@ from voyager_compiler.quantization.quantize_pt2e import (
     sink_obs_or_fq,
     swap_matmul_inputs,
 )
+from voyager_compiler.quantization.training import (
+    TrainingQuantizers,
+    capture_training,
+    disable_observers,
+    prepare_from_args,
+    prepare_training,
+)
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
-    ErrorQuantizationSpec,
     QuantizationSpec,
 )
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
@@ -58,14 +64,14 @@ __all__ = [
     "Histogram",
     "DerivedQuantizationSpec",
     "DirectCastFakeQuantize",
-    "ErrorFakeQuantize",
-    "ErrorQuantizationSpec",
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
+    "TrainingQuantizers",
+    "capture_training",
     "codebook_qmap",
     "compensate_weight",
     "convert_pt2e",
@@ -80,11 +86,13 @@ __all__ = [
     "get_quantization_map",
     "gptq",
     "load_codebooks",
+    "make_spec",
     "optimal_codebook",
     "parse_codebook_dtype",
     "prepare_from_args",
     "prepare_pt2e",
     "prepare_qat_pt2e",
+    "prepare_training",
     "set_batch_norm_training",
     "set_training",
     "sink_obs_or_fq",

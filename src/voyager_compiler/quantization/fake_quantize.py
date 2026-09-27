@@ -24,7 +24,6 @@ from voyager_compiler.quantization.qspec import (
 
 __all__ = [
     "DirectCastFakeQuantize",
-    "ErrorFakeQuantize",
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
@@ -442,7 +441,10 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
 
     The per-tensor and per-channel schemes keep the absolute maxima of the
     last ``amax_history_len`` inputs, one per tensor or one per channel
-    along ``ch_axis``, and scale by the largest.
+    along ``ch_axis``, and scale by the largest.  An input is quantized
+    before its own amax joins the history, so the first call uses scale
+    1.0, as Transformer Engine's delayed scaling does (whose default
+    history is 1024 long).
 
     Args:
         dtype: Element dtype, as a spec string names it.
@@ -781,36 +783,3 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
 
     def calculate_qparams(self):
         return self.derive_qparams_fn(self.obs_or_fqs)
-
-
-class ErrorFakeQuantize(FakeQuantizeBase):
-    """Fake-quantize an op's output forward and its gradient backward.
-
-    The gradient is the one reaching the output in the backward pass,
-    summed over every user of the output, so the op's own backward reads
-    the quantized value.  Each part is an ordinary fake-quant, and the
-    observer and fake-quant switches reach both.
-
-    Args:
-        forward_fq: Fake-quant for the output, or None to pass it through.
-        error_fq: Fake-quant for the gradient.
-    """
-
-    def __init__(
-        self,
-        forward_fq: Optional[FakeQuantizeBase],
-        error_fq: FakeQuantizeBase,
-    ) -> None:
-        super().__init__()
-        self.forward_fq = forward_fq
-        self.error_fq = error_fq
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.forward_fq is not None:
-            x = self.forward_fq(x)
-        if x.requires_grad:
-            x.register_hook(self.error_fq)
-        return x
-
-    def calculate_qparams(self):
-        return self.forward_fq.calculate_qparams()

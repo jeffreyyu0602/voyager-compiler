@@ -17,6 +17,7 @@ from torchao.quantization.pt2e.quantizer.utils import (
 
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
+    QScheme,
     QuantizationSpec,
 )
 
@@ -29,12 +30,60 @@ _SDPA_OPS = (_SDPA, torch.ops.quantized_ops.sdpa_mx.default)
 # In the absence of better name, just winging it with QuantizationConfig
 @dataclass(eq=True, frozen=True)
 class QuantizationConfig:
+    """Specs for an op's operands.
+
+    A GEMM of quantized training has each operand tagged with its type in
+    ``meta["operand_types"]``; its operands take ``input_activation``,
+    ``weight`` or ``error`` by that type.  Elsewhere a matmul's second
+    operand takes ``weight``.
+    """
+
     input_activation: Optional[QuantizationSpec]
     output_activation: Optional[QuantizationSpec]
     weight: Optional[QuantizationSpec]
     bias: Optional[QuantizationSpec]
     # TODO: remove, since we can use observer_or_fake_quant_ctr to express this
     is_qat: bool = False
+    error: Optional[QuantizationSpec] = None
+
+
+def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
+    """``qspec`` blocked along ``ch_axis``, if its scheme blocks along one.
+
+    A spec naming several axes, e.g. ``ax=(0,1)`` for square weight blocks,
+    is the user's choice of block and is kept as given.
+    """
+    if (
+        qspec is None
+        or qspec.qscheme
+        not in (QScheme.MICROSCALING, QScheme.GROUP_WISE_AFFINE)
+        or isinstance(qspec.ch_axis, tuple)
+    ):
+        return qspec
+    return replace(qspec, ch_axis=ch_axis)
+
+
+def _typed_specs(node: Node, config: QuantizationConfig, axes):
+    """Specs of a training GEMM's two operands, by their tagged types.
+
+    Args:
+        node: GEMM with ``meta["operand_types"]``.
+        config: Gives each type its spec.
+        axes: Each operand's contraction axis, which its spec is blocked
+            along.
+
+    Returns:
+        The two operands' specs.
+    """
+    specs = {
+        "activation": config.input_activation,
+        "weight": config.weight,
+        "error": config.error,
+    }
+    return [
+        _set_ch_axis(specs[kind], axis)
+        for kind, axis in zip(node.meta["operand_types"], axes)
+    ]
 
 
 OperatorPatternType = List[Callable]
@@ -105,6 +154,11 @@ def _annotate_linear(
         bias_node = None
         if len(node.args) > 2:
             bias_node = node.args[2]
+        act_spec, weight_spec = input_act_qspec, weight_qspec
+        if "operand_types" in node.meta:
+            act_spec, weight_spec = _typed_specs(
+                node, quantization_config, (-1, -1)
+            )
 
         if isinstance(quantization_config.bias, DerivedQuantizationSpec):
             bias_qspec = replace(
@@ -116,12 +170,12 @@ def _annotate_linear(
             _annotate_input_qspec_map(
                 node,
                 act_node,
-                input_act_qspec,
+                act_spec,
             )
             _annotate_input_qspec_map(
                 node,
                 weight_node,
-                weight_qspec,
+                weight_spec,
             )
             nodes_to_mark_annotated = [node, weight_node]
             if bias_node:
@@ -214,16 +268,19 @@ def _annotate_matmul(
         if _is_annotated([node]):
             continue
 
+        # We use weight_qspec for the second input to differentiate
+        # the two inputs of torch.matmul
+        specs = [input_act_qspec, weight_qspec]
+        if "operand_types" in node.meta:
+            specs = _typed_specs(node, quantization_config, (-1, -2))
         input_qspec_map = {}
         input_act0 = node.args[0]
         if isinstance(input_act0, Node):
-            input_qspec_map[input_act0] = input_act_qspec
+            input_qspec_map[input_act0] = specs[0]
 
-        # We use weight_qspec for the second input to differentiate
-        # the two inputs of torch.matmul
         input_act1 = node.args[1]
         if isinstance(input_act1, Node):
-            input_qspec_map[input_act1] = weight_qspec
+            input_qspec_map[input_act1] = specs[1]
 
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
