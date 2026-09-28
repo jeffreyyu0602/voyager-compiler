@@ -87,7 +87,6 @@ from voyager_compiler import (
     gen_compute_graph,
     get_default_quantizer,
     prepare_pt2e,
-    remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
     split_kv_cache,
     transform,
@@ -637,9 +636,9 @@ def build_decode(cfg: SweepConfig):
     input_ids = torch.ones((cfg.batch, 1), dtype=torch.long)
     cache_position = torch.tensor([cfg.kv_len], dtype=torch.long)
     # Strict export bakes in aten._assert_tensor_metadata guards (e.g. the
-    # attention softmax's dtype=float32); ``remove_softmax_dtype_cast`` later
+    # attention softmax's dtype=float32); ``remove_fp32_casts`` later
     # rewrites that softmax to bf16, so those stale guards must be suppressed at
-    # export or they fail at calibration.
+    # export.
     with _disable_aten_to_metadata_assertions():
         ep = convert_and_export_with_cache(
             model,
@@ -837,8 +836,6 @@ def _frontend(cfg: SweepConfig):
     else:
         gm, model, example_args, example_kwargs = build_prefill(cfg)
 
-    remove_softmax_dtype_cast(gm)
-
     # get_decoder() is the text decoder, wherever the model nests it.
     layernorm = model.get_decoder().layers[0].input_layernorm
     seq = 1 if is_decode else 128
@@ -868,6 +865,7 @@ def _frontend(cfg: SweepConfig):
         skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
+        keep_fp32=False,
     )
 
     if cfg.dump_dir is not None:

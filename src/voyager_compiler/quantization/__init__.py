@@ -47,8 +47,10 @@ from voyager_compiler.quantization.training import (
     TrainingQuantizers,
     capture_training,
     disable_observers,
+    gradient_program,
     prepare_from_args,
     prepare_training,
+    update_program,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
@@ -85,6 +87,7 @@ __all__ = [
     "get_default_quantizer",
     "get_quantization_map",
     "gptq",
+    "gradient_program",
     "load_codebooks",
     "make_spec",
     "optimal_codebook",
@@ -97,4 +100,5 @@ __all__ = [
     "set_training",
     "sink_obs_or_fq",
     "swap_matmul_inputs",
+    "update_program",
 ]

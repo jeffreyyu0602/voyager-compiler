@@ -262,10 +262,38 @@ def _materializes_dram(node: Node) -> bool:
     )
 
 
-def _plan_dram(model: GraphModule, buffer_of, config) -> int:
+def shared_dram_layout(
+    models: List[GraphModule], config
+) -> Dict[str, Tuple[int, int]]:
+    """One DRAM range per input name across programs that share their inputs.
+
+    The programs of a training step read and write the same parameters,
+    gradients and optimizer state; each input keeps one address in all of
+    them, and the ranges are laid out one after another from address 0.
+
+    Args:
+        models: Transformed programs, their inputs shape-propagated.
+        config: The accelerator, which sets each range's alignment.
+
+    Returns:
+        ``{input name: (start, end)}`` in bytes.
+    """
+    layout, offset = {}, 0
+    for model in models:
+        for node in model.graph.nodes:
+            if node.op == "placeholder" and node.name not in layout:
+                size = _nbytes(node, config)
+                layout[node.name] = (offset, offset + size)
+                offset += size
+    return layout
+
+
+def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
-    ``meta['memory']`` on each DRAM buffer root.
+    ``meta['memory']`` on each DRAM buffer root.  An input named in
+    ``dram_layout`` takes its range there, and the other persistent tensors
+    follow the whole layout.
     """
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
@@ -319,8 +347,12 @@ def _plan_dram(model: GraphModule, buffer_of, config) -> int:
                 last_t[root] = max(last_t[root], pos[n])
 
     # Persistent region first (params + inputs), linear, no reuse.
-    offset = 0
+    offset = max((end for _, end in dram_layout.values()), default=0)
     for b in persistent:
+        if b.op == "placeholder" and b.name in dram_layout:
+            start, end = dram_layout[b.name]
+            b.meta["memory"] = Segment(start, end, MemoryLevel.DRAM, b)
+            continue
         size = _nbytes(b, config)
         b.meta["memory"] = Segment(offset, offset + size, MemoryLevel.DRAM, b)
         offset += size
@@ -749,8 +781,15 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def plan_memory(model: GraphModule, config) -> MemoryPlan:
+def plan_memory(
+    model: GraphModule,
+    config,
+    dram_layout: Optional[Dict[str, Tuple[int, int]]] = None,
+) -> MemoryPlan:
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
+
+    ``dram_layout`` (see ``shared_dram_layout``) pins the inputs this
+    program shares with others to their agreed DRAM ranges.
 
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —
@@ -776,7 +815,7 @@ def plan_memory(model: GraphModule, config) -> MemoryPlan:
     # them (a buffer dies at the last read of *any* of its names), so compute
     # them once.
     buffer_of = _buffer_identity(model)
-    dram_bytes = _plan_dram(model, buffer_of, config)
+    dram_bytes = _plan_dram(model, buffer_of, config, dram_layout or {})
     bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), config)
 
     scratchpad_bytes = 0

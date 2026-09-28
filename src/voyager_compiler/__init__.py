@@ -38,8 +38,8 @@ from voyager_compiler.codegen import (
     pad_matrix_op_dimensions,
     pad_vector_op_dimensions,
     pad_vit_embeddings_output,
+    remove_fp32_casts,
     remove_prunable_ops,
-    remove_softmax_dtype_cast,
     remove_zero_attention_mask,
     rename_nodes_with_param_names,
     replace_conv2d_with_im2col,
@@ -55,6 +55,7 @@ from voyager_compiler.codegen.transform.bufferize import (
     plan_memory,
     print_bufferized_graph,
     print_layer_table,
+    shared_dram_layout,
 )
 from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
@@ -96,6 +97,7 @@ from voyager_compiler.quantization import (
     freeze_cache_reads,
     freeze_weights,
     get_default_quantizer,
+    gradient_program,
     make_spec,
     prepare_from_args,
     prepare_pt2e,
@@ -104,6 +106,7 @@ from voyager_compiler.quantization import (
     set_batch_norm_training,
     set_training,
     sink_obs_or_fq,
+    update_program,
 )
 from voyager_compiler.quantization.dtypes import (
     quantize_to_nf,
@@ -153,6 +156,7 @@ __all__ = [
     "get_default_quantizer",
     "get_device_map",
     "get_node_name_to_scope",
+    "gradient_program",
     "insert_align_device_nodes",
     "make_spec",
     "pad_vit_embeddings_output",
@@ -164,7 +168,7 @@ __all__ = [
     "propagate_shape",
     "quantize_to_nf",
     "quantize_to_posit",
-    "remove_softmax_dtype_cast",
+    "remove_fp32_casts",
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
@@ -172,9 +176,11 @@ __all__ = [
     "scalarize_index_arithmetic",
     "set_batch_norm_training",
     "set_training",
+    "shared_dram_layout",
     "sink_obs_or_fq",
     "split_kv_cache",
     "transform",
+    "update_program",
     "with_execution_context",
 ]
 
@@ -234,15 +240,21 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
+    keep_fp32=True,
 ):
     """Lower ``model`` in place through the graph-level passes.  The passes
-    run on fake inputs and read shapes only; see ``shape_prop``."""
+    run on fake inputs and read shapes only; see ``shape_prop``.
+    ``keep_fp32=False`` computes in 16-bit float where the model casts up to
+    float32 (``remove_fp32_casts``)."""
     if example_kwargs is None:
         example_kwargs = {}
 
     # A null config (no hardware) skips padding and tiling.
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+
+    if not keep_fp32:
+        remove_fp32_casts(model)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
     ShapeProp(model).propagate(*map(fake_like, flatten_args))
@@ -286,7 +298,13 @@ def compile(
     output_file="compute_graph",
     dump_tensors=True,
     runtime_tolerance=None,
+    dram_layout=None,
 ):
+    """Bufferize ``model``, plan its memory and write its ``voyager`` IR.
+
+    ``dram_layout`` (see ``shared_dram_layout``) pins the inputs ``model``
+    shares with other programs, such as a training step's gradient and
+    update programs, to their agreed DRAM ranges."""
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
@@ -304,7 +322,7 @@ def compile(
     )
     tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
     bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
-    plan_memory(model, config)
+    plan_memory(model, config, dram_layout)
     print_bufferized_graph(model)
 
     path = os.path.join(output_dir, "tensor_files")

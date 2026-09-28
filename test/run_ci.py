@@ -93,7 +93,11 @@ assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 
 # Reused per-command extra-flag groups.
 _SINGLE = "--num_hidden_layers 1"
-_LLM = "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask"
+_FP16 = "--remove_fp32_casts"
+_LLM = (
+    "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask "
+    + _FP16
+)
 _LLM_MP = _LLM + " --qconfig mxnf4_attn_head_int6"
 _LLM_SPMM = _LLM + " --qconfig mxnf4_outlier"
 _DB = "--double_buffered_l2"
@@ -139,7 +143,7 @@ COMMANDS = [
     # -- MXNF4 (vision / bert) --
     Command("resnet18", "MXNF4", "64,64"),
     Command("resnet50", "MXNF4", "64,64"),
-    Command("vit", "MXNF4", "64,64"),
+    Command("vit", "MXNF4", "64,64", extra=_FP16),
     Command("bert", "MXNF4", "64,64"),
     # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
     # pipeline apart) --

@@ -20,7 +20,6 @@ from voyager_compiler import (
 )
 from voyager_compiler.codegen import (
     pad_vit_embeddings_output,
-    remove_softmax_dtype_cast,
     remove_zero_attention_mask,
 )
 from voyager_compiler.quantization import parse_codebook_dtype
@@ -151,8 +150,6 @@ def quantize_and_dump_model(
         replace_conv2d_with_im2col(gm)
 
     gm = prepare_pt2e(gm, quantizer)
-
-    remove_softmax_dtype_cast(gm)
 
     for i in tqdm(range(args.calibration_steps), desc="Calibrating ViT"):
         inputs = calibration_data[i]["image"]

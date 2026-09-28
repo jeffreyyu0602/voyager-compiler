@@ -19,6 +19,7 @@ from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler.codegen.node_info import (
     _pair,
+    activation_transforms,
     ancestors,
     bound_operands,
     compute_output_tiled_shapes,
@@ -2002,7 +2003,7 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
             if role == "output":
                 return node
             if role == "input":
-                return src(anchor.args[0])
+                return src(activation_transforms(anchor.args[0])[0])
             if role == "weight":
                 return src(weight_transforms(anchor.args[1])[0])
             if role == "bias":
@@ -2523,8 +2524,9 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         return None
     anchor = info.anchor if info is not None else node
 
-    weight_node, transposed, weight_repeat, dequant = weight_transforms(
-        anchor.args[1]
+    act_node, act_transposed = activation_transforms(anchor.args[0])
+    weight_node, weight_transposed, weight_repeat, weight_dequant = (
+        weight_transforms(anchor.args[1])
     )
 
     act = anchor.args[0].value.clone()
@@ -2597,8 +2599,9 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         )
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
+    act_spec.transposed = act_transposed
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
-    weight_spec.transposed = transposed
+    weight_spec.transposed = weight_transposed
     weight_spec.repeat = weight_repeat
     bias_spec = _InputSpec((tn,), (gn,), (False,))
     # The output(s) tile onto the M/N grid dims (K reduction ``gk`` dropped); a
@@ -2616,7 +2619,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     bound = bound_operands(node, node.meta.get("submodule"))
     src = lambda n: bound.get(n, n)
     node_to_spec = {
-        src(anchor.args[0]): (act, act_spec),
+        src(act_node): (act_node.value.clone(), act_spec),
         src(weight_node): (weight, weight_spec),
     }
 
@@ -2687,9 +2690,11 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     # so they dice with it, that axis divided by the block; the codebook, indexed
     # by value rather than by position, loads whole.
     dq_nodes = {}
-    if dequant is not None:
-        dq_axes = {a % weight.ndim for a in get_arg_value(dequant, 3, "axes")}
-        dq_bs = get_arg_value(dequant, 4, "block_size")
+    if weight_dequant is not None:
+        dq_axes = {
+            a % weight.ndim for a in get_arg_value(weight_dequant, 3, "axes")
+        }
+        dq_bs = get_arg_value(weight_dequant, 4, "block_size")
         k_dim, n_dim = (
             (weight.ndim - 2, weight.ndim - 1)
             if ck
@@ -2699,8 +2704,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
             tn // dq_bs if n_dim in dq_axes else tn,
             tk // dq_bs if k_dim in dq_axes else tk,
         )
-        tables = quant_param_arg_nodes(dequant)
-        for i, v in enumerate(dequant.args):
+        tables = quant_param_arg_nodes(weight_dequant)
+        for i, v in enumerate(weight_dequant.args):
             if i == 0 or not isinstance(v, torch.fx.Node):
                 continue
             spec = None
@@ -2726,7 +2731,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     inputs = [node_to_spec[n][0] for n in node.all_input_nodes]
     in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
 
-    act_idx = order[src(anchor.args[0])]
+    act_idx = order[src(act_node)]
     weight_idx = order[src(weight_node)]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
@@ -2737,14 +2742,14 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     # there — so read the dequantize's call apart here: its scalar args as plain
     # Python, and the tile slot each of its tensor args comes from.
     dq_idx = {i: order[n] for i, n in dq_nodes.items()}
-    dq_target = dequant.target if dequant is not None else None
+    dq_target = weight_dequant.target if weight_dequant is not None else None
     dq_args = [
         (
             None
             if isinstance(a, torch.fx.Node)
             else tuple(a) if isinstance(a, (list, tuple)) else a
         )
-        for a in (dequant.args if dequant is not None else ())
+        for a in (weight_dequant.args if weight_dequant is not None else ())
     ]
 
     op = anchor.target
@@ -2791,7 +2796,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         gemm_kernel=gemm_kernel,
         fused_gm=fused_gm,
         fused_idx=fused_idx,
-        outline_dps=num_k > 1 or info is not None or dequant is not None,
+        outline_dps=num_k > 1 or info is not None or weight_dequant is not None,
     )
 
 

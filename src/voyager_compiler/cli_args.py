@@ -382,6 +382,12 @@ def add_compile_args(parser=None):
         help="Do not fuse reshape with the following GEMM in Transformers.",
     )
     parser.add_argument(
+        "--remove_fp32_casts",
+        action="store_true",
+        help="Compute in 16-bit float where the model casts up to float32, "
+        "for an accelerator with no float32 datapath.",
+    )
+    parser.add_argument(
         "--runtime_tolerance",
         type=float,
         default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()

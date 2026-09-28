@@ -30,6 +30,12 @@ the join through a reshape keeps storing at its own shape, so it takes the
 window reshaped back to it; a source with no alloc to redirect (a
 parameter) is host-copied into its window with ``insert(clone(src),
 window)``, the sanctioned buffer-to-buffer move.
+
+``aten.copy_`` (write side): a training program ends by writing each
+result into a buffer that outlives it -- a gradient, a parameter, an
+optimizer moment.  That is a one-source join whose window is the whole
+destination: the producing nest's output alloc is redirected into it, so
+the nest stores straight into the destination and the copy goes.
 """
 
 import operator
@@ -44,6 +50,7 @@ from voyager_compiler.shape_prop import set_node_value
 _ALLOC = torch.ops.voyager.alloc.default
 _CAT = torch.ops.aten.cat.default
 _CLONE = torch.ops.aten.clone.default
+_COPY = torch.ops.aten.copy_.default
 _INSERT = torch.ops.voyager.insert.default
 _RESHAPE = torch.ops.aten.reshape.default
 _SELECT = torch.ops.aten.select.int
@@ -60,9 +67,9 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 
 def lower_views(model: GraphModule) -> GraphModule:
     """Rewrite foldable ``select`` / ``slice`` / ``unbind`` / ``split`` /
-    ``cat`` / ``stack`` nodes into subview windows.  A window carries the
-    logical (quantized) dtype of the buffer it views, so its bytes are sized
-    like the buffer's."""
+    ``cat`` / ``stack`` / ``copy_`` nodes into subview windows.  A window
+    carries the logical (quantized) dtype of the buffer it views, so its
+    bytes are sized like the buffer's."""
     for node in list(model.graph.nodes):
         if node.op != "call_function":
             continue
@@ -76,6 +83,8 @@ def lower_views(model: GraphModule) -> GraphModule:
             _fold_split(model, node)
         elif node.target in (_CAT, _STACK):
             _fold_join(model, node)
+        elif node.target is _COPY:
+            _fold_copy(model, node)
     model.graph.lint()
     model.recompile()
     return model
@@ -331,17 +340,7 @@ def _fold_join(model: GraphModule, node: Node) -> None:
         window.meta["dtype"] = dtype
         last = window
         if t is not None:
-            dest = window
-            if tuple(t.value.shape) != tuple(v.shape):
-                with graph.inserting_after(last):
-                    dest = graph.call_function(
-                        _RESHAPE, (window, list(t.value.shape))
-                    )
-                set_node_value(dest, t.value)
-                dest.meta["dtype"] = dtype
-                last = dest
-            t.replace_all_uses_with(dest)
-            graph.erase_node(t)
+            last = _redirect(graph, t, window, before=last.next)
         else:
             with graph.inserting_before(node):
                 clone = graph.call_function(_CLONE, (s,))
@@ -351,3 +350,88 @@ def _fold_join(model: GraphModule, node: Node) -> None:
 
     node.replace_all_uses_with(buf)
     graph.erase_node(node)
+
+
+def _redirect(graph, storage: Node, window: Node, before: Node) -> Node:
+    """Point the output alloc ``storage`` at ``window``, so the nest that
+    stores into it stores into the window: reshaped back to the alloc's
+    shape, inserted before ``before``, when the two differ.  Returns the node
+    the nest now stores into."""
+    dest = window
+    if tuple(storage.value.shape) != tuple(window.value.shape):
+        with graph.inserting_before(before):
+            dest = graph.call_function(
+                _RESHAPE, (window, list(storage.value.shape))
+            )
+        set_node_value(dest, storage.value)
+        dest.meta["dtype"] = window.meta.get("dtype")
+    storage.replace_all_uses_with(dest)
+    graph.erase_node(storage)
+    return dest
+
+
+def _names_of(buffer: Node) -> list:
+    """``buffer`` and every view that names its bytes, transitively."""
+    names, frontier = [buffer], [buffer]
+    while frontier:
+        node = frontier.pop()
+        for user in node.users:
+            if (user.target is _SUBVIEW or is_nop(user)) and (
+                user.args[0] is node
+            ):
+                names.append(user)
+                frontier.append(user)
+    return names
+
+
+def _space(buffer: Node) -> int:
+    """The memory level a buffer root lives in: an ``alloc``'s level
+    argument; an input or a weight is in DRAM."""
+    if buffer.target is _ALLOC:
+        return get_arg_value(buffer, 2, "space", int(MemoryLevel.DRAM))
+    return int(MemoryLevel.DRAM)
+
+
+def _fold_copy(model: GraphModule, node: Node) -> None:
+    """Make ``copy_(dst, src)``'s producer store into ``dst``.
+
+    Folds when ``src`` is a nest's output of ``dst``'s shape and dtype, in
+    the memory ``dst`` lives in, and nothing reads the buffer ``dst`` views,
+    under any name, after that nest starts storing.  The nest may read
+    ``dst`` itself, as an update does: it reads each tile before storing
+    over it.
+    """
+    dst, src = node.args
+    storage = _storage_of(src)
+    value = getattr(src, "value", None)
+    dst_value = getattr(dst, "value", None)
+    root = dst
+    while root.target is _SUBVIEW or is_nop(root):
+        root = root.args[0]
+    if (
+        storage is None
+        or _space(storage) != _space(root)
+        or not isinstance(value, torch.Tensor)
+        or not isinstance(dst_value, torch.Tensor)
+        or value.shape != dst_value.shape
+        or value.dtype != dst_value.dtype
+    ):
+        return
+    graph = model.graph
+    order = {n: i for i, n in enumerate(graph.nodes)}
+    first_store = min(storage.users, key=order.__getitem__)
+    if any(
+        order[user] > order[first_store]
+        for name in _names_of(root)
+        for user in name.users
+        if user is not node
+    ):
+        return
+    _redirect(graph, storage, dst, before=first_store)
+    node.replace_all_uses_with(dst)
+    graph.erase_node(node)
+    # The views that named the result for the copy are unread now.
+    while src is not storage and is_nop(src) and not src.users:
+        source = src.args[0]
+        graph.erase_node(src)
+        src = source

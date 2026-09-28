@@ -6,30 +6,40 @@ only the forward pass is quantized.  With one, ``prepare_training``
 quantizes the backward pass too.
 
 ``capture_training`` hands ``prepare_training`` AOTAutograd's joint graph of
-the forward and backward passes before splitting it.  There each GEMM is
+the forward and backward passes before splitting it.  AOTAutograd traces it
+with the ops broken into the ones the compiler lowers, and each GEMM is
 renamed back to the op the model wrote -- a forward GEMM to its ``linear``
-or ``matmul``, a backward one to ``matmul`` -- and each GEMM operand is
-tagged with its type: an error is computed from an incoming gradient, a
-weight views a parameter, and anything else is an activation.  The
-quantizer annotates the joint graph as it annotates an export, a tagged
-operand taking its type's spec blocked along its GEMM's contraction axis,
-and ``prepare`` inserts the fake-quants.  Everything but the GEMM operands
-stays in high precision, the bias gradient included.
+or ``matmul``, a backward one to ``matmul``.  Each GEMM operand is tagged
+with its type: an error is computed from an incoming gradient, a weight
+views a parameter, and anything else is an activation.  The quantizer
+annotates the joint graph as it annotates an export, a tagged operand
+taking its type's spec blocked along its GEMM's contraction axis, and
+``prepare`` inserts the fake-quants.  Everything but the GEMM operands stays
+in high precision, the bias gradient included.
 
 A tensor several GEMMs read, as it is or transposed, with the same spec
 whose values do not depend on the axis -- per-tensor, a plain cast, or
 blocks spanning both axes -- is quantized once: every such GEMM reads one
 fake-quant's output, which the split saves when the backward reads it.
+
+For the compiler, a training step is two graphs: ``gradient_program`` runs
+the forward, the loss and the backward, and ``update_program`` the
+optimizer's update.  Each writes the tensors it updates in place.
 """
 
+import copy
 import types
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 import torch
 from torch import nn
+from torch._decomp import core_aten_decompositions
 from torch._functorch import config as functorch_config
+from torch._dynamo.backends.common import aot_autograd
 from torch._functorch._aot_autograd.descriptors import (
+    GradAOTOutput,
     ParamAOTInput,
+    PlainAOTInput,
     TangentAOTInput,
 )
 from torch._functorch.aot_autograd import (
@@ -64,8 +74,10 @@ __all__ = [
     "TrainingQuantizers",
     "capture_training",
     "disable_observers",
+    "gradient_program",
     "prepare_from_args",
     "prepare_training",
+    "update_program",
 ]
 
 aten = torch.ops.aten
@@ -124,6 +136,35 @@ class TrainingQuantizers(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.gradients = set()
+
+
+def _fold_permutes(joint: GraphModule) -> None:
+    """Fold each permute of a permute into one permute of the source.
+
+    Autograd transposes a transpose -- the backward reads a linear's weight
+    through two permutes, and a weight gradient leaves through two -- so a
+    pair that cancels becomes the tensor itself, and a GEMM operand reads
+    the tensor it transposes.
+
+    Args:
+        joint: AOTAutograd's joint graph, rewritten in place.
+    """
+    graph = joint.graph
+    for node in list(graph.nodes):
+        if (
+            node.target is not aten.permute.default
+            or node.args[0].target is not aten.permute.default
+        ):
+            continue
+        source, inner_dims = node.args[0].args
+        ndim = len(inner_dims)
+        dims = [inner_dims[d] % ndim for d in node.args[1]]
+        if dims == list(range(ndim)):
+            node.replace_all_uses_with(source)
+            graph.erase_node(node)
+        else:
+            node.args = (source, dims)
+    joint.recompile()
 
 
 def _rename_gemms(joint: GraphModule, export: GraphModule) -> None:
@@ -207,6 +248,10 @@ def _is_transpose(node: Node) -> bool:
         return False
     if node.target is aten.t.default:
         return True
+    if node.target is aten.permute.default:
+        ndim = node.meta["val"].dim()
+        dims = [d % ndim for d in node.args[1]]
+        return dims == list(range(ndim - 2)) + [ndim - 1, ndim - 2]
     if node.target is not aten.transpose.int:
         return False
     ndim = node.meta["val"].dim()
@@ -269,19 +314,22 @@ def capture_training(
     args: Tuple[Any, ...],
     kwargs: Optional[Dict[str, Any]],
     dynamic_shapes: Optional[Dict[str, Any]],
-    make_transform: Callable[
-        [GraphModule], Callable[[GraphModule], GraphModule]
-    ],
-    hidden: Sequence[str],
+    make_transform: Optional[
+        Callable[[GraphModule], Callable[[GraphModule], GraphModule]]
+    ] = None,
+    hidden: Sequence[str] = (),
 ) -> None:
     """Run ``model`` through the graphs AOTAutograd derives from its export.
 
     ``model``, in training mode, is exported once with the example inputs.
     AOTAutograd traces the export's forward and backward into one joint
-    graph, which ``make_transform(export)`` rewrites before AOTAutograd
-    splits it into the forward graph and the backward graph that
-    differentiates it; ``model.forward.graphs`` holds the two, and
-    ``model``'s forward is replaced to run them.  Parameters stay the
+    graph, with the ops broken into the ones the compiler lowers and the
+    GEMMs named as the model wrote them.  ``make_transform(export)``, when
+    given, rewrites the joint graph before AOTAutograd splits it into the
+    forward graph and the backward graph that differentiates it.
+    ``model.forward.graphs`` holds the ``"joint"``, ``"forward"`` and
+    ``"backward"`` graphs, and ``model``'s forward is replaced to run the
+    last two.  Parameters stay the
     model's own, so optimizers, checkpoints and ``train()`` / ``eval()``
     work as on the eager model: ``eval()`` switches the graphs' dropouts
     off, and under ``torch.no_grad()`` the outputs come back detached.
@@ -296,7 +344,7 @@ def capture_training(
         kwargs: Keyword example inputs.
         dynamic_shapes: Dynamic-shape spec forwarded to ``torch.export``.
         make_transform: Called with the export graph; returns the rewrite of
-            the joint graph.
+            the joint graph.  None leaves the joint graph as traced.
         hidden: Names of ``model``'s submodules to detach while exporting,
             so that state the forward never reads stays out of the graphs.
 
@@ -313,7 +361,7 @@ def capture_training(
         gm = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
     finally:
         model._modules.update(detached)
-    transform = make_transform(gm)
+    transform = None if make_transform is None else make_transform(gm)
     in_spec, out_spec = gm._in_spec, gm._out_spec
     inputs = [n.meta["val"] for n in gm.graph.nodes if n.op == "placeholder"]
     # AOTAutograd takes flat inputs and a tuple of outputs.
@@ -322,11 +370,12 @@ def capture_training(
     output.args = (tuple(output.args[0]),)
     gm.recompile()
     graphs = {}
-    joints = []
 
     def partition(joint, joint_inputs, **kwargs):
-        joints.append(transform(joint))
-        return default_partition(joints[0], joint_inputs, **kwargs)
+        _fold_permutes(joint)
+        _rename_gemms(joint, gm)
+        graphs["joint"] = joint if transform is None else transform(joint)
+        return default_partition(graphs["joint"], joint_inputs, **kwargs)
 
     def compile_forward(graph, _):
         graphs["forward"] = graph
@@ -336,7 +385,7 @@ def capture_training(
         # AOTAutograd hands over a deep copy; the backward calls the joint
         # graph's submodules, as the forward does.
         for name, _ in list(graph.named_children()):
-            setattr(graph, name, getattr(joints[0], name))
+            setattr(graph, name, getattr(graphs["joint"], name))
         # Drop the partitioner's dead copies of random forward ops, which
         # dead-code elimination otherwise keeps as impure.
         graph.graph.eliminate_dead_code(
@@ -357,6 +406,8 @@ def capture_training(
             fw_compiler=compile_forward,
             bw_compiler=compile_backward,
             partition_fn=partition,
+            # Backward ops break into the smaller ones the compiler lowers.
+            decompositions=core_aten_decompositions(),
         )
     for node in graphs["forward"].graph.nodes:
         schema = getattr(node.target, "_schema", None)
@@ -393,18 +444,11 @@ def capture_training(
             )
         if model.training != training[0]:
             training[0] = model.training
-            # Out of training a dropout passes its input and gradient
-            # through.
+            # Out of training a dropout passes its input through.
             for graph in graphs.values():
                 for node in graph.graph.nodes:
                     if node.target == torch.ops.aten.native_dropout.default:
                         node.update_arg(2, model.training)
-                    elif (
-                        node.target
-                        == torch.ops.aten.native_dropout_backward.default
-                    ):
-                        scale = node.meta.setdefault("scale", node.args[2])
-                        node.update_arg(2, scale if model.training else 1.0)
                 graph.recompile()
         flat = _check_inputs_match(call_args, call_kwargs, in_spec)
         outputs = list(run(*(leaf for _, leaf in flat)))
@@ -469,7 +513,6 @@ def prepare_training(
                 )
 
         def transform(joint):
-            _rename_gemms(joint, export)
             errors = _tag_operands(joint)
             quantizer.annotate(joint)
             for node in joint.graph.nodes:
@@ -529,6 +572,179 @@ def prepare_training(
         del model.training_quantizers
         raise
     return model
+
+
+def _parameter_name(target: str) -> str:
+    """The graph name of the parameter at module path ``target``."""
+    return target.replace(".", "_")
+
+
+def gradient_program(model: nn.Module) -> GraphModule:
+    """The forward, the loss and the backward of a training step, as a graph.
+
+    Built from the joint graph ``capture_training`` captured from ``model``,
+    whose forward returns only the loss.  The loss's incoming gradient is 1,
+    and each parameter's gradient is written in place into a buffer of its
+    own.  A parameter is named after its module path (``fc1.weight`` becomes
+    ``fc1_weight``) and its gradient buffer after it, with ``_grad``.
+
+    Args:
+        model: Model captured by ``capture_training``.
+
+    Returns:
+        A graph taking the parameters, the model's inputs and one gradient
+        buffer per trainable parameter, in that order, and returning the loss.
+
+    Raises:
+        ValueError: ``model``'s forward returns more than the loss.
+    """
+    program = copy.deepcopy(model.forward.graphs["joint"])
+    graph = program.graph
+    # The joint graph takes its inputs as two lists, primals and tangents.
+    graph._codegen = CodeGen()
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    tangents = [
+        n for n in placeholders if isinstance(n.meta["desc"], TangentAOTInput)
+    ]
+    if len(tangents) != 1:
+        raise ValueError("The model's forward must return only the loss")
+    for node in placeholders:
+        if isinstance(node.meta["desc"], ParamAOTInput):
+            node._rename(_parameter_name(node.meta["desc"].target))
+            node.target = node.name
+
+    (tangent,) = tangents
+    last = placeholders[-1]
+    with graph.inserting_after(last):
+        one = graph.call_function(
+            aten.full.default,
+            ([], 1.0),
+            {"dtype": tangent.meta["val"].dtype},
+        )
+    tangent.replace_all_uses_with(one)
+    graph.erase_node(tangent)
+
+    output = graph.output_node()
+    loss = []
+    for value, desc in zip(output.args[0], output.meta["desc"]):
+        if value is None:
+            continue
+        if not isinstance(desc, GradAOTOutput):
+            loss.append(value)
+        else:
+            name = _parameter_name(desc.grad_of.target)
+            with graph.inserting_before(one):
+                buffer = graph.placeholder(f"{name}_grad")
+            buffer.meta["val"] = value.meta["val"]
+            with graph.inserting_before(output):
+                graph.call_function(aten.copy_.default, (buffer, value))
+    output.args = (tuple(loss),)
+    graph.eliminate_dead_code()
+    program.recompile()
+    return program
+
+
+def update_program(
+    model: nn.Module, optimizer: torch.optim.Optimizer
+) -> GraphModule:
+    """``optimizer``'s update of ``model``'s parameters, as a graph.
+
+    Captured from ``optimizer.step`` itself, so it is whatever update the
+    optimizer makes.  An optimizer of the same class and groups steps meta
+    copies of the parameters twice under dynamo: the first step creates its
+    state, and the second step's graph is the program.  It is capturable
+    where the optimizer offers that, so its step count and other scalars
+    stay tensors instead of Python numbers.  Every tensor that step reads
+    is an input -- the parameters, their gradients, the optimizer's state
+    and each group's learning rate, a 0-d tensor so a schedule can change
+    it -- and every tensor it updates is written in place.
+
+    Args:
+        model: Model whose parameters ``optimizer`` updates.
+        optimizer: The optimizer training ``model``.
+
+    Returns:
+        A graph whose inputs are named after the parameters as
+        ``gradient_program`` names them: ``fc1_weight``, its gradient
+        ``fc1_weight_grad`` and each state tensor under its key, such as
+        ``fc1_weight_exp_avg``; each group's learning rate is ``lr_<i>``.
+    """
+    names = {p: _parameter_name(n) for n, p in model.named_parameters()}
+    inputs = {}
+    groups = []
+    for i, group in enumerate(optimizer.param_groups):
+        params = []
+        for param in group["params"]:
+            meta_param = nn.Parameter(
+                torch.empty_like(param, device="meta"), param.requires_grad
+            )
+            inputs[meta_param] = names[param]
+            if param.requires_grad:
+                meta_param.grad = torch.empty_like(meta_param)
+                inputs[meta_param.grad] = f"{names[param]}_grad"
+            params.append(meta_param)
+        lr = torch.tensor(float(group["lr"]))
+        inputs[lr] = f"lr_{i}"
+        groups.append({**group, "params": params, "lr": lr})
+        if "capturable" in group:
+            groups[-1]["capturable"] = True
+    stand_in = type(optimizer)(groups)
+
+    captured = []
+
+    def backend(graph, example_inputs):
+        attributes = dict(graph.named_parameters())
+        attributes.update(graph.named_buffers())
+
+        def keep(program, _):
+            captured.append((program, attributes, example_inputs))
+            return program
+
+        return aot_autograd(
+            fw_compiler=keep, keep_inference_input_mutations=True
+        )(graph, example_inputs)
+
+    step = torch.compile(stand_in.step, backend=backend)
+    step()
+    first = len(captured)
+    step()
+    # The first step creates the optimizer's state; the second retraces
+    # unless that left the step unchanged.
+    ((program, attributes, example_inputs),) = captured[first:] or captured
+    # Named after the compiled step, which may replace a state tensor, such
+    # as moving a step count to the parameters' device.
+    for meta_param, state in stand_in.state.items():
+        for key, value in state.items():
+            inputs[value] = f"{inputs[meta_param]}_{key}"
+    for node in program.graph.nodes:
+        if node.op != "placeholder":
+            continue
+        desc = node.meta["desc"]
+        tensor = (
+            example_inputs[desc.idx]
+            if isinstance(desc, PlainAOTInput)
+            else attributes[desc.target]
+        )
+        node._rename(inputs[tensor])
+        node.target = node.name
+    # Dynamo writes an update as ``copy_(x, copy(x, value))``, where the
+    # inner copy only gives ``value`` the shape and dtype it already has.
+    graph = program.graph
+    for node in list(graph.nodes):
+        if node.target is not aten.copy.default:
+            continue
+        destination, value = (a.meta["val"] for a in node.args)
+        if (destination.shape, destination.dtype) == (value.shape, value.dtype):
+            node.replace_all_uses_with(node.args[1])
+            graph.erase_node(node)
+    # A tensor the step creates, such as ``where``'s scalar operand, goes on
+    # the parameters' device, not the stand-in's.
+    device = next(model.parameters()).device
+    for node in graph.nodes:
+        if node.kwargs.get("device") == torch.device("meta"):
+            node.update_kwarg("device", device)
+    program.recompile()
+    return program
 
 
 def disable_observers(model: nn.Module) -> None:

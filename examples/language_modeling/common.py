@@ -44,7 +44,7 @@ from voyager_compiler import (
     split_kv_cache,
 )
 from voyager_compiler.codegen import (
-    remove_softmax_dtype_cast,
+    remove_fp32_casts,
     replace_rmsnorm_with_layer_norm,
 )
 from voyager_compiler.quantization import load_codebooks
@@ -324,8 +324,7 @@ def build_quantizer(qconfig, decode, kivi):
 
 def rewrite_for_compiler(gm, model, seq):
     """Apply the graph rewrites the compiler's Llama path makes before
-    quantizing: the softmax in bf16, RMSNorm as the layer-norm op."""
-    remove_softmax_dtype_cast(gm)
+    quantizing: RMSNorm as the layer-norm op, the softmax in bf16."""
     # get_decoder() is the text decoder, wherever the model nests it.
     layernorm = model.get_decoder().layers[0].input_layernorm
     hidden = layernorm.weight.shape[-1]
@@ -333,6 +332,7 @@ def rewrite_for_compiler(gm, model, seq):
         1, seq, hidden, dtype=model.dtype, device=model.device
     )
     replace_rmsnorm_with_layer_norm(gm, layernorm, (example,))
+    remove_fp32_casts(gm)
 
 
 def build_prefill(model, quantizer, quantized, max_tokens):

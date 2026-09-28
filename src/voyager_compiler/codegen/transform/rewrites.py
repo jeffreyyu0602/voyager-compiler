@@ -45,8 +45,8 @@ __all__ = [
     "extract_input_preprocessor",
     "inline_autocast_modules",
     "fold_constant_generators",
+    "remove_fp32_casts",
     "remove_prunable_ops",
-    "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
 ]
 
@@ -478,13 +478,15 @@ def fold_constant_generators(model: GraphModule):
 
     Walking in program order, a node is constant iff every FX-Node input is a
     ``get_attr`` (an initial buffer or one this pass just created) that the
-    graph never writes.  It is evaluated by the shape-propagation rule: real
-    when it descends from parameters alone, a fake stand-in when it descends
-    from a generator, as a causal mask does.  Either way the chain that
-    produced it is kept on the new ``get_attr`` node as ``meta['producer']``,
-    a graph over the model's own buffers, so a real run can compute the
-    tensor when it needs it.  A buffer this pass created is deleted as soon
-    as its last reader folds; its producer lives on inside its readers'.
+    graph never writes.  A ``full_like`` reads only its input's shape, so it
+    becomes a ``full`` of that shape first.  A constant is evaluated by the
+    shape-propagation rule: real when it descends from parameters alone, a
+    fake stand-in when it descends from a generator, as a causal mask does.
+    Either way the chain that produced it is kept on the new ``get_attr``
+    node as ``meta['producer']``, a graph over the model's own buffers, so a
+    real run can compute the tensor when it needs it.  A buffer this pass
+    created is deleted as soon as its last reader folds; its producer lives
+    on inside its readers'.
 
     Args:
         model: The graph to fold, in place.
@@ -502,6 +504,18 @@ def fold_constant_generators(model: GraphModule):
         return fetch_attr(model, n.target)
 
     for node in list(graph.nodes):
+        if node.target is torch.ops.aten.full_like.default:
+            value = node.value
+            with graph.inserting_before(node):
+                full = graph.call_function(
+                    torch.ops.aten.full.default,
+                    (list(value.shape), node.args[1]),
+                    {"dtype": value.dtype, "device": value.device},
+                )
+            propagate_shape(full, model)
+            node.replace_all_uses_with(full)
+            graph.erase_node(node)
+            node = full
         if node.op != "call_function" or any(
             inp not in constants for inp in node.all_input_nodes
         ):
@@ -592,11 +606,46 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
     return model
 
 
-def remove_softmax_dtype_cast(model: torch.fx.GraphModule):
+# Ops that cast a tensor to another dtype.
+_CASTS = (
+    torch.ops.aten._to_copy.default,
+    torch.ops.aten.to.dtype,
+    torch.ops.aten.to.dtype_layout,
+)
+
+
+def remove_fp32_casts(model: torch.fx.GraphModule):
+    """Compute in 16-bit float where the model casts up to float32.
+
+    For an accelerator with no float32 datapath: a ``softmax`` asked for a
+    float32 result gives it in its input's dtype, and a cast of a bfloat16
+    or float16 tensor to float32 is dropped, so what reads it computes in
+    the narrower dtype.  The casts back down then convert nothing, and
+    ``remove_prunable_ops`` drops them.  A float32 tensor that is not cast
+    up -- a float32 buffer, or integers cast to float, as RoPE's
+    frequencies are -- stays float32.
+
+    Args:
+        model: The graph to rewrite in place.
+
+    Returns:
+        ``model``.
+    """
     graph = model.graph
-    for node in list(model.graph.nodes):
+    for node in list(graph.nodes):
         if node.target == torch.ops.aten.softmax.int:
             node.args = node.args[:2]
+            continue
+        if node.target not in _CASTS:
+            continue
+        source = node.args[0]
+        value = getattr(source, "value", source.meta.get("val"))
+        if (
+            get_arg_value(node, 1, "dtype") == torch.float32
+            and value.dtype in (torch.bfloat16, torch.float16)
+        ):
+            node.replace_all_uses_with(source)
+            graph.erase_node(node)
 
     graph.lint()
     model.recompile()

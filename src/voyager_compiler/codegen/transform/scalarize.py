@@ -1,19 +1,20 @@
-"""Lower single-element integer arithmetic to control-processor scalars.
+"""Lower single-element arithmetic to control-processor scalars.
 
 A decode graph does its index bookkeeping -- the cache position, the slot a
 token lands in, the chunk it belongs to -- as arithmetic on one-element
-``int64`` tensors, because that is how PyTorch spells it.  Lowered as tensor
-ops, each becomes a vector-unit kernel with a DMA in and out for a single
-number.  This pass rewrites such a chain into what the accelerator's control
-processor does natively: one read of each source tensor
-(``_local_scalar_dense``), Python-scalar arithmetic on the result (emitted
-as ``cpu`` ops), and, where a consumer needs a tensor again, a host-written
-one (``full`` for a single element, ``arange`` for an index vector shifted
-by a scalar).  Only integer and boolean tensors are touched: float
-arithmetic stays on the datapath, where its rounding is defined.
+``int64`` tensors, because that is how PyTorch spells it; a training step
+computes its optimizer's per-step factors and its loss's final division on
+one-element float tensors.  Lowered as tensor ops, each becomes a
+vector-unit kernel with a DMA in and out for a single number.  This pass
+rewrites such a chain into what the accelerator's control processor does
+natively: one read of each source tensor (``_local_scalar_dense``),
+Python-scalar arithmetic on the result (emitted as ``cpu`` ops), and, where
+a consumer needs a tensor again, a host-written one (``full`` for a single
+element, ``arange`` for an index vector shifted by a scalar).
 """
 
 import logging
+import math
 import operator
 
 import torch
@@ -30,6 +31,31 @@ logger = logging.getLogger(__name__)
 __all__ = ["scalarize_index_arithmetic"]
 
 aten = torch.ops.aten
+
+
+# The scalar ops below are emitted by name, as ``cpu`` ops.
+def truediv(a, b):
+    """``a / b`` as a tensor divides it: by zero, an infinity or a NaN."""
+    if b == 0:
+        if a == 0:
+            return math.nan
+        return math.copysign(math.inf, a) * math.copysign(1.0, b)
+    return a / b
+
+
+def rsub(a, b):
+    """``b - a``, as ``aten.rsub`` computes it."""
+    return b - a
+
+
+def reciprocal(a):
+    """``1 / a``, as ``aten.reciprocal`` computes it."""
+    return truediv(1.0, a)
+
+
+def sqrt(a):
+    """The square root of ``a`` as a tensor takes it: of a negative, NaN."""
+    return math.sqrt(a) if a >= 0 else math.nan
 
 # Elementwise ops that mean the same on Python scalars.  ``floor_divide``
 # and ``remainder`` follow Python's floor semantics, as ``//`` and ``%`` do.
@@ -57,19 +83,23 @@ _SCALAR_OPS = {
     aten.gt.Scalar: operator.gt,
     aten.ge.Tensor: operator.ge,
     aten.ge.Scalar: operator.ge,
+    aten.div.Tensor: truediv,
+    aten.div.Scalar: truediv,
+    aten.rsub.Scalar: rsub,
+    aten.pow.Scalar: operator.pow,
+    aten.pow.Tensor_Scalar: operator.pow,
+    aten.pow.Tensor_Tensor: operator.pow,
+    aten.sqrt.default: sqrt,
+    aten.reciprocal.default: reciprocal,
 }
 
 _INTEGER_DTYPES = (torch.int64, torch.int32, torch.bool)
 
 
-def _single_integer(node) -> bool:
-    """Whether ``node`` is a one-element integer or boolean tensor."""
+def _single_element(node) -> bool:
+    """Whether ``node`` is a one-element tensor."""
     value = getattr(node, "value", None)
-    return (
-        isinstance(value, torch.Tensor)
-        and value.numel() == 1
-        and value.dtype in _INTEGER_DTYPES
-    )
+    return isinstance(value, torch.Tensor) and value.numel() == 1
 
 
 def _index_vector(model: GraphModule, node):
@@ -93,10 +123,10 @@ def _index_vector(model: GraphModule, node):
 
 
 def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
-    """Rewrite arithmetic on one-element integer tensors into scalar ops.
+    """Rewrite arithmetic on one-element tensors into scalar ops.
 
     Walking in program order, an elementwise op in ``_SCALAR_OPS`` whose
-    tensor operands are all single-element integer tensors becomes the
+    tensor operands are all single-element tensors becomes the
     matching Python operator on scalars: a constant operand folds to its
     value, a computed one is read once with ``_local_scalar_dense``, and an
     already scalarized one is used as is.  A consumer that needs a tensor
@@ -163,8 +193,8 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
                 ):
                     vector = (node.args[index], node.args[other])
         if vector is None and not (
-            _single_integer(node)
-            and all(_single_integer(a) or a in scalar_of for a in tensors)
+            _single_element(node)
+            and all(_single_element(a) or a in scalar_of for a in tensors)
         ):
             continue
 
@@ -196,8 +226,16 @@ def scalarize_index_arithmetic(model: GraphModule) -> GraphModule:
         # Consumers that still want the tensor read a host-written one.
         tensor = None
         for user in list(node.users):
-            if user.target in _SCALAR_OPS:
-                continue  # scalarized in its turn
+            # A consumer scalarized in its turn, one element or an index
+            # vector shifted by this scalar, reads the scalar.
+            if user.target in _SCALAR_OPS and (
+                _single_element(user)
+                or (
+                    user.target in (aten.add.Tensor, aten.add.Scalar)
+                    and any(_index_vector(model, a) for a in user.args)
+                )
+            ):
+                continue
             if tensor is None:
                 tensor = materialize(node, new, user)
             user.replace_input_with(node, tensor)

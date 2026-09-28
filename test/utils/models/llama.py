@@ -46,7 +46,6 @@ from voyager_compiler import (
     transform,
 )
 from voyager_compiler.codegen import (
-    remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
 )
 
@@ -242,7 +241,7 @@ def build_decode(model, tokenizer, args, config, tokens):
         args.context_length, args.context_length + tokens
     )
     # Strict export bakes in aten._assert_tensor_metadata guards (the
-    # attention softmax's float32); remove_softmax_dtype_cast later rewrites
+    # attention softmax's float32); remove_fp32_casts later rewrites
     # that softmax to bf16, so the guards must be suppressed at export.
     with _disable_aten_to_metadata_assertions():
         ep = convert_and_export_with_cache(
@@ -358,8 +357,6 @@ def quantize_model(model, tokenizer, quantizer, vector_stages, args):
     else:
         gm, example_args, example_kwargs = build_prefill(model, tokenizer, args)
     kv_state = kv_cache_state(gm)
-
-    remove_softmax_dtype_cast(gm)
 
     # get_decoder() is the text decoder, wherever the model nests it.
     layernorm = model.get_decoder().layers[0].input_layernorm

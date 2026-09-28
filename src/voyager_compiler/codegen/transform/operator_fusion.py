@@ -371,6 +371,7 @@ def _fuse_reshape_with_input_impl(
         and is_gemm_op(current_node)
         and fused_nodes[-2]
         in (
+            current_node.args[0],
             current_node.args[1],
             current_node.kwargs.get("weight_scale"),
             current_node.kwargs.get("other_scale"),

@@ -673,6 +673,12 @@ def _bufferize_key(node):
             return None
         else:
             key = ("bare", _node_to_hashable(node))
+            # A nest built for an op reading one tensor twice, such as
+            # ``x * x``, has one operand, so it cannot serve ``x * y``.
+            uses = []
+            fx.node.map_arg((node.args, node.kwargs), uses.append)
+            if len(set(uses)) < len(uses):
+                key += (tuple(node.all_input_nodes.index(u) for u in uses),)
         hash(key)  # surface any unhashable literal as uncacheable
         return key
     except TypeError:

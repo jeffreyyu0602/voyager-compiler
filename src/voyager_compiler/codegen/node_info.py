@@ -280,8 +280,11 @@ def is_prunable_op(node: Node) -> bool:
             node, 2, "train"
         )
 
-    # A same-dtype ``to.dtype`` is a pure pass-through.
-    if node.target == torch.ops.aten.to.dtype:
+    # A same-dtype cast is a pure pass-through.
+    if node.target in (
+        torch.ops.aten.to.dtype,
+        torch.ops.aten._to_copy.default,
+    ):
         dtype = get_arg_value(node, 1, "dtype")
         inp = node.args[0]
         val = getattr(inp, "value", inp.meta.get("val"))
@@ -573,6 +576,22 @@ def weight_transforms(node: Node):
         return source, transposed, repeat, dequant
 
     return node, False, None, None
+
+
+def activation_transforms(node: Node):
+    """The transpose fused onto a GEMM activation, and the operand beneath it.
+
+    A weight gradient ``dYᵀ @ X`` fuses ``dY.transpose(-2, -1)`` onto its
+    activation, and the transpose folds into the DMA as a weight's does.
+    Only a transpose over an external operand -- a placeholder -- counts.
+
+    Returns:
+        ``(node, transposed)``: the operand the transpose reads, and whether
+        there is one.
+    """
+    if swaps_last_two_dims(node) and node.args[0].op == "placeholder":
+        return node.args[0], True
+    return node, False
 
 
 # --------------------------------------------------------------------------

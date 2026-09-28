@@ -14,6 +14,15 @@ and decode graphs.  timm models are plain ``nn.Module`` and use ``torch.export``
 directly.  Attention is forced to ``eager`` so the harvested vocabulary is the
 explicit matmul / softmax chain the compiler lowers, not ``sdpa``.
 
+The ``prims`` ops, the primitives below ATen, have no decomposition to Core
+ATen; they are seeded by hand (the ``PRIMS_*_IR`` lists) as the Core ATen ops
+are.
+
+Each Hugging Face model's training step joins the corpus as the compiler lowers
+it -- the gradient program of ``voyager_compiler``'s training capture -- and so
+does one step of every ``torch.optim`` optimizer, as its update program; they
+carry the backward and optimizer ops no inference export has.
+
 Usage::
 
     python tools/gen_aten_classifier.py --hf-count 200 --timm-count 50
@@ -50,6 +59,7 @@ from pathlib import Path
 import timm
 import torch
 import torch.nn as nn
+from torch.fx import GraphModule
 from huggingface_hub import HfApi
 from transformers import (
     AutoConfig,
@@ -59,6 +69,12 @@ from transformers import (
     PretrainedConfig,
 )
 from transformers.exporters import DynamoConfig, DynamoExporter
+
+from voyager_compiler import (
+    capture_training,
+    gradient_program,
+    update_program,
+)
 
 logger = logging.getLogger("gen_aten_classifier")
 
@@ -319,6 +335,169 @@ CORE_ATEN_IR = (
     CORE_ATEN_COMPUTE_IR + CORE_ATEN_PURE_IR + CORE_ATEN_DATA_MOVEMENT_IR
 )
 
+
+# ---------------------------------------------------------------------------
+# Prims seeds
+#
+# ``torch.ops.prims`` are the primitives below ATen.  A decomposition or dynamo
+# may write one into a graph -- dynamo makes an ``fma`` of an optimizer's
+# ``addcmul_`` with a tensor scale -- and none decomposes to Core ATen, so each
+# is seeded in the bucket of its closest Core ATen op, read from its definition
+# in ``torch/_prims`` or ``torch/_inductor/inductor_prims.py``.  The four lists
+# partition ``PRIMS_IR``.
+# ---------------------------------------------------------------------------
+
+PRIMS_ELEMENTWISE_IR = (
+    "prims.abs",
+    "prims.acos",
+    "prims.acosh",
+    "prims.add",
+    "prims.asin",
+    "prims.asinh",
+    "prims.atan",
+    "prims.atan2",
+    "prims.atanh",
+    "prims.bessel_i0",
+    "prims.bessel_i0e",
+    "prims.bessel_i1",
+    "prims.bessel_i1e",
+    "prims.bessel_j0",
+    "prims.bessel_j1",
+    "prims.bitwise_and",
+    "prims.bitwise_not",
+    "prims.bitwise_or",
+    "prims.bitwise_xor",
+    "prims.cbrt",
+    "prims.ceil",
+    "prims.conj_physical",
+    "prims.cos",
+    "prims.cosh",
+    "prims.digamma",
+    "prims.div",
+    "prims.eq",
+    "prims.erf",
+    "prims.erf_inv",
+    "prims.erfc",
+    "prims.erfcx",
+    "prims.exp",
+    "prims.exp2",
+    "prims.expm1",
+    "prims.floor",
+    "prims.fma",
+    "prims.fmax",
+    "prims.fmin",
+    "prims.fmod",
+    "prims.frexp",
+    "prims.gcd",
+    "prims.ge",
+    "prims.gt",
+    "prims.hypot",
+    "prims.igamma",
+    "prims.igammac",
+    "prims.inductor_cvt_e8m0_rceil",
+    "prims.isfinite",
+    "prims.le",
+    "prims.lgamma",
+    "prims.log",
+    "prims.log10",
+    "prims.log1p",
+    "prims.log2",
+    "prims.lt",
+    "prims.maximum",
+    "prims.minimum",
+    "prims.mul",
+    "prims.ndtri",
+    "prims.ne",
+    "prims.neg",
+    "prims.nextafter",
+    "prims.pow",
+    "prims.reciprocal",
+    "prims.remainder",
+    "prims.round",
+    "prims.rsqrt",
+    "prims.shift_left",
+    "prims.shift_right_arithmetic",
+    "prims.sign",
+    "prims.signbit",
+    "prims.sin",
+    "prims.sinh",
+    "prims.spherical_bessel_j0",
+    "prims.sqrt",
+    "prims.sub",
+    "prims.tan",
+    "prims.tanh",
+    "prims.trunc",
+    "prims.where",
+    "prims.zeta",
+)
+
+_PRIMS_COMPUTE_ONLY_IR = (
+    "prims.amax",
+    "prims.amin",
+    "prims.fft_c2c",
+    "prims.fft_c2r",
+    "prims.fft_r2c",
+    "prims.prepare_softmax_online",
+    "prims.prod",
+    "prims.sum",
+    "prims.svd",
+    "prims.var",
+    "prims.xor_sum",
+)
+
+PRIMS_COMPUTE_IR = PRIMS_ELEMENTWISE_IR + _PRIMS_COMPUTE_ONLY_IR
+
+PRIMS_PURE_IR = (
+    "prims.as_strided",
+    "prims.broadcast_in_dim",
+    "prims.clone",
+    "prims.collapse",
+    "prims.collapse_view",
+    "prims.conj",
+    "prims.convert_element_type",
+    "prims.copy_strided",
+    "prims.copy_to",
+    "prims.device_put",
+    "prims.empty",
+    "prims.empty_permuted",
+    "prims.empty_strided",
+    "prims.fill",
+    "prims.full",
+    "prims.full_like",
+    "prims.imag",
+    "prims.inductor_force_stride_order",
+    "prims.item",
+    "prims.maximum_value",
+    "prims.minimum_value",
+    "prims.real",
+    "prims.reshape",
+    "prims.resize",
+    "prims.scalar_tensor",
+    "prims.split_dim",
+    "prims.squeeze",
+    "prims.transpose",
+    "prims.view_of",
+    "prims.view_of_dtype",
+)
+
+PRIMS_DATA_MOVEMENT_IR = (
+    "prims.as_strided_scatter",
+    "prims.cat",
+    "prims.inductor_lookup_seed",
+    "prims.inductor_rand_eager_offset",
+    "prims.inductor_rand_eager_offsets",
+    "prims.inductor_randint",
+    "prims.inductor_random",
+    "prims.inductor_seed",
+    "prims.inductor_seeds",
+    "prims.iota",
+    "prims.normal",
+    "prims.rev",
+    "prims.uniform",
+)
+
+PRIMS_IR = PRIMS_COMPUTE_IR + PRIMS_PURE_IR + PRIMS_DATA_MOVEMENT_IR
+
 # Non-core leaves that ``run_decompositions`` leaves behind and that carry no
 # data-flow meaning.  Stripped from a decomposition before classification.
 IGNORED_LEAVES = frozenset(
@@ -342,23 +521,34 @@ IGNORED_LEAVES = frozenset(
 
 
 def _check_partition() -> None:
-    """The four seed lists must exactly partition the Core ATen IR."""
-    compute = set(CORE_ATEN_COMPUTE_IR)
-    pure = set(CORE_ATEN_PURE_IR)
-    moves = set(CORE_ATEN_DATA_MOVEMENT_IR)
-    elementwise = set(CORE_ATEN_ELEMENTWISE_IR)
-
-    for name, a, b in (
-        ("compute/pure", compute, pure),
-        ("compute/data-movement", compute, moves),
-        ("pure/data-movement", pure, moves),
+    """Each set of four seed lists must exactly partition its IR."""
+    for elementwise, compute, pure, moves, ir in (
+        (
+            CORE_ATEN_ELEMENTWISE_IR,
+            CORE_ATEN_COMPUTE_IR,
+            CORE_ATEN_PURE_IR,
+            CORE_ATEN_DATA_MOVEMENT_IR,
+            CORE_ATEN_IR,
+        ),
+        (
+            PRIMS_ELEMENTWISE_IR,
+            PRIMS_COMPUTE_IR,
+            PRIMS_PURE_IR,
+            PRIMS_DATA_MOVEMENT_IR,
+            PRIMS_IR,
+        ),
     ):
-        overlap = a & b
-        assert not overlap, f"{name} seeds overlap: {sorted(overlap)}"
+        for name, a, b in (
+            ("compute/pure", compute, pure),
+            ("compute/data-movement", compute, moves),
+            ("pure/data-movement", pure, moves),
+        ):
+            overlap = set(a) & set(b)
+            assert not overlap, f"{name} seeds overlap: {sorted(overlap)}"
 
-    assert elementwise <= compute, "elementwise seed escapes the compute seed"
-    assert len(CORE_ATEN_IR) == len(set(CORE_ATEN_IR)), "duplicate core entry"
-    assert len(compute) == len(CORE_ATEN_COMPUTE_IR), "duplicate compute entry"
+        assert set(elementwise) <= set(compute), "elementwise seed escapes"
+        assert len(ir) == len(set(ir)), "duplicate seed entry"
+        assert len(compute) == len(set(compute)), "duplicate compute entry"
 
 
 # ---------------------------------------------------------------------------
@@ -367,13 +557,16 @@ def _check_partition() -> None:
 
 
 def resolve(target: str):
-    """``"aten.add.Tensor"`` / ``"add.Tensor"`` / ``"add"`` -> an OpOverload.
+    """``"aten.add.Tensor"`` / ``"add.Tensor"`` / ``"add"`` / ``"prims.fma"``
+    -> an OpOverload; a bare name is an ATen op.
 
     Returns ``None`` when the installed torch lacks the op or the overload.
     """
-    name = target[len("aten.") :] if target.startswith("aten.") else target
-    parts = name.split(".")
-    packet = getattr(torch.ops.aten, parts[0], None)
+    namespace = "aten"
+    if target.startswith(("aten.", "prims.")):
+        namespace, target = target.split(".", 1)
+    parts = target.split(".")
+    packet = getattr(getattr(torch.ops, namespace), parts[0], None)
     if packet is None:
         return None
     overload = parts[1] if len(parts) > 1 else "default"
@@ -387,7 +580,7 @@ def resolve_all(targets) -> set:
     for t in targets:
         op = resolve(t)
         if op is None:
-            logger.warning("core aten op %r not present in this torch", t)
+            logger.warning("seed op %r not present in this torch", t)
         else:
             resolved.add(op)
     return resolved
@@ -511,6 +704,18 @@ def discover_models(hf_count: int, timm_count: int) -> list:
     return picked
 
 
+def discover_optimizers() -> list:
+    """Every optimizer ``torch.optim`` defines.  Returns
+    ``[(class_name, "optimizer"), ...]``."""
+    return sorted(
+        (name, "optimizer")
+        for name, cls in vars(torch.optim).items()
+        if isinstance(cls, type)
+        and issubclass(cls, torch.optim.Optimizer)
+        and cls is not torch.optim.Optimizer
+    )
+
+
 def _sub_configs(config):
     """``config`` and every nested ``PretrainedConfig`` beneath it.
 
@@ -601,10 +806,31 @@ def _export_causal_lm(config) -> dict:
         )
 
 
+def _inputs(model_id: str, config, tag: str) -> dict:
+    """Example inputs of a Hugging Face model: pixels for an image model,
+    token ids -- and decoder ids for an encoder-decoder -- for a text one."""
+    if tag in _IMAGE_TAGS:
+        height, width = _image_size(model_id)
+        channels = getattr(config, "num_channels", 3) or 3
+        return {"pixel_values": torch.randn(1, channels, height, width)}
+    vocab = getattr(config.get_text_config(), "vocab_size", None)
+    if not isinstance(vocab, int) or vocab <= 0:
+        raise ValueError("text model without a vocab_size")
+    input_ids = torch.randint(0, vocab, (1, SEQ_LEN))
+    inputs = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones(1, SEQ_LEN, dtype=torch.long),
+    }
+    if getattr(config, "is_encoder_decoder", False):
+        inputs["decoder_input_ids"] = input_ids.clone()
+    return inputs
+
+
 def _export_hf(model_id: str) -> dict:
-    """``{variant: ExportedProgram}`` for a Hugging Face repo, built from config
-    and metadata only -- weights are never downloaded and remote code is never
-    executed."""
+    """``{variant: program}`` for a Hugging Face repo, built from config and
+    metadata only -- weights are never downloaded and remote code is never
+    executed: its inference exports and, when it trains, its training step.
+    """
     info = HfApi().model_info(model_id)
     tag = getattr(info, "pipeline_tag", None)
     if tag not in SUPPORTED_TAGS:
@@ -612,7 +838,16 @@ def _export_hf(model_id: str) -> dict:
 
     config = AutoConfig.from_pretrained(model_id, trust_remote_code=False)
     _shrink(config)
+    programs = _export_inference(model_id, config, tag)
+    try:
+        programs["gradient"] = _export_training(model_id, config, tag)
+    except Exception as exc:  # noqa: BLE001 - it still exports for inference
+        logger.warning("%s: training capture failed (%s)", model_id, exc)
+    return programs
 
+
+def _export_inference(model_id: str, config, tag: str) -> dict:
+    """``{variant: ExportedProgram}`` for a Hugging Face model's inference."""
     if tag in _TEXT_TAGS and _is_causal_lm(config, tag):
         try:
             return _export_causal_lm(config)
@@ -626,22 +861,7 @@ def _export_hf(model_id: str) -> dict:
     model = AutoModel.from_config(
         config, trust_remote_code=False, attn_implementation="eager"
     ).eval()
-
-    if tag in _IMAGE_TAGS:
-        height, width = _image_size(model_id)
-        channels = getattr(config, "num_channels", 3) or 3
-        inputs = {"pixel_values": torch.randn(1, channels, height, width)}
-    else:
-        vocab = getattr(config.get_text_config(), "vocab_size", None)
-        if not isinstance(vocab, int) or vocab <= 0:
-            raise ValueError("text model without a vocab_size")
-        input_ids = torch.randint(0, vocab, (1, SEQ_LEN))
-        inputs = {
-            "input_ids": input_ids,
-            "attention_mask": torch.ones(1, SEQ_LEN, dtype=torch.long),
-        }
-        if getattr(config, "is_encoder_decoder", False):
-            inputs["decoder_input_ids"] = input_ids.clone()
+    inputs = _inputs(model_id, config, tag)
 
     # ``prepare_model_and_inputs`` pops ``use_cache`` / ``return_dict`` and
     # applies them to the config, so a decoder no longer returns a
@@ -662,6 +882,59 @@ def _export_timm(model_id: str) -> dict:
     inputs = (torch.randn(1, channels, height, width),)
     with torch.no_grad():
         return {"forward": torch.export.export(model, inputs, strict=False)}
+
+
+class _Loss(nn.Module):
+    """A Hugging Face model whose forward returns a loss alone: its own,
+    given labels, or else the mean of its first output."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, **inputs):
+        outputs = self.model(**inputs)
+        if "labels" in inputs:
+            return outputs.loss
+        return outputs[0].mean()
+
+
+def _export_training(model_id: str, config, tag: str) -> GraphModule:
+    """The gradient program of one bfloat16 training step of a Hugging Face
+    model, as the compiler lowers it.  A causal LM trains on next-token
+    prediction; any other model on the mean of its first output, which
+    reaches every parameter's backward whatever the task."""
+    # Eager attention, as the compiler trains it.
+    if tag in _TEXT_TAGS and _is_causal_lm(config, tag):
+        model = AutoModelForCausalLM.from_config(
+            config, attn_implementation="eager", dtype=torch.bfloat16
+        )
+        input_ids = _inputs(model_id, config, tag)["input_ids"]
+        inputs = {"input_ids": input_ids, "labels": input_ids}
+    else:
+        model = AutoModel.from_config(
+            config,
+            trust_remote_code=False,
+            attn_implementation="eager",
+            dtype=torch.bfloat16,
+        )
+        inputs = {
+            name: value.bfloat16() if value.is_floating_point() else value
+            for name, value in _inputs(model_id, config, tag).items()
+        }
+    model = _Loss(model).train()
+    with torch.enable_grad():
+        capture_training(model, (), inputs, None)
+    return gradient_program(model)
+
+
+def _export_optimizer(name: str) -> dict:
+    """``{"update": GraphModule}``: the update program of one step of
+    ``torch.optim.<name>`` at its default hyperparameters, on a small
+    bfloat16 linear layer with no bias, since Muon updates only matrices."""
+    model = nn.Linear(8, 8, bias=False).bfloat16()
+    optimizer = getattr(torch.optim, name)(model.parameters())
+    return {"update": update_program(model, optimizer)}
 
 
 def _spec(value):
@@ -709,9 +982,12 @@ def export_one(model_id: str, source: str) -> dict:
     """Export one model -- every variant of it -- and harvest its ATen ops plus
     one replayable example call per op.  Raises on failure; caller records it.
     """
-    programs = (
-        _export_timm(model_id) if source == "timm" else _export_hf(model_id)
-    )
+    export = {
+        "hf": _export_hf,
+        "timm": _export_timm,
+        "optimizer": _export_optimizer,
+    }
+    programs = export[source](model_id)
 
     ops: set = set()
     examples: dict = {}
@@ -720,7 +996,7 @@ def export_one(model_id: str, source: str) -> dict:
             if node.op != "call_function":
                 continue
             target = str(node.target)
-            if not target.startswith("aten."):
+            if not target.startswith(("aten.", "prims.")):
                 continue
             ops.add(target)
             if target not in examples:
@@ -916,8 +1192,10 @@ def _counterpart(op):
     """The other member of ``op``'s in-place / functional pair, or ``None``.
 
     ``aten.add.Tensor`` <-> ``aten.add_.Tensor``, in whichever direction ``op``
-    is not.
+    is not.  A prim has no in-place twin.
     """
+    if not str(op).startswith("aten."):
+        return None
     name = str(op)[len("aten.") :]
     packet, _, overload = name.partition(".")
     packet = packet[:-1] if packet.endswith("_") else packet + "_"
@@ -1085,6 +1363,7 @@ Model corpus size:      {corpus_size}
   timm count:           {timm_count}
   exported models:      {exported}
   failed models:        {failed}
+Training steps:         {training_steps}
 Unique ATen ops seen:   {unique_ops}
 Classified compute:     {n_compute}
 Classified elementwise: {n_elementwise}
@@ -1231,7 +1510,9 @@ def main() -> None:
         "observed ones (slower, and the extra ops are unobserved in practice)",
     )
     parser.add_argument("--export-one", metavar="MODEL_ID")
-    parser.add_argument("--source", default="hf", choices=("hf", "timm"))
+    parser.add_argument(
+        "--source", default="hf", choices=("hf", "timm", "optimizer")
+    )
     parser.add_argument("--shard", type=Path)
     args = parser.parse_args()
 
@@ -1246,12 +1527,14 @@ def main() -> None:
 
     _check_partition()
     core = {
-        "all": resolve_all(CORE_ATEN_IR),
-        "compute": resolve_all(CORE_ATEN_COMPUTE_IR),
-        "elementwise": resolve_all(CORE_ATEN_ELEMENTWISE_IR),
-        "pure": resolve_all(CORE_ATEN_PURE_IR),
+        "all": resolve_all(CORE_ATEN_IR + PRIMS_IR),
+        "compute": resolve_all(CORE_ATEN_COMPUTE_IR + PRIMS_COMPUTE_IR),
+        "elementwise": resolve_all(
+            CORE_ATEN_ELEMENTWISE_IR + PRIMS_ELEMENTWISE_IR
+        ),
+        "pure": resolve_all(CORE_ATEN_PURE_IR + PRIMS_PURE_IR),
     }
-    cross_check_core_tag(core["all"])
+    cross_check_core_tag(resolve_all(CORE_ATEN_IR))
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
     histogram_path = ARTIFACT_DIR / "aten_ops_histogram.json"
@@ -1267,6 +1550,7 @@ def main() -> None:
     else:
         started = time.time()
         models = discover_models(args.hf_count, args.timm_count)
+        models += discover_optimizers()
         records, failures = build_corpus(
             models, args.max_workers, ARTIFACT_DIR / "shards"
         )
@@ -1313,6 +1597,9 @@ def main() -> None:
             "timm_count": args.timm_count,
             "exported": len(records),
             "failed": len(failures),
+            "training_steps": sum(
+                "gradient" in record["variants"] for record in records
+            ),
             "unique_ops": len(histogram),
         }
         stats_path.write_text(json.dumps(stats, indent=2))
