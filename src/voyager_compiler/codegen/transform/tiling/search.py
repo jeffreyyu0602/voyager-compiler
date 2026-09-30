@@ -9,6 +9,8 @@ import torch
 import interstellar
 from voyager_compiler.codegen.node_info import (
     DYNAMIC_QUANTIZE_OPS,
+    LAYER_NORM_OPS,
+    SOFTMAX_OPS,
     _pair,
     bound_operands,
     compute_output_tiled_shapes,
@@ -18,10 +20,12 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_elementwise_op,
     is_fully_connected,
+    is_axis_reduction,
     is_matmul,
     is_pooling,
     normalize_shape,
     quant_param_arg_nodes,
+    reduced_input_tiling,
     reduction_scratch,
     require_allocation,
     stream_breaking_quantize,
@@ -717,8 +721,9 @@ def gemv_op_tiling(node, config, constraint=None):
 
 
 def _build_vector_op_shape_map(node, tile_sizes, divisor):
+    in_divisor = reduced_input_tiling(get_anchor_node(node), divisor)
     shapes_map = {
-        n: compute_tiled_shape(tuple(n.shape), divisor)
+        n: compute_tiled_shape(tuple(n.shape), in_divisor)
         for n in node.all_input_nodes
         if require_allocation(n)
     }
@@ -727,36 +732,23 @@ def _build_vector_op_shape_map(node, tile_sizes, divisor):
 
 
 def _vector_op_tiling_limits(node, vector_unit_width):
-    """``(last_dim, multiple_of)`` for a vector op's tile search, or ``None``
-    when ``node`` is not an op this pass tiles.
+    """``(last_dim, multiple_of)`` for a vector op's tile search.
 
     Args:
         node: The vector op whose dimensions are being constrained.
         vector_unit_width: Lanes the last dim has to fill.
     """
-    if (
-        not is_elementwise_op(node)
-        and node.target not in DYNAMIC_QUANTIZE_OPS
-        and node.target
-        not in [
-            torch.ops.aten.softmax.int,
-            torch.ops.aten.layer_norm.default,
-            torch.ops.aten.permute.default,
-            torch.ops.aten.transpose.int,
-            torch.ops.quantized_ops.layer_norm.default,
-        ]
-    ):
-        return None
+    # A tile of the output reads each reduced dim whole; the kept dims tile
+    # freely, the last in whole lane groups.
+    if is_axis_reduction(node):
+        return None, (vector_unit_width if node.shape[-1] > 1 else 1,)
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
     multiple_of = (vector_unit_width,)
-    if node.target == torch.ops.aten.softmax.int:
+    if node.target in SOFTMAX_OPS:
         last_dim = get_arg_value(node, 1, "dim", -1)
-    elif node.target in [
-        torch.ops.aten.layer_norm.default,
-        torch.ops.quantized_ops.layer_norm.default,
-    ]:
+    elif node.target in LAYER_NORM_OPS:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
@@ -812,8 +804,7 @@ def vector_op_tiling(node, config):
     ``node.meta["bank_groups"]`` (see ``gemv_op_tiling``).
 
     Returns:
-        Tile counts over ``node``'s output, or ``None`` when the op is not one
-        this tiles.
+        Tile counts over ``node``'s output, or ``None`` when it has no anchor.
 
     Raises:
         RuntimeError: when no tiling of the op's operands fits the scratchpad.
@@ -821,10 +812,9 @@ def vector_op_tiling(node, config):
     anchor = get_anchor_node(node)
     if anchor is None:
         return None
-    limits = _vector_op_tiling_limits(anchor, config.vector_lanes)
-    if limits is None:
-        return None
-    last_dim, multiple_of = limits
+    last_dim, multiple_of = _vector_op_tiling_limits(
+        anchor, config.vector_lanes
+    )
 
     logger.info(f"Running L2 tiling for vector op: {node}")
 
@@ -837,15 +827,20 @@ def vector_op_tiling(node, config):
     )
 
     output_shape = _output_shape(node)
-    found = _search_tiling(
+    search = partial(
+        _search_tiling,
         node=node,
         full_shape=output_shape,
         multiple_of=multiple_of,
-        last_dim=last_dim,
         shape_builder_fn=_build_vector_op_shape_map,
         config=config,
         cost_fn=cost_fn,
     )
+    found = search(last_dim=last_dim)
+    # An elementwise op whose whole rows do not fit splits its rows too, in
+    # whole lane groups.
+    if found is None and is_elementwise_op(anchor) and last_dim is not None:
+        found = search(last_dim=None)
     if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "

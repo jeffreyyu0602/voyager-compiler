@@ -56,6 +56,26 @@ QUANTIZE_FAMILY_OPS = DYNAMIC_QUANTIZE_OPS | {
     torch.ops.quantized_ops.dequantize.default,
 }
 
+# The layer norms and the softmaxes, in every form a graph spells them: the
+# model's op, the one a training graph's decomposition leaves, and the
+# quantized twin the compiler retargets to.  A log-softmax reduces and stages
+# like a softmax.
+LAYER_NORM_OPS = frozenset(
+    {
+        torch.ops.aten.layer_norm.default,
+        torch.ops.aten.native_layer_norm.default,
+        torch.ops.quantized_ops.layer_norm.default,
+    }
+)
+SOFTMAX_OPS = frozenset(
+    {
+        torch.ops.aten.softmax.int,
+        torch.ops.aten._softmax.default,
+        torch.ops.aten._log_softmax.default,
+        torch.ops.quantized_ops.softmax.default,
+    }
+)
+
 
 # --------------------------------------------------------------------------
 # Graph walking
@@ -245,6 +265,38 @@ def is_pooling(node: Node) -> bool:
         torch.ops.quantized_ops.adaptive_avg_pool2d.default,
         torch.ops.quantized_ops._adaptive_avg_pool2d.default,
     ]
+
+
+_SUMS = (torch.ops.aten.sum.dim_IntList, torch.ops.aten.mean.dim)
+
+
+def is_axis_reduction(node: Node) -> bool:
+    """``node`` sums or averages over some dims into a tensor, not a scalar:
+    a tile of its output reads each reduced dim whole."""
+    return node.target in _SUMS and len(node.shape) > 0
+
+
+def reduced_input_grid(node: Node) -> Optional[tuple]:
+    """For a ``sum`` / ``mean`` that drops the dims it reduces, the output
+    dim each input dim is tiled along, ``None`` for a reduced one, which is
+    read whole; ``None`` for any other op, whose operands right-align onto
+    its output."""
+    if node.target not in _SUMS or get_arg_value(node, 2, "keepdim", False):
+        return None
+    ndim = len(node.args[0].shape)
+    dims = get_arg_value(node, 1, "dim") or range(ndim)
+    reduced = {d % ndim for d in dims}
+    kept = iter(range(ndim - len(reduced)))
+    return tuple(None if d in reduced else next(kept) for d in range(ndim))
+
+
+def reduced_input_tiling(node: Node, tiling: tuple) -> tuple:
+    """``tiling``, over ``node``'s output, as the tiling of its operands: a
+    dim ``reduced_input_grid`` reads whole takes 1."""
+    grid = reduced_input_grid(node)
+    if grid is None:
+        return tiling
+    return tuple(1 if g is None else tiling[g] for g in grid)
 
 
 def is_reshape_op(node: Node) -> bool:

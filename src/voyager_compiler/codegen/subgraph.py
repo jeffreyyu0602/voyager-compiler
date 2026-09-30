@@ -18,7 +18,12 @@ from voyager_compiler.codegen.iteration_space import (
     IterationSpaceNormalizer,
     NormalizationError,
 )
-from voyager_compiler.codegen.node_info import is_gemm_op, is_nop, is_reshape_op
+from voyager_compiler.codegen.node_info import (
+    LAYER_NORM_OPS,
+    is_gemm_op,
+    is_nop,
+    is_reshape_op,
+)
 from voyager_compiler.export_utils import create_getattr_from_value
 from voyager_compiler.shape_prop import (
     ShapeProp,
@@ -166,13 +171,12 @@ def create_subgraph(nodes: List[Node]):
 
 OP_PARAM_ARG_INDEX = {
     torch.ops.aten.conv2d.default: 1,
-    torch.ops.aten.layer_norm.default: 2,
     torch.ops.aten.linear.default: 1,
     torch.ops.quantized_ops.conv2d.default: 1,
     torch.ops.quantized_ops.conv2d_mx.default: 1,
-    torch.ops.quantized_ops.layer_norm.default: 2,
     torch.ops.quantized_ops.linear.default: 1,
     torch.ops.quantized_ops.linear_mx.default: 1,
+    **dict.fromkeys(LAYER_NORM_OPS, 2),
 }
 
 

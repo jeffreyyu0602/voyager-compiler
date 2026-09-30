@@ -25,6 +25,8 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     DYNAMIC_QUANTIZE_OPS,
+    LAYER_NORM_OPS,
+    SOFTMAX_OPS,
     bound_operands,
     csr_quantize_node,
     gemm_produces_csr,
@@ -34,6 +36,7 @@ from voyager_compiler.codegen.node_info import (
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
+    is_axis_reduction,
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
@@ -889,6 +892,7 @@ def bufferize_graph(
     """
     graph = model.graph
     num_slots = 2 if pipelined else 1
+    accumulate_fp32 = tiler is not None and tiler.accumulate_fp32
     build_cache = {}
     group_ids = itertools.count()
 
@@ -946,6 +950,7 @@ def bufferize_graph(
                 sub_gm = build_sparse_gemm(
                     node,
                     num_slots=num_slots,
+                    accumulate_fp32=accumulate_fp32,
                     async_pipeline=pipelined,
                     tiler=tiler,
                 )
@@ -953,6 +958,7 @@ def bufferize_graph(
                 sub_gm = build_gemm(
                     node,
                     num_slots=num_slots,
+                    accumulate_fp32=accumulate_fp32,
                     single_buffer_tail=single_buffer_tail,
                     async_pipeline=pipelined,
                     tiler=tiler,
@@ -986,6 +992,7 @@ def bufferize_graph(
                     )
             elif (
                 is_elementwise_op(anchor)
+                or is_axis_reduction(anchor)
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):
@@ -1215,12 +1222,12 @@ def _dedup_regions(gm: GraphModule) -> None:
                 _dedup_regions(sub)
 
 
-_REDUCTION_POINTWISE_OPS = DYNAMIC_QUANTIZE_OPS | {
-    torch.ops.quantized_ops.quantize.default,
-    torch.ops.quantized_ops.layer_norm.default,
-    torch.ops.aten.layer_norm.default,
-    torch.ops.aten.softmax.int,
-}
+_REDUCTION_POINTWISE_OPS = (
+    DYNAMIC_QUANTIZE_OPS
+    | LAYER_NORM_OPS
+    | SOFTMAX_OPS
+    | {torch.ops.quantized_ops.quantize.default}
+)
 # A standalone transpose / permute relayout — build_pointwise stores each tile
 # identity and loads the input from the transposed source.  (Untiled ones fall
 # to ``_build_for_untiled``; build_pointwise returns ``None`` when untiled.)

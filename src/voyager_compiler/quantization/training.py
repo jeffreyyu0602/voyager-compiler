@@ -37,6 +37,7 @@ from torch._decomp import core_aten_decompositions
 from torch._functorch import config as functorch_config
 from torch._dynamo.backends.common import aot_autograd
 from torch._functorch._aot_autograd.descriptors import (
+    BufferAOTInput,
     GradAOTOutput,
     ParamAOTInput,
     PlainAOTInput,
@@ -202,6 +203,75 @@ def _rename_gemms(joint: GraphModule, export: GraphModule) -> None:
         node.meta = gemm.meta
         gemm.replace_all_uses_with(node)
         graph.erase_node(gemm)
+    joint.recompile()
+
+
+def _unflatten_gemms(joint: GraphModule) -> None:
+    """Give each GEMM the operands before AOTAutograd flattened them.
+
+    AOTAutograd traces a ``linear`` or ``matmul`` of N-d tensors as a 2-d or
+    3-d GEMM of views that flatten their leading dimensions, and views the
+    result back.  Where the result is viewed back, the GEMM reads the
+    tensors those views flatten -- transposed, if it read the view
+    transposed, and past any ``expand`` that changes nothing -- and gives
+    the N-d result, as in the model.  A GEMM contracting over the flattened
+    dimensions, as a weight gradient does, keeps its views.
+
+    Args:
+        joint: AOTAutograd's joint graph, rewritten in place.
+    """
+    graph = joint.graph
+
+    def unflattened(operand, gemm, lead):
+        """The tensor whose ``lead`` dimensions ``operand`` flattens, or
+        ``None``."""
+        ndim = operand.meta["val"].ndim
+        swap = [*range(ndim - 2), ndim - 1, ndim - 2]
+        transposed = (
+            operand.target is aten.permute.default
+            and list(operand.args[1]) == swap
+        )
+        view = operand.args[0] if transposed else operand
+        if view.target is not aten.view.default:
+            return None
+        tensor = view.args[0]
+        while (
+            tensor.target is aten.expand.default
+            and tensor.meta["val"].shape == tensor.args[0].meta["val"].shape
+        ):
+            tensor = tensor.args[0]
+        if tensor.meta["val"].shape != (*lead, *view.meta["val"].shape[1:]):
+            return None
+        if not transposed:
+            return tensor
+        n = len(tensor.meta["val"].shape)
+        with graph.inserting_before(gemm):
+            node = graph.call_function(
+                aten.permute.default, (tensor, [*range(n - 2), n - 1, n - 2])
+            )
+        node.meta = {**operand.meta, "val": tensor.meta["val"].mT}
+        return node
+
+    for gemm in list(graph.nodes):
+        if gemm.target not in _OPS or len(gemm.users) != 1:
+            continue
+        (view,) = gemm.users
+        if view.target is not aten.view.default:
+            continue
+        _, *rest = gemm.meta["val"].shape
+        lead = tuple(view.meta["val"].shape[: -len(rest)])
+        if len(lead) < 2 or view.meta["val"].shape != (*lead, *rest):
+            continue
+        # A 3-d GEMM flattens both operands; a 2-d one, only the rows.
+        count = 2 if len(rest) == 2 else 1
+        operands = [unflattened(a, gemm, lead) for a in gemm.args[:count]]
+        if None in operands:
+            continue
+        gemm.args = (*operands, *gemm.args[count:])
+        gemm.meta["val"] = view.meta["val"]
+        view.replace_all_uses_with(gemm)
+        graph.erase_node(view)
+    graph.eliminate_dead_code()
     joint.recompile()
 
 
@@ -372,8 +442,9 @@ def capture_training(
     graphs = {}
 
     def partition(joint, joint_inputs, **kwargs):
-        _fold_permutes(joint)
         _rename_gemms(joint, gm)
+        _unflatten_gemms(joint)
+        _fold_permutes(joint)
         graphs["joint"] = joint if transform is None else transform(joint)
         return default_partition(graphs["joint"], joint_inputs, **kwargs)
 
@@ -586,7 +657,8 @@ def gradient_program(model: nn.Module) -> GraphModule:
     whose forward returns only the loss.  The loss's incoming gradient is 1,
     and each parameter's gradient is written in place into a buffer of its
     own.  A parameter is named after its module path (``fc1.weight`` becomes
-    ``fc1_weight``) and its gradient buffer after it, with ``_grad``.
+    ``fc1_weight``), a tied one after its first, and its gradient buffer
+    after it, with ``_grad``.
 
     Args:
         model: Model captured by ``capture_training``.
@@ -608,9 +680,29 @@ def gradient_program(model: nn.Module) -> GraphModule:
     ]
     if len(tangents) != 1:
         raise ValueError("The model's forward must return only the loss")
+    # A tensor under several names, such as tied embeddings, takes the first,
+    # as ``named_parameters`` and so ``update_program`` name it.
+    tensors = [
+        *model.named_parameters(remove_duplicate=False),
+        *model.named_buffers(remove_duplicate=False),
+    ]
+    first = {}
+    for name, tensor in tensors:
+        first.setdefault(tensor, name)
+    canonical = {name: first[tensor] for name, tensor in tensors}
+    named = {}
     for node in placeholders:
-        if isinstance(node.meta["desc"], ParamAOTInput):
-            node._rename(_parameter_name(node.meta["desc"].target))
+        desc = node.meta["desc"]
+        if not isinstance(desc, (ParamAOTInput, BufferAOTInput)):
+            continue
+        name = _parameter_name(canonical[desc.target])
+        if name in named:
+            # The joint graph takes a tied tensor once per name.
+            node.replace_all_uses_with(named[name])
+            graph.erase_node(node)
+        else:
+            named[name] = node
+            node._rename(name)
             node.target = node.name
 
     (tangent,) = tangents
@@ -621,23 +713,35 @@ def gradient_program(model: nn.Module) -> GraphModule:
             ([], 1.0),
             {"dtype": tangent.meta["val"].dtype},
         )
+    one.meta["val"] = tangent.meta["val"]
     tangent.replace_all_uses_with(one)
     graph.erase_node(tangent)
 
     output = graph.output_node()
     loss = []
+    grads = {}
     for value, desc in zip(output.args[0], output.meta["desc"]):
         if value is None:
             continue
         if not isinstance(desc, GradAOTOutput):
             loss.append(value)
         else:
-            name = _parameter_name(desc.grad_of.target)
-            with graph.inserting_before(one):
-                buffer = graph.placeholder(f"{name}_grad")
-            buffer.meta["val"] = value.meta["val"]
-            with graph.inserting_before(output):
-                graph.call_function(aten.copy_.default, (buffer, value))
+            name = _parameter_name(canonical[desc.grad_of.target])
+            grads.setdefault(name, []).append(value)
+    for name, values in grads.items():
+        with graph.inserting_before(one):
+            buffer = graph.placeholder(f"{name}_grad")
+        # A new placeholder's name is snake-cased; keep the parameter's.
+        buffer._rename(f"{name}_grad")
+        buffer.target = buffer.name
+        buffer.meta["val"] = values[0].meta["val"]
+        # A tied tensor's gradient sums the ones through each of its names.
+        total = values[0]
+        with graph.inserting_before(output):
+            for value in values[1:]:
+                total = graph.call_function(aten.add.Tensor, (total, value))
+                total.meta["val"] = values[0].meta["val"]
+            graph.call_function(aten.copy_.default, (buffer, total))
     output.args = (tuple(loss),)
     graph.eliminate_dead_code()
     program.recompile()

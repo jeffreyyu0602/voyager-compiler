@@ -21,9 +21,11 @@ def load_model(args):
     if args.model_name_or_path is None:
         args.model_name_or_path = "bert-base-uncased"
 
+    layers = getattr(args, "num_hidden_layers", None)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         attn_implementation="eager",
+        **({"num_hidden_layers": layers} if layers else {}),
     )
 
     model.eval()

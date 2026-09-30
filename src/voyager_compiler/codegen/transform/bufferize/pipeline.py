@@ -27,8 +27,11 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_nop,
     is_reshape_op,
     quant_param_arg_nodes,
+    reduced_input_grid,
+    reduced_input_tiling,
     reduction_op,
     reduction_scratch,
     relayout_view_shape,
@@ -2102,7 +2105,8 @@ def _gemm_scratch_and_kernel(
         return result
 
     out_dtype = anchor.value.dtype
-    acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
+    # A single round has no running sum to widen.
+    acc_dtype = torch.float32 if accumulate_fp32 and num_k > 1 else out_dtype
     # A multi-round reduction accumulates in L2, so its partials have to reach
     # the accumulator already scaled -- the psum type lives on chip only.  Every
     # round scales its own partial, so the head rides the op rather than the
@@ -2118,6 +2122,24 @@ def _gemm_scratch_and_kernel(
             return dequantize(
                 op(in_tiles, first), *[in_tiles[i] for i in fused_idx]
             )
+
+    # A tail that only regroups the tile's dims computes nothing: each
+    # round's partial takes the output's shape, and the reduction runs as
+    # one with no tail.  A caller rebuilding its kernel under export tracing
+    # (``split`` given) cannot walk the tail's graph, so keeps it.
+    if (
+        split is _CLASSIFY
+        and fused_gm is not None
+        and not fused_idx
+        and acc_dtype == out_dtype
+        and all(
+            is_nop(n) for n in fused_gm.graph.nodes if n.op == "call_function"
+        )
+    ):
+        reshape, fused_gm = fused_gm, None
+
+        def gemm_kernel(in_tiles, first, op=gemm_kernel):
+            return reshape(op(in_tiles, first))
 
     if split is _CLASSIFY:
         split = _split_stream_break(fused_gm)
@@ -2929,8 +2951,6 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     """
     anchor = get_anchor_node(node)
     tiling = vector_op_tiling(node, tiler.config)
-    if node.op != "call_module" and tiling is None:
-        return None
 
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
@@ -2939,8 +2959,6 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     outputs = val if isinstance(val, (list, tuple)) else (val,)
 
     output_shape = tuple(outputs[-1].shape)
-    if tiling is None:
-        tiling = (1,) * len(output_shape)
     grid = tuple(tiling)
     # ``compute_output_tiled_shapes`` dices each output by ``tiling``, with the
     # sparse-output handling a per-output ``compute_tiled_shape`` would miss.
@@ -3020,9 +3038,11 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         )
         in_specs = [_InputSpec(in_tile, in_imap, (False,) * ndim)]
     else:
+        in_tiling = reduced_input_tiling(anchor, tiling)
+        in_grid = reduced_input_grid(anchor)
         in_specs = [
             (
-                _compute_input_spec(tiling, tuple(n.shape))
+                _compute_input_spec(in_tiling, tuple(n.shape), in_grid)
                 if n not in codebooks
                 else None
             )

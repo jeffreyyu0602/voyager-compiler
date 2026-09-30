@@ -81,7 +81,8 @@ twin, and fell back to the one-pass default.
 
 The report therefore understated the reductions' cost—and the corresponding
 latency—while still producing plausible numbers. `OP_PASSES` now lists both
-ATen and twin targets for each operator.
+ATen and twin targets for each operator, through `LAYER_NORM_OPS` and
+`SOFTMAX_OPS`.
 
 ## Target Lifecycle
 
@@ -126,7 +127,11 @@ In the standard pipeline, the targets evolve as follows:
 
 The handling labels below mean:
 
-- **Explicit**: the lookup directly lists every reachable twin.
+- **Explicit**: the lookup directly lists every reachable twin.  Most do
+  so through `LAYER_NORM_OPS` and `SOFTMAX_OPS` in
+  [`node_info.py`](../codegen/node_info.py), which list each op's ATen
+  form, its training-graph form (`native_layer_norm`, `_softmax`,
+  `_log_softmax`) and its twin.
 - **Indirect**: another audited lookup provides the coverage.
 - **Phase-safe**: the twin is intentionally absent because the standard
   pipeline cannot deliver it to this site. Re-audit this assumption whenever
@@ -135,14 +140,13 @@ The handling labels below mean:
 
 | Site | Operator(s) | Handling | Reason |
 | --- | --- | --- | --- |
-| [`OP_PASSES`](../codegen/transform/tiling/cost.py) | `softmax`, `layer_norm` | **Explicit** | Lists both ATen and twin targets. |
+| [`OP_PASSES`](../codegen/transform/tiling/cost.py) | `softmax`, `layer_norm` | **Explicit** | Keyed by `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
 | [`op_utilization`](../codegen/reporting/cost.py) | `softmax`, `layer_norm` | **Indirect** | Delegates its vector branch to `vector_op_utilization`, which reads `OP_PASSES`. |
-| [`_fuse_dequantize_recursive`](../codegen/transform/operator_fusion.py) endpoints | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | Lists the `layer_norm` twin; `softmax` remains ATen at this stage. |
-| [`OP_PARAM_ARG_INDEX`](../codegen/subgraph.py) | `layer_norm` | **Explicit** | Lists the twin at the same argument index; `weight` remains argument 2. |
-| [`_vector_op_tiling_limits`](../codegen/transform/tiling/search.py) guard | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | Lists the `layer_norm` twin; `softmax` remains ATen at this stage. |
-| [`_vector_op_tiling_limits`](../codegen/transform/tiling/search.py) constraint branch | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | The `layer_norm` twin uses `last_dim = -len(normalized_shape)`; `softmax` remains ATen. |
+| [`_fuse_dequantize_recursive`](../codegen/transform/operator_fusion.py) endpoints | `softmax`, `layer_norm` | **Explicit** | Matches `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
+| [`OP_PARAM_ARG_INDEX`](../codegen/subgraph.py) | `layer_norm` | **Explicit** | Every op in `LAYER_NORM_OPS` takes `weight` as argument 2. |
+| [`_vector_op_tiling_limits`](../codegen/transform/tiling/search.py) constraint branch | `softmax`, `layer_norm` | **Explicit** | Matches `SOFTMAX_OPS` (`last_dim = dim`) and `LAYER_NORM_OPS` (`last_dim = -len(normalized_shape)`). |
 | [`_REDUCTION_SCRATCH`](../codegen/node_info.py) | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | Includes the `layer_norm` self-entry; a `softmax` twin does not normally reach this table. |
-| [`_REDUCTION_POINTWISE_OPS`](../codegen/transform/bufferize/bufferization.py) | `softmax`, `layer_norm` | `layer_norm`: **Explicit**; `softmax`: **Phase-safe** | Lists the `layer_norm` twin; `softmax` remains ATen before generic retargeting. |
+| [`_REDUCTION_POINTWISE_OPS`](../codegen/transform/bufferize/bufferization.py) | `softmax`, `layer_norm` | **Explicit** | Includes `SOFTMAX_OPS` and `LAYER_NORM_OPS`. |
 | [`pad_vector_op_dimensions`](../codegen/transform/padding.py) dispatch | `softmax`, `layer_norm` | `layer_norm`: **ATen-only by design**; `softmax`: **Phase-safe** | Matching the `layer_norm` twin would pad an already-padded operator again; a `softmax` twin does not yet exist. |
 | [`is_compute_op`](../codegen/aten_classifier.py) | `softmax`, `layer_norm` | **Explicit** | The hand-maintained `_QUANTIZED_COMPUTE_OPS` allowlist includes both twin names. |
 | [`_reduced_dims`](../codegen/node_info.py) | `softmax` | **Phase-safe** | It is reached through `reduction_scratch` before generic retargeting. A twin here would misread `dim` as `normalized_shape`. |

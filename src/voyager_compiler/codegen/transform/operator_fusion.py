@@ -12,6 +12,8 @@ import torch
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
+    LAYER_NORM_OPS,
+    SOFTMAX_OPS,
     dtype_byte_size,
     get_arg_value,
     is_elementwise_op,
@@ -598,12 +600,8 @@ def _fuse_dequantize_recursive(graph, candidates, current_node, fused_nodes):
     if (
         is_gemm_op(current_node)
         or is_elementwise_op(current_node)
-        or current_node.target
-        in [
-            torch.ops.aten.layer_norm.default,
-            torch.ops.aten.softmax.int,
-            torch.ops.quantized_ops.layer_norm.default,
-        ]
+        or current_node.target in LAYER_NORM_OPS
+        or current_node.target in SOFTMAX_OPS
     ):
         fused_nodes = duplicate_shared_nodes(graph, fused_nodes)
         fused_nodes = move_dq_after_select(graph, fused_nodes)

@@ -388,6 +388,12 @@ def add_compile_args(parser=None):
         "for an accelerator with no float32 datapath.",
     )
     parser.add_argument(
+        "--accumulate_fp32",
+        action="store_true",
+        help="Accumulate a GEMM split along K in float32 rather than its "
+        "output dtype, as training needs.",
+    )
+    parser.add_argument(
         "--runtime_tolerance",
         type=float,
         default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()

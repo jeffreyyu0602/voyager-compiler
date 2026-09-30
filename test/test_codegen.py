@@ -8,6 +8,7 @@ from torchvision import models
 from utils.dataset import glue, imagenet
 from utils.models import bert, llama, mobilebert, torchvision_models, vit
 from utils.models.llama import QUANTIZATION_CONFIGS
+from utils.models.utils import compile_training_step
 
 from voyager_compiler import (
     OpMatcher,
@@ -240,6 +241,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--training",
+        action="store_true",
+        help=(
+            "Compile one AdamW training step instead of inference: the "
+            "gradient program (forward, loss and backward) and the update "
+            "program, into the gradient/ and update/ subdirectories of "
+            "--model_output_dir.  bert trains on a GLUE batch; "
+            "llama_prefill pre-trains on --context_length wikitext tokens."
+        ),
+    )
+    parser.add_argument(
         "--log_level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         default="WARNING",
@@ -248,6 +260,10 @@ def main():
     add_quantization_args(parser)
     add_compile_args(parser)
     args = parser.parse_args()
+    if args.training and args.model not in ("bert", "llama_prefill"):
+        parser.error("--training compiles bert or llama_prefill")
+    if args.training and args.report:
+        parser.error("--report takes one graph; --training compiles two")
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -340,16 +356,22 @@ def main():
                 args.dataset_output_dir, eval_dataset, model
             )
 
-        gm, old_output, new_output = bert.quantize_and_dump_model(
-            model=model,
-            quantizer=quantizer,
-            calibration_data=train_dataset,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
-        )
+        if args.training:
+            inputs = {k: torch.tensor([v]) for k, v in train_dataset[0].items()}
+            gm, old_output, new_output = compile_training_step(
+                model, inputs, VECTOR_PIPELINE, args
+            )
+        else:
+            gm, old_output, new_output = bert.quantize_and_dump_model(
+                model=model,
+                quantizer=quantizer,
+                calibration_data=train_dataset,
+                vector_stages=VECTOR_PIPELINE,
+                args=args,
+            )
 
-        if args.evaluate:
-            bert.evaluate_gm(gm, preprocessed_dataset)
+            if args.evaluate:
+                bert.evaluate_gm(gm, preprocessed_dataset)
 
     elif args.model in (
         "llama_prefill",
@@ -359,13 +381,20 @@ def main():
     ):
         model, tokenizer = llama.load_model(args)
 
-        gm, old_output, new_output = llama.quantize_and_dump_model(
-            model=model,
-            tokenizer=tokenizer,
-            quantizer=quantizer,
-            vector_stages=VECTOR_PIPELINE,
-            args=args,
-        )
+        if args.training:
+            input_ids = llama._prompt_ids(tokenizer, args.context_length)
+            inputs = {"input_ids": input_ids, "labels": input_ids}
+            gm, old_output, new_output = compile_training_step(
+                model, inputs, VECTOR_PIPELINE, args
+            )
+        else:
+            gm, old_output, new_output = llama.quantize_and_dump_model(
+                model=model,
+                tokenizer=tokenizer,
+                quantizer=quantizer,
+                vector_stages=VECTOR_PIPELINE,
+                args=args,
+            )
     elif args.model == "vit":
         model = vit.load_model(args)
 

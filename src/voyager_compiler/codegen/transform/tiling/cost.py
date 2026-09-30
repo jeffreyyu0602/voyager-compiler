@@ -24,6 +24,8 @@ from torch.fx import Node
 
 import interstellar
 from voyager_compiler.codegen.node_info import (
+    LAYER_NORM_OPS,
+    SOFTMAX_OPS,
     _pair,
     bound_operands,
     dtype_byte_size,
@@ -33,6 +35,7 @@ from voyager_compiler.codegen.node_info import (
     is_fully_connected,
     is_gemm_op,
     is_pooling,
+    reduced_input_grid,
     require_allocation,
     weight_transforms,
 )
@@ -53,10 +56,8 @@ IN, MID, OUT = "in", "mid", "out"
 _LAYER_NORM_PASSES = [(IN, None), (IN, None), (IN, MID), (MID, OUT)]
 _SOFTMAX_PASSES = [(IN, None), (IN, None), (IN, OUT)]
 OP_PASSES = {
-    torch.ops.aten.layer_norm.default: _LAYER_NORM_PASSES,
-    torch.ops.aten.softmax.int: _SOFTMAX_PASSES,
-    torch.ops.quantized_ops.layer_norm.default: _LAYER_NORM_PASSES,
-    torch.ops.quantized_ops.softmax.default: _SOFTMAX_PASSES,
+    **dict.fromkeys(LAYER_NORM_OPS, _LAYER_NORM_PASSES),
+    **dict.fromkeys(SOFTMAX_OPS, _SOFTMAX_PASSES),
 }
 
 # Cycles a pass costs the vector unit whatever it holds: params, instruction
@@ -442,7 +443,13 @@ def vector_op_utilization(node, config, ideal_cycles=None, tile=None):
             switch_cycles = pool_bank_switch_cycles(node, anchor, tile, config)
     elif anchor.target in OP_PASSES:
         profile = OP_PASSES[anchor.target]
-        reads = {IN: _input_bits(node, anchor), MID: _node_dtype_bits(anchor)}
+        # ``native_layer_norm`` also returns its mean and rstd: the staged
+        # intermediate is its normalized output, the first.
+        mid = _node_dtype_bits(anchor)
+        reads = {
+            IN: _input_bits(node, anchor),
+            MID: mid[0] if isinstance(mid, list) else mid,
+        }
     else:
         widths = [
             _node_dtype_bits(n)
@@ -497,8 +504,9 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
 
     The grid is the tile counts over ``node``'s own output, and each input's
     dims right-align onto it, the way the tile shapes were built
-    (``compute_tiled_shape``) -- so a dim an operand lacks, or broadcasts
-    over, leaves its tile in place while that loop turns and
+    (``compute_tiled_shape``), or follow ``reduced_input_grid`` for a
+    reduction that drops its reduced dims -- so a dim an operand lacks, or
+    broadcasts over, leaves its tile in place while that loop turns and
     ``_block_transfers`` prices the reuse.  A tile costs its element count
     spread over the lanes and de-rated by ``vector_op_utilization``, sized by
     the larger of the output tile and the widest input tile.  Double-buffered
@@ -551,14 +559,23 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     # (``compute_tiled_shape``).
     dmas = [(_transfer_cost(out_shape, out_bytes, lat, bpc), num_tiles)]
     traffic = num_tiles * out_bytes
+    # A reduction that drops its reduced dims reads them whole.
+    grid = reduced_input_grid(anchor)
     for n, shp in tiled_shapes.items():
         if n is node:
             continue
-        offset = out_ndim - len(n.shape)
+        if grid is None:
+            offset = out_ndim - len(n.shape)
+            dims = [
+                offset + j if offset + j >= 0 else None
+                for j in range(len(n.shape))
+            ]
+        else:
+            dims = grid[len(grid) - len(n.shape) :]
         spans = {
-            offset + j: 1
-            for j, size in enumerate(n.shape)
-            if offset + j >= 0 and size != 1
+            g: 1
+            for g, size in zip(dims, n.shape)
+            if g is not None and size != 1
         }
         transfers = _block_transfers(spans, tiling)
         n_bytes = _operand_bytes(shp, n)

@@ -787,7 +787,7 @@ def build_quantize_mx_outlier(
             math.prod(shape) * dtype.itemsize
             for _, shape, dtype in reduction_scratch(node, ones + [1, K], lanes)
         )
-        start = M if tiling is None else max(1, M // max(1, tiling[-2]))
+        start = max(1, M // max(1, tiling[-2]))
         per_row = _NEST_ROW_BLOCK_COPIES * K * act_bytes + scratch_per_row
         capacity = config.usable_scratchpad_size // config.num_slots
     else:

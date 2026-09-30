@@ -141,21 +141,25 @@ class TileConstraint:
 class TilerContext:
     """The interstellar architecture + run options, built once and shared by
     every builder so each can map its anchor node on demand.  ``arch`` /
-    ``schedule`` are built from ``config``; ``cache`` is per-run
-    memoization, and ``constraints`` the :class:`TileConstraint` a joint
-    optimization settled on for an anchor, which its search then runs
-    under."""
+    ``schedule`` are built from ``config``; ``accumulate_fp32`` accumulates
+    a GEMM split along K in float32; ``cache`` is per-run memoization, and
+    ``constraints`` the :class:`TileConstraint` a joint optimization
+    settled on for an anchor, which its search then runs under."""
 
     arch: object
     schedule: object
     config: object  # AcceleratorConfig
+    accumulate_fp32: bool
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     cache: dict = field(default_factory=dict)
     constraints: dict = field(default_factory=dict)
 
 
 def build_interstellar_tiler(
-    config, dram_access_cost=1000, runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE
+    config,
+    dram_access_cost=1000,
+    runtime_tolerance=DEFAULT_RUNTIME_TOLERANCE,
+    accumulate_fp32=False,
 ):
     """Build the 4-level (PE / L1 / L2 / DRAM) interstellar architecture and
     schedule and wrap them in a ``TilerContext``.
@@ -181,6 +185,8 @@ def build_interstellar_tiler(
     ``config`` carries physical units (GB); the interstellar model wants bytes,
     so ``dram_size`` is scaled to bytes here (the ``dram_bandwidth`` conversion
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
+    ``accumulate_fp32`` sizes and prices a GEMM split along K with a float32
+    accumulator.
     """
     ic_dim, oc_dim = config.pe_array_size
 
@@ -261,6 +267,7 @@ def build_interstellar_tiler(
         arch=architecture,
         schedule=schedule,
         config=config,
+        accumulate_fp32=accumulate_fp32,
         runtime_tolerance=runtime_tolerance,
     )
 
@@ -409,6 +416,7 @@ def make_size_fn(
     single_k_tail_extra_pass=False,
     tail_keeps_shape=False,
     scratch_regions=1,
+    accumulate_fp32=False,
     num_slots=1,
     batch=1,
     weight_batch=1,
@@ -439,7 +447,8 @@ def make_size_fn(
     Each such source is ping-ponged, so it costs ``num_slots`` whole banks --
     the two halves live in *separate* banks, which is what the planner does and
     what lets a load overlap the compute reading the other half.  A split
-    reduction with a fused tail also accumulates into a scratch buffer the
+    reduction with a fused tail, or accumulating in float32
+    (``accumulate_fp32``), also accumulates into a scratch buffer the
     builders allocate exactly once (``_ScratchSpec``); it is charged a single
     bank-aligned region on top.  So is the finished tile a tail that needs
     a pass of its own (``single_k_tail_extra_pass``) parks even for a
@@ -651,12 +660,16 @@ def make_size_fn(
 
         # A reduction split across L3 steps accumulates into a scratch buffer
         # the builders allocate once for the whole kernel, not per ping-pong
-        # half -- so it is charged one region, outside ``num_slots``.  A
-        # shape-changing extra pass parks even a single round's tile.
-        if has_tail and (
-            point.loop_blocking(le.IC)[3] > 1
-            or (single_k_tail_extra_pass and not tail_keeps_shape)
-        ):
+        # half -- so it is charged one region, outside ``num_slots``.  One
+        # accumulating in float32 always has it, since the output slot holds
+        # the narrower result.  A shape-changing extra pass parks even a
+        # single round's tile.
+        split = point.loop_blocking(le.IC)[3] > 1
+        if split and (has_tail or accumulate_fp32):
+            scratch = _alloc_bytes(
+                of_count, 32 if accumulate_fp32 else stage_bits
+            )
+        elif has_tail and single_k_tail_extra_pass and not tail_keeps_shape:
             scratch = _alloc_bytes(of_count, stage_bits)
         else:
             scratch = 0.0
@@ -1862,6 +1875,7 @@ def _prepare_search(node, tiler, constraint=None):
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
+    accumulate_fp32 = tiler.accumulate_fp32
     # The tail needs a pass of its own when its quantize breaks the stream
     # or the pipeline has no stage left for it: after the drain on a single
     # round, after the accumulate on a split one, which takes one more.
@@ -1999,7 +2013,7 @@ def _prepare_search(node, tiler, constraint=None):
         if_bits,
         fl_bits,
         of_bits,
-        get_dtype_width(anchor.value.dtype),
+        32 if accumulate_fp32 else get_dtype_width(anchor.value.dtype),
         tiler.config.double_buffered_accum_buffer,
         sram_bandwidth,
         tiler.config.bytes_per_cycle,
@@ -2035,6 +2049,7 @@ def _prepare_search(node, tiler, constraint=None):
         single_k_tail_extra_pass=single_k_tail_extra_pass,
         tail_keeps_shape=tail_keeps_shape,
         scratch_regions=scratch_regions,
+        accumulate_fp32=accumulate_fp32,
         num_slots=tiler.config.num_slots,
         batch=batch,
         weight_batch=batch // weight_repeat,

@@ -613,6 +613,8 @@ _CASTS = (
     torch.ops.aten.to.dtype_layout,
 )
 
+_HALF = (torch.bfloat16, torch.float16)
+
 
 def remove_fp32_casts(model: torch.fx.GraphModule):
     """Compute in 16-bit float where the model casts up to float32.
@@ -620,10 +622,15 @@ def remove_fp32_casts(model: torch.fx.GraphModule):
     For an accelerator with no float32 datapath: a ``softmax`` asked for a
     float32 result gives it in its input's dtype, and a cast of a bfloat16
     or float16 tensor to float32 is dropped, so what reads it computes in
-    the narrower dtype.  The casts back down then convert nothing, and
-    ``remove_prunable_ops`` drops them.  A float32 tensor that is not cast
-    up -- a float32 buffer, or integers cast to float, as RoPE's
-    frequencies are -- stays float32.
+    the narrower dtype.  A float32 tensor that then meets a 16-bit one is
+    made in 16-bit too, back through whatever built it from constants and
+    integers -- a ``full``, a cast of integers -- or it would carry the
+    computation back to float32: a loss's gradient starts as one, and an
+    embedding's backward accumulates into one.  The casts back down then
+    convert nothing, and ``remove_prunable_ops`` drops them.  Float32 that
+    meets no 16-bit tensor -- a float32 buffer, or RoPE's frequencies made
+    from integers -- stays float32, as does a 0-d tensor, which does not
+    decide the dtype of what it meets.
 
     Args:
         model: The graph to rewrite in place.
@@ -632,20 +639,64 @@ def remove_fp32_casts(model: torch.fx.GraphModule):
         ``model``.
     """
     graph = model.graph
+    # The dtype a node computes in once the casts are gone, where that is
+    # not the one it was traced with.
+    narrowed = {}
+
+    def value(node):
+        return getattr(node, "value", node.meta.get("val"))
+
+    def dtype(node):
+        return narrowed.get(node, getattr(value(node), "dtype", None))
+
+    def floats(node):
+        return [
+            a
+            for a in node.all_input_nodes
+            if dtype(a) is not None and dtype(a).is_floating_point
+        ]
+
+    def narrow(node, half):
+        """Build ``node``, a float32 tensor, in ``half``: a cast or a
+        generator through its dtype argument, any other op from its
+        operands, back to the graph's inputs."""
+        stack = [node]
+        while stack:
+            node = stack.pop()
+            if node.op != "call_function" or dtype(node) != torch.float32:
+                continue
+            narrowed[node] = half
+            if "dtype" in node.kwargs:
+                node.update_kwarg("dtype", half)
+            elif node.target in _CASTS:
+                node.update_arg(1, half)
+            else:
+                stack.extend(floats(node))
+
     for node in list(graph.nodes):
         if node.target == torch.ops.aten.softmax.int:
             node.args = node.args[:2]
+            narrowed[node] = dtype(node.args[0])
             continue
-        if node.target not in _CASTS:
-            continue
-        source = node.args[0]
-        value = getattr(source, "value", source.meta.get("val"))
         if (
-            get_arg_value(node, 1, "dtype") == torch.float32
-            and value.dtype in (torch.bfloat16, torch.float16)
+            node.target in _CASTS
+            and get_arg_value(node, 1, "dtype") == torch.float32
+            and dtype(node.args[0]) in _HALF
         ):
-            node.replace_all_uses_with(source)
+            node.replace_all_uses_with(node.args[0])
             graph.erase_node(node)
+            continue
+        if dtype(node) != torch.float32 or "dtype" in node.kwargs:
+            continue
+        inputs = [a for a in floats(node) if value(a).ndim]
+        half = {dtype(a) for a in inputs} & set(_HALF)
+        if len(half) != 1:
+            continue
+        (half,) = half
+        for a in inputs:
+            narrow(a, half)
+        if all(dtype(a) == half for a in inputs):
+            narrowed[node] = half
 
     graph.lint()
     model.recompile()

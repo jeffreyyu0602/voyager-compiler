@@ -18,8 +18,8 @@ Model corpus size:      265
   failed models:        37
 Training steps:         166
 Unique ATen ops seen:   183
-Classified compute:     354
-Classified elementwise: 268
+Classified compute:     355
+Classified elementwise: 269
 """
 
 import functools
@@ -219,6 +219,7 @@ _GENERATED_COMPUTE_OPS = (
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.mul_.Scalar,
     torch.ops.aten.mul_.Tensor,
+    torch.ops.aten.native_dropout.default,
     torch.ops.aten.native_group_norm.default,
     torch.ops.aten.native_group_norm_backward.default,
     torch.ops.aten.native_layer_norm.default,
@@ -521,6 +522,7 @@ _GENERATED_ELEMENTWISE_OPS = (
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.mul_.Scalar,
     torch.ops.aten.mul_.Tensor,
+    torch.ops.aten.native_dropout.default,
     torch.ops.aten.ne.Scalar,
     torch.ops.aten.ne.Tensor,
     torch.ops.aten.ne_.Scalar,

@@ -242,10 +242,31 @@ def transform(
     fuse_reshape=True,
     keep_fp32=True,
 ):
-    """Lower ``model`` in place through the graph-level passes.  The passes
-    run on fake inputs and read shapes only; see ``shape_prop``.
-    ``keep_fp32=False`` computes in 16-bit float where the model casts up to
-    float32 (``remove_fp32_casts``)."""
+    """Lower ``model`` in place through the graph-level passes.
+
+    The passes run on fake copies of the example inputs and read only their
+    shapes (see ``shape_prop``).
+
+    Args:
+        model: The exported graph, rewritten in place.
+        example_args: Example positional inputs.
+        example_kwargs: Example keyword inputs; ``None`` for none.
+        patterns: The fusion patterns ``fuse_operator`` applies, each a list
+            of ``OpMatcher`` from anchor to tail.
+        config: The accelerator's ``AcceleratorConfig``; ``None`` models no
+            hardware and skips padding.
+        layout_policy: The data-layout policy: ``"systolic"`` puts conv2d in
+            NHWC, and the policy picks the matrix-matrix GEMM weight layout.
+        gemv_weight_layout: The weight layout of a matrix-vector GEMM.
+        skip_op_fusion: Skip operator fusion.
+        fuse_reshape: Let fusion fold a trailing reshape or permute into
+            its producer's output.
+        keep_fp32: ``False`` computes in 16-bit float where the model casts
+            up to float32 (``remove_fp32_casts``).
+
+    Returns:
+        ``model``.
+    """
     if example_kwargs is None:
         example_kwargs = {}
 
@@ -299,12 +320,37 @@ def compile(
     dump_tensors=True,
     runtime_tolerance=None,
     dram_layout=None,
+    accumulate_fp32=False,
 ):
     """Bufferize ``model``, plan its memory and write its ``voyager`` IR.
 
-    ``dram_layout`` (see ``shared_dram_layout``) pins the inputs ``model``
-    shares with other programs, such as a training step's gradient and
-    update programs, to their agreed DRAM ranges."""
+    Writes ``model.txt`` (the IR as text), ``layers.txt`` (a table of its
+    layers) and ``<output_file>.svg`` (the compute graph) to ``output_dir``.
+
+    Args:
+        model: A graph ``transform`` lowered, bufferized in place.
+        example_args: The inputs ``model`` runs on, so one it writes, such
+            as a gradient buffer, is overwritten.
+        example_kwargs: Keyword inputs; ``None`` for none.
+        config: The accelerator's ``AcceleratorConfig``; ``None`` models no
+            hardware.
+        output_dir: The directory the files are written to.
+        output_file: The compute-graph drawing's basename.
+        dump_tensors: Also write every tensor's values under
+            ``output_dir/tensor_files``.
+        runtime_tolerance: How much longer than the fastest modeled tiling
+            a tiling may run and still be chosen, as a fraction; ``None``
+            takes ``DEFAULT_RUNTIME_TOLERANCE``.
+        dram_layout: The DRAM ranges ``shared_dram_layout`` agreed for the
+            inputs ``model`` shares with other programs, such as a training
+            step's gradient and update programs; ``None`` places every
+            input freely.
+        accumulate_fp32: Accumulate a GEMM split along K in float32 rather
+            than its output dtype.
+
+    Returns:
+        The ``voyager`` IR ``Model`` written to ``model.txt``.
+    """
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
@@ -320,7 +366,9 @@ def compile(
         if runtime_tolerance is None
         else runtime_tolerance
     )
-    tiler = build_interstellar_tiler(config, runtime_tolerance=tolerance)
+    tiler = build_interstellar_tiler(
+        config, runtime_tolerance=tolerance, accumulate_fp32=accumulate_fp32
+    )
     bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
     plan_memory(model, config, dram_layout)
     print_bufferized_graph(model)
