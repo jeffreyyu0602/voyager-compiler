@@ -188,6 +188,7 @@ def build_interstellar_tiler(
     ``accumulate_fp32`` sizes and prices a GEMM split along K with a float32
     accumulator.
     """
+    config.require_systolic_mapping()
     ic_dim, oc_dim = config.pe_array_size
 
     architecture = interstellar.Resource(

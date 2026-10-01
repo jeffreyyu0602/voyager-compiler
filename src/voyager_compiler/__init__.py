@@ -272,6 +272,7 @@ def transform(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
+    config.require_systolic_mapping()
     if not keep_fp32:
         remove_fp32_casts(model)
 
@@ -352,6 +353,7 @@ def compile(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
+    config.require_systolic_mapping()
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
