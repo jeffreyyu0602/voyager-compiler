@@ -51,8 +51,9 @@ class AcceleratorConfig:
     of the Voyager accelerator template described in the paper.
 
     ``matrix_backend=1`` describes the native INT8 CIM replacement for the
-    systolic engine. Its configuration can be validated here, but mapping
-    and instruction lowering for that backend are not implemented yet.
+    systolic engine. Its configuration can be validated here and used by the
+    standalone tiling search. Full graph transformation and instruction
+    lowering for that backend are not implemented yet.
     """
 
     # Compute
@@ -242,8 +243,8 @@ class AcceleratorConfig:
         """Keep CIM configs out of the existing systolic lowering path."""
         if self.matrix_backend == 1:
             raise NotImplementedError(
-                "CIM configuration is supported, but CIM mapping and "
-                "instruction lowering are not implemented yet"
+                "CIM tiling is supported, but CIM instruction lowering "
+                "is not implemented yet"
             )
 
     @property

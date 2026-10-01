@@ -39,6 +39,7 @@ from voyager_compiler.codegen.node_info import (
     weight_is_ck,
     weight_transforms,
 )
+from voyager_compiler.codegen.transform.tiling import cim
 from voyager_compiler.codegen.transform.tiling.cost import (
     BANK_SWITCH_CYCLES,
     _node_dtype_bits,
@@ -188,7 +189,17 @@ def build_interstellar_tiler(
     ``accumulate_fp32`` sizes and prices a GEMM split along K with a float32
     accumulator.
     """
-    config.require_systolic_mapping()
+    if config.matrix_backend == 1:
+        architecture, schedule = cim.build_architecture(
+            config, dram_access_cost
+        )
+        return TilerContext(
+            arch=architecture,
+            schedule=schedule,
+            config=config,
+            accumulate_fp32=accumulate_fp32,
+            runtime_tolerance=runtime_tolerance,
+        )
     ic_dim, oc_dim = config.pe_array_size
 
     architecture = interstellar.Resource(
@@ -1762,6 +1773,102 @@ class RuntimeCalculator:
         return total_time
 
 
+class CIMRuntimeCalculator(RuntimeCalculator):
+    """CIM command work inside the common bank/DRAM scheduling model.
+
+    Weight programming and MAC issue work are summed conservatively; operand
+    bank traffic can overlap that work. SRAM feedback is charged for contexts
+    beyond the local registers. This ranks candidates, not cycle-exact RTL
+    timing; descriptor handshakes and within-command prefetch are not modeled.
+    """
+
+    def __init__(self, *args, config, layer, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.layer = layer
+
+    def evaluate(self, mapping):
+        # A multi-beat output uses the banked path when the hardware provides
+        # it. Full vector-tail lowering remains guarded at compile().
+        output_width = (
+            self.accum_dtype_width
+            if mapping.loop_blockings[le.IC][3] > 1
+            else self.output_dtype_width
+        )
+        banked = (
+            output_width * self.config.cim_output_lanes > self.sram_bandwidth
+        )
+        return cim.evaluate(
+            self.config, self.layer, mapping, banked_output=banked
+        )
+
+    def calculate_runtime(self, architecture, layer, mapping):
+        if not self.evaluate(mapping).legal:
+            return math.inf
+        return super().calculate_runtime(architecture, layer, mapping)
+
+    def matrix_cycles(self, mapping, bank_groups):
+        result = self.evaluate(mapping)
+        if not result.legal:
+            return math.inf
+        ic, oc = self.config.pe_array_size
+        policy = result.policy
+        words = {
+            "input": result.input_fill_words * self._bus_words(ic, 8),
+            "weight": policy.full_set_loads * ic * self._bus_words(oc, 8),
+            "bias": self._bus_words(
+                result.output_vectors * oc, self.bias_width
+            ),
+        }
+        if mapping.loop_blockings[le.IC][3] > 1:
+            words["scratch"] = 2 * self._bus_words(
+                result.output_vectors * oc, self.accum_dtype_width
+            )
+        else:
+            words.update(self._tail_words(mapping, 2))
+        compute = (
+            result.mac_requests * cim.issue_window(self.config)
+            + self.config.cim_mac_latency
+            + result.weight_write_beats
+            + 2 * result.buffer_partial_updates
+        )
+        return max(compute, self._bank_cycles(words, bank_groups))
+
+
+def _validate_cim_node(node):
+    """Reject unsupported operators before they reach systolic fallbacks."""
+    if is_depthwise_conv(node) or is_fully_connected(node):
+        raise ValueError(
+            "CIM tiling currently supports dense GEMM and convolution"
+        )
+    for operand in node.args[:2]:
+        dtype = operand.meta.get("dtype") or operand.value.dtype
+        if dtype not in ("int8", torch.int8):
+            raise ValueError("CIM tiling requires native signed INT8 operands")
+    if any(
+        node.kwargs.get(name) is not None
+        for name in (
+            "input_scale", "weight_scale", "block_size", "A_data", "qmap"
+        )
+    ):
+        raise ValueError(
+            "CIM tiling does not support microscaling or sparse operands"
+        )
+    if is_conv2d(node):
+        if (
+            _pair(get_arg_value(node, 3, "stride", 1)) != (1, 1)
+            or _pair(get_arg_value(node, 5, "dilation", 1)) != (1, 1)
+            or get_arg_value(node, 6, "groups", 1) != 1
+        ):
+            raise ValueError(
+                "CIM tiling requires dense unit-stride, unit-dilation convolution"
+            )
+    layer = _extract_layer_from_node(node)
+    if layer is None:
+        raise ValueError("CIM tiling requires padded matrix input channels")
+    return layer
+
+
 def _extract_layer_from_node(node):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
@@ -1856,6 +1963,8 @@ def _prepare_search(node, tiler, constraint=None):
         when interstellar skips the layer.
     """
     anchor = get_anchor_node(node)
+    if tiler.config.matrix_backend == 1 and is_fully_connected(anchor):
+        _validate_cim_node(anchor)
     if (
         not is_gemm_op(anchor)
         or is_fully_connected(anchor)
@@ -1873,6 +1982,8 @@ def _prepare_search(node, tiler, constraint=None):
         for i, ph in enumerate(phs):
             ph.meta["dtype"] = dtypes[i]
 
+    if tiler.config.matrix_backend == 1:
+        _validate_cim_node(anchor)
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
@@ -2010,7 +2121,17 @@ def _prepare_search(node, tiler, constraint=None):
         math.prod(repeat[: max(0, len(weight.shape) - 2)]) if repeat else 1
     )
 
-    rc = RuntimeCalculator(
+    calculator = RuntimeCalculator
+    backend_args = {}
+    if tiler.config.matrix_backend == 1:
+        ic, oc = tiler.config.pe_array_size
+        if layer.nifm % ic or layer.nofm % oc:
+            raise ValueError(
+                "CIM tiling requires channels padded to the physical lanes"
+            )
+        calculator = CIMRuntimeCalculator
+        backend_args = {"config": tiler.config, "layer": layer}
+    rc = calculator(
         if_bits,
         fl_bits,
         of_bits,
@@ -2036,6 +2157,7 @@ def _prepare_search(node, tiler, constraint=None):
         stride=(layer.hstd, layer.wstd),
         bank_size=tiler.config.bank_size,
         weight_transposed=transposed,
+        **backend_args,
     )
 
     # Built up front rather than per attempt: each one reads the node, which
@@ -2092,6 +2214,8 @@ def _run_search(search):
             raise
         raise RuntimeError(f"{search.name}: no tiling fits on chip") from e
     _, runtime, mapping, _ = result
+    if search.tiler.config.matrix_backend == 1 and not math.isfinite(runtime):
+        raise RuntimeError(f"{search.name}: no legal CIM tiling fits on chip")
     return runtime, mapping
 
 
@@ -2413,6 +2537,13 @@ def get_tiling(node, tiler=None):
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor):
         return None, None
+    if tiler is not None and tiler.config.matrix_backend == 1:
+        if is_fully_connected(anchor):
+            _validate_cim_node(anchor)
+        if anchor.meta.get("l2_tiling") is not None:
+            raise ValueError(
+                "CIM tiling requires a search with resident-weight evaluation"
+            )
     is_conv = is_conv2d(anchor)
 
     # Neither search tiles the leading batch dims (e.g. attention heads); the
@@ -2489,6 +2620,11 @@ def get_tiling(node, tiler=None):
         "runtime_calculator": search.rc,
         "layer": search.layer,
     }
+    if tiler.config.matrix_backend == 1:
+        # Preserve the selected policy for inspection and the later CIM
+        # lowering step; generic Interstellar access counts do not describe
+        # resident-sequence replay or oversized singleton refills.
+        anchor.meta["tiling"]["cim_evaluation"] = search.rc.evaluate(mapping)
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim
 

@@ -408,8 +408,8 @@ def add_compile_args(parser=None):
         type=int,
         choices=(0, 1),
         default=AcceleratorConfig.matrix_backend,
-        help="Matrix backend: 0 = systolic, 1 = CIM. CIM configuration is "
-        "available; CIM mapping and instruction lowering are not yet enabled.",
+        help="Matrix backend: 0 = systolic, 1 = CIM. CIM tiling is available; "
+        "full compilation is not yet enabled.",
     )
     # Keep defaults on AcceleratorConfig, shared by CLI and Python callers.
     for name, help_text in (
