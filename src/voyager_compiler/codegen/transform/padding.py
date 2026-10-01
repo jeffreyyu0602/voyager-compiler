@@ -479,7 +479,8 @@ def pad_matrix_op_dimensions(
         model: The graph to transform.
         pe_array_size: The PE array's ``(input, output)`` channel counts.
         fold_cache: Take a pad on a KV-cache write into the buffer.
-        skip_first_conv: Leave RGB inputs for systolic replication.
+        skip_first_conv: Skip padding convolutions with three input
+            channels, leaving them for systolic replication.
 
     Returns:
         ``model``.

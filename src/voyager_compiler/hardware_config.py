@@ -50,8 +50,8 @@ class AcceleratorConfig:
     parameters are later system-modeling extensions, rather than parameters
     of the Voyager accelerator template described in the paper.
 
-    ``matrix_backend=1`` describes the native INT8 CIM replacement for the
-    systolic engine. The tiling search models resident weight sequences and
+    ``matrix_backend=1`` selects CIM in place of the systolic engine.
+    The tiling search models resident weight sequences and
     accumulation capacity; graph lowering uses the shared vector engine and
     NHWC/HWIO/CK operand layouts.
     """
@@ -80,9 +80,9 @@ class AcceleratorConfig:
     dram_energy_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT  # pJ/bit
 
     # Matrix backend: matches MATRIX_BACKEND in the accelerator build.
-    # pe_array_size remains the complete (input, output) lane count for both.
+    # pe_array_size is the total (input, output) lane count for both backends.
     matrix_backend: int = 0  # 0 = systolic, 1 = CIM
-    # Native INT8 CIM geometry; defaults match src/cim/CIMConfig.h.
+    # CIM macro parameters; defaults match src/cim/CIMConfig.h.
     cim_macro_input_lanes: int = 64
     cim_macro_output_lanes: int = 8
     cim_weight_sets: int = 18
@@ -145,7 +145,7 @@ class AcceleratorConfig:
             )
 
     def _validate_cim(self):
-        """Validate the native INT8 contract of CIMProcessor and CIMArray."""
+        """Check CIM macro parameters and controller limits."""
         for name, axis in (
             ("cim_a_port_tiles", self.cim_input_axis_tiles),
             ("cim_b_port_tiles", self.cim_output_axis_tiles),
@@ -167,19 +167,12 @@ class AcceleratorConfig:
                 raise ValueError(f"{field.name} must be a positive integer")
         if type(self.cim_mode) is not int or self.cim_mode not in (0, 1):
             raise ValueError("cim_mode must be 0 (parallel) or 1 (serial)")
-        if self.cim_signed is not True:
-            raise ValueError("CIMProcessor requires signed native INT8")
+        if type(self.cim_signed) is not bool:
+            raise ValueError("cim_signed must be a boolean")
         if type(self.cim_c_beat_layout) is not int or self.cim_c_beat_layout != 1:
             raise ValueError("CIMProcessor requires output-major C beats (1)")
         if self.cim_macro_write_input_lanes != 1:
             raise ValueError("CIMProcessor writes one input lane per request")
-        if 8 % self.cim_base_b_width:
-            raise ValueError("cim_base_b_width must divide the INT8 weight")
-        weight_slices = 8 // self.cim_base_b_width
-        if self.cim_macro_output_lanes % weight_slices:
-            raise ValueError(
-                "cim_macro_output_lanes must be divisible by INT8 weight slices"
-            )
         guard_width = max(1, (self.cim_macro_input_lanes - 1).bit_length())
         if (
             self.cim_mode == 1
@@ -188,10 +181,13 @@ class AcceleratorConfig:
             raise ValueError("cim_base_c_width cannot hold a bit-serial slice")
         if self.cim_input_lanes not in (4, 8, 16, 32, 64):
             raise ValueError("CIM input lanes must be 4, 8, 16, 32, or 64")
-        if self.pe_array_size != (self.cim_input_lanes, self.cim_output_lanes):
+        if (
+            self.pe_array_size is None
+            or self.pe_array_size[0] != self.cim_input_lanes
+        ):
             raise ValueError(
-                "pe_array_size must match the CIM geometry: "
-                f"{self.cim_input_lanes},{self.cim_output_lanes}"
+                "pe_array_size input lanes must match the CIM geometry: "
+                f"{self.cim_input_lanes}"
             )
         if self.cim_a_port_tiles != self.cim_input_axis_tiles:
             raise ValueError("CIMProcessor requires the full input axis A port")
@@ -222,21 +218,11 @@ class AcceleratorConfig:
 
     @property
     def cim_input_lanes(self) -> int:
-        """Complete CIM input axis, in native INT8 lanes."""
+        """Complete CIM input axis, in logical operand lanes."""
         return (
             self.cim_macro_input_lanes
             * self.cim_tile_input_axis_elements
             * self.cim_input_axis_tiles
-        )
-
-    @property
-    def cim_output_lanes(self) -> int:
-        """Logical outputs after allocating macro lanes to weight slices."""
-        return (
-            self.cim_macro_output_lanes
-            // (8 // self.cim_base_b_width)
-            * self.cim_tile_output_axis_elements
-            * self.cim_output_axis_tiles
         )
 
     @property

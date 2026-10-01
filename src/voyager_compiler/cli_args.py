@@ -376,8 +376,8 @@ def add_compile_args(parser=None):
         "--pe_array_size",
         type=lambda x: tuple(map(int, x.split(","))),
         default=DEFAULT_PE_ARRAY_SIZE,
-        help="Matrix input,output lanes, e.g. 16,16; must match CIM geometry "
-        "when --matrix_backend=1 (default CIM geometry: 64,16).",
+        help="Matrix input/output lane counts, e.g. 16,16. For CIM, these "
+        "must match the macro geometry and weight datatype.",
     )
     parser.add_argument(
         "--vector_unit_width",
@@ -408,17 +408,16 @@ def add_compile_args(parser=None):
         type=int,
         choices=(0, 1),
         default=AcceleratorConfig.matrix_backend,
-        help="Matrix backend: 0 = systolic, 1 = CIM. CIM tiling is available; "
-        "full compilation is not yet enabled.",
+        help="Matrix backend: 0 = systolic, 1 = CIM.",
     )
     # Keep defaults on AcceleratorConfig, shared by CLI and Python callers.
     for name, help_text in (
         ("cim_macro_input_lanes", "Physical input lanes per macro."),
         ("cim_macro_output_lanes", "Physical output lanes per macro."),
         ("cim_weight_sets", "Resident weight sets per macro."),
-        ("cim_base_a_width", "Native macro input slice width (bits)."),
-        ("cim_base_b_width", "Native macro weight slice width (bits)."),
-        ("cim_base_c_width", "Native macro accumulator width (bits)."),
+        ("cim_base_a_width", "Macro input width (bits)."),
+        ("cim_base_b_width", "Macro weight width (bits)."),
+        ("cim_base_c_width", "Macro accumulation width (bits)."),
         ("cim_macro_write_input_lanes", "Input lanes per weight write (1)."),
         ("cim_mac_latency", "Macro MAC latency (cycles)."),
         ("cim_mode", "Macro mode: 0 = bit-parallel, 1 = bit-serial."),
@@ -449,7 +448,7 @@ def add_compile_args(parser=None):
         "--cim_signed",
         action=argparse.BooleanOptionalAction,
         default=AcceleratorConfig.cim_signed,
-        help="Signed macro arithmetic; CIMProcessor requires signed INT8.",
+        help="Signed integer operands; disable for unsigned operands.",
     )
 
     # -- tiling / lowering --------------------------------------------------

@@ -17,6 +17,7 @@ import logging
 import math
 import multiprocessing
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -1774,12 +1775,12 @@ class RuntimeCalculator:
 
 
 class CIMRuntimeCalculator(RuntimeCalculator):
-    """CIM command work inside the common bank/DRAM scheduling model.
+    """Estimate CIM runtime with the shared SRAM bank and DRAM model.
 
     Weight programming and MAC issue work are summed conservatively; operand
-    bank traffic can overlap that work. SRAM feedback is charged for contexts
-    beyond the local registers. This ranks candidates, not cycle-exact RTL
-    timing; descriptor handshakes and within-command prefetch are not modeled.
+    bank traffic can overlap that work. Partial sums beyond the local register
+    capacity incur SRAM reads and writes. The estimate ranks mappings without
+    modeling descriptor handshakes or weight prefetch within a command.
     """
 
     def __init__(self, *args, config, layer, **kwargs):
@@ -1789,14 +1790,14 @@ class CIMRuntimeCalculator(RuntimeCalculator):
 
     def evaluate(self, mapping):
         # A multi-beat output uses the banked path when the hardware provides
-        # it. Full vector-tail lowering remains guarded at compile().
+        # it, including when the matrix result feeds a fused vector tail.
         output_width = (
             self.accum_dtype_width
             if mapping.loop_blockings[le.IC][3] > 1
             else self.output_dtype_width
         )
         banked = (
-            output_width * self.config.cim_output_lanes > self.sram_bandwidth
+            output_width * self.config.pe_array_size[1] > self.sram_bandwidth
         )
         return cim.evaluate(
             self.config, self.layer, mapping, banked_output=banked
@@ -1814,8 +1815,10 @@ class CIMRuntimeCalculator(RuntimeCalculator):
         ic, oc = self.config.pe_array_size
         policy = result.policy
         words = {
-            "input": result.input_fill_words * self._bus_words(ic, 8),
-            "weight": policy.full_set_loads * ic * self._bus_words(oc, 8),
+            "input": result.input_fill_words
+            * self._bus_words(ic, self.input_dtype_width),
+            "weight": policy.full_set_loads * ic
+            * self._bus_words(oc, self.weight_dtype_width),
             "bias": self._bus_words(
                 result.output_vectors * oc, self.bias_width
             ),
@@ -1827,7 +1830,8 @@ class CIMRuntimeCalculator(RuntimeCalculator):
         else:
             words.update(self._tail_words(mapping, 2))
         compute = (
-            result.mac_requests * cim.issue_window(self.config)
+            result.mac_requests
+            * cim.issue_window(self.config, self.input_dtype_width)
             + self.config.cim_mac_latency
             + result.weight_write_beats
             + 2 * result.buffer_partial_updates
@@ -1947,12 +1951,37 @@ def _prepare_search(node, tiler, constraint=None):
             ph.meta["dtype"] = dtypes[i]
 
     if tiler.config.matrix_backend == 1:
-        # The CIM cost model assumes native INT8 matrix operands. GEMV is
+        # CIM uses the operand datatypes from the graph. GEMV is
         # handled by the shared vector tiler before reaching this boundary.
         for operand in anchor.args[:2]:
             dtype = operand.meta.get("dtype") or operand.value.dtype
-            if dtype not in ("int8", torch.int8):
-                raise ValueError("CIM tiling requires native signed INT8 operands")
+            dtype = str(dtype).removeprefix("torch.")
+            if re.fullmatch(r"u?int[1-9]\d*", dtype) is None:
+                raise ValueError("CIM tiling requires integer operands")
+            if dtype.startswith("uint") == tiler.config.cim_signed:
+                raise ValueError(
+                    "CIM operand signedness must match cim_signed"
+                )
+        weight_width = _node_dtype_bits(anchor.args[1])
+        if weight_width % tiler.config.cim_base_b_width:
+            raise ValueError(
+                "CIM weight width must be a multiple of cim_base_b_width"
+            )
+        weight_slices = weight_width // tiler.config.cim_base_b_width
+        if tiler.config.cim_macro_output_lanes % weight_slices:
+            raise ValueError(
+                "CIM macro output lanes must be divisible by weight slices"
+            )
+        output_lanes = (
+            tiler.config.cim_macro_output_lanes // weight_slices
+            * tiler.config.cim_tile_output_axis_elements
+            * tiler.config.cim_output_axis_tiles
+        )
+        if tiler.config.pe_array_size[1] != output_lanes:
+            raise ValueError(
+                "pe_array_size output lanes must match the CIM geometry "
+                f"for {dtype}: {output_lanes}"
+            )
         if any(
             anchor.kwargs.get(name) is not None
             for name in (
@@ -2531,7 +2560,7 @@ def get_tiling(node, tiler=None):
     ):
         if anchor.meta.get("l2_tiling") is not None:
             raise ValueError(
-                "CIM tiling requires a search with resident-weight evaluation"
+                "CIM handling of l2_tiling overrides is not implemented yet"
             )
     is_conv = is_conv2d(anchor)
 
@@ -2610,9 +2639,8 @@ def get_tiling(node, tiler=None):
         "layer": search.layer,
     }
     if tiler.config.matrix_backend == 1:
-        # Preserve the selected policy for inspection and the later CIM
-        # lowering step; generic Interstellar access counts do not describe
-        # resident-sequence replay or oversized singleton refills.
+        # Record weight reuse and reload counts for the selected schedule;
+        # Interstellar's access counts do not include them.
         anchor.meta["tiling"]["cim_evaluation"] = search.rc.evaluate(mapping)
 
     b = mapping.loop_blockings  # b[dim][3] = number of DRAM tiles for the dim

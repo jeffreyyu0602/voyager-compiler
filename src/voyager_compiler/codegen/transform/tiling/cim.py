@@ -1,8 +1,8 @@
-"""CIM candidate legality and resident-weight work for Interstellar.
+"""CIM schedule checks and weight reuse estimates for Interstellar.
 
 The weight policy follows CIMWeightController::reader: innermost spatial
-loops reuse one selected set, enclosing spatial loops replay a resident
-sequence, and an oversized sequence streams singleton descriptors. Counts
+loops reuse one weight set, enclosing spatial loops repeat a stored weight
+sequence, and a sequence that does not fit loads one set per descriptor. Counts
 describe one L2 command (one step of the compiler's L3 grid).
 """
 
@@ -80,7 +80,7 @@ def build_architecture(config, dram_access_cost):
 
 @dataclass(frozen=True)
 class WeightPolicy:
-    """Exact resident sequence and descriptor counts, without a large trace."""
+    """Weight loads, reuse, and descriptor counts for a schedule."""
 
     reader_l1: tuple
     reader_l2: tuple
@@ -105,7 +105,7 @@ class WeightPolicy:
 
 
 def weight_policy(config, mapping):
-    """Apply the controller's collapse, replay, and oversized-fetch rules."""
+    """Compute weight loads and reuse from the controller's loop order."""
     b, order = mapping.loop_blockings, mapping.loop_orders
     l1 = [row[1] for row in b]
     l2 = [row[2] for row in b]
@@ -164,11 +164,11 @@ class Evaluation:
 
 
 def evaluate(config, layer, mapping, *, banked_output=False):
-    """Check native INT8 schedules against the processor and controller ABI.
+    """Check a mapping against CIM buffer and controller limits.
 
-    This first mapping stage supports dense, unit-stride convolutions with
-    complete filter loops at L1. Local register overflow spills to the
-    accumulation SRAM; exceeding the register count alone is not illegal.
+    The search supports dense convolutions with stride 1 and complete filter
+    loops at L1. Partial sums beyond the local register capacity use the
+    accumulation SRAM.
     """
     b, p, order = (
         mapping.loop_blockings,
@@ -187,11 +187,11 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     if any(n != 1 for n in b[le.ON]):
         reasons.append("batch must be handled outside the CIM command")
     if any(b[d][level] != 1 for d in (le.FX, le.FY) for level in (2, 3)):
-        reasons.append("CIM mapping currently keeps complete filters at L1")
+        reasons.append("CIM mapping keeps complete filters at L1")
     if any(prod(b[d]) * prod(p[d]) != layer.sizes[d] for d in range(le.NUM)):
         reasons.append("mapping must cover the padded workload exactly")
     if layer.wstd != 1 or layer.hstd != 1:
-        reasons.append("CIM mapping currently requires unit convolution stride")
+        reasons.append("CIM mapping requires convolution stride 1")
     if any(b[d][level] > 1023 for d in range(le.NUM) for level in (1, 2)):
         reasons.append("temporal factor exceeds the 10-bit controller bound")
     if b[le.FX][1] > 15 or b[le.FY][1] > 15:
@@ -252,8 +252,8 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     spilled_outputs = outputs // contexts * max(
         0, contexts - config.cim_local_accum_contexts
     )
-    # InputController fills one halo-bearing bank per L2 visit, independent
-    # of which weights the CIM ring retains across those visits.
+    # InputController loads an input tile, including its halo, on each L2
+    # iteration, even when the weights remain loaded in the CIM array.
     input_fills = prod(b[d][2] for d in range(le.NUM))
     return Evaluation(
         tuple(reasons),
@@ -270,14 +270,18 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     )
 
 
-def issue_window(config):
+def issue_window(config, input_width):
     """Minimum element issue spacing from CIMElement::issue_window()."""
     if config.cim_mode == 0:
-        return (8 + config.cim_base_a_width - 1) // config.cim_base_a_width
+        return (
+            input_width + config.cim_base_a_width - 1
+        ) // config.cim_base_a_width
     guard = max(1, (config.cim_macro_input_lanes - 1).bit_length())
-    width = min(8, config.cim_base_c_width - config.cim_base_b_width - guard)
+    width = min(
+        input_width, config.cim_base_c_width - config.cim_base_b_width - guard
+    )
     interval = (
         (width + config.cim_base_a_width - 1) // config.cim_base_a_width
         * config.cim_base_a_width
     )
-    return (8 + width - 1) // width * interval
+    return (input_width + width - 1) // width * interval
