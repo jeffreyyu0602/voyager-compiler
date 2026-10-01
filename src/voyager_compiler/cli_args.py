@@ -363,7 +363,7 @@ def add_compile_args(parser=None):
         choices=LAYOUT_POLICIES,
         default=DEFAULT_LAYOUT_POLICY,
         help="Operand layouts (activation / conv weight / matmul weight): "
-        "pytorch = NCHW/OIHW/KC, systolic = NHWC/HWIO/CK.",
+        "pytorch = NCHW/OIHW/KC, systolic or cim = NHWC/HWIO/CK.",
     )
     parser.add_argument(
         "--gemv_weight_layout",

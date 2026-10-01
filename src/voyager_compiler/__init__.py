@@ -272,7 +272,6 @@ def transform(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    config.require_systolic_mapping()
     if not keep_fp32:
         remove_fp32_casts(model)
 
@@ -286,9 +285,13 @@ def transform(
     fuse_quantize_dequantize_with_producer(model)
 
     if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, config.pe_array_size)
+        pad_matrix_op_dimensions(
+            model,
+            config.pe_array_size,
+            skip_first_conv=config.matrix_backend == 0,
+        )
 
-    if layout_policy == "systolic":
+    if layout_policy in ("systolic", "cim"):
         normalize_conv2d_layout(model)
 
     normalize_gemm_weight_layout(
@@ -353,7 +356,6 @@ def compile(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    config.require_systolic_mapping()
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
