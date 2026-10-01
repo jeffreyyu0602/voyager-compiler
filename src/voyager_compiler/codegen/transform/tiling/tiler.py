@@ -1835,40 +1835,6 @@ class CIMRuntimeCalculator(RuntimeCalculator):
         return max(compute, self._bank_cycles(words, bank_groups))
 
 
-def _validate_cim_node(node):
-    """Reject unsupported operators before they reach systolic fallbacks."""
-    if is_depthwise_conv(node) or is_fully_connected(node):
-        raise ValueError(
-            "CIM tiling currently supports dense GEMM and convolution"
-        )
-    for operand in node.args[:2]:
-        dtype = operand.meta.get("dtype") or operand.value.dtype
-        if dtype not in ("int8", torch.int8):
-            raise ValueError("CIM tiling requires native signed INT8 operands")
-    if any(
-        node.kwargs.get(name) is not None
-        for name in (
-            "input_scale", "weight_scale", "block_size", "A_data", "qmap"
-        )
-    ):
-        raise ValueError(
-            "CIM tiling does not support microscaling or sparse operands"
-        )
-    if is_conv2d(node):
-        if (
-            _pair(get_arg_value(node, 3, "stride", 1)) != (1, 1)
-            or _pair(get_arg_value(node, 5, "dilation", 1)) != (1, 1)
-            or get_arg_value(node, 6, "groups", 1) != 1
-        ):
-            raise ValueError(
-                "CIM tiling requires dense unit-stride, unit-dilation convolution"
-            )
-    layer = _extract_layer_from_node(node)
-    if layer is None:
-        raise ValueError("CIM tiling requires padded matrix input channels")
-    return layer
-
-
 def _extract_layer_from_node(node):
     """
     Build an interstellar Layer from a node's current (pre-tiling) shapes.
@@ -1963,8 +1929,6 @@ def _prepare_search(node, tiler, constraint=None):
         when interstellar skips the layer.
     """
     anchor = get_anchor_node(node)
-    if tiler.config.matrix_backend == 1 and is_fully_connected(anchor):
-        _validate_cim_node(anchor)
     if (
         not is_gemm_op(anchor)
         or is_fully_connected(anchor)
@@ -1983,7 +1947,28 @@ def _prepare_search(node, tiler, constraint=None):
             ph.meta["dtype"] = dtypes[i]
 
     if tiler.config.matrix_backend == 1:
-        _validate_cim_node(anchor)
+        # The CIM cost model assumes native INT8 matrix operands. GEMV is
+        # handled by the shared vector tiler before reaching this boundary.
+        for operand in anchor.args[:2]:
+            dtype = operand.meta.get("dtype") or operand.value.dtype
+            if dtype not in ("int8", torch.int8):
+                raise ValueError("CIM tiling requires native signed INT8 operands")
+        if any(
+            anchor.kwargs.get(name) is not None
+            for name in (
+                "input_scale", "weight_scale", "block_size", "A_data", "qmap"
+            )
+        ):
+            raise ValueError(
+                "CIM tiling does not support microscaling or sparse operands"
+            )
+        if is_conv2d(anchor) and (
+            _pair(get_arg_value(anchor, 5, "dilation", 1)) != (1, 1)
+            or get_arg_value(anchor, 6, "groups", 1) != 1
+        ):
+            raise ValueError("CIM tiling requires dense unit-dilation convolution")
+        if tiler.accumulate_fp32:
+            raise ValueError("CIM accumulates integer partial sums, not float32")
     out_dtype = node.meta.get("dtype")
     fused_specs = _fused_operand_specs(node, anchor)
     has_tail = sub_gm is not None
@@ -2079,6 +2064,8 @@ def _prepare_search(node, tiler, constraint=None):
 
     layer = _extract_layer_from_node(anchor)
     if layer is None:
+        if tiler.config.matrix_backend == 1:
+            raise ValueError("CIM tiling requires padded matrix input channels")
         return key, None
 
     mx_out = isinstance(out_dtype, (list, tuple))
@@ -2537,9 +2524,11 @@ def get_tiling(node, tiler=None):
     anchor = get_anchor_node(node)
     if not is_gemm_op(anchor):
         return None, None
-    if tiler is not None and tiler.config.matrix_backend == 1:
-        if is_fully_connected(anchor):
-            _validate_cim_node(anchor)
+    if (
+        tiler is not None
+        and tiler.config.matrix_backend == 1
+        and not is_fully_connected(anchor)
+    ):
         if anchor.meta.get("l2_tiling") is not None:
             raise ValueError(
                 "CIM tiling requires a search with resident-weight evaluation"
