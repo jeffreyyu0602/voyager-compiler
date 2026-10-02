@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from math import prod
 
 import interstellar
+from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 
 le = interstellar.le
 SPATIAL = (le.OX, le.OY)
@@ -166,9 +167,8 @@ class Evaluation:
 def evaluate(config, layer, mapping, *, banked_output=False):
     """Check a mapping against CIM buffer and controller limits.
 
-    The search supports dense convolutions with stride 1 and complete filter
-    loops at L1. Partial sums beyond the local register capacity use the
-    accumulation SRAM.
+    The search keeps complete filter loops at L1. Partial sums beyond the
+    local register capacity use the accumulation SRAM.
     """
     b, p, order = (
         mapping.loop_blockings,
@@ -176,7 +176,9 @@ def evaluate(config, layer, mapping, *, banked_output=False):
         mapping.loop_orders,
     )
     ic, oc = config.pe_array_size
-    reasons = []
+    input_words, reasons = input_buffer_usage(
+        mapping, (layer.hstd, layer.wstd), config.input_buffer_size
+    )
     for d in range(le.NUM):
         expected = (ic if d == le.IC else oc if d == le.OC else 1, 1, 1, 1)
         if tuple(p[d]) != expected or b[d][0] != 1:
@@ -190,12 +192,8 @@ def evaluate(config, layer, mapping, *, banked_output=False):
         reasons.append("CIM mapping keeps complete filters at L1")
     if any(prod(b[d]) * prod(p[d]) != layer.sizes[d] for d in range(le.NUM)):
         reasons.append("mapping must cover the padded workload exactly")
-    if layer.wstd != 1 or layer.hstd != 1:
-        reasons.append("CIM mapping requires convolution stride 1")
     if any(b[d][level] > 1023 for d in range(le.NUM) for level in (1, 2)):
         reasons.append("temporal factor exceeds the 10-bit controller bound")
-    if b[le.FX][1] > 15 or b[le.FY][1] > 15:
-        reasons.append("filter extent exceeds the 4-bit input-controller field")
     macs = prod(b[d][level] for d in range(le.NUM) for level in (1, 2))
     if macs > 0xFFFFFFFF:
         reasons.append("operation count exceeds the 32-bit controller counter")
@@ -219,17 +217,6 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     )
     if accum_words > config.accum_buffer_size:
         reasons.append("live partial outputs exceed accumulation capacity")
-    width = b[le.OX][1] + b[le.FX][1] - 1
-    height = b[le.OY][1] + b[le.FY][1] - 1
-    input_words = width * height * b[le.IC][1]
-    if input_words > min(config.input_buffer_size, 65536):
-        reasons.append(
-            "input tile including halo exceeds one input-buffer bank"
-        )
-    if width > 512 or height > 1023 or max(b[le.OX][2], b[le.OY][2]) > 512:
-        reasons.append(
-            "input traversal exceeds the controller coordinate fields"
-        )
     policy = weight_policy(config, mapping)
     if policy.compute_replays > 65535:
         reasons.append("replay count exceeds the 16-bit descriptor field")

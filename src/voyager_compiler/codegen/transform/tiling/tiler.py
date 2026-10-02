@@ -51,6 +51,7 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     get_dtype_width,
     strided_bank_walk,
 )
+from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 from voyager_compiler.codegen.transform.tiling.search import (
     DEFAULT_RUNTIME_TOLERANCE,
     _attention_sram_bytes,
@@ -790,10 +791,10 @@ class RuntimeCalculator:
     the spreading charges a share; the cycle-exact datapath, the systolic
     skew being a constant of the array dims; a stream-breaking
     ``quantize_mx`` tail, charged as a staged region rather than a drained
-    pass; a conv input tile's halo; more than one port width, every operand
-    moving at ``sram_bandwidth`` over one bus per bank; the block scales'
-    bank switches; and the outlier density of an individual tile, priced at
-    the layer's average.
+    pass; more than one port width, every operand moving at
+    ``sram_bandwidth`` over one bus per bank; the block scales' bank
+    switches; and the outlier density of an individual tile, priced at the
+    layer's average.
     """
 
     def __init__(
@@ -823,6 +824,7 @@ class RuntimeCalculator:
         stride: Tuple[int, int] = (1, 1),
         bank_size: Optional[int] = None,
         weight_transposed: bool = False,
+        input_buffer_size: Optional[int] = None,
     ):
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
@@ -849,6 +851,7 @@ class RuntimeCalculator:
         self.stride = stride
         self.bank_size = bank_size
         self.weight_transposed = weight_transposed
+        self.input_buffer_size = input_buffer_size
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -947,6 +950,8 @@ class RuntimeCalculator:
         ic_unroll = mapping.loop_partitionings[le.IC][0]
         oc_unroll = mapping.loop_partitionings[le.OC][0]
         weight_loop = 0 if self.weight_transposed else blockings[le.OC][1]
+        # The input tile includes the convolution halo and stride.
+        input_words, _ = input_buffer_usage(mapping, self.stride)
         # The tile buffers are [rows, IC] for the input and [IC, OC] for the
         # weight and its scales: a request walks one row of each.
         ic3 = self._extent(mapping, le.IC, 2)
@@ -956,7 +961,7 @@ class RuntimeCalculator:
         scale_pitch = oc3 * self.weight_scale_width // 8
         words = {
             "input": self._request_words(
-                rows * depth / ic_unroll,
+                input_words,
                 ic_unroll,
                 self.input_dtype_width,
                 blockings[le.IC][1],
@@ -979,7 +984,7 @@ class RuntimeCalculator:
         }
         if self.input_scale_width:
             words["input_scale"] = math.ceil(
-                rows * depth / self.scale_block_size
+                input_words * ic_unroll / self.scale_block_size
             )
         return words
 
@@ -1614,19 +1619,19 @@ class RuntimeCalculator:
         return per_step * (self.batch if per_step > 1 else distinct)
 
     def calculate_runtime(self, architecture, layer, mapping):
+        if self.input_buffer_size is not None:
+            _, reasons = input_buffer_usage(
+                mapping, self.stride, self.input_buffer_size
+            )
+            if reasons:
+                return math.inf
         blockings = mapping.loop_blockings
         partitionings = mapping.loop_partitionings
 
         # Elements of one L3 tile: levels 0-2 only, since [3] is the grid trip
         # count, not part of the tile.
-        input_elems = (
-            partitionings[le.IC][0]
-            * blockings[le.IC][1]
-            * blockings[le.IC][2]
-            * blockings[le.OY][1]
-            * blockings[le.OY][2]
-            * blockings[le.OX][1]
-            * blockings[le.OX][2]
+        input_elems = interstellar.cost_model.get_if_bank_size(
+            [self._extent(mapping, loop, 2) for loop in range(le.NUM)], layer
         )
         weight_elems = (
             partitionings[le.IC][0]
@@ -2173,6 +2178,7 @@ def _prepare_search(node, tiler, constraint=None):
         stride=(layer.hstd, layer.wstd),
         bank_size=tiler.config.bank_size,
         weight_transposed=transposed,
+        input_buffer_size=tiler.config.input_buffer_size,
         **backend_args,
     )
 
@@ -2230,8 +2236,10 @@ def _run_search(search):
             raise
         raise RuntimeError(f"{search.name}: no tiling fits on chip") from e
     _, runtime, mapping, _ = result
-    if search.tiler.config.matrix_backend == 1 and not math.isfinite(runtime):
-        raise RuntimeError(f"{search.name}: no legal CIM tiling fits on chip")
+    if not math.isfinite(runtime):
+        raise RuntimeError(
+            f"{search.name}: no tiling satisfies the matrix controller limits"
+        )
     return runtime, mapping
 
 
