@@ -6,11 +6,13 @@ sequence, and a sequence that does not fit loads one set per descriptor. Counts
 describe one L2 command (one step of the compiler's L3 grid).
 """
 
+import math
 from dataclasses import dataclass
 from math import prod
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
+from voyager_compiler.codegen.transform.tiling.sa import RuntimeCalculator
 
 le = interstellar.le
 SPATIAL = (le.OX, le.OY)
@@ -272,3 +274,68 @@ def issue_window(config, input_width):
         * config.cim_base_a_width
     )
     return (input_width + width - 1) // width * interval
+
+
+class CIMRuntimeCalculator(RuntimeCalculator):
+    """Estimate CIM runtime with the shared SRAM bank and DRAM model.
+
+    Weight programming and MAC issue work are summed conservatively; operand
+    bank traffic can overlap that work. Partial sums beyond the local register
+    capacity incur SRAM reads and writes. The estimate ranks mappings without
+    modeling descriptor handshakes or weight prefetch within a command.
+    """
+
+    def __init__(self, *args, config, layer, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.layer = layer
+
+    def evaluate(self, mapping):
+        # A multi-beat output uses the banked path when the hardware provides
+        # it, including when the matrix result feeds a fused vector tail.
+        output_width = (
+            self.accum_dtype_width
+            if mapping.loop_blockings[le.IC][3] > 1
+            else self.output_dtype_width
+        )
+        banked = (
+            output_width * self.config.pe_array_size[1] > self.sram_bandwidth
+        )
+        return evaluate(
+            self.config, self.layer, mapping, banked_output=banked
+        )
+
+    def calculate_runtime(self, architecture, layer, mapping):
+        if not self.evaluate(mapping).legal:
+            return math.inf
+        return super().calculate_runtime(architecture, layer, mapping)
+
+    def matrix_cycles(self, mapping, bank_groups):
+        result = self.evaluate(mapping)
+        if not result.legal:
+            return math.inf
+        ic, oc = self.config.pe_array_size
+        policy = result.policy
+        words = {
+            "input": result.input_fill_words
+            * self._bus_words(ic, self.input_dtype_width),
+            "weight": policy.full_set_loads * ic
+            * self._bus_words(oc, self.weight_dtype_width),
+            "bias": self._bus_words(
+                result.output_vectors * oc, self.bias_width
+            ),
+        }
+        if mapping.loop_blockings[le.IC][3] > 1:
+            words["scratch"] = 2 * self._bus_words(
+                result.output_vectors * oc, self.accum_dtype_width
+            )
+        else:
+            words.update(self._tail_words(mapping, 2))
+        compute = (
+            result.mac_requests
+            * issue_window(self.config, self.input_dtype_width)
+            + self.config.cim_mac_latency
+            + result.weight_write_beats
+            + 2 * result.buffer_partial_updates
+        )
+        return max(compute, self._bank_cycles(words, bank_groups))
