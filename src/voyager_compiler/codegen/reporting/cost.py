@@ -24,8 +24,10 @@ from voyager_compiler.codegen.node_info import (
     is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
+from voyager_compiler.codegen.transform.tiling.cim import issue_window
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_lanes,
+    get_dtype_width,
     pool_taps,
     vector_op_utilization,
 )
@@ -144,8 +146,8 @@ def op_utilization(
 
 def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     """Classify a compute node and compute its ideal (100%-utilization) cycle
-    count.  GEMM/conv use the ``unroll[0]*unroll[1]`` systolic throughput;
-    vector ops use the ``unroll[1]`` lane count.
+    count. GEMM/conv use the matrix lane count and backend issue interval;
+    vector ops use the vector-unit lane count.
 
     All shapes come from the *anchor* -- the real GEMM/conv/vector op (inside
     the submodule for a fused ``call_module``, the node itself when bare).  Its
@@ -155,6 +157,13 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     """
     anchor = get_anchor_node(node)
     mma_macs = max(1, cost.pe_array_size[0] * cost.pe_array_size[1])
+    mma_interval = (
+        issue_window(cost, get_dtype_width(_dtype(anchor.args[0])))
+        if cost.matrix_backend == 1
+        and is_gemm_op(anchor)
+        and not is_fully_connected(anchor)
+        else 1
+    )
     vec_lanes = max(1, cost.vector_lanes)
     out = _shape(anchor)
 
@@ -174,7 +183,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
         macs = math.prod(out) * c * kh * kw
-        ideal = math.ceil(macs / mma_macs)
+        ideal = math.ceil(macs * mma_interval / mma_macs)
         return OpInfo(
             node.name,
             "conv",
@@ -199,7 +208,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         # matrix-vector or the vector unit (``gemv_lanes``), not the array.
         fc = is_fully_connected(anchor)
         divisor = gemv_lanes(anchor, cost) if fc else mma_macs
-        ideal = math.ceil(macs / divisor)
+        ideal = math.ceil(macs * mma_interval / divisor)
         units = ("vector",) if fc else matrix_units
         return OpInfo(
             node.name,

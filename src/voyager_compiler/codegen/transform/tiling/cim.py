@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from math import prod
 
 import interstellar
+from voyager_compiler.codegen.transform.tiling.cim_timing import (
+    TimingOptions,
+    estimate_cycles,
+)
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
-from voyager_compiler.codegen.transform.tiling.runtime import BaseRuntimeCalculator
+from voyager_compiler.codegen.transform.tiling.runtime import (
+    BaseRuntimeCalculator,
+)
 
 le = interstellar.le
 SPATIAL = (le.OX, le.OY)
@@ -279,30 +285,46 @@ def issue_window(config, input_width):
 class CIMRuntimeCalculator(BaseRuntimeCalculator):
     """Estimate CIM runtime with the shared SRAM bank and DRAM model.
 
-    Weight programming and MAC issue work are summed conservatively; operand
-    bank traffic can overlap that work. Partial sums beyond the local register
-    capacity incur SRAM reads and writes. The estimate ranks mappings without
-    modeling descriptor handshakes or weight prefetch within a command.
+    Weight and input prefetch overlap MAC issue, subject to resident-set and
+    buffer availability. Partial sums beyond the local register capacity
+    incur SRAM reads and writes. Output bursts retain their queued work across
+    operand waits. The estimate ranks mappings without modeling command
+    serialization or unprofiled HLS pipeline stages.
     """
 
-    def __init__(self, *args, config, layer, **kwargs):
+    def __init__(
+        self, *args, config, layer, timing_options=TimingOptions(), **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.config = config
         self.layer = layer
+        self.timing_options = timing_options
+        self._input_cache = {}
 
-    def evaluate(self, mapping):
+    def uses_banked_output(self, mapping):
         # A multi-beat output uses the banked path when the hardware provides
         # it, including when the matrix result feeds a fused vector tail.
-        output_width = (
+        width = (
             self.accum_dtype_width
             if mapping.loop_blockings[le.IC][3] > 1
             else self.output_dtype_width
         )
-        banked = (
-            output_width * self.config.pe_array_size[1] > self.sram_bandwidth
+        if (
+            self.has_tail
+            and mapping.loop_blockings[le.IC][3] == 1
+            and not self.single_k_tail_extra_pass
+        ):
+            # MatrixOps::should_use_direct_path also checks fused fetch ports.
+            width = max([width, *(bits for _, bits in self.tail_specs)])
+        return (
+            self.config.double_buffered_accum_buffer
+            and width * self.config.pe_array_size[1] > self.sram_bandwidth
         )
+
+    def evaluate(self, mapping):
         return evaluate(
-            self.config, self.layer, mapping, banked_output=banked
+            self.config, self.layer, mapping,
+            banked_output=self.uses_banked_output(mapping),
         )
 
     def calculate_runtime(self, architecture, layer, mapping):
@@ -310,32 +332,24 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
             return math.inf
         return super().calculate_runtime(architecture, layer, mapping)
 
-    def matrix_cycles(self, mapping, bank_groups):
+    def timing(self, mapping, bank_groups=None):
+        """Return command timing and traffic, or None for an illegal mapping."""
         result = self.evaluate(mapping)
         if not result.legal:
-            return math.inf
-        ic, oc = self.config.pe_array_size
-        policy = result.policy
-        words = {
-            "input": result.input_fill_words
-            * self._bus_words(ic, self.input_dtype_width),
-            "weight": policy.full_set_loads * ic
-            * self._bus_words(oc, self.weight_dtype_width),
-            "bias": self._bus_words(
-                result.output_vectors * oc, self.bias_width
-            ),
-        }
-        if mapping.loop_blockings[le.IC][3] > 1:
-            words["scratch"] = 2 * self._bus_words(
-                result.output_vectors * oc, self.accum_dtype_width
-            )
-        else:
-            words.update(self._tail_words(mapping, 2))
-        compute = (
-            result.mac_requests
-            * issue_window(self.config, self.input_dtype_width)
-            + self.config.cim_mac_latency
-            + result.weight_write_beats
-            + 2 * result.buffer_partial_updates
+            return None
+        return estimate_cycles(
+            self,
+            mapping,
+            result,
+            bank_groups,
+            issue_window(self.config, self.input_dtype_width),
         )
-        return max(compute, self._bank_cycles(words, bank_groups))
+
+    def matrix_cycles(self, mapping, bank_groups):
+        timing = self.timing(mapping, bank_groups)
+        if (
+            timing is None
+            or timing.readiness.get("accumulation_feedback_safe") is False
+        ):
+            return math.inf
+        return timing.runtime_cycles
