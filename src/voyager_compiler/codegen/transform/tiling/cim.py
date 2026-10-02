@@ -12,7 +12,7 @@ from math import prod
 
 import interstellar
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
-from voyager_compiler.codegen.transform.tiling.sa import RuntimeCalculator
+from voyager_compiler.codegen.transform.tiling.runtime import BaseRuntimeCalculator
 
 le = interstellar.le
 SPATIAL = (le.OX, le.OY)
@@ -276,7 +276,7 @@ def issue_window(config, input_width):
     return (input_width + width - 1) // width * interval
 
 
-class CIMRuntimeCalculator(RuntimeCalculator):
+class CIMRuntimeCalculator(BaseRuntimeCalculator):
     """Estimate CIM runtime with the shared SRAM bank and DRAM model.
 
     Weight programming and MAC issue work are summed conservatively; operand

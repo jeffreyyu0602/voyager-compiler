@@ -47,15 +47,18 @@ from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_compute_cycles,
     get_dtype_width,
 )
+from voyager_compiler.codegen.transform.tiling.runtime import (
+    BaseRuntimeCalculator,
+    _FL_DIMS,
+    _IF_DIMS,
+    _OF_DIMS,
+    bank_partition,
+)
 from voyager_compiler.codegen.transform.tiling.sa import (
     OUTPUT_SLACK as OUTPUT_SLACK,
     SPMM_ROW_CYCLES as SPMM_ROW_CYCLES,
     SPMM_SCALE_ROWS,
     RuntimeCalculator,
-    _FL_DIMS,
-    _IF_DIMS,
-    _OF_DIMS,
-    bank_partition,
     spmm_scale_rows,
 )
 from voyager_compiler.codegen.transform.tiling.search import (
@@ -698,14 +701,14 @@ class _Search:
         name: The anchor node's name, for logging.
         tiler: The shared ``TilerContext``.
         layer: The interstellar ``Layer`` to map.
-        rc: The ``RuntimeCalculator`` scoring each candidate mapping.
+        rc: The ``BaseRuntimeCalculator`` scoring each candidate mapping.
         size_fn: The ``Layer.size_fn`` the fit check runs.
     """
 
     name: str
     tiler: TilerContext
     layer: object
-    rc: RuntimeCalculator
+    rc: BaseRuntimeCalculator
     size_fn: object
 
 
