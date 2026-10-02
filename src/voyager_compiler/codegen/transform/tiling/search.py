@@ -757,6 +757,7 @@ def _vector_op_tiling_limits(node, vector_unit_width):
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
     multiple_of = (vector_unit_width,)
+    dequantize = node.target == torch.ops.quantized_ops.dequantize.default
     if node.target in SOFTMAX_OPS:
         last_dim = get_arg_value(node, 1, "dim", -1)
     elif node.target in LAYER_NORM_OPS:
@@ -764,15 +765,19 @@ def _vector_op_tiling_limits(node, vector_unit_width):
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
         )
-    elif node.target in DYNAMIC_QUANTIZE_OPS:
-        axes = get_arg_value(node, 2, "axes", None)
-        block_size = get_arg_value(node, 3, "block_size", None)
+    elif node.target in DYNAMIC_QUANTIZE_OPS or (
+        dequantize and get_arg_value(node, 4, "block_size", None)
+    ):
+        axes_arg = 3 if dequantize else 2
+        axes = get_arg_value(node, axes_arg, "axes", None)
+        block_size = get_arg_value(node, axes_arg + 1, "block_size", None)
         ndim = len(node.args[0].shape)
 
         # A quantization block must not straddle a tile boundary, so a tile on a
         # quantization axis holds a whole number of blocks; the last dim also
-        # respects the hardware unroll.
-        last_dim = None
+        # respects the hardware unroll.  A dequantize keeps its last dim whole,
+        # as any elementwise op does.
+        last_dim = -1 if dequantize else None
         axes = set(a % ndim for a in (axes or ()))
         multiple_of = tuple(
             (
