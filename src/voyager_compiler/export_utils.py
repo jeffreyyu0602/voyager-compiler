@@ -222,7 +222,7 @@ def get_node_name_to_scope(
     )
     for n in model.graph.nodes:
         if not (nn_module_stack := get_module_stack(n)):
-            node_name_to_scope[n.name] = [("", type(None))]
+            node_name_to_scope[n.name] = ("", type(None), 0)
             continue
 
         current_scope = []

@@ -276,6 +276,12 @@ def is_axis_reduction(node: Node) -> bool:
     return node.target in _SUMS and len(node.shape) > 0
 
 
+def is_full_reduction(node: Node) -> bool:
+    """``node`` takes the max of a whole tensor, into one value: a tile of
+    its input folds into that value rather than making a tile of its own."""
+    return node.target is aten.amax.default and math.prod(node.shape) == 1
+
+
 def reduced_input_grid(node: Node) -> Optional[tuple]:
     """For a ``sum`` / ``mean`` that drops the dims it reduces, the output
     dim each input dim is tiled along, ``None`` for a reduced one, which is

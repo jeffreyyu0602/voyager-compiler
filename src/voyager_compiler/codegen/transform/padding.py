@@ -86,6 +86,25 @@ def _padded_dim(pad):
     return dims[0] if len(dims) == 1 else None
 
 
+def _end_padding(ndim, padding):
+    """The ``F.pad`` spec growing dims of an ``ndim``-dim tensor at their ends.
+
+    Args:
+        ndim: Rank of the tensor padded.
+        padding: Dim (negative counts from the end) -> elements to add after
+            its last; a dim left out grows by none.
+
+    Returns:
+        ``F.pad``'s list: a ``(before, after)`` pair per dim, from the last
+        dim back to the first one ``padding`` names.
+    """
+    padding = {dim % ndim: size for dim, size in padding.items()}
+    spec = []
+    for dim in range(ndim - 1, min(padding) - 1, -1):
+        spec += [0, padding.get(dim, 0)]
+    return spec
+
+
 def _pad_for_dim(pad, dim, new_dim):
     """``pad``'s one non-zero pair, restated to grow ``new_dim`` rather than
     ``dim`` -- both counted from the end, as ``F.pad`` orders its pairs."""
@@ -328,7 +347,7 @@ def _hoist_pad_above_repeat(model, node, pad, pad_value, fold_cache):
     return node
 
 
-def pad_input_node(model, node, is_weight, pad, scale_pad, fold_cache):
+def pad_input_node(model, node, is_weight, pad, pad_scale, fold_cache):
     if is_weight:
         input = node.args[1]
         scale = node.kwargs.get("weight_scale")
@@ -369,10 +388,10 @@ def pad_input_node(model, node, is_weight, pad, scale_pad, fold_cache):
     else:
         node.replace_input_with(node_to_pad, new_input)
 
-        if scale is not None and any(x for x in scale_pad):
+        if scale is not None and any(x for x in pad_scale):
             node.replace_input_with(
                 scale,
-                _hoist_pad_above_repeat(model, scale, scale_pad, 0, fold_cache),
+                _hoist_pad_above_repeat(model, scale, pad_scale, 0, fold_cache),
             )
 
 
@@ -391,7 +410,10 @@ def _crossable(node, user, slice_args):
         torch.ops.quantized_ops.dequantize.default,
         torch.ops.quantized_ops.quantize.default,
     ]:
-        return get_arg_value(user, 4, "block_size") is None
+        if get_arg_value(user, 4, "block_size") is not None:
+            return False
+        propagate_shape(user)
+        return True
 
     if not is_elementwise_op(user):
         return False
@@ -443,22 +465,22 @@ def slice_output(model, node, slice_args):
 
 def pad_matrix_op_dimensions(
     model: GraphModule,
-    C_unroll,
-    K_unroll,
+    pe_array_size,
     fold_cache: bool = FOLD_PAD_INTO_CACHE,
 ) -> GraphModule:
-    """
-    Pad inputs and weights to conv2d nodes in a torch.fx.GraphModule so that
-    the input channels (C) and output channels (K) are multiples of the
-    provided unroll factors.
+    """Pad each GEMM's operands so its channels fill the PE array.
 
-    Parameters:
-        model (torch.fx.GraphModule): The FX graph module to transform.
-        C_unroll (int): Unroll factor for the input channels (C_in).
-        K_unroll (int): Unroll factor for the output channels (C_out).
+    Input channels pad to a multiple of the PE array's number of rows and of
+    the GEMM's MX block, output channels to a multiple of its number of
+    columns, and the output is sliced back to its original channels.
+
+    Args:
+        model: The graph to transform.
+        pe_array_size: The PE array's ``(input, output)`` channel counts.
+        fold_cache: Take a pad on a KV-cache write into the buffer.
 
     Returns:
-        torch.fx.GraphModule: The transformed FX graph module.
+        ``model``.
     """
     for node in list(model.graph.nodes):
         if not is_gemm_op(node):
@@ -468,63 +490,70 @@ def pad_matrix_op_dimensions(
         is_conv = is_conv2d(node)
         is_mm = is_matmul(node)
 
-        input = node.args[0]
-        C_in = input.shape[1] if is_conv else input.shape[-1]
+        input, weight = node.args[0], node.args[1]
+        ic = input.shape[1] if is_conv else input.shape[-1]
+        oc = weight.shape[-1] if is_mm else weight.shape[0]
 
         # Skip CNN first layer with input channels equal to 3
-        if is_conv and C_in == 3:
+        if is_conv and ic == 3:
             continue
 
-        pad_C = (C_unroll - (C_in % C_unroll)) % C_unroll
-
+        # The contraction pads to whole PE rows and whole MX blocks, and its
+        # scales to one per block, a partial block counting as one; the
+        # outputs pad to whole PE columns.
         bs = node.kwargs.get("block_size", 1)
+        multiple = math.lcm(pe_array_size[0], bs)
+        padding_ic = (multiple - (ic % multiple)) % multiple
+        padding_ic_scale = (ic + padding_ic) // bs - math.ceil(ic / bs)
+        padding_oc = (-oc) % pe_array_size[1]
 
-        # Pad input along input channel dimension
-        if pad_C:
-            lead = [0, 0, 0, 0] if is_conv else []
-            in_pad = lead + [0, pad_C]
-            in_scale_pad = lead + [0, pad_C // bs]
-            pad_input_node(model, node, False, in_pad, in_scale_pad, fold_cache)
+        if padding_ic:
+            ic_dim = -3 if is_conv else -1
+            ndim = len(input.shape)
+            pad_input_node(
+                model,
+                node,
+                False,
+                _end_padding(ndim, {ic_dim: padding_ic}),
+                _end_padding(ndim, {ic_dim: padding_ic_scale}),
+                fold_cache,
+            )
 
-        weight = node.args[1]
-        C_in = weight.shape[-2] if is_mm else weight.shape[1]
-        C_out = weight.shape[-1] if is_mm else weight.shape[0]
-
+        # A depthwise conv's groups grow with its channels, and its weight
+        # grows only along its output channels.
         if is_dw:
-            C_in *= node.args[6]
-            node.args = node.args[:-1] + (node.args[-1] + pad_C,)
+            node.args = node.args[:-1] + (node.args[-1] + padding_ic,)
+            padding_oc = padding_ic
+            padding_ic = padding_ic_scale = 0
 
-        pad_C = (C_unroll - (C_in % C_unroll)) % C_unroll
-        pad_K = (K_unroll - (C_out % K_unroll)) % K_unroll
-
-        if is_dw:
-            pad_K = pad_C
-
-        # Pad weight along input and output channel dimensions
-        if pad_C or pad_K:
-            if is_dw:
-                w_pad = [0, 0, 0, 0, 0, 0, 0, pad_K]
-                ws_pad = [0, 0, 0, 0, 0, 0, 0, pad_K]
-            elif is_conv:
-                w_pad = [0, 0, 0, 0, 0, pad_C, 0, pad_K]
-                ws_pad = [0, 0, 0, 0, 0, pad_C // bs, 0, pad_K]
+        if padding_ic or padding_oc:
+            if is_conv:
+                ic_dim, oc_dim = -3, -4  # (out, in, kH, kW)
             elif is_mm:
-                w_pad = [0, pad_K, 0, pad_C]
-                ws_pad = [0, pad_K, 0, pad_C // bs]
+                ic_dim, oc_dim = -2, -1  # (in, out)
             else:
-                w_pad = [0, pad_C, 0, pad_K]
-                ws_pad = [0, pad_C // bs, 0, pad_K]
-            pad_input_node(model, node, True, w_pad, ws_pad, fold_cache)
+                ic_dim, oc_dim = -1, -2  # (out, in)
+            ndim = len(weight.shape)
+            pad_input_node(
+                model,
+                node,
+                True,
+                _end_padding(ndim, {ic_dim: padding_ic, oc_dim: padding_oc}),
+                _end_padding(
+                    ndim, {ic_dim: padding_ic_scale, oc_dim: padding_oc}
+                ),
+                fold_cache,
+            )
 
         bias = get_arg_value(node, 2, "bias")
-        if pad_K and bias is not None:
-            new_bias = _insert_pad(model, bias, [0, pad_K], 0)
+        if padding_oc and bias is not None:
+            new_bias = _insert_pad(model, bias, [0, padding_oc], 0)
             node.replace_input_with(bias, new_bias)
 
         propagate_shape(node)
-        if pad_K:
+        if padding_oc:
             slice_dim = 1 if is_conv else -1
-            slice_output(model, node, (slice_dim, 0, C_out))
+            slice_output(model, node, (slice_dim, 0, oc))
 
     model.graph.lint()
     model.graph.eliminate_dead_code()
@@ -535,7 +564,7 @@ def pad_matrix_op_dimensions(
 def _pad_layer_norm(
     model: GraphModule,
     node: Node,
-    unroll: int,
+    vector_lanes: int,
 ) -> GraphModule:
     input = node.args[0]
     normalize_shape = node.args[1]
@@ -543,7 +572,7 @@ def _pad_layer_norm(
     bias = node.args[3] if len(node.args) > 3 else None
 
     orig_k = input.shape[-1]
-    pad_k = (-orig_k) % unroll
+    pad_k = (-orig_k) % vector_lanes
     if pad_k == 0:
         return model
 
@@ -593,14 +622,14 @@ def _pad_layer_norm(
     model.graph.erase_node(node)
 
 
-def _pad_quantize_mx(model, node, unroll, fold_cache):
+def _pad_quantize_mx(model, node, vector_lanes, fold_cache):
     input = node.args[0]
     axes = get_arg_value(node, 2, "axes")
     block_size = get_arg_value(node, 3, "block_size")
     ndim = len(input.shape)
     axes = {a % ndim for a in axes}
 
-    # A tile boundary on the last dim must land on a hardware-unroll multiple,
+    # A tile boundary on the last dim must land on a multiple of the lanes,
     # and no quantization block may straddle two tiles, so each quant axis must
     # land on a block multiple.  A dim that is both must satisfy their lcm.  We
     # do not rely on the GEMM input padding to have aligned the last dim.
@@ -608,7 +637,7 @@ def _pad_quantize_mx(model, node, unroll, fold_cache):
     for i in range(ndim):
         multiple = 1
         if i == ndim - 1:
-            multiple = unroll
+            multiple = vector_lanes
         if i in axes:
             multiple = math.lcm(multiple, block_size)
         if multiple > 1 and input.shape[i] % multiple:
@@ -622,12 +651,9 @@ def _pad_quantize_mx(model, node, unroll, fold_cache):
     getitems = list(node.users)
     orig_shapes = {g: tuple(g.shape) for g in getitems}
 
-    min_pad_dim = min(pad_dims)
-    pad_tuple = []
-    for dim in range(ndim - 1, min_pad_dim - 1, -1):
-        pad_tuple.extend([0, pad_dims.get(dim, 0)])
-
-    new_input = _insert_pad(model, input, pad_tuple, 0, fold_cache)
+    new_input = _insert_pad(
+        model, input, _end_padding(ndim, pad_dims), 0, fold_cache
+    )
     node.replace_input_with(input, new_input)
     propagate_shape(node)
 
@@ -653,13 +679,13 @@ def _pad_quantize_mx(model, node, unroll, fold_cache):
                 u.replace_input_with(g, sliced)
 
 
-def _pad_softmax(model, node, unroll):
+def _pad_softmax(model, node, vector_lanes):
     input = node.args[0]
 
-    # The hardware fetches in units of ``unroll`` elements along the last
-    # dim, so pad it to a multiple of ``unroll`` with -inf and slice back.
+    # The hardware fetches in units of ``vector_lanes`` elements along the last
+    # dim, so pad it to a multiple of ``vector_lanes`` with -inf and slice back.
     orig = input.shape[-1]
-    pad_k = (-orig) % unroll
+    pad_k = (-orig) % vector_lanes
     if pad_k == 0:
         return
 
@@ -688,30 +714,33 @@ def _pad_softmax(model, node, unroll):
 
 def pad_vector_op_dimensions(
     model: GraphModule,
-    K_unroll,
+    vector_lanes,
     fold_cache: bool = FOLD_PAD_INTO_CACHE,
 ) -> GraphModule:
-    """
-    Pad inputs to vector operations to multiples of the hardware unroll size.
-    Only support softmax operation for now.
+    """Pad vector ops so their last dim fills whole lane groups.
 
-    Parameters:
-        model (torch.fx.GraphModule): The FX graph module to transform.
-        K_unroll (int): Unroll factor for the output channels.
+    Each layer norm, softmax and dynamic quantize pads its last dim to a
+    multiple of ``vector_lanes``, and each pad that undoes a slice above it
+    is dropped with the slice.
+
+    Args:
+        model: The graph to transform.
+        vector_lanes: Lanes the vector unit computes at once.
+        fold_cache: Take a pad on a KV-cache write into the buffer.
 
     Returns:
-        torch.fx.GraphModule: The transformed FX graph module.
+        ``model``.
     """
     for node in list(model.graph.nodes):
         if node.target == torch.ops.aten.layer_norm.default:
-            _pad_layer_norm(model, node, K_unroll)
+            _pad_layer_norm(model, node, vector_lanes)
         elif node.target == torch.ops.aten.softmax.int:
-            _pad_softmax(model, node, K_unroll)
+            _pad_softmax(model, node, vector_lanes)
         elif node.target in (
             torch.ops.quantized_ops.quantize_mx.default,
             torch.ops.quantized_ops.quantize_affine.default,
         ):
-            _pad_quantize_mx(model, node, K_unroll, fold_cache)
+            _pad_quantize_mx(model, node, vector_lanes, fold_cache)
 
     for node in list(model.graph.nodes):
         if node.target is not torch.ops.aten.pad.default:
@@ -740,7 +769,7 @@ def pad_vit_embeddings_output(
     embeddings,
     example_inputs,
     dynamic_shapes=None,
-    unroll=32,
+    vector_lanes=32,
 ):
     original_graph = model.graph
 
@@ -764,7 +793,7 @@ def pad_vit_embeddings_output(
 
     vit_embed_out = _matches[0].returning_nodes[0]
     orig_dim = vit_embed_out.meta["val"].shape[-2]
-    pad = (unroll - (orig_dim % unroll)) % unroll
+    pad = (vector_lanes - (orig_dim % vector_lanes)) % vector_lanes
     logger.info(f"Padding {vit_embed_out} with {pad}")
 
     with model.graph.inserting_after(vit_embed_out):

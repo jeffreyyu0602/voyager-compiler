@@ -27,6 +27,7 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
+    is_full_reduction,
     is_nop,
     is_reshape_op,
     quant_param_arg_nodes,
@@ -1417,6 +1418,33 @@ def _single_pass_kernel(
         commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
 
     return kernel
+
+
+def _running_max_kernel(compute: Callable):
+    """Kernel for a max of the whole grid into one output tile.
+
+    Each step stores its tile's max in the scratch ref; the first step moves
+    it into the output slot, and each later one folds it in.  The output
+    block never changes, so the scheduler stores it once, after the last
+    step.
+    """
+
+    def inner(grid_index, *args):
+        *in_slots, out_slot, tile_max = args
+        voyager.insert(compute(*in_slots), tile_max)
+        first = grid_index[0] == 0
+        for coord in grid_index[1:]:
+            first = first & (coord == 0)
+
+        def init():
+            return tile_max.clone()
+
+        def fold(prev=out_slot):
+            return torch.maximum(tile_max, prev)
+
+        voyager.insert(torch.cond(first, init, fold), out_slot)
+
+    return inner
 
 
 def _inplace_tail_kernel(
@@ -2943,7 +2971,9 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
     standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
-    writes each output tile once (no cross-tile reduction).
+    writes each output tile once (no cross-tile reduction) -- except a max of
+    a whole tensor into one value (``is_full_reduction``), which tiles its
+    input and folds every tile into that value (``_running_max_kernel``).
 
     A batched reduction also reserves the on-chip regions its backend kernel
     keeps beside its tiles (``reduction_scratch``); the kernel ignores them, so
@@ -3053,7 +3083,12 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         for o, ts in zip(outputs, tiled_shape)
     ]
     scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
-    kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
+    if is_full_reduction(anchor):
+        # Each tile's max, beside the running one.
+        scratch_specs.append(_ScratchSpec((), outputs[-1].dtype))
+        kernel = _running_max_kernel(compute)
+    else:
+        kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

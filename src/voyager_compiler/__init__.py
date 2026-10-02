@@ -287,7 +287,7 @@ def transform(
     fuse_quantize_dequantize_with_producer(model)
 
     if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, *config.pe_array_size)
+        pad_matrix_op_dimensions(model, config.pe_array_size)
 
     if layout_policy == "systolic":
         normalize_conv2d_layout(model)

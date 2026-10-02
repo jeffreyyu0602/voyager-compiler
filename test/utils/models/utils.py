@@ -5,6 +5,7 @@ from voyager_compiler import (
     capture_training,
     compile,
     gradient_program,
+    prepare_training,
     shared_dram_layout,
     transform,
     update_program,
@@ -46,7 +47,7 @@ class Loss(torch.nn.Module):
         return self.model(**inputs).loss
 
 
-def compile_training_step(model, inputs, vector_stages, args):
+def compile_training_step(model, inputs, vector_stages, args, quantizer):
     """Compile one AdamW step of training ``model`` on the batch ``inputs``.
 
     The step is two programs sharing one DRAM layout: the gradient program
@@ -54,14 +55,18 @@ def compile_training_step(model, inputs, vector_stages, args):
     into its own directory under ``args.model_output_dir``.  They run on
     ``model``'s own tensors and ``inputs``, zeroed gradient buffers or, for
     the update, random gradients, and the optimizer's state as before a
-    first step.  A dropout draws its mask per tile once compiled, so with
-    dropout the compiled program's results differ from the reference's.
+    first step.  With ``--error``, the step trains through ``quantizer``'s
+    fake-quants, forward and backward, after ``--calibration_steps`` eager
+    steps have started their delayed scaling.  A dropout draws its mask per
+    tile once compiled, so with dropout the compiled program's results
+    differ from the reference's.
 
     Args:
         model: A Hugging Face model that returns its loss given labels.
         inputs: One batch, labels included.
         vector_stages: The fusion patterns ``transform`` applies.
         args: The command line.
+        quantizer: Picks the GEMM operands to quantize, with ``--error``.
 
     Returns:
         ``(programs, reference, lowered)``, each keyed ``"gradient"`` and
@@ -71,8 +76,15 @@ def compile_training_step(model, inputs, vector_stages, args):
         same from the compiled graphs under ``--debug``, else ``None``.
     """
     model = Loss(model).train()
-    with torch.enable_grad():
-        capture_training(model, (), inputs, None)
+    if args.error is not None:
+        prepare_training(model, quantizer, (), inputs, None)
+        for _ in range(args.calibration_steps):
+            with torch.enable_grad():
+                model(**inputs).backward()
+        model.zero_grad(set_to_none=True)
+    else:
+        with torch.enable_grad():
+            capture_training(model, (), inputs, None)
     gradient = gradient_program(model)
     # A torch optimizer skips a parameter the loss never reaches, such as a
     # vision tower under a text-only batch: it steps the ones with gradients.

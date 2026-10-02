@@ -264,6 +264,8 @@ def main():
         parser.error("--training compiles bert or llama_prefill")
     if args.training and args.report:
         parser.error("--report takes one graph; --training compiles two")
+    if args.training and args.activation and args.error is None:
+        parser.error("--training quantizes the backward pass too: give --error")
 
     logger.setLevel(getattr(logging, args.log_level))
 
@@ -279,6 +281,7 @@ def main():
         input_activation=args.activation,
         weight=args.weight,
         bias=args.bias,
+        error=args.error,
         force_scale_power_of_two=args.force_scale_power_of_two,
     )
 
@@ -359,7 +362,7 @@ def main():
         if args.training:
             inputs = {k: torch.tensor([v]) for k, v in train_dataset[0].items()}
             gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args
+                model, inputs, VECTOR_PIPELINE, args, quantizer
             )
         else:
             gm, old_output, new_output = bert.quantize_and_dump_model(
@@ -384,8 +387,12 @@ def main():
         if args.training:
             input_ids = llama._prompt_ids(tokenizer, args.context_length)
             inputs = {"input_ids": input_ids, "labels": input_ids}
+            # As inference: the rotary embedding's matmul stays unquantized.
+            quantizer.set_module_name_object_type_order(
+                llama._ROTARY_SCOPE, torch.ops.aten.matmul.default, 0, None
+            )
             gm, old_output, new_output = compile_training_step(
-                model, inputs, VECTOR_PIPELINE, args
+                model, inputs, VECTOR_PIPELINE, args, quantizer
             )
         else:
             gm, old_output, new_output = llama.quantize_and_dump_model(

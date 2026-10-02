@@ -444,7 +444,8 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
     along ``ch_axis``, and scale by the largest.  An input is quantized
     before its own amax joins the history, so the first call uses scale
     1.0, as Transformer Engine's delayed scaling does (whose default
-    history is 1024 long).
+    history is 1024 long).  The history and the scale are kept in the
+    dtype of the tensor quantized.
 
     Args:
         dtype: Element dtype, as a spec string names it.
@@ -493,14 +494,28 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
             torch.tensor([], device=self.scale.device, dtype=torch.float),
         )
 
+    def start_history(self, shape: Tuple[int, ...], dtype) -> None:
+        """Size the history and the scale as before any input.
+
+        Args:
+            shape: Shape of one amax: ``()`` per tensor, or the channel
+                shape per channel.
+            dtype: Dtype of the tensor quantized.
+        """
+        device = self.scale.device
+        self.amax_history = torch.zeros(
+            (self.amax_history_len, *shape), dtype=dtype, device=device
+        )
+        self.scale = torch.ones(shape, dtype=dtype, device=device)
+
     @torch.no_grad()
     def _update_amax_scale(self, x: torch.Tensor) -> None:
         """Fold ``x``'s amax into the history and recompute ``scale``.
 
         The absolute maximum is taken over every axis, or over every axis
         but ``ch_axis`` when the observer is per-channel. The history and
-        the scale are lazily sized on the first call, since the observed
-        shape is only known once a tensor arrives.
+        the scale are started on the first call, since the observed shape
+        and dtype are only known once a tensor arrives.
 
         Args:
             x: The tensor being observed.
@@ -513,9 +528,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
             amax_cur = torch.amax(torch.abs(x))
 
         if self.amax_history.numel() == 0:
-            size = (self.amax_history_len,) + amax_cur.shape
-            self.amax_history.resize_(size).fill_(0.0)
-            self.scale.resize_(amax_cur.shape).fill_(1.0)
+            self.start_history(amax_cur.shape, x.dtype)
 
         amax = torch.amax(self.amax_history, dim=0)
         self.amax_history.copy_(torch.roll(self.amax_history, -1, 0))

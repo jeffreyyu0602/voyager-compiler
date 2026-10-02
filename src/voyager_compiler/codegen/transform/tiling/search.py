@@ -21,6 +21,7 @@ from voyager_compiler.codegen.node_info import (
     is_elementwise_op,
     is_fully_connected,
     is_axis_reduction,
+    is_full_reduction,
     is_matmul,
     is_pooling,
     normalize_shape,
@@ -322,6 +323,13 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
         )
     )
     reserved += _staged_scratch_bytes(node, tiled_shapes, config)
+    # A reduction to one value keeps each tile's result beside the running
+    # one (``_running_max_kernel``).
+    anchor = get_anchor_node(node)
+    if anchor is not None and is_full_reduction(anchor):
+        reserved += tensor_alloc_bytes(
+            1, anchor.value.dtype, config.bank_width, config.vector_lanes
+        )
     if reserved:
         sized.append((reserved, [BANK_GROUP_RESERVED]))
 
@@ -742,6 +750,9 @@ def _vector_op_tiling_limits(node, vector_unit_width):
     # freely, the last in whole lane groups.
     if is_axis_reduction(node):
         return None, (vector_unit_width if node.shape[-1] > 1 else 1,)
+    # A reduction to one value tiles its input the same way.
+    if is_full_reduction(node):
+        return None, (vector_unit_width if node.args[0].shape[-1] > 1 else 1,)
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
@@ -804,7 +815,9 @@ def vector_op_tiling(node, config):
     ``node.meta["bank_groups"]`` (see ``gemv_op_tiling``).
 
     Returns:
-        Tile counts over ``node``'s output, or ``None`` when it has no anchor.
+        Tile counts over ``node``'s output -- over its input for a reduction
+        to one value (``is_full_reduction``) -- or ``None`` when it has no
+        anchor.
 
     Raises:
         RuntimeError: when no tiling of the op's operands fits the scratchpad.
@@ -826,11 +839,17 @@ def vector_op_tiling(node, config):
         else None
     )
 
-    output_shape = _output_shape(node)
+    # A reduction to one value has no output to tile: every tile of its input
+    # folds into that one value.
+    shape = (
+        anchor.args[0].shape
+        if is_full_reduction(anchor)
+        else _output_shape(node)
+    )
     search = partial(
         _search_tiling,
         node=node,
-        full_shape=output_shape,
+        full_shape=shape,
         multiple_of=multiple_of,
         shape_builder_fn=_build_vector_op_shape_map,
         config=config,
@@ -849,7 +868,7 @@ def vector_op_tiling(node, config):
     tile_sizes, groups, _ = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
-    return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
+    return tuple(s // ts for s, ts in zip(shape, tile_sizes))
 
 
 def _divisors_descending(n):

@@ -143,7 +143,7 @@ def quantize_and_dump_model(
     gm = export_model(model, example_args)
     remove_zero_attention_mask(gm, example_args)
     pad_vit_embeddings_output(
-        gm, embeddings, example_args, unroll=vector_lanes
+        gm, embeddings, example_args, vector_lanes=vector_lanes
     )
 
     if args.conv2d_im2col:

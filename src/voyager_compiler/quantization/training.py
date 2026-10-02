@@ -50,15 +50,24 @@ from torch._functorch.aot_autograd import (
 from torch._functorch.partitioners import default_partition
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.export._unlift import _check_inputs_match
-from torch.fx import CodeGen, GraphModule, Node
+from torch.fx import CodeGen, Graph, GraphModule, Node
 from torch.utils import _pytree as pytree
 from torchao.quantization.pt2e import FakeQuantizeBase
 from torchao.quantization.pt2e import prepare as torchao_prepare
 from torchao.quantization.pt2e.quantizer import QuantizationAnnotation
 
-from voyager_compiler.export_utils import export_model
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    export_model,
+)
+from voyager_compiler.quantization.fake_quantize import (
+    FusedAmaxObsFakeQuantize,
+    MXFakeQuantize,
+    _DerivedObserverOrFakeQuantize,
+)
 from voyager_compiler.quantization.quantize_pt2e import (
     _get_obs_or_fq_map,
+    _replace_observer_with_quantize_mx_node_decomposed,
     get_default_quantizer,
     prepare_qat_pt2e,
     set_training,
@@ -650,6 +659,240 @@ def _parameter_name(target: str) -> str:
     return target.replace(".", "_")
 
 
+def _delayed_scale(
+    graph: Graph,
+    operand: Node,
+    history: Node,
+    scale: Node,
+    fake_quant: FusedAmaxObsFakeQuantize,
+) -> Node:
+    """Build the scale update a delayed-scaling fake-quant makes per call.
+
+    The new scale is the largest amax in ``history`` over ``quant_max``,
+    or the old ``scale`` when that amax is zero or not finite; ``operand``'s
+    own amax then joins the history in place of its oldest.  Both state
+    tensors are written in place.
+
+    Args:
+        graph: Graph to build in, at its insertion point.
+        operand: The tensor the fake-quant quantizes.
+        history: ``fake_quant``'s amax history.
+        scale: ``fake_quant``'s scale.
+        fake_quant: The per-tensor fake-quant being lowered.
+
+    Returns:
+        The new scale.
+    """
+    call = graph.call_function
+    magnitude = call(aten.abs.default, (operand,))
+    newest = call(aten.amax.default, (magnitude, []))
+    amax = call(aten.amax.default, (history, [0]))
+    # The update rolls the history back by one and overwrites its first.
+    length = fake_quant.amax_history_len
+    entries = [call(aten.view.default, (newest, [1]))]
+    if length > 1:
+        entries.append(call(aten.slice.Tensor, (history, 0, 2, length)))
+        entries.append(call(aten.slice.Tensor, (history, 0, 0, 1)))
+    updated = call(aten.cat.default, (entries,))
+    call(aten.copy_.default, (history, updated))
+
+    new = call(aten.div.Tensor, (amax, fake_quant.quant_max))
+    positive = call(aten.gt.Scalar, (amax, 0.0))
+    new = call(aten.where.self, (positive, new, scale))
+    # An amax is never negative, so below infinity is finite.
+    finite = call(aten.lt.Scalar, (amax, float("inf")))
+    new = call(aten.where.self, (finite, new, scale))
+    if fake_quant.force_scale_power_of_two:
+        exponent = call(aten.log2.default, (new,))
+        exponent = call(aten.ceil.default, (exponent,))
+        new = call(aten.pow.Scalar, (2.0, exponent))
+    call(aten.copy_.default, (scale, new))
+    return new
+
+
+def _dequantize_gemms(graph: Graph, scales: Dict[Node, Node]) -> None:
+    """Scale each GEMM of per-tensor quantized operands back after it.
+
+    The GEMM reads the quantized values themselves, so its result is scaled
+    by the product of its operands' scales, and its bias, which is not in
+    that domain, is added after.
+
+    Args:
+        graph: Graph rewritten in place.
+        scales: Each per-tensor ``quantize`` -> the scale it divides by.
+
+    Raises:
+        NotImplementedError: A quantized tensor is read by an op other than
+            a GEMM.
+    """
+    for quantized in scales:
+        stack = list(quantized.users)
+        while stack:
+            user = stack.pop()
+            if user.target in _VIEWS:
+                stack.extend(user.users)
+            elif user.target not in _OPS:
+                raise NotImplementedError(
+                    f"{user.target} reads the quantized {quantized.name}"
+                )
+    for gemm in list(graph.nodes):
+        if gemm.target not in _OPS:
+            continue
+        found = []
+        for operand in gemm.args[:2]:
+            while operand.target in _VIEWS:
+                operand = operand.args[0]
+            if operand in scales:
+                found.append(scales[operand])
+        if not found:
+            continue
+        bias = gemm.args[2] if len(gemm.args) > 2 else None
+        gemm.args = gemm.args[:2]
+        users = list(gemm.users)
+        with graph.inserting_before(gemm.next):
+            product = found[0]
+            for other in found[1:]:
+                product = graph.call_function(aten.mul.Tensor, (product, other))
+            result = graph.call_function(
+                torch.ops.quantized_ops.dequantize.default, (gemm, product)
+            )
+            if bias is not None:
+                result = graph.call_function(aten.add.Tensor, (result, bias))
+        for user in users:
+            user.replace_input_with(gemm, result)
+
+
+def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
+    """Replace each fake-quant of ``program`` with the ops that quantize.
+
+    A microscaling fake-quant becomes a ``quantize_mx`` and the GEMMs
+    reading it their ``_mx`` twins, as ``convert_pt2e`` lowers an
+    activation's.  A weight is a program input that changes every step, so
+    it is quantized in the graph like an activation rather than baked.
+
+    A per-tensor fake-quant scales by its delayed-scaling state: its amax
+    history and scale become program inputs, named after the fake-quant's
+    buffers in the model, that the program updates as the fake-quant does
+    (``_delayed_scale``).  Its GEMMs read the quantized values and are
+    scaled back after (``_dequantize_gemms``).  A bias fake-quant, derived
+    from its GEMM's operand scales as they stand where it runs, rounds the
+    bias as the fake-quant does.
+
+    Args:
+        program: A gradient program, rewritten in place.
+        names: Each fake-quant's attribute in ``program`` -> its module path
+            in the model.
+
+    Raises:
+        NotImplementedError: A fake-quant's scheme has no lowering yet, or a
+            per-tensor quantized tensor is read by an op other than a GEMM.
+    """
+    graph = program.graph
+    calls = [n for n in graph.nodes if n.target is _fake_quantize]
+    attributes = {id(m): name for name, m in program.named_children()}
+
+    # The scale each per-tensor fake-quant holds where the graph now stands:
+    # its state until it runs, the scale it computes after.
+    current = {}
+    states = {}
+    # ``prepare`` puts a parameter's fake-quant right after it; moving the
+    # inputs ahead of every op lets the state inputs follow them.
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    first = next(n for n in graph.nodes if n.op != "placeholder")
+    for placeholder in placeholders:
+        first.prepend(placeholder)
+    last = placeholders[-1]
+    for node in calls:
+        target = node.args[0].target
+        fake_quant = program.get_submodule(target)
+        if not isinstance(fake_quant, FusedAmaxObsFakeQuantize):
+            continue
+        state = []
+        for buffer in ("amax_history", "scale"):
+            with graph.inserting_after(last):
+                last = graph.placeholder(
+                    _parameter_name(f"{names[target]}.{buffer}")
+                )
+            last.meta["val"] = torch.empty_like(getattr(fake_quant, buffer))
+            state.append(last)
+        states[target] = state
+        current[target] = state[1]
+
+    scales = {}
+    for node in calls:
+        fake_quant_attr, operand = node.args
+        target = fake_quant_attr.target
+        fake_quant = program.get_submodule(target)
+        if not fake_quant.fake_quant_on():
+            node.replace_all_uses_with(operand)
+            graph.erase_node(node)
+            continue
+        if isinstance(fake_quant, MXFakeQuantize):
+            # The lowering replaces the call_module form ``prepare`` leaves.
+            with graph.inserting_before(node):
+                call = graph.call_module(target, (operand,))
+            call.meta = node.meta
+            node.replace_all_uses_with(call)
+            graph.erase_node(node)
+            modules = dict(program.named_modules(remove_duplicate=False))
+            _replace_observer_with_quantize_mx_node_decomposed(
+                program, call, modules
+            )
+            continue
+        if isinstance(fake_quant, FusedAmaxObsFakeQuantize):
+            if fake_quant.is_per_channel:
+                raise NotImplementedError(
+                    "Per-channel scales have no lowering for training"
+                )
+            with graph.inserting_before(node):
+                if fake_quant.observer_on():
+                    current[target] = _delayed_scale(
+                        graph, operand, *states[target], fake_quant
+                    )
+        elif isinstance(fake_quant, _DerivedObserverOrFakeQuantize):
+            act, weight = (
+                current[attributes[id(m)]] for m in fake_quant.obs_or_fqs
+            )
+            with graph.inserting_before(node):
+                weight = graph.call_function(aten.flatten.using_ints, (weight,))
+                current[target] = graph.call_function(
+                    aten.mul.Tensor, (act, weight)
+                )
+        else:
+            raise NotImplementedError(
+                f"{type(fake_quant).__name__} has no lowering for training"
+            )
+        with graph.inserting_before(node):
+            # The fake-quant scales in its operand's dtype.
+            scale = graph.call_function(
+                aten._to_copy.default,
+                (current[target],),
+                {"dtype": operand.meta["val"].dtype},
+            )
+            qmap = create_getattr_from_value(
+                program, graph, "qmap", fake_quant.qmap
+            )
+            quantized = graph.call_function(
+                torch.ops.quantized_ops.quantize.default,
+                (operand, scale, None, None, None, qmap),
+            )
+            quantized.meta["dtype"] = fake_quant.dtype
+            if isinstance(fake_quant, _DerivedObserverOrFakeQuantize):
+                # A bias is added in its own dtype, rounded as the fake-quant
+                # rounds it.
+                quantized = graph.call_function(
+                    torch.ops.quantized_ops.dequantize.default,
+                    (quantized, scale),
+                )
+            else:
+                scales[quantized] = scale
+        node.replace_all_uses_with(quantized)
+        graph.erase_node(node)
+    _dequantize_gemms(graph, scales)
+    graph.eliminate_dead_code()
+    program.delete_all_unused_submodules()
+
+
 def gradient_program(model: nn.Module) -> GraphModule:
     """The forward, the loss and the backward of a training step, as a graph.
 
@@ -658,7 +901,8 @@ def gradient_program(model: nn.Module) -> GraphModule:
     and each parameter's gradient is written in place into a buffer of its
     own.  A parameter is named after its module path (``fc1.weight`` becomes
     ``fc1_weight``), a tied one after its first, and its gradient buffer
-    after it, with ``_grad``.
+    after it, with ``_grad``.  The fake-quants of a model
+    ``prepare_training`` prepared become the ops that quantize.
 
     Args:
         model: Model captured by ``capture_training``.
@@ -670,7 +914,22 @@ def gradient_program(model: nn.Module) -> GraphModule:
     Raises:
         ValueError: ``model``'s forward returns more than the loss.
     """
-    program = copy.deepcopy(model.forward.graphs["joint"])
+    joint = model.forward.graphs["joint"]
+    paths = {id(m): name for name, m in model.named_modules()}
+    names = {}
+    for node in joint.graph.find_nodes(
+        op="call_function", target=_fake_quantize
+    ):
+        fake_quant_attr, operand = node.args
+        module = joint.get_submodule(fake_quant_attr.target)
+        names[fake_quant_attr.target] = paths[id(module)]
+        if (
+            isinstance(module, FusedAmaxObsFakeQuantize)
+            and module.amax_history.numel() == 0
+        ):
+            # As the fake-quant's first call starts it.
+            module.start_history((), operand.meta["val"].dtype)
+    program = copy.deepcopy(joint)
     graph = program.graph
     # The joint graph takes its inputs as two lists, primals and tangents.
     graph._codegen = CodeGen()
@@ -744,6 +1003,7 @@ def gradient_program(model: nn.Module) -> GraphModule:
             graph.call_function(aten.copy_.default, (buffer, total))
     output.args = (tuple(loss),)
     graph.eliminate_dead_code()
+    _lower_fake_quants(program, names)
     program.recompile()
     return program
 

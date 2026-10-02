@@ -32,6 +32,7 @@ from voyager_compiler.codegen.node_info import (
     get_anchor_node,
     get_arg_value,
     get_node_to_key_map,
+    is_full_reduction,
     is_fully_connected,
     is_gemm_op,
     is_pooling,
@@ -556,9 +557,10 @@ def vector_tile_latency(node, tile_sizes, tiled_shapes, tiling, config):
     lat = config.access_latency_cycles
     # ``_sweep_cycles`` reads the store off the front.  An operand's dims
     # right-align onto the output's, the way the tile shapes were built
-    # (``compute_tiled_shape``).
-    dmas = [(_transfer_cost(out_shape, out_bytes, lat, bpc), num_tiles)]
-    traffic = num_tiles * out_bytes
+    # (``compute_tiled_shape``).  A reduction to one value stores it once.
+    stores = 1 if is_full_reduction(anchor) else num_tiles
+    dmas = [(_transfer_cost(out_shape, out_bytes, lat, bpc), stores)]
+    traffic = stores * out_bytes
     # A reduction that drops its reduced dims reads them whole.
     grid = reduced_input_grid(anchor)
     for n, shp in tiled_shapes.items():

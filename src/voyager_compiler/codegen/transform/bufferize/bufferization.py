@@ -37,6 +37,7 @@ from voyager_compiler.codegen.node_info import (
     is_elementwise_op,
     is_gemm_op,
     is_axis_reduction,
+    is_full_reduction,
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
@@ -993,6 +994,7 @@ def bufferize_graph(
             elif (
                 is_elementwise_op(anchor)
                 or is_axis_reduction(anchor)
+                or is_full_reduction(anchor)
                 or anchor.target in _REDUCTION_POINTWISE_OPS
                 or anchor.target in _RELAYOUT_POINTWISE_OPS
             ):

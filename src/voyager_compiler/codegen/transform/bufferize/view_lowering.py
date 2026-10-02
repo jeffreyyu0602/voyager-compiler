@@ -248,12 +248,17 @@ def _fold_slice(model: GraphModule, node: Node) -> None:
 def _storage_of(node):
     """The builder-created output ``alloc`` whose bytes ``node`` names, walked
     through result handles and views; ``None`` when there is none to redirect
-    (a parameter, or a shape this walk does not cover)."""
+    (a parameter, a window onto part of a buffer -- one an earlier join
+    already placed -- or a shape this walk does not cover)."""
     while isinstance(node, Node):
         if node.op != "call_function":
             return None
         if node.target is _ALLOC:
             return node
+        if node.target is _SUBVIEW and (
+            node.value.numel() != node.args[0].value.numel()
+        ):
+            return None
         if node.target is operator.getitem:
             src, index = node.args
             if isinstance(src, Node) and src.target is _WHILE_LOOP:
