@@ -496,6 +496,8 @@ def pad_matrix_op_dimensions(
         input, weight = node.args[0], node.args[1]
         ic = input.shape[1] if is_conv else input.shape[-1]
         oc = weight.shape[-1] if is_mm else weight.shape[0]
+        # Retain logical channels for useful-work reporting after padding.
+        node.meta.setdefault("logical_channels", (ic, oc))
 
         # Skip CNN first layer with input channels equal to 3
         if skip_first_conv and is_conv and ic == 3:

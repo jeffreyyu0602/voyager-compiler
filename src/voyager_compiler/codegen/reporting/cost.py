@@ -197,6 +197,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=matrix_units,
             utilization=op_utilization(node, matrix_units, ideal, cost),
+            useful_work_fraction=node.meta.get("useful_work_fraction", 1.0),
         )
 
     if is_gemm_op(anchor):
@@ -223,6 +224,7 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
             },
             units=units,
             utilization=op_utilization(node, units, ideal, cost),
+            useful_work_fraction=node.meta.get("useful_work_fraction", 1.0),
         )
 
     # Vector op: work is the larger of input / output element count -- a
