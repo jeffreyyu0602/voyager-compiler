@@ -1132,6 +1132,7 @@ def prepare_from_args(
     example_args: Tuple[Any, ...] = (),
     example_kwargs: Optional[Dict[str, Any]] = None,
     dynamic_shapes=None,
+    quantizer: Optional[XNNPACKQuantizer] = None,
 ) -> nn.Module:
     """Prepare ``model`` for training as the quantization flags ask.
 
@@ -1148,6 +1149,8 @@ def prepare_from_args(
         example_args: Positional inputs to export with.
         example_kwargs: Keyword inputs to export with.
         dynamic_shapes: Dynamic dimensions of the inputs.
+        quantizer: Quantizer to prepare with instead of the one the flags
+            build, e.g. one that leaves some GEMMs unquantized.
 
     Returns:
         The prepared model: ``model`` itself with ``--error``, otherwise
@@ -1155,13 +1158,14 @@ def prepare_from_args(
     """
     if args.bf16:
         model.bfloat16()
-    quantizer = get_default_quantizer(
-        input_activation=args.activation,
-        weight=args.weight,
-        bias=args.bias,
-        error=args.error,
-        force_scale_power_of_two=args.force_scale_power_of_two,
-    )
+    if quantizer is None:
+        quantizer = get_default_quantizer(
+            input_activation=args.activation,
+            weight=args.weight,
+            bias=args.bias,
+            error=args.error,
+            force_scale_power_of_two=args.force_scale_power_of_two,
+        )
     if args.error is not None:
         return prepare_training(
             model.train(),
