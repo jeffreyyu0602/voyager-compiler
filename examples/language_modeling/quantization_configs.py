@@ -9,150 +9,153 @@ from voyager_compiler import QuantizationSpec, QuantizationConfig
 logger = logging.getLogger(__name__)
 
 
-# Microscaling geometry every spec shares: 64 elements to a block, taken
-# along the contraction axis.  The value operand of an attention matmul
-# contracts along -2, so it blocks there.
-BLOCKING = "qs=microscaling,bs=64"
+def mx_spec(dtype, scale, axis, block_size=64):
+    """The spec of ``dtype`` in 64-element microscaling blocks.
 
-# The same, with each block scale itself quantized to fp8.  A config
-# named `_scale_bf16` is the one that leaves the scale alone.
-MICROSCALING = f"{BLOCKING},scale=fp8_e5m3"
+    Args:
+        dtype: Element dtype, e.g. ``int8`` or ``lut4_to_int6``.
+        scale: How each block's scale is stored, ``MX_POT_SCALE`` or
+            ``MX_E5M3_SCALE``.
+        axis: Axis the blocks run along, the operand's contraction axis.
 
-# MXNF4: a 4-bit index into 16 int6 entries, seeded with NormalFloat.
-MXNF4_SPEC = f"lut4_to_int6,{MICROSCALING},ax=-1"
-MXNF4_VALUE_SPEC = f"lut4_to_int6,{MICROSCALING},ax=-2"
+    Returns:
+        The spec string.
+    """
+    return f"{dtype},qs=microscaling,bs={block_size},{scale},ax={axis}"
 
-# Plain 6-bit integers, which the attention operands carry in the variants
-# that quantize them separately from the linears.
-INT6_SPEC = f"int6,{MICROSCALING},ax=-1"
-INT6_VALUE_SPEC = f"int6,{MICROSCALING},ax=-2"
 
-# Plain integers, fp4 and the int6 lookup table with the block scale a
-# power of two (``fp8_e8m0``); the arms in ``POWER_OF_TWO_SCALE`` build
-# their quantizer with that flag.
-INT8_SPEC = f"int8,{BLOCKING},ax=-1"
-INT8_VALUE_SPEC = f"int8,{BLOCKING},ax=-2"
-INT4_SPEC = f"int4,{BLOCKING},ax=-1"
-INT4_VALUE_SPEC = f"int4,{BLOCKING},ax=-2"
-FP4_SPEC = f"fp4_e2m1,{BLOCKING},ax=-1"
-FP4_VALUE_SPEC = f"fp4_e2m1,{BLOCKING},ax=-2"
-NF4_SPEC = f"lut4_to_int6,{BLOCKING},ax=-1"
-NF4_VALUE_SPEC = f"lut4_to_int6,{BLOCKING},ax=-2"
+def uniform_config(dtype, scale):
+    """A config quantizing every linear and matmul operand to ``dtype``.
 
-# 8-bit integer activations beside 4-bit lookup-table weights with int8
-# entries.
-MXINT8_ACT_SPEC = f"int8,{MICROSCALING},ax=-1"
-MXINT8_VALUE_SPEC = f"int8,{MICROSCALING},ax=-2"
-MXNF4_INT8_SPEC = f"lut4_to_int8,{MICROSCALING},ax=-1"
+    A matmul's right-hand operand contracts along -2, so it blocks there.
+
+    Args:
+        dtype: Element dtype of every operand.
+        scale: How each block's scale is stored.
+
+    Returns:
+        The config, as ``QUANTIZATION_CONFIGS`` holds it.
+    """
+    lhs, rhs = mx_spec(dtype, scale, -1), mx_spec(dtype, scale, -2)
+    return {
+        torch.nn.Linear: [lhs, lhs],
+        torch.ops.aten.matmul.default: [lhs, rhs],
+    }
+
+
+MX_POT_SCALE = "power_2_scale=1"
+MX_E5M3_SCALE = "scale=fp8_e5m3"
+MXINT6_E5M3_SPEC = mx_spec("int6", MX_E5M3_SCALE, -1)
+MXINT6_E5M3_RHS_SPEC = mx_spec("int6", MX_E5M3_SCALE, -2)
+MXLUT4_INT6_E5M3_SPEC = mx_spec("lut4_to_int6", MX_E5M3_SCALE, -1)
+MXLUT4_INT6_E5M3_RHS_SPEC = mx_spec("lut4_to_int6", MX_E5M3_SCALE, -2)
 
 QUANTIZATION_CONFIGS = {}
 
-# Reference points.  ``bf16`` quantizes nothing; ``mxint8``, ``mxint4`` and
-# ``mxfp4`` are the plain MX deployments with power-of-two block scales
-# (``POWER_OF_TWO_SCALE``), and ``mxnf4_pot`` is ``mxnf4`` under that same
-# scale; ``mxnf4_int8`` keeps 4-bit weights through an 8-bit codebook under
-# 8-bit activations.
 QUANTIZATION_CONFIGS["bf16"] = {
     torch.nn.Linear: [None, None],
     torch.ops.aten.matmul.default: [None, None],
 }
-QUANTIZATION_CONFIGS["mxint8"] = {
-    torch.nn.Linear: [INT8_SPEC, INT8_SPEC],
-    torch.ops.aten.matmul.default: [INT8_SPEC, INT8_VALUE_SPEC],
-}
-QUANTIZATION_CONFIGS["mxint4"] = {
-    torch.nn.Linear: [INT4_SPEC, INT4_SPEC],
-    torch.ops.aten.matmul.default: [INT4_SPEC, INT4_VALUE_SPEC],
-}
-QUANTIZATION_CONFIGS["mxfp4"] = {
-    torch.nn.Linear: [FP4_SPEC, FP4_SPEC],
-    torch.ops.aten.matmul.default: [FP4_SPEC, FP4_VALUE_SPEC],
-}
-QUANTIZATION_CONFIGS["mxnf4_pot"] = {
-    torch.nn.Linear: [NF4_SPEC, NF4_SPEC],
-    torch.ops.aten.matmul.default: [NF4_SPEC, NF4_VALUE_SPEC],
-}
-QUANTIZATION_CONFIGS["mxnf4_int8"] = {
-    torch.nn.Linear: [MXINT8_ACT_SPEC, MXNF4_INT8_SPEC],
-    torch.ops.aten.matmul.default: [MXINT8_ACT_SPEC, MXINT8_VALUE_SPEC],
-}
-POWER_OF_TWO_SCALE = {"mxint8", "mxint4", "mxfp4", "mxnf4_pot"}
 
-QUANTIZATION_CONFIGS["mxnf4"] = {
-    torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [MXNF4_SPEC, MXNF4_VALUE_SPEC],
+QUANTIZATION_CONFIGS["mxint8_pot"] = uniform_config("int8", MX_POT_SCALE)
+QUANTIZATION_CONFIGS["mxint4_pot"] = uniform_config("int4", MX_POT_SCALE)
+QUANTIZATION_CONFIGS["mxfp4_pot"] = uniform_config("fp4_e2m1", MX_POT_SCALE)
+QUANTIZATION_CONFIGS["mxlut4_int6_pot"] = uniform_config(
+    "lut4_to_int6", MX_POT_SCALE
+)
+
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3"] = {
+    **uniform_config("lut4_to_int6", MX_E5M3_SCALE),
     # Flash attention (``--attn_implementation sdpa``): the specs the two
     # attention matmuls take, on the one node that stands for both.
     torch.ops.aten.scaled_dot_product_attention.default: [
-        MXNF4_SPEC,
-        MXNF4_VALUE_SPEC,
+        MXLUT4_INT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_RHS_SPEC,
     ],
 }
 
 # Attribution configs: quantize one side at a time, so the weight term, the
 # activation term, and the interaction between them can be separated.
-QUANTIZATION_CONFIGS["w4a16"] = {
-    torch.nn.Linear: [None, MXNF4_SPEC],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_w_only"] = {
+    torch.nn.Linear: [None, MXLUT4_INT6_E5M3_SPEC],
     torch.ops.aten.matmul.default: [None, None],
 }
-QUANTIZATION_CONFIGS["w16a4"] = {
-    torch.nn.Linear: [MXNF4_SPEC, None],
-    torch.ops.aten.matmul.default: [MXNF4_SPEC, MXNF4_VALUE_SPEC],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_a_only"] = {
+    torch.nn.Linear: [MXLUT4_INT6_E5M3_SPEC, None],
+    torch.ops.aten.matmul.default: [
+        MXLUT4_INT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_RHS_SPEC,
+    ],
 }
 
 # Attention operands at plain int6 rather than through the lookup table.
-QUANTIZATION_CONFIGS["mxnf4_attn_int6"] = {
-    torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_attn_int6"] = {
+    torch.nn.Linear: [MXLUT4_INT6_E5M3_SPEC, MXLUT4_INT6_E5M3_SPEC],
+    torch.ops.aten.matmul.default: [MXINT6_E5M3_SPEC, MXINT6_E5M3_RHS_SPEC],
 }
 
 # ... and with `lm_head` reading an int6 activation as well.
-QUANTIZATION_CONFIGS["mxnf4_attn_head_int6"] = {
-    torch.nn.Linear: [MXNF4_SPEC, MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
-    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_attn_head_int6"] = {
+    torch.nn.Linear: [MXLUT4_INT6_E5M3_SPEC, MXLUT4_INT6_E5M3_SPEC],
+    torch.ops.aten.matmul.default: [MXINT6_E5M3_SPEC, MXINT6_E5M3_RHS_SPEC],
+    ("lm_head", torch.ops.aten.linear.default, 0): [
+        MXINT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_SPEC,
+    ],
 }
 
 # NF4 weights under int6 activations everywhere
-QUANTIZATION_CONFIGS["mxnf4_int6"] = {
-    torch.nn.Linear: [INT6_SPEC, MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_a_int6"] = {
+    torch.nn.Linear: [MXINT6_E5M3_SPEC, MXLUT4_INT6_E5M3_SPEC],
+    torch.ops.aten.matmul.default: [MXINT6_E5M3_SPEC, MXINT6_E5M3_RHS_SPEC],
 }
 
 # Outlier filtering on the linears only: each activation sets aside its
 # largest 1% before quantizing.  Attention and the `lm_head` activation stay
-# dense at int6, as in `mxnf4_attn_head_int6`, which is this config's dense
-# twin.
-QUANTIZATION_CONFIGS["mxnf4_outlier"] = {
-    torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [INT6_SPEC, INT6_VALUE_SPEC],
-    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+# dense at int6, as in `mxlut4_int6_e5m3_attn_head_int6`, which is this
+# config's dense twin.
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_outlier"] = {
+    torch.nn.Linear: [
+        f"{MXLUT4_INT6_E5M3_SPEC},opct=0.01",
+        MXLUT4_INT6_E5M3_SPEC,
+    ],
+    torch.ops.aten.matmul.default: [MXINT6_E5M3_SPEC, MXINT6_E5M3_RHS_SPEC],
+    ("lm_head", torch.ops.aten.linear.default, 0): [
+        MXINT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_SPEC,
+    ],
 }
 
 # The same linears, plus the attention key and value: the matmuls' second
 # operand sets aside its largest 1% too, with the attention operands kept at
 # NormalFloat.  A side-stream on the column operand makes the lowering swap
 # each matmul so the CSR lands on the row side, transposing the scores.
-QUANTIZATION_CONFIGS["mxnf4_outlier_kv"] = {
-    torch.nn.Linear: [f"{MXNF4_SPEC},opct=0.01", MXNF4_SPEC],
-    torch.ops.aten.matmul.default: [
-        MXNF4_SPEC,
-        f"{MXNF4_VALUE_SPEC},opct=0.01",
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_outlier_kv"] = {
+    torch.nn.Linear: [
+        f"{MXLUT4_INT6_E5M3_SPEC},opct=0.01",
+        MXLUT4_INT6_E5M3_SPEC,
     ],
-    ("lm_head", torch.ops.aten.linear.default, 0): [INT6_SPEC, MXNF4_SPEC],
+    torch.ops.aten.matmul.default: [
+        MXLUT4_INT6_E5M3_SPEC,
+        f"{MXLUT4_INT6_E5M3_RHS_SPEC},opct=0.01",
+    ],
+    ("lm_head", torch.ops.aten.linear.default, 0): [
+        MXINT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_SPEC,
+    ],
 }
 
 # The attention side-stream on the row operand instead: Q carries it on the
 # first matmul and P @ V has none, so no matmul is swapped.
-QUANTIZATION_CONFIGS["mxnf4_outlier_q"] = {
-    **QUANTIZATION_CONFIGS["mxnf4_outlier_kv"],
+QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_outlier_q"] = {
+    **QUANTIZATION_CONFIGS["mxlut4_int6_e5m3_outlier_kv"],
     ("self_attn", torch.ops.aten.matmul.default, 0): [
-        f"{MXNF4_SPEC},opct=0.01",
-        MXNF4_VALUE_SPEC,
+        f"{MXLUT4_INT6_E5M3_SPEC},opct=0.01",
+        MXLUT4_INT6_E5M3_RHS_SPEC,
     ],
     ("self_attn", torch.ops.aten.matmul.default, 1): [
-        MXNF4_SPEC,
-        MXNF4_VALUE_SPEC,
+        MXLUT4_INT6_E5M3_SPEC,
+        MXLUT4_INT6_E5M3_RHS_SPEC,
     ],
 }
 
@@ -301,17 +304,9 @@ def annotate_kivi_cache(gm, bits=KIVI_CACHE_BITS):
     return count
 
 
-def set_qconfig(quantizer, qconfigs, force_scale_power_of_two=False):
+def set_qconfig(quantizer, qconfigs):
     def make_qspec(spec):
-        if spec is None:
-            return None
-        quant_spec = QuantizationSpec.from_str(spec)
-        quant_spec.observer_or_fake_quant_ctr = (
-            quant_spec.observer_or_fake_quant_ctr.with_args(
-                force_scale_power_of_two=force_scale_power_of_two,
-            )
-        )
-        return quant_spec
+        return None if spec is None else QuantizationSpec.from_str(spec)
 
     for key, qspec in qconfigs.items():
         if qspec is None:

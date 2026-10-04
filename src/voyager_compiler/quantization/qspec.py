@@ -40,6 +40,7 @@ _ABBREV_MAP = {
     "ahl": "amax_history_len",
     "ax": "ch_axis",
     "bs": "block_size",
+    "pot": "power_2_scale",
     "scale": "scale_dtype",
     "othr": "outlier_threshold",
     "opct": "outlier_pct",
@@ -54,6 +55,12 @@ def _parse_int_or_list(value: str):
     return int(value)
 
 
+def _parse_bool(value: str) -> bool:
+    if value not in ("0", "1", "false", "true"):
+        raise ValueError(f"Expected 0, 1, false or true but got '{value}'")
+    return value in ("1", "true")
+
+
 _PARAMS_TYPE = {
     "quant_min": float,
     "quant_max": float,
@@ -61,6 +68,7 @@ _PARAMS_TYPE = {
     "amax_history_len": int,
     "ch_axis": _parse_int_or_list,
     "block_size": _parse_int_or_list,
+    "power_2_scale": _parse_bool,
     "scale_dtype": str,
     "outlier_threshold": float,
     "outlier_pct": float,

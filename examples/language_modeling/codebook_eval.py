@@ -22,7 +22,7 @@ one fixed threshold and the filtered distribution behind it.
 
 Examples:
     # fit + compensate + score in one process (loss-aware, per-head Q/K/V)
-    python codebook_eval.py --gpu 1 --config mxnf4 --fit \\
+    python codebook_eval.py --gpu 1 --config mxlut4_int6_e5m3 --fit \\
         --weighting fisher_activations \\
         --granularity '|q:-1,1,1' '|k:-1,1,1' --gptq --shrink \\
         --fit_windows 128 --gptq_windows 480 --c4_docs 4000
@@ -32,14 +32,15 @@ Examples:
         --dump codebooks/fitted.json
 
     # install dumped tables, compensate, and score
-    python codebook_eval.py --gpu 1 --config mxnf4 --codebooks \\
+    python codebook_eval.py --gpu 1 --config mxlut4_int6_e5m3 --codebooks \\
         codebooks/fitted.json --gptq --shrink --gptq_windows 480
     # the ppl_2048 recipe: per-head attention tables fitted on a seeded
     # spread of 512 windows (after the thresholds freeze, for an outlier
     # config), GPTQ + shrink, scored at 2048/2048
-    python codebook_eval.py --gpu 1 --config mxnf4_outlier --fit --spread \\
-        --seed 0 --fit_windows 512 --granularity '|q:-1,1,1' '|k:-1,1,1' \\
-        '|v:-1,1,1' --weight_by v_proj --gptq --shrink --gptq_windows 480 \\
+    python codebook_eval.py --gpu 1 --config mxlut4_int6_e5m3_outlier \\
+        --fit --spread --seed 0 --fit_windows 512 \\
+        --granularity '|q:-1,1,1' '|k:-1,1,1' '|v:-1,1,1' --weight_by v_proj \\
+        --gptq --shrink --gptq_windows 480 \\
         --c4_docs 4000 --max_length 2048 --stride 2048 --dump tables.json
 """
 
@@ -122,7 +123,7 @@ def parse_args(parser=None):
     parser.add_argument("--gpu", type=int, default=1)
     parser.add_argument(
         "--config",
-        default="mxnf4",
+        default="mxlut4_int6_e5m3",
         help=(
             "Scheme giving the block size, contraction axis and range to fit "
             "into and compensate against. Its tables are only a seed."
@@ -382,7 +383,7 @@ def main(args):
 
     quantizer = get_default_quantizer()
     quantizer.set_module_name("model.rotary_emb", None)
-    set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.config], False)
+    set_qconfig(quantizer, QUANTIZATION_CONFIGS[args.config])
     example = torch.randint(
         0, model.config.vocab_size, (1, WINDOW), device=device
     )

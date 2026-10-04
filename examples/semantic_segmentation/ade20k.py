@@ -139,7 +139,6 @@ def main(args):
         input_activation=args.activation,
         weight=args.weight,
         bias=args.bias,
-        force_scale_power_of_two=args.force_scale_power_of_two,
     )
     example_args = (dataset[0]["pixel_values"].to(device),)
     model = prepare_pt2e(model, quantizer, example_args)

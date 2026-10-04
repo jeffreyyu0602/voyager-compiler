@@ -38,6 +38,7 @@ Abbreviations and their full names:
   - ahl: amax_history_len
   - ax: ch_axis
   - bs: block_size
+  - pot: power_2_scale
 
 Example usage:
   --params int8,qscheme=qscheme1,quant_max=127,amax_history_len=50,\
@@ -53,7 +54,18 @@ posit8_1)
   - amax_history_len (int): Length of the amax history (default: 50)
   - ch_axis (int): Channel axis (default: 0)
   - block_size (int): Block size (default: 32)
+  - power_2_scale (0/1): Round each scale to a power of two (default: 0)
 """
+
+
+def _gemm_kinds(value: str):
+    """The GEMM kinds a comma-separated list names."""
+    kinds = tuple(value.split(","))
+    if not set(kinds) <= {"fprop", "dgrad", "wgrad"}:
+        raise argparse.ArgumentTypeError(
+            f"{value}: expected a subset of fprop,dgrad,wgrad"
+        )
+    return kinds
 
 
 def add_quantization_args(parser=None):
@@ -84,6 +96,17 @@ def add_quantization_args(parser=None):
         ),
     )
     parser.add_argument(
+        "--random_hadamard_transform",
+        type=_gemm_kinds,
+        default=(),
+        help=(
+            "GEMM kinds whose two operands are rotated by a random Hadamard "
+            "transform along their contraction axis before they are "
+            "quantized: a comma-separated subset of fprop, dgrad, wgrad "
+            "(dgrad and wgrad need --error). Microscaling specs only."
+        ),
+    )
+    parser.add_argument(
         "--bias",
         default=None,
         help=("Bias quantization specification. Format same as activation."),
@@ -92,11 +115,6 @@ def add_quantization_args(parser=None):
         "--residual",
         default=None,
         help="Residual quantization specification. Format same as activation.",
-    )
-    parser.add_argument(
-        "--force_scale_power_of_two",
-        action="store_true",
-        help="Whether to force the scaling factor to be a power of two.",
     )
     parser.add_argument(
         "--calibration_steps",

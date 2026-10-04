@@ -111,7 +111,6 @@ def prepare_whisper(model, args, features):
         input_activation=args.activation,
         weight=args.weight,
         bias=args.bias,
-        force_scale_power_of_two=args.force_scale_power_of_two,
     )
     encoder = WhisperEncoder(model).eval()
     states = encoder(features)

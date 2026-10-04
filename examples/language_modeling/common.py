@@ -263,7 +263,7 @@ def add_quantization_args(parser):
         choices=sorted(QUANTIZATION_CONFIGS),
         help=(
             "Scheme for the decode graph when it differs from --qconfig, "
-            "e.g. mxnf4_int6 to decode with int6 activations"
+            "e.g. mxlut4_int6_e5m3_a_int6 to decode with int6 activations"
         ),
     )
     parser.add_argument(

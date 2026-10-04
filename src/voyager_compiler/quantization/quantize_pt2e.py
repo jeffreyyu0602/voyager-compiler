@@ -32,6 +32,7 @@ from voyager_compiler.quantization.fake_quantize import (
     DirectCastFakeQuantize,
     GroupWiseAffineFakeQuantize,
     MXFakeQuantize,
+    RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
     _FreezableFlags,
     get_quantization_map,
@@ -83,6 +84,19 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
     return observer_or_fake_quant_ctr.with_args(**kwargs)()
 
 
+# Spec fields torchao's implicit sharing does not compare, but that the
+# readers of one tensor must agree on to share a fake-quant.
+_SHARED_FIELDS = (
+    "amax_history_len",
+    "block_size",
+    "power_2_scale",
+    "scale_dtype",
+    "outlier_threshold",
+    "outlier_pct",
+    "rht_axis",
+)
+
+
 def _get_obs_or_fq_map(
     edge_or_node_to_group_id: Dict[EdgeOrNode, int],
     edge_or_node_to_qspec: Dict[EdgeOrNode, QuantizationSpecBase],
@@ -93,9 +107,13 @@ def _get_obs_or_fq_map(
     same observer or fake quant instances
     """
     obs_or_fq_map: Dict[EdgeOrNode, ObserverOrFakeQuantize] = {}
-    group_id_to_obs_or_fq: Dict[int, ObserverOrFakeQuantize] = {}
+    group_id_to_obs_or_fq: Dict[Tuple, ObserverOrFakeQuantize] = {}
     for edge_or_node, qspec in edge_or_node_to_qspec.items():
-        group_id = edge_or_node_to_group_id[edge_or_node]
+        # torchao's union-find groups readers by its own spec attributes
+        # only; split each group by the fields it does not compare.
+        group_id = (edge_or_node_to_group_id[edge_or_node],) + tuple(
+            getattr(qspec, field, None) for field in _SHARED_FIELDS
+        )
         if group_id not in group_id_to_obs_or_fq:
             # TODO: maybe edge_or_node_to_qspec should be
             # edge_or_node_to_root_qspec, this will simplify the implementation
@@ -121,6 +139,7 @@ def get_microscaling_quantizer(
     activation: Optional[QuantizationSpec],
     weight: Optional[QuantizationSpec],
     error: Optional[QuantizationSpec] = None,
+    random_hadamard_transform: Tuple[str, ...] = (),
 ):
     # Microscaling performs quantization along the reduction dimension
     act_qspec = _set_ch_axis(activation, 1)
@@ -130,7 +149,12 @@ def get_microscaling_quantizer(
     act_qspec = _set_ch_axis(activation, -1)
     weight_qspec = _set_ch_axis(weight, -1)
     qconfig_linear = QuantizationConfig(
-        act_qspec, None, weight_qspec, None, error=error
+        act_qspec,
+        None,
+        weight_qspec,
+        None,
+        error=error,
+        random_hadamard_transform=random_hadamard_transform,
     )
 
     act0_qspec = _set_ch_axis(activation, -1)
@@ -142,6 +166,7 @@ def get_microscaling_quantizer(
         act1_qspec if error is None else weight,
         None,
         error=error,
+        random_hadamard_transform=random_hadamard_transform,
     )
 
     return (
@@ -200,33 +225,13 @@ def derive_bias_qparams_fn(
     return act_scale * weight_scale.flatten()
 
 
-def make_spec(
-    spec_str: str, force_scale_power_of_two: bool
-) -> QuantizationSpec:
-    """Parse ``spec_str`` into a spec whose fake-quant takes the scale rule.
-
-    Args:
-        spec_str: Comma-separated spec string, e.g. ``int8,qs=microscaling``.
-        force_scale_power_of_two: Whether the fake-quant rounds each scale
-            to a power of two.
-
-    Returns:
-        The parsed spec.
-    """
-    spec = QuantizationSpec.from_str(spec_str)
-    spec.observer_or_fake_quant_ctr = spec.observer_or_fake_quant_ctr.with_args(
-        force_scale_power_of_two=force_scale_power_of_two,
-    )
-    return spec
-
-
 def get_default_quantizer(
     input_activation: Optional[str] = None,
     output_activation: Optional[str] = None,
     weight: Optional[str] = None,
     bias: Optional[str] = None,
     error: Optional[str] = None,
-    force_scale_power_of_two: bool = False,
+    random_hadamard_transform: Tuple[str, ...] = (),
     **kwargs: Any,
 ) -> XNNPACKQuantizer:
     """Build a quantizer for conv2d, linear and matmul from spec strings.
@@ -241,28 +246,32 @@ def get_default_quantizer(
         error: Spec for gradients, or None.  Setting it builds the quantizer
             of ``prepare_training``, whose GEMM configs give each operand
             the spec of its type.
-        force_scale_power_of_two: Whether every scale is a power of two.
+        random_hadamard_transform: GEMM kinds -- ``"fprop"``, ``"dgrad"``,
+            ``"wgrad"`` -- whose operands are rotated before quantizing;
+            microscaling specs only.
         **kwargs: Ignored.
 
     Returns:
         The configured quantizer.
+
+    Raises:
+        ValueError: ``random_hadamard_transform`` is set with specs that are
+            not microscaling.
     """
     qschemes = []
     if input_activation is not None:
-        input_activation = make_spec(input_activation, force_scale_power_of_two)
+        input_activation = QuantizationSpec.from_str(input_activation)
         qschemes.append(input_activation.qscheme)
 
     if output_activation is not None:
-        output_activation = make_spec(
-            output_activation, force_scale_power_of_two
-        )
+        output_activation = QuantizationSpec.from_str(output_activation)
 
     if weight is not None:
-        weight = make_spec(weight, force_scale_power_of_two)
+        weight = QuantizationSpec.from_str(weight)
         qschemes.append(weight.qscheme)
 
     if error is not None:
-        error = make_spec(error, force_scale_power_of_two)
+        error = QuantizationSpec.from_str(error)
 
     qschemes = [qs for qs in qschemes if qs is not None]
     if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
@@ -281,10 +290,14 @@ def get_default_quantizer(
         )
 
     if QScheme.MICROSCALING in qschemes:
-        assert (
-            len(set(qschemes)) == 1
-        ), f"Quantization scheme {qschemes[0]} does not work with {qschemes[1]}"
-        return get_microscaling_quantizer(input_activation, weight, error)
+        return get_microscaling_quantizer(
+            input_activation, weight, error, random_hadamard_transform
+        )
+
+    if random_hadamard_transform:
+        raise ValueError(
+            "The random Hadamard transform supports microscaling specs only"
+        )
 
     if weight is not None and weight.qscheme == QScheme.PER_CHANNEL_SYMMETRIC:
         assert weight.ch_axis == 0, (
@@ -682,7 +695,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             activation_post_process.ch_axis,
             activation_post_process.block_size,
             activation_post_process.quant_max,
-            activation_post_process.force_scale_power_of_two,
+            activation_post_process.power_2_scale,
             activation_post_process.scale_qmap,
         )
 
@@ -720,7 +733,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 activation_post_process.ch_axis,
                 activation_post_process.block_size,
                 activation_post_process.quant_max,
-                activation_post_process.force_scale_power_of_two,
+                activation_post_process.power_2_scale,
                 scale_qmap,
                 quant_code,
             ]
@@ -746,7 +759,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
         scale_dtype = (
             "fp8_e8m0"
-            if activation_post_process.force_scale_power_of_two
+            if activation_post_process.power_2_scale
             else activation_post_process.scale_dtype
         )
 
@@ -772,7 +785,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     quantized_node.meta["dtype"] = activation_post_process.dtype
 
-    if activation_post_process.force_scale_power_of_two:
+    if activation_post_process.power_2_scale:
         scale_node.meta["dtype"] = "fp8_e8m0"
     elif activation_post_process.scale_dtype is not None:
         scale_node.meta["dtype"] = activation_post_process.scale_dtype
@@ -823,7 +836,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 kwargs.setdefault("probs_code", quant_code)
                 kwargs.setdefault(
                     "force_scale_power_of_two",
-                    activation_post_process.force_scale_power_of_two,
+                    activation_post_process.power_2_scale,
                 )
             else:
                 kwargs.setdefault("weight_code", kwarg1)
@@ -1495,6 +1508,13 @@ def convert_pt2e(
         assert mod is not None
         if not isinstance(mod, FakeQuantizeBase):
             continue
+        if (
+            isinstance(mod, RandomHadamardTransform)
+            and mod.rht_axis is not None
+        ):
+            raise NotImplementedError(
+                "The random Hadamard transform has no lowering yet"
+            )
         if isinstance(mod, MXFakeQuantize):
             _replace_observer_with_quantize_mx_node_decomposed(
                 model, node, modules

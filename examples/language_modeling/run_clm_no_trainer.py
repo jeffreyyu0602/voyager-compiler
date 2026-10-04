@@ -214,7 +214,7 @@ def build_quantizer(args, num_layers):
         weight=args.weight,
         bias=args.bias,
         error=args.error,
-        force_scale_power_of_two=args.force_scale_power_of_two,
+        random_hadamard_transform=args.random_hadamard_transform,
     )
     if not args.quantize_lm_head:
         quantizer.set_module_name("lm_head", None)

@@ -522,7 +522,7 @@ def _accumulate(
         block_size=module.block_size,
         quant_max=module.quant_max,
         force_scale_power_of_two=(
-            getattr(module, "force_scale_power_of_two", False)
+            getattr(module, "power_2_scale", False)
             if quantized_scale
             else False
         ),

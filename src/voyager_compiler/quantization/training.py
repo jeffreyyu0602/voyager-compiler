@@ -63,6 +63,7 @@ from voyager_compiler.export_utils import (
 from voyager_compiler.quantization.fake_quantize import (
     FusedAmaxObsFakeQuantize,
     MXFakeQuantize,
+    RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
 )
 from voyager_compiler.quantization.quantize_pt2e import (
@@ -119,8 +120,12 @@ def _quantized_once(spec: QuantizationSpec) -> bool:
 
     A per-tensor scale, a plain cast, or blocks spanning both of a matrix's
     axes quantize a matrix and its transpose alike, so one quantization
-    serves every GEMM reading the tensor.
+    serves every GEMM reading the tensor -- unless it is rotated along an
+    axis first.
     """
+    # A bias's derived spec has no rotation.
+    if getattr(spec, "rht_axis", None) is not None:
+        return False
     if spec.qscheme in _BLOCKS:
         return isinstance(spec.ch_axis, tuple) and len(spec.ch_axis) > 1
     return spec.qscheme in (None, QScheme.PER_TENSOR_SYMMETRIC)
@@ -285,11 +290,15 @@ def _unflatten_gemms(joint: GraphModule) -> None:
 
 
 def _tag_operands(joint: GraphModule) -> Set[Node]:
-    """Tag each linear and matmul operand of the joint graph with its type.
+    """Tag each linear and matmul of the joint graph with its operand types
+    and its kind.
 
     ``meta["operand_types"]`` holds a GEMM's two operand types: an error is
     computed from an incoming gradient (a tangent input), a weight views a
-    parameter, and anything else is an activation.
+    parameter, and anything else is an activation.  ``meta["gemm_kind"]``
+    is ``"fprop"`` for a forward GEMM, ``"wgrad"`` for a backward GEMM whose
+    result reaches a parameter's gradient through views and sums only, and
+    ``"dgrad"`` for any other backward GEMM.
 
     Args:
         joint: AOTAutograd's joint graph, tagged in place.
@@ -303,9 +312,28 @@ def _tag_operands(joint: GraphModule) -> Set[Node]:
             node.meta.get("desc"), TangentAOTInput
         ) or not errors.isdisjoint(node.all_input_nodes):
             errors.add(node)
+    output = joint.graph.output_node()
+    pending = [
+        value
+        for value, desc in zip(output.args[0], output.meta["desc"])
+        if isinstance(desc, GradAOTOutput) and value is not None
+    ]
+    wgrads = set()
+    while pending:
+        node = pending.pop()
+        if node.target in _OPS:
+            wgrads.add(node)
+        elif node.target in _VIEWS or node.target is aten.add.Tensor:
+            pending.extend(node.all_input_nodes)
     for gemm in joint.graph.nodes:
         if gemm.target not in _OPS:
             continue
+        if gemm.meta.get("partitioner_tag") != "is_backward":
+            gemm.meta["gemm_kind"] = "fprop"
+        elif gemm in wgrads:
+            gemm.meta["gemm_kind"] = "wgrad"
+        else:
+            gemm.meta["gemm_kind"] = "dgrad"
         kinds = []
         for operand in gemm.args[:2]:
             source = operand
@@ -702,7 +730,7 @@ def _delayed_scale(
     # An amax is never negative, so below infinity is finite.
     finite = call(aten.lt.Scalar, (amax, float("inf")))
     new = call(aten.where.self, (finite, new, scale))
-    if fake_quant.force_scale_power_of_two:
+    if fake_quant.power_2_scale:
         exponent = call(aten.log2.default, (new,))
         exponent = call(aten.ceil.default, (exponent,))
         new = call(aten.pow.Scalar, (2.0, exponent))
@@ -784,8 +812,9 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             in the model.
 
     Raises:
-        NotImplementedError: A fake-quant's scheme has no lowering yet, or a
-            per-tensor quantized tensor is read by an op other than a GEMM.
+        NotImplementedError: A fake-quant's scheme or random Hadamard
+            transform has no lowering yet, or a per-tensor quantized tensor
+            is read by an op other than a GEMM.
     """
     graph = program.graph
     calls = [n for n in graph.nodes if n.target is _fake_quantize]
@@ -827,6 +856,13 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             node.replace_all_uses_with(operand)
             graph.erase_node(node)
             continue
+        if (
+            isinstance(fake_quant, RandomHadamardTransform)
+            and fake_quant.rht_axis is not None
+        ):
+            raise NotImplementedError(
+                "The random Hadamard transform has no lowering yet"
+            )
         if isinstance(fake_quant, MXFakeQuantize):
             # The lowering replaces the call_module form ``prepare`` leaves.
             with graph.inserting_before(node):
@@ -1164,7 +1200,7 @@ def prepare_from_args(
             weight=args.weight,
             bias=args.bias,
             error=args.error,
-            force_scale_power_of_two=args.force_scale_power_of_two,
+            random_hadamard_transform=args.random_hadamard_transform,
         )
     if args.error is not None:
         return prepare_training(

@@ -395,7 +395,7 @@ def dtype_spec(bits: int, group: int) -> Optional[str]:
     if bits == 16:
         return None
     if bits == 8:
-        return f"int8,qs=microscaling,bs={group}"
+        return f"int8,qs=microscaling,bs={group},pot=1"
     if bits == 4:
         return f"fp4_e2m1,qs=microscaling,bs={group},scale=fp8_e5m3"
     raise ValueError(f"unsupported weight/activation bits: {bits}")
@@ -484,7 +484,6 @@ def build_quantizer(cfg: SweepConfig):
     quantizer = get_default_quantizer(
         input_activation=dtype_spec(cfg.act_bits, group),
         weight=dtype_spec(cfg.weight_bits, group),
-        force_scale_power_of_two=max(cfg.act_bits, cfg.weight_bits) >= 8,
     )
     quantizer.set_module_name_object_type_order(
         _ROTARY_SCOPE,

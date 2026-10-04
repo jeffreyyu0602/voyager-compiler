@@ -34,9 +34,11 @@ class QuantizationSpec(QuantizationSpecBase):
     amax_history_len: Optional[int] = None
     ch_axis: Optional[Union[int, List[int]]] = None
     block_size: Optional[Union[int, List[int]]] = None
+    power_2_scale: bool = False
     scale_dtype: Optional[str] = None
     outlier_threshold: Optional[float] = None
     outlier_pct: Optional[float] = None
+    rht_axis: Optional[int] = None
     is_dynamic: bool = False  # required by sharing nodes
 
     @staticmethod

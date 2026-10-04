@@ -282,7 +282,6 @@ def main():
         weight=args.weight,
         bias=args.bias,
         error=args.error,
-        force_scale_power_of_two=args.force_scale_power_of_two,
     )
 
     torch_dtype = torch.bfloat16 if args.bf16 else torch.float32

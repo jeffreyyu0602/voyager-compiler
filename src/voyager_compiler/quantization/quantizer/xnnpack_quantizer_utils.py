@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.ao.quantization.fx.utils import (
@@ -36,15 +36,20 @@ class QuantizationConfig:
     ``meta["operand_types"]``; its operands take ``input_activation``,
     ``weight`` or ``error`` by that type.  Elsewhere a matmul's second
     operand takes ``weight``.
+
+    ``random_hadamard_transform`` names the GEMM kinds -- ``"fprop"``,
+    ``"dgrad"``, ``"wgrad"``, from ``meta["gemm_kind"]``, and ``"fprop"``
+    for a GEMM outside quantized training -- whose two operands are each
+    rotated along their contraction axis before they are quantized, which
+    their microscaling specs carry out.
     """
 
     input_activation: Optional[QuantizationSpec]
     output_activation: Optional[QuantizationSpec]
     weight: Optional[QuantizationSpec]
     bias: Optional[QuantizationSpec]
-    # TODO: remove, since we can use observer_or_fake_quant_ctr to express this
-    is_qat: bool = False
     error: Optional[QuantizationSpec] = None
+    random_hadamard_transform: Tuple[str, ...] = ()
 
 
 def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
@@ -83,6 +88,31 @@ def _typed_specs(node: Node, config: QuantizationConfig, axes):
     return [
         _set_ch_axis(specs[kind], axis)
         for kind, axis in zip(node.meta["operand_types"], axes)
+    ]
+
+
+def _rotated(specs, axes, node: Node, config: QuantizationConfig):
+    """``specs`` rotated along their ``axes`` if ``config`` rotates
+    ``node``'s GEMM kind.
+
+    Args:
+        specs: The GEMM's two operand specs.
+        axes: Each operand's contraction axis.
+        node: The GEMM.
+        config: Names the GEMM kinds that are rotated.
+
+    Returns:
+        The two specs, each with ``rht_axis`` set to its axis if the GEMM is
+        rotated.
+    """
+    if (
+        node.meta.get("gemm_kind", "fprop")
+        not in config.random_hadamard_transform
+    ):
+        return specs
+    return [
+        None if spec is None else replace(spec, rht_axis=axis)
+        for spec, axis in zip(specs, axes)
     ]
 
 
@@ -159,6 +189,9 @@ def _annotate_linear(
             act_spec, weight_spec = _typed_specs(
                 node, quantization_config, (-1, -1)
             )
+        act_spec, weight_spec = _rotated(
+            [act_spec, weight_spec], (-1, -1), node, quantization_config
+        )
 
         if isinstance(quantization_config.bias, DerivedQuantizationSpec):
             bias_qspec = replace(
@@ -273,6 +306,7 @@ def _annotate_matmul(
         specs = [input_act_qspec, weight_qspec]
         if "operand_types" in node.meta:
             specs = _typed_specs(node, quantization_config, (-1, -2))
+        specs = _rotated(specs, (-1, -2), node, quantization_config)
         input_qspec_map = {}
         input_act0 = node.args[0]
         if isinstance(input_act0, Node):

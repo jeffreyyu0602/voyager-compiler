@@ -61,8 +61,8 @@ SCHEME_ARGS = {
         "--calibration_steps 3 --layout_policy systolic"
     ),
     "MXINT8": (
-        "--activation int8,qs=microscaling,bs=16 "
-        "--weight int8,qs=microscaling,bs=16 --force_scale_power_of_two "
+        "--activation int8,qs=microscaling,bs=16,pot=1 "
+        "--weight int8,qs=microscaling,bs=16,pot=1 "
         "--bf16 --layout_policy systolic"
     ),
     "MXNF4": (
@@ -98,8 +98,8 @@ _LLM = (
     "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask "
     + _FP16
 )
-_LLM_MP = _LLM + " --qconfig mxnf4_attn_head_int6"
-_LLM_SPMM = _LLM + " --qconfig mxnf4_outlier"
+_LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
+_LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
 _LLM_SPMM_DB = _LLM_SPMM + " " + _DB

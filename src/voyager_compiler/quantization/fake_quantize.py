@@ -27,13 +27,52 @@ __all__ = [
     "FusedAmaxObsFakeQuantize",
     "GroupWiseAffineFakeQuantize",
     "MXFakeQuantize",
+    "OutlierFilter",
+    "RandomHadamardTransform",
     "_DerivedObserverOrFakeQuantize",
     "entry_levels",
     "fake_quantize_class",
+    "hadamard_matrix",
 ]
 
 
 logger = logging.getLogger(__name__)
+
+# Elements a random Hadamard transform mixes together, as in NVFP4.
+HADAMARD_SIZE = 16
+# The random signs of the transform: Transformer Engine's fixed vector
+# (``get_wgrad_sign_vector``), shared by every operand.
+HADAMARD_SIGNS = (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
+
+
+def hadamard_matrix(device=None) -> torch.Tensor:
+    """The random Hadamard matrix ``diag(signs) @ H / 4``.
+
+    ``H`` is Sylvester's 16x16 Hadamard matrix and ``signs`` is
+    ``HADAMARD_SIGNS``; the matrix is orthogonal.
+
+    Args:
+        device: Where the matrix lives.
+
+    Returns:
+        A float32 ``HADAMARD_SIZE`` x ``HADAMARD_SIZE`` tensor.
+    """
+    matrix = torch.ones(1, 1)
+    while matrix.shape[0] < HADAMARD_SIZE:
+        matrix = torch.cat(
+            [torch.cat([matrix, matrix], 1), torch.cat([matrix, -matrix], 1)]
+        )
+    signs = torch.tensor(HADAMARD_SIGNS, dtype=torch.float)
+    return (signs[:, None] * matrix / math.sqrt(HADAMARD_SIZE)).to(device)
+
+
+def _rotate(x: torch.Tensor, axis: int, matrix: torch.Tensor) -> torch.Tensor:
+    """``x`` with each run of ``HADAMARD_SIZE`` elements along ``axis``
+    multiplied by ``matrix``, computed in float32."""
+    moved = x.movedim(axis, -1)
+    blocks = moved.reshape(*moved.shape[:-1], -1, HADAMARD_SIZE)
+    rotated = (blocks.float() @ matrix).reshape(moved.shape)
+    return rotated.to(x.dtype).movedim(-1, axis)
 
 
 @functools.lru_cache(maxsize=None)
@@ -411,6 +450,137 @@ class _FakeQuantize(_FreezableFlags):
         )
 
 
+class _QuantizeTransform:
+    """The end of the ``pre`` / ``post`` chain, which leaves its input as is.
+
+    A fake-quant's ``forward`` passes its input through ``pre`` before it
+    quantizes and through ``post`` after.  Each transform mixin acts when
+    its spec field is set and hands on to ``super()``: ``pre`` transforms
+    first, ``post`` last, so mixins listed before a scheme's base nest, the
+    first one outermost.
+    """
+
+    def pre(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def post(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class RandomHadamardTransform(_QuantizeTransform):
+    """Rotate the input by ``hadamard_matrix`` before it is quantized and
+    rotate it back after, while fake-quantization is on.
+
+    Args:
+        rht_axis: Axis to rotate along, or None.
+        *args: Forwarded to the scheme's base.
+        **kwargs: Forwarded to the scheme's base.
+    """
+
+    rht_matrix: Optional[torch.Tensor]
+
+    def __init__(self, *args, rht_axis: Optional[int] = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rht_axis = rht_axis
+        self.register_buffer(
+            "rht_matrix",
+            (
+                hadamard_matrix(self.scale.device)
+                if rht_axis is not None
+                else None
+            ),
+            persistent=False,
+        )
+
+    def extra_repr(self):
+        return f"{super().extra_repr()}, rht_axis={self.rht_axis}"
+
+    def pre(self, x: torch.Tensor) -> torch.Tensor:
+        if self.rht_axis is not None and self.fake_quant_on():
+            x = _rotate(x, self.rht_axis, self.rht_matrix)
+        return super().pre(x)
+
+    def post(self, x: torch.Tensor) -> torch.Tensor:
+        x = super().post(x)
+        if self.rht_axis is not None and self.fake_quant_on():
+            x = _rotate(x, self.rht_axis, self.rht_matrix.T)
+        return x
+
+
+class OutlierFilter(_QuantizeTransform):
+    """Keep outliers out of quantization: zeroed before it, restored after.
+
+    An outlier is an element whose magnitude reaches the threshold.  The
+    threshold is given, or calibrated while the observer is on as the
+    smallest of the largest ``outlier_pct`` of the elements, the largest
+    any call asked for.
+
+    Args:
+        outlier_threshold: Magnitude from which an element is an outlier.
+        outlier_pct: Fraction of elements to treat as outliers instead.
+        *args: Forwarded to the scheme's base.
+        **kwargs: Forwarded to the scheme's base.
+    """
+
+    def __init__(
+        self,
+        *args,
+        outlier_threshold: Optional[float] = None,
+        outlier_pct: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        assert (
+            outlier_pct is None or outlier_threshold is None
+        ), "Only one of outlier_pct and outlier_threshold can be set."
+        self.outlier_pct = outlier_pct
+        self.max_outlier_pct = 0.0
+        if outlier_pct is not None:
+            self.register_buffer(
+                "outlier_threshold",
+                torch.tensor([], device=self.scale.device, dtype=torch.float),
+            )
+        else:
+            self.outlier_threshold = outlier_threshold
+        # The outlier mask and the input ``pre`` took it from, which
+        # ``post`` restores.
+        self._outliers = None
+
+    def pre(self, x: torch.Tensor) -> torch.Tensor:
+        if self.outlier_pct is not None and self.observer_on():
+            flat = x.abs().flatten()
+            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+
+            vals = torch.topk(flat, k, largest=True, sorted=False).values
+            threshold = vals.min()
+
+            # The largest threshold any calibration batch asked for, so
+            # the bound holds on every batch seen.
+            if self.outlier_threshold.numel() == 0:
+                self.outlier_threshold.resize_as_(threshold)
+                self.outlier_threshold.copy_(threshold)
+            else:
+                self.outlier_threshold.copy_(
+                    torch.maximum(self.outlier_threshold, threshold)
+                )
+
+        if self.outlier_threshold is not None:
+            skip = x.abs() >= self.outlier_threshold
+            self._outliers = (skip, x)
+            x = x.masked_fill(skip, 0.0)
+            outlier_pct = skip.sum().item() / x.numel()
+            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
+        return super().pre(x)
+
+    def post(self, x: torch.Tensor) -> torch.Tensor:
+        x = super().post(x)
+        if self._outliers is not None:
+            skip, original = self._outliers
+            self._outliers = None
+            x = torch.where(skip, original, x)
+        return x
+
+
 class DirectCastFakeQuantize(_FakeQuantize):
     """Fake-quantize by rounding each value to the dtype, with no scale.
 
@@ -453,7 +623,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         quant_max: Largest magnitude the dtype represents.
         amax_history_len: How many past amaxes the scale is taken over.
         ch_axis: The channel axis of a per-channel scale.
-        force_scale_power_of_two: Round each scale up to a power of two.
+        power_2_scale: Round each scale up to a power of two.
         **kwargs: Forwarded to ``_FakeQuantize``.
 
     Raises:
@@ -471,7 +641,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         quant_max: float,
         amax_history_len: int,
         ch_axis: Optional[int] = None,
-        force_scale_power_of_two: bool = False,
+        power_2_scale: bool = False,
         **kwargs,
     ) -> None:
         if qscheme not in (
@@ -487,7 +657,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         self.quant_max = quant_max
         self.amax_history_len = amax_history_len
         self.ch_axis = ch_axis
-        self.force_scale_power_of_two = force_scale_power_of_two
+        self.power_2_scale = power_2_scale
         self.is_per_channel = qscheme == QScheme.PER_CHANNEL_SYMMETRIC
         self.register_buffer(
             "amax_history",
@@ -537,7 +707,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
         sf = amax / self.quant_max
         sf = torch.where(amax > 0.0, sf, self.scale)
         sf = torch.where(torch.isfinite(amax), sf, self.scale)
-        if self.force_scale_power_of_two:
+        if self.power_2_scale:
             sf = torch.pow(2, torch.ceil(torch.log2(sf)))
         self.scale.copy_(sf)
 
@@ -549,7 +719,7 @@ class FusedAmaxObsFakeQuantize(_FakeQuantize):
             f"{super().extra_repr()}, qscheme={self.qscheme}, "
             f"quant_max={self.quant_max}, ch_axis={self.ch_axis}, "
             f"amax_history_len={self.amax_history_len}, "
-            f"force_scale_power_of_two={self.force_scale_power_of_two}"
+            f"power_2_scale={self.power_2_scale}"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -607,82 +777,33 @@ class _BlockFakeQuantize(_FakeQuantize):
         )
 
 
-class MXFakeQuantize(_BlockFakeQuantize):
+class MXFakeQuantize(
+    RandomHadamardTransform, OutlierFilter, _BlockFakeQuantize
+):
     """Fake-quantize in microscaling blocks.
 
     Each block's scale is its absolute maximum over ``quant_max``; ``scale``
-    holds the last call's block scales.  Outliers, set by a threshold or by
-    the fraction of elements to keep out, skip quantization and are restored
-    afterwards.
+    holds the last call's block scales.  Outliers skip quantization
+    (``OutlierFilter``).
 
     Args:
-        force_scale_power_of_two: Round each block scale to a power of two.
-        outlier_threshold: Magnitude from which an element is an outlier.
-        outlier_pct: Fraction of elements to treat as outliers instead; the
-            threshold is calibrated while the observer is on.
+        power_2_scale: Round each block scale to a power of two.
         *args: Forwarded to ``_BlockFakeQuantize``.
         **kwargs: Forwarded to ``_BlockFakeQuantize``.
     """
 
-    def __init__(
-        self,
-        *args,
-        force_scale_power_of_two: bool = False,
-        outlier_threshold: Optional[float] = None,
-        outlier_pct: Optional[float] = None,
-        **kwargs,
-    ) -> None:
+    def __init__(self, *args, power_2_scale: bool = False, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.force_scale_power_of_two = force_scale_power_of_two
-        assert (
-            outlier_pct is None or outlier_threshold is None
-        ), "Only one of outlier_pct and outlier_threshold can be set."
-        self.outlier_pct = outlier_pct
-        self.max_outlier_pct = 0.0
-        if outlier_pct is not None:
-            self.register_buffer(
-                "outlier_threshold",
-                torch.tensor([], device=self.scale.device, dtype=torch.float),
-            )
-        else:
-            self.outlier_threshold = outlier_threshold
+        self.power_2_scale = power_2_scale
 
     def calculate_qparams(self):
         return self.scale
 
     def extra_repr(self):
-        return (
-            f"{super().extra_repr()}, "
-            f"force_scale_power_of_two={self.force_scale_power_of_two}"
-        )
+        return f"{super().extra_repr()}, power_2_scale={self.power_2_scale}"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.outlier_pct is not None and self.observer_on():
-            flat = x.abs().flatten()
-            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
-
-            vals = torch.topk(flat, k, largest=True, sorted=False).values
-            threshold = vals.min()
-
-            # The largest threshold any calibration batch asked for, so
-            # the bound holds on every batch seen.
-            if self.outlier_threshold.numel() == 0:
-                self.outlier_threshold.resize_as_(threshold)
-                self.outlier_threshold.copy_(threshold)
-            else:
-                self.outlier_threshold.copy_(
-                    torch.maximum(self.outlier_threshold, threshold)
-                )
-
-        # Remove outliers from x before quantization
-        skip = None
-        if self.outlier_threshold is not None:
-            skip = x.abs() >= self.outlier_threshold
-            orig_x = x.clone()
-            x = x.masked_fill(skip, 0.0)
-            outlier_pct = skip.sum().item() / x.numel()
-            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
-
+        x = self.pre(x)
         x = MXFakeQuantizeFunction.apply(
             x,
             self.fake_quant_on(),
@@ -691,14 +812,10 @@ class MXFakeQuantize(_BlockFakeQuantize):
             self.ch_axis,
             self.block_size,
             self.quant_max,
-            self.force_scale_power_of_two,
+            self.power_2_scale,
             self.scale_qmap,
         )
-
-        # Restore all outlier positions.
-        if skip is not None:
-            x = torch.where(skip, orig_x, x)
-        return x
+        return self.post(x)
 
 
 class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):

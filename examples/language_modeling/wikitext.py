@@ -136,12 +136,11 @@ def main(args):
         input_activation=args.activation,
         weight=args.weight,
         bias=args.bias,
-        force_scale_power_of_two=args.force_scale_power_of_two,
     )
     quantizer.set_module_name("model.rotary_emb", None)
 
     if (qconfig := QUANTIZATION_CONFIGS.get(args.qconfig)) is not None:
-        set_qconfig(quantizer, qconfig, args.force_scale_power_of_two)
+        set_qconfig(quantizer, qconfig)
 
     model, tokenizer = setup_quantized_model(
         args.model_id,
