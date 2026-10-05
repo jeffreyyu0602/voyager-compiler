@@ -39,6 +39,7 @@ Abbreviations and their full names:
   - ax: ch_axis
   - bs: block_size
   - pot: power_2_scale
+  - sr: stochastic_rounding
 
 Example usage:
   --params int8,qscheme=qscheme1,quant_max=127,amax_history_len=50,\
@@ -55,6 +56,8 @@ posit8_1)
   - ch_axis (int): Channel axis (default: 0)
   - block_size (int): Block size (default: 32)
   - power_2_scale (0/1): Round each scale to a power of two (default: 0)
+  - stochastic_rounding (0/1): Round each element at random, unbiased;
+    microscaling only (default: 0)
 """
 
 

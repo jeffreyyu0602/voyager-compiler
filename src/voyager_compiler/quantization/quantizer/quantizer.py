@@ -39,6 +39,7 @@ class QuantizationSpec(QuantizationSpecBase):
     outlier_threshold: Optional[float] = None
     outlier_pct: Optional[float] = None
     rht_axis: Optional[int] = None
+    stochastic_rounding: bool = False
     is_dynamic: bool = False  # required by sharing nodes
 
     @staticmethod
@@ -55,6 +56,11 @@ class QuantizationSpec(QuantizationSpecBase):
             and self.block_size is None
         ):
             raise ValueError("block_size is required for microscaling.")
+
+        if self.stochastic_rounding and self.qscheme != QScheme.MICROSCALING:
+            raise ValueError(
+                "Stochastic rounding supports microscaling specs only"
+            )
 
         if self.observer_or_fake_quant_ctr is None:
             self.observer_or_fake_quant_ctr = fake_quantize_class(self.qscheme)

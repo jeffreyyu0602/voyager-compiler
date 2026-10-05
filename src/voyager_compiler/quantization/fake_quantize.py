@@ -173,7 +173,7 @@ def _fake_quant(input, qmap, scale):
 
 @_compiled_per_shape
 def _mx_fake_quant(
-    input, qmap, axes, block_size, quant_max, power_of_two, scale_qmap
+    input, qmap, axes, block_size, quant_max, power_of_two, scale_qmap, seed
 ):
     """Fake-quantize ``input`` in microscaling blocks.
 
@@ -185,6 +185,8 @@ def _mx_fake_quant(
         quant_max: Largest magnitude ``qmap`` represents.
         power_of_two: Round each block scale to a power of two.
         scale_qmap: Lookup table the scales are quantized into, or None.
+        seed: int64 scalar keying stochastic rounding, or None to round to
+            the nearest value.
 
     Returns:
         ``(scale, output)``: the block scales and the fake-quantized tensor.
@@ -197,6 +199,7 @@ def _mx_fake_quant(
         quant_max,
         power_of_two,
         scale_qmap=scale_qmap,
+        seed=seed,
     )
     return scale, output * expand(scale, output.shape, block_size)
 
@@ -295,9 +298,16 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
         quant_max: float,
         force_scale_power_of_two=False,
         scale_qmap=None,
+        stochastic_rounding=False,
     ):
         if not enabled:
             return input
+        # Each call rounds under a fresh seed from torch's generator.
+        seed = (
+            torch.randint(2**63 - 1, (), device=input.device)
+            if stochastic_rounding
+            else None
+        )
         sf, output = _mx_fake_quant(
             input,
             qmap,
@@ -306,6 +316,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
             quant_max,
             force_scale_power_of_two,
             scale_qmap,
+            seed,
         )
         scale.resize_(sf.shape).copy_(sf)
         return output
@@ -313,7 +324,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 8
+        return (grad_output,) + (None,) * 9
 
 
 class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
@@ -788,19 +799,31 @@ class MXFakeQuantize(
 
     Args:
         power_2_scale: Round each block scale to a power of two.
+        stochastic_rounding: Round each element to one of the two values
+            around it at random, unbiased, rather than to the nearest.
         *args: Forwarded to ``_BlockFakeQuantize``.
         **kwargs: Forwarded to ``_BlockFakeQuantize``.
     """
 
-    def __init__(self, *args, power_2_scale: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        power_2_scale: bool = False,
+        stochastic_rounding: bool = False,
+        **kwargs,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.power_2_scale = power_2_scale
+        self.stochastic_rounding = stochastic_rounding
 
     def calculate_qparams(self):
         return self.scale
 
     def extra_repr(self):
-        return f"{super().extra_repr()}, power_2_scale={self.power_2_scale}"
+        return (
+            f"{super().extra_repr()}, power_2_scale={self.power_2_scale}, "
+            f"stochastic_rounding={self.stochastic_rounding}"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.pre(x)
@@ -814,6 +837,7 @@ class MXFakeQuantize(
             self.quant_max,
             self.power_2_scale,
             self.scale_qmap,
+            self.stochastic_rounding,
         )
         return self.post(x)
 

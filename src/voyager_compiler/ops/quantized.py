@@ -337,10 +337,130 @@ def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
     return picked.reshape(index.shape).to(input.dtype)
 
 
+#: Philox4x32-10 (Salmon et al., 2011), the generator Transformer Engine's
+#: stochastic rounding draws from: its round multipliers, the increments
+#: that bump its key between rounds, and its round count.
+PHILOX_MULTIPLIERS = (0xD2511F53, 0xCD9E8D57)
+PHILOX_KEY_INCREMENTS = (0x9E3779B9, 0xBB67AE85)
+PHILOX_ROUNDS = 10
+_UINT32_MASK = 0xFFFFFFFF
+
+
+def _mulhilo32(a: torch.Tensor, b: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The high and low 32 bits of ``a * b``.
+
+    ``a`` holds uint32 values in int64 and ``b`` is a uint32.  The product
+    is taken over 16-bit halves of ``b``, so no partial product overflows.
+    """
+    low_half = a * (b & 0xFFFF)
+    high_half = a * (b >> 16)
+    low = low_half + ((high_half & 0xFFFF) << 16)
+    return (high_half >> 16) + (low >> 32), low & _UINT32_MASK
+
+
+def _philox(counter: torch.Tensor, seed: torch.Tensor) -> torch.Tensor:
+    """Philox4x32-10 of each counter under the key ``seed``.
+
+    Args:
+        counter: int64 counters, the low 64 bits of 128-bit counters whose
+            high 64 bits are zero.
+        seed: int64 scalar, the 64-bit key.
+
+    Returns:
+        int64 tensor ``[*counter.shape, 4]``: the four uint32 words each
+        counter draws.
+    """
+    c0, c1 = counter & _UINT32_MASK, (counter >> 32) & _UINT32_MASK
+    c2 = c3 = torch.zeros_like(counter)
+    k0, k1 = seed & _UINT32_MASK, (seed >> 32) & _UINT32_MASK
+    for _ in range(PHILOX_ROUNDS):
+        hi0, lo0 = _mulhilo32(c0, PHILOX_MULTIPLIERS[0])
+        hi1, lo1 = _mulhilo32(c2, PHILOX_MULTIPLIERS[1])
+        c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
+        k0 = (k0 + PHILOX_KEY_INCREMENTS[0]) & _UINT32_MASK
+        k1 = (k1 + PHILOX_KEY_INCREMENTS[1]) & _UINT32_MASK
+    return torch.stack([c0, c1, c2, c3], -1)
+
+
+def _random_bytes(seed: torch.Tensor, shape, device) -> torch.Tensor:
+    """Eight random bits for each element of a ``shape`` tensor.
+
+    Element ``i`` in flat order takes byte ``i % 4``, least significant
+    first, of word ``i % 16 // 4`` of the Philox draw with counter
+    ``i // 16``, so each 128-bit draw serves 16 elements.
+
+    Args:
+        seed: int64 scalar keying the draws.
+        shape: Shape of the tensor the bits are for.
+        device: Where the bits are drawn.
+
+    Returns:
+        int64 tensor of ``shape``, each value in [0, 255].
+    """
+    numel = math.prod(shape)
+    words = _philox(torch.arange(-(-numel // 16), device=device), seed)
+    shifts = torch.arange(0, 32, 8, device=device)
+    return ((words[..., None] >> shifts) & 0xFF).flatten()[:numel].view(shape)
+
+
+# Inductor cannot lower ``searchsorted`` against levels sorted in the same
+# graph, so under ``torch.compile`` this runs eagerly.
+@torch.compiler.disable
+def _neighbors(value: torch.Tensor, qmap: torch.Tensor):
+    """The levels of ``qmap`` on either side of each element.
+
+    Args:
+        value: float32 tensor, already divided by its scale.
+        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
+
+    Returns:
+        ``(value, low, high)``: each element saturated to the levels'
+        range, the largest level below it and the smallest at or above
+        it.  An element on a level is its own ``low`` and ``high``.
+    """
+    table = qmap.float()
+    # A table's NaN bit patterns take its first entry, zero's level.
+    levels = torch.sort(torch.where(torch.isfinite(table), table, table[0]))
+    levels = levels.values
+    value = value.clamp(levels[0], levels[-1])
+    upper = torch.searchsorted(levels, value).clamp(max=levels.numel() - 1)
+    high = levels[upper]
+    low = torch.where(high == value, high, levels[(upper - 1).clamp(min=0)])
+    return value, low, high
+
+
+def _stochastic_round(
+    input: torch.Tensor, qmap: torch.Tensor, seed: torch.Tensor
+) -> torch.Tensor:
+    """Round each element to one of the two levels of ``qmap`` around it.
+
+    Transformer Engine's rule: an element ``x`` between levels ``near``,
+    the one nearer zero, and ``far`` rounds to ``far`` when its eight
+    random bits ``r`` (``_random_bytes``) satisfy
+    ``|x| + r / 256 * |far - near| >= |far|``, and to ``near`` otherwise,
+    so the rounding is unbiased to 1/256 of the gap.  An element on a level
+    keeps it; one past the outermost levels saturates.
+
+    Args:
+        input: Tensor to round, already divided by its scale.
+        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
+        seed: int64 scalar keying the random bits.
+
+    Returns:
+        The rounded tensor, in ``input``'s dtype.
+    """
+    value, low, high = _neighbors(input.float(), qmap)
+    noise = _random_bytes(seed, input.shape, input.device) / 256
+    near = torch.where(value < 0, high, low)
+    far = torch.where(value < 0, low, high)
+    rounds_away = value.abs() + noise * (high - low) >= far.abs()
+    return torch.where(rounds_away, far, near).to(input.dtype)
+
+
 quantized_ops_lib.define(
     "quantize(Tensor input, Tensor scale, Tensor? zero_point=None, "
     "SymInt[]? axes=None, int? block_size=None, Tensor? qmap=None, "
-    "Tensor? output_code=None) -> Tensor"
+    "Tensor? output_code=None, Tensor? seed=None) -> Tensor"
 )
 
 
@@ -353,6 +473,7 @@ def quantize(
     block_size: Optional[int] = None,
     qmap: torch.Tensor = None,
     output_code: Optional[torch.Tensor] = None,
+    seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Quantization for the Tensor using scales and zero points to map
     from floating point to quantized values
@@ -371,6 +492,9 @@ def quantize(
             carries one row per attention head (or head group), a 3-D one
             a row per group of channels along the last axis.
         output_code (torch.Tensor): codebook for quantizing the output
+        seed (torch.Tensor): int64 scalar keying stochastic rounding
+            (``_stochastic_round``) against a ``qmap`` of values, or None
+            to round to the nearest value
 
     Returns:
         Tensor with requested dtype (e.g. int8), note the quantization
@@ -388,6 +512,9 @@ def quantize(
         input = input / scale
     else:
         input = input / scale + zero_point
+
+    if seed is not None:
+        return _stochastic_round(input, qmap, seed)
 
     # Both a value table and the index table ``convert_pt2e`` swaps in have
     # one entry per bit pattern, so size is what tells a table from a
@@ -857,7 +984,8 @@ def calculate_mx_qparam(
 quantized_ops_lib.define(
     "quantize_mx(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
-    "Tensor scale_qmap=None, Tensor output_code=None) -> (Tensor, Tensor)"
+    "Tensor scale_qmap=None, Tensor output_code=None, Tensor? seed=None) "
+    "-> (Tensor, Tensor)"
 )
 
 
@@ -871,6 +999,7 @@ def quantize_mx(
     force_scale_power_of_two: bool = False,
     scale_qmap: Optional[torch.Tensor] = None,
     output_code: Optional[torch.Tensor] = None,
+    seed: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor]:
     scale = calculate_mx_qparam(
         input,
@@ -880,7 +1009,9 @@ def quantize_mx(
         force_scale_power_of_two=force_scale_power_of_two,
         scale_qmap=scale_qmap,
     )
-    input = quantize(input, scale, None, axes, block_size, qmap, output_code)
+    input = quantize(
+        input, scale, None, axes, block_size, qmap, output_code, seed
+    )
     return scale, input
 
 

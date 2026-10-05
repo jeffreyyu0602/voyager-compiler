@@ -812,9 +812,9 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             in the model.
 
     Raises:
-        NotImplementedError: A fake-quant's scheme or random Hadamard
-            transform has no lowering yet, or a per-tensor quantized tensor
-            is read by an op other than a GEMM.
+        NotImplementedError: A fake-quant's scheme, random Hadamard
+            transform or stochastic rounding has no lowering yet, or a
+            per-tensor quantized tensor is read by an op other than a GEMM.
     """
     graph = program.graph
     calls = [n for n in graph.nodes if n.target is _fake_quantize]
@@ -863,6 +863,11 @@ def _lower_fake_quants(program: GraphModule, names: Dict[str, str]) -> None:
             raise NotImplementedError(
                 "The random Hadamard transform has no lowering yet"
             )
+        if (
+            isinstance(fake_quant, MXFakeQuantize)
+            and fake_quant.stochastic_rounding
+        ):
+            raise NotImplementedError("Stochastic rounding has no lowering yet")
         if isinstance(fake_quant, MXFakeQuantize):
             # The lowering replaces the call_module form ``prepare`` leaves.
             with graph.inserting_before(node):

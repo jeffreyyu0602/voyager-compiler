@@ -329,6 +329,11 @@ def main(args):
         lr_scheduler.load_state_dict(state["lr_scheduler"])
         train_stream.shard, train_stream.offset = state["stream"]
         completed_steps = state["step"]
+        # Stochastic rounding draws from the generators, so a resumed run
+        # carries on with the same draws.
+        torch.set_rng_state(state["rng"].cpu())
+        if state["cuda_rng"] is not None:
+            torch.cuda.set_rng_state(state["cuda_rng"].cpu(), device)
         logger.info(f"Resumed from {args.resume_from_checkpoint}")
 
     tokens_per_step = math.prod(shape) * args.gradient_accumulation_steps
@@ -390,6 +395,12 @@ def main(args):
                     "lr_scheduler": lr_scheduler.state_dict(),
                     "stream": (train_stream.shard, train_stream.offset),
                     "step": completed_steps,
+                    "rng": torch.get_rng_state(),
+                    "cuda_rng": (
+                        torch.cuda.get_rng_state(device)
+                        if device.type == "cuda"
+                        else None
+                    ),
                 },
                 path,
             )

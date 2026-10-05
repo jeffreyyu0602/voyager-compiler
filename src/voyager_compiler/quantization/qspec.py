@@ -44,6 +44,7 @@ _ABBREV_MAP = {
     "scale": "scale_dtype",
     "othr": "outlier_threshold",
     "opct": "outlier_pct",
+    "sr": "stochastic_rounding",
 }
 
 
@@ -72,6 +73,7 @@ _PARAMS_TYPE = {
     "scale_dtype": str,
     "outlier_threshold": float,
     "outlier_pct": float,
+    "stochastic_rounding": _parse_bool,
 }
 
 

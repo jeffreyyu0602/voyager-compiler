@@ -94,6 +94,7 @@ _SHARED_FIELDS = (
     "outlier_threshold",
     "outlier_pct",
     "rht_axis",
+    "stochastic_rounding",
 )
 
 
@@ -1515,6 +1516,8 @@ def convert_pt2e(
             raise NotImplementedError(
                 "The random Hadamard transform has no lowering yet"
             )
+        if isinstance(mod, MXFakeQuantize) and mod.stochastic_rounding:
+            raise NotImplementedError("Stochastic rounding has no lowering yet")
         if isinstance(mod, MXFakeQuantize):
             _replace_observer_with_quantize_mx_node_decomposed(
                 model, node, modules
