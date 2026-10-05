@@ -1304,7 +1304,8 @@ def get_tiling(node, tiler=None):
     ):
         if anchor.meta.get("l2_tiling") is not None:
             raise ValueError(
-                "CIM handling of l2_tiling overrides is not implemented yet"
+                "CIM l2_tiling overrides require the unsupported C++ "
+                "manual-tiling fallback; use the compiler tiling search"
             )
     is_conv = is_conv2d(anchor)
 
