@@ -14,8 +14,8 @@ def mx_spec(dtype, scale, axis, block_size=64):
 
     Args:
         dtype: Element dtype, e.g. ``int8`` or ``lut4_to_int6``.
-        scale: How each block's scale is stored, ``MX_POT_SCALE`` or
-            ``MX_E5M3_SCALE``.
+        scale: How each block's scale is stored: ``MX_POT_SCALE``,
+            ``MX_E5M3_SCALE`` or ``MX_E4M3_GLOBAL_SCALE``.
         axis: Axis the blocks run along, the operand's contraction axis.
 
     Returns:
@@ -45,6 +45,9 @@ def uniform_config(dtype, scale):
 
 MX_POT_SCALE = "power_2_scale=1"
 MX_E5M3_SCALE = "scale=fp8_e5m3"
+MX_E4M3_GLOBAL_SCALE = "scale=fp8_e4m3,global_scale=1"
+NVFP4_SPEC = mx_spec("fp4_e2m1", MX_E4M3_GLOBAL_SCALE, -1, block_size=16)
+NVFP4_RHS_SPEC = mx_spec("fp4_e2m1", MX_E4M3_GLOBAL_SCALE, -2, block_size=16)
 MXINT6_E5M3_SPEC = mx_spec("int6", MX_E5M3_SCALE, -1)
 MXINT6_E5M3_RHS_SPEC = mx_spec("int6", MX_E5M3_SCALE, -2)
 MXLUT4_INT6_E5M3_SPEC = mx_spec("lut4_to_int6", MX_E5M3_SCALE, -1)
@@ -63,6 +66,10 @@ QUANTIZATION_CONFIGS["mxfp4_pot"] = uniform_config("fp4_e2m1", MX_POT_SCALE)
 QUANTIZATION_CONFIGS["mxlut4_int6_pot"] = uniform_config(
     "lut4_to_int6", MX_POT_SCALE
 )
+QUANTIZATION_CONFIGS["nvfp4"] = {
+    torch.nn.Linear: [NVFP4_SPEC, NVFP4_SPEC],
+    torch.ops.aten.matmul.default: [NVFP4_SPEC, NVFP4_RHS_SPEC],
+}
 
 QUANTIZATION_CONFIGS["mxlut4_int6_e5m3"] = {
     **uniform_config("lut4_to_int6", MX_E5M3_SCALE),

@@ -40,6 +40,7 @@ class QuantizationSpec(QuantizationSpecBase):
     outlier_pct: Optional[float] = None
     rht_axis: Optional[int] = None
     stochastic_rounding: bool = False
+    global_scale: bool = False
     is_dynamic: bool = False  # required by sharing nodes
 
     @staticmethod
@@ -60,6 +61,17 @@ class QuantizationSpec(QuantizationSpecBase):
         if self.stochastic_rounding and self.qscheme != QScheme.MICROSCALING:
             raise ValueError(
                 "Stochastic rounding supports microscaling specs only"
+            )
+
+        quantized_block_scales = (
+            self.qscheme == QScheme.MICROSCALING
+            and self.scale_dtype is not None
+            and not self.power_2_scale
+        )
+        if self.global_scale and not quantized_block_scales:
+            raise ValueError(
+                "A global scale needs a microscaling spec with a scale dtype "
+                "and no power-of-two scales"
             )
 
         if self.observer_or_fake_quant_ctr is None:

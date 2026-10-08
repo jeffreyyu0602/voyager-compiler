@@ -646,12 +646,14 @@ def conv2d_mx(
     )
 
 
+# ``alpha`` scales a GEMM's product, as in ``alpha * (A @ B) + bias``: the
+# operands' global scales, which factor out of the contraction.
 quantized_ops_lib.define(
     "linear_mx(Tensor input, Tensor weight, Tensor? bias=None, *, "
     "Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, Tensor? weight_code=None, "
-    "Tensor? A_data=None, Tensor? A_indices=None, Tensor? A_indptr=None, "
-    'str weight_layout="kc") -> Tensor'
+    "Tensor? alpha=None, Tensor? A_data=None, Tensor? A_indices=None, "
+    'Tensor? A_indptr=None, str weight_layout="kc") -> Tensor'
 )
 
 
@@ -666,6 +668,7 @@ def linear_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
@@ -678,12 +681,22 @@ def linear_mx(
         weight, weight_scale, weight_code, block_size
     )
 
+    # ``alpha`` scales the product alone, so the bias is added after it.
+    gemm_bias = bias if alpha is None else None
+
     # Call the operator matching the weight's storage layout: aten for
     # the KC-native layout, the layout twin for a CK-stored weight.
     if weight_layout == "kc":
-        dense_out = torch.ops.aten.linear(input, decoded_weight, bias)
+        dense_out = torch.ops.aten.linear(input, decoded_weight, gemm_bias)
     else:
-        dense_out = torch.ops.quantized_ops.linear(input, decoded_weight, bias)
+        dense_out = torch.ops.quantized_ops.linear(
+            input, decoded_weight, gemm_bias
+        )
+
+    if alpha is not None:
+        dense_out = dense_out * alpha
+        if bias is not None:
+            dense_out = dense_out + bias
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -716,8 +729,9 @@ def _(
 quantized_ops_lib.define(
     "matmul_mx(Tensor self, Tensor other, *, Tensor? input_scale=None, "
     "Tensor? weight_scale=None, int? block_size=None, Tensor? input_code=None, "
-    "Tensor? weight_code=None, Tensor? A_data=None, Tensor? A_indices=None, "
-    'Tensor? A_indptr=None, str weight_layout="ck") -> Tensor'
+    "Tensor? weight_code=None, Tensor? alpha=None, Tensor? A_data=None, "
+    "Tensor? A_indices=None, Tensor? A_indptr=None, "
+    'str weight_layout="ck") -> Tensor'
 )
 
 
@@ -731,6 +745,7 @@ def matmul_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
@@ -747,6 +762,9 @@ def matmul_mx(
         dense_out = torch.ops.aten.matmul(self, decoded_other)
     else:
         dense_out = torch.ops.quantized_ops.matmul(self, decoded_other)
+
+    if alpha is not None:
+        dense_out = dense_out * alpha
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -914,7 +932,7 @@ def _(
 quantized_ops_lib.define(
     "calculate_mx_qparam(Tensor self, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
-    "Tensor scale_qmap=None) -> Tensor"
+    "Tensor scale_qmap=None, Tensor? global_scale=None) -> Tensor"
 )
 
 
@@ -926,6 +944,7 @@ def calculate_mx_qparam(
     quant_max: float,
     force_scale_power_of_two: bool = False,
     scale_qmap: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Deferred to break a real cycle: ``quantization`` imports this module for
     # the ops, so it cannot be imported here at module scope.
@@ -973,6 +992,11 @@ def calculate_mx_qparam(
         amax = torch.amax(torch.abs(input), dim=shared_exp_axes)
         scale = amax / quant_max
 
+        # NVFP4's second level: the tensor's global scale divides out its
+        # own magnitude before the block scales are quantized.
+        if global_scale is not None:
+            scale = scale / global_scale
+
         # Quantize the scale using the codebook
         if scale_qmap is not None:
             scale = vmap(scale, scale_qmap)
@@ -984,8 +1008,8 @@ def calculate_mx_qparam(
 quantized_ops_lib.define(
     "quantize_mx(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
-    "Tensor scale_qmap=None, Tensor output_code=None, Tensor? seed=None) "
-    "-> (Tensor, Tensor)"
+    "Tensor scale_qmap=None, Tensor output_code=None, Tensor? seed=None, "
+    "Tensor? global_scale=None) -> (Tensor, Tensor)"
 )
 
 
@@ -1000,7 +1024,18 @@ def quantize_mx(
     scale_qmap: Optional[torch.Tensor] = None,
     output_code: Optional[torch.Tensor] = None,
     seed: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor]:
+    """Quantize ``input`` in microscaling blocks.
+
+    With a ``global_scale`` ``t``, each block scale is quantized as
+    ``scale_qmap(amax_block / quant_max / t)`` and the elements are divided
+    by it times ``t``.  The returned scales leave ``t`` out: whatever reads
+    the codes applies it once, as a GEMM's ``alpha``.
+
+    Returns:
+        ``(scale, codes)``.
+    """
     scale = calculate_mx_qparam(
         input,
         axes=axes,
@@ -1008,9 +1043,11 @@ def quantize_mx(
         quant_max=quant_max,
         force_scale_power_of_two=force_scale_power_of_two,
         scale_qmap=scale_qmap,
+        global_scale=global_scale,
     )
+    element_scale = scale if global_scale is None else scale * global_scale
     input = quantize(
-        input, scale, None, axes, block_size, qmap, output_code, seed
+        input, element_scale, None, axes, block_size, qmap, output_code, seed
     )
     return scale, input
 

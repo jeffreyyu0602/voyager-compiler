@@ -57,6 +57,12 @@ def sqrt(a):
     """The square root of ``a`` as a tensor takes it: of a negative, NaN."""
     return math.sqrt(a) if a >= 0 else math.nan
 
+
+def clamp_min(a, b):
+    """The larger of ``a`` and ``b``, as ``aten.clamp_min`` takes it: a NaN
+    ``a`` stays NaN."""
+    return a if math.isnan(a) or a >= b else b
+
 # Elementwise ops that mean the same on Python scalars.  ``floor_divide``
 # and ``remainder`` follow Python's floor semantics, as ``//`` and ``%`` do.
 _SCALAR_OPS = {
@@ -91,6 +97,7 @@ _SCALAR_OPS = {
     aten.pow.Tensor_Tensor: operator.pow,
     aten.sqrt.default: sqrt,
     aten.reciprocal.default: reciprocal,
+    aten.clamp_min.default: clamp_min,
 }
 
 _INTEGER_DTYPES = (torch.int64, torch.int32, torch.bool)

@@ -2716,6 +2716,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         )
         add_kw_input("input_code", None)
         add_kw_input("weight_code", None)
+        add_kw_input("alpha", None)
 
     # An outlier CSR rides the GEMM as three kwargs. The row pointers are one
     # continuous array per K slice, so this tile is a row *range* of it: tm+1

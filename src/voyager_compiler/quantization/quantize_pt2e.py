@@ -35,6 +35,7 @@ from voyager_compiler.quantization.fake_quantize import (
     RandomHadamardTransform,
     _DerivedObserverOrFakeQuantize,
     _FreezableFlags,
+    calculate_global_scale,
     get_quantization_map,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
@@ -95,6 +96,7 @@ _SHARED_FIELDS = (
     "outlier_pct",
     "rht_axis",
     "stochastic_rounding",
+    "global_scale",
 )
 
 
@@ -612,6 +614,15 @@ MX_OP_MAPPING = {
 # An attention operand's scale kwarg, by its position among the operands.
 _ATTENTION_SCALES = ("query_scale", "key_scale", "value_scale")
 
+# The GEMMs whose operands may carry a global scale: they apply it to their
+# product, as ``alpha``.
+_GEMMS = (
+    torch.ops.aten.linear.default,
+    torch.ops.aten.matmul.default,
+    torch.ops.quantized_ops.linear_mx.default,
+    torch.ops.quantized_ops.matmul_mx.default,
+)
+
 
 def _replace_observer_with_quantize_mx_node_decomposed(
     model: torch.fx.GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
@@ -686,26 +697,37 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         if activation_post_process.code_dtype is not None:
             dequant_code.meta["dtype"] = activation_post_process.code_dtype
 
-    get_attr_node = scale_qmap = None
+    uses_global_scale = activation_post_process.global_scale
+    filters_outliers = activation_post_process.outlier_threshold is not None
+    if uses_global_scale and filters_outliers:
+        raise NotImplementedError(
+            "A global scale with outlier filtering has no lowering yet"
+        )
+
+    get_attr_node = scale_qmap = global_scale_node = None
     if input_node.op == "get_attr":
         # quantize model parameter and remove the fq module
         param = fetch_attr(model, input_node.target)
 
-        scale = torch.ops.quantized_ops.calculate_mx_qparam(
+        global_scale = (
+            calculate_global_scale(
+                param.data,
+                activation_post_process.quant_max,
+                activation_post_process.scale_max,
+            )
+            if uses_global_scale
+            else None
+        )
+
+        scale, weight = torch.ops.quantized_ops.quantize_mx(
             param.data,
+            activation_post_process.qmap,
             activation_post_process.ch_axis,
             activation_post_process.block_size,
             activation_post_process.quant_max,
             activation_post_process.power_2_scale,
             activation_post_process.scale_qmap,
-        )
-
-        weight = torch.ops.quantized_ops.quantize(
-            param.data,
-            scale,
-            axes=activation_post_process.ch_axis,
-            block_size=activation_post_process.block_size,
-            qmap=activation_post_process.qmap,
+            global_scale=global_scale,
         )
 
         with graph.inserting_before(node):
@@ -715,6 +737,13 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             scale_node = create_getattr_from_value(
                 model, graph, input_node.name + "_scale", scale
             )
+            if global_scale is not None:
+                global_scale_node = create_getattr_from_value(
+                    model,
+                    graph,
+                    input_node.name + "_global_scale",
+                    global_scale,
+                )
     else:
         with graph.inserting_before(node):
             get_attr_node = create_getattr_from_value(
@@ -738,6 +767,30 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 scale_qmap,
                 quant_code,
             ]
+
+            if uses_global_scale:
+                # ``calculate_global_scale`` as graph nodes: the amax over
+                # the whole tensor, then scalar arithmetic.
+                magnitude = graph.call_function(
+                    torch.ops.aten.abs.default, (node_to_quantize,)
+                )
+                amax = graph.call_function(
+                    torch.ops.aten.amax.default, (magnitude,)
+                )
+                ratio = graph.call_function(
+                    torch.ops.aten.div.Scalar,
+                    (
+                        amax,
+                        activation_post_process.quant_max
+                        * activation_post_process.scale_max,
+                    ),
+                )
+                global_scale_node = graph.call_function(
+                    torch.ops.aten.clamp_min.default,
+                    (ratio, torch.finfo(torch.float32).tiny),
+                )
+                # No seed: a converted graph rounds to nearest.
+                args += [None, global_scale_node]
 
             if activation_post_process.outlier_threshold is not None:
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
@@ -802,6 +855,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     for user in orig_fq_users:
         # Keep the original nodes for other users
         kwarg1, kwarg2 = dequant_code, scale_node
+        global_scale_arg = global_scale_node
         operand = quantized_node
 
         # Skip device alignment node
@@ -815,6 +869,10 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 kwarg2 = graph.call_function(
                     torch.Tensor.to, (scale_node, user_device)
                 )
+                if global_scale_arg is not None:
+                    global_scale_arg = graph.call_function(
+                        torch.Tensor.to, (global_scale_node, user_device)
+                    )
             operand = user
             user = next(iter(user.users))
 
@@ -850,6 +908,21 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             kwargs.setdefault("input_code", kwarg1)
             kwargs.setdefault("input_scale", kwarg2)
 
+        if global_scale_arg is not None:
+            if user.target not in _GEMMS:
+                raise NotImplementedError(
+                    f"A global scale on {user.target} has no lowering yet"
+                )
+            # ``alpha`` collects the operands' global scales, one multiply
+            # per operand after the first.
+            alpha = kwargs.get("alpha")
+            if alpha is not None:
+                with graph.inserting_before(user):
+                    global_scale_arg = graph.call_function(
+                        torch.ops.aten.mul.Tensor, (alpha, global_scale_arg)
+                    )
+            kwargs["alpha"] = global_scale_arg
+
         order = [
             "input_scale",
             "weight_scale",
@@ -859,6 +932,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             "block_size",
             "input_code",
             "weight_code",
+            "alpha",
             "probs_qmap",
             "probs_quant_max",
             "probs_scale_qmap",

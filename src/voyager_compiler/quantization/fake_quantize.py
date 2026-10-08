@@ -30,6 +30,7 @@ __all__ = [
     "OutlierFilter",
     "RandomHadamardTransform",
     "_DerivedObserverOrFakeQuantize",
+    "calculate_global_scale",
     "entry_levels",
     "fake_quantize_class",
     "hadamard_matrix",
@@ -67,12 +68,19 @@ def hadamard_matrix(device=None) -> torch.Tensor:
 
 
 def _rotate(x: torch.Tensor, axis: int, matrix: torch.Tensor) -> torch.Tensor:
-    """``x`` with each run of ``HADAMARD_SIZE`` elements along ``axis``
-    multiplied by ``matrix``, computed in float32."""
+    """``x`` with each whole run of ``HADAMARD_SIZE`` elements along ``axis``
+    multiplied by ``matrix``, computed in float32.
+
+    A shorter run left at the end stays as it is.  Both operands of a GEMM
+    have the same length along the axis they are rotated on, so they leave
+    the same tail and their product is unchanged.
+    """
     moved = x.movedim(axis, -1)
-    blocks = moved.reshape(*moved.shape[:-1], -1, HADAMARD_SIZE)
-    rotated = (blocks.float() @ matrix).reshape(moved.shape)
-    return rotated.to(x.dtype).movedim(-1, axis)
+    whole = moved.shape[-1] // HADAMARD_SIZE * HADAMARD_SIZE
+    head, tail = moved[..., :whole], moved[..., whole:]
+    blocks = head.reshape(*head.shape[:-1], -1, HADAMARD_SIZE)
+    rotated = (blocks.float() @ matrix).reshape(head.shape).to(x.dtype)
+    return torch.cat([rotated, tail], -1).movedim(-1, axis)
 
 
 @functools.lru_cache(maxsize=None)
@@ -151,6 +159,27 @@ def entry_levels(dtype, device=None):
     return levels[levels >= -levels.max()] + 0.0
 
 
+def calculate_global_scale(
+    input: torch.Tensor, quant_max: float, scale_max: float
+) -> torch.Tensor:
+    """NVFP4's per-tensor scale: ``amax(|input|) / (quant_max * scale_max)``.
+
+    Dividing the block scales by it puts the tensor's largest one on the
+    scale dtype's largest value.  An all-zero tensor gets float32's smallest
+    normal value instead of zero, which its blocks then divide to nothing.
+
+    Args:
+        input: Tensor about to be quantized.
+        quant_max: Largest magnitude of the element dtype.
+        scale_max: Largest value of the block scales' dtype.
+
+    Returns:
+        A 0-d tensor in ``input``'s dtype.
+    """
+    ratio = torch.amax(torch.abs(input)) / (quant_max * scale_max)
+    return ratio.clamp_min(torch.finfo(torch.float32).tiny)
+
+
 # A fake-quant graph sees the same shapes window after window.
 _compiled_per_shape = compiled_on_gpu(dynamic=False)
 
@@ -173,7 +202,15 @@ def _fake_quant(input, qmap, scale):
 
 @_compiled_per_shape
 def _mx_fake_quant(
-    input, qmap, axes, block_size, quant_max, power_of_two, scale_qmap, seed
+    input,
+    qmap,
+    axes,
+    block_size,
+    quant_max,
+    power_of_two,
+    scale_qmap,
+    seed,
+    global_scale,
 ):
     """Fake-quantize ``input`` in microscaling blocks.
 
@@ -187,9 +224,11 @@ def _mx_fake_quant(
         scale_qmap: Lookup table the scales are quantized into, or None.
         seed: int64 scalar keying stochastic rounding, or None to round to
             the nearest value.
+        global_scale: The tensor's global scale, a 0-d tensor, or None.
 
     Returns:
-        ``(scale, output)``: the block scales and the fake-quantized tensor.
+        ``(scale, output)``: the block scales, without the global scale,
+        and the fake-quantized tensor.
     """
     scale, output = quantize_mx(
         input,
@@ -200,8 +239,12 @@ def _mx_fake_quant(
         power_of_two,
         scale_qmap=scale_qmap,
         seed=seed,
+        global_scale=global_scale,
     )
-    return scale, output * expand(scale, output.shape, block_size)
+    output = output * expand(scale, output.shape, block_size)
+    if global_scale is not None:
+        output = output * global_scale
+    return scale, output
 
 
 @_compiled_per_shape
@@ -299,6 +342,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
         force_scale_power_of_two=False,
         scale_qmap=None,
         stochastic_rounding=False,
+        global_scale=None,
     ):
         if not enabled:
             return input
@@ -317,6 +361,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
             force_scale_power_of_two,
             scale_qmap,
             seed,
+            global_scale,
         )
         scale.resize_(sf.shape).copy_(sf)
         return output
@@ -324,7 +369,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 9
+        return (grad_output,) + (None,) * 10
 
 
 class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
@@ -794,13 +839,16 @@ class MXFakeQuantize(
     """Fake-quantize in microscaling blocks.
 
     Each block's scale is its absolute maximum over ``quant_max``; ``scale``
-    holds the last call's block scales.  Outliers skip quantization
-    (``OutlierFilter``).
+    holds the last call's block scales, without the global scale.  Outliers
+    skip quantization (``OutlierFilter``).
 
     Args:
         power_2_scale: Round each block scale to a power of two.
         stochastic_rounding: Round each element to one of the two values
             around it at random, unbiased, rather than to the nearest.
+        global_scale: Divide the block scales by the tensor's global scale
+            (``calculate_global_scale``) before quantizing them to
+            ``scale_dtype``, as NVFP4 does.
         *args: Forwarded to ``_BlockFakeQuantize``.
         **kwargs: Forwarded to ``_BlockFakeQuantize``.
     """
@@ -810,11 +858,20 @@ class MXFakeQuantize(
         *args,
         power_2_scale: bool = False,
         stochastic_rounding: bool = False,
+        global_scale: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.power_2_scale = power_2_scale
         self.stochastic_rounding = stochastic_rounding
+        self.global_scale = global_scale
+        # The largest block scale, which the global scale maps the tensor's
+        # largest block onto.
+        self.scale_max = (
+            entry_levels(self.scale_dtype).max().item()
+            if global_scale
+            else None
+        )
 
     def calculate_qparams(self):
         return self.scale
@@ -822,11 +879,17 @@ class MXFakeQuantize(
     def extra_repr(self):
         return (
             f"{super().extra_repr()}, power_2_scale={self.power_2_scale}, "
-            f"stochastic_rounding={self.stochastic_rounding}"
+            f"stochastic_rounding={self.stochastic_rounding}, "
+            f"global_scale={self.global_scale}"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.pre(x)
+        global_scale = (
+            calculate_global_scale(x, self.quant_max, self.scale_max)
+            if self.global_scale
+            else None
+        )
         x = MXFakeQuantizeFunction.apply(
             x,
             self.fake_quant_on(),
@@ -838,6 +901,7 @@ class MXFakeQuantize(
             self.power_2_scale,
             self.scale_qmap,
             self.stochastic_rounding,
+            global_scale,
         )
         return self.post(x)
 
