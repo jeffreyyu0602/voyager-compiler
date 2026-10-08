@@ -301,7 +301,7 @@ def order_key(level, order, mapping, tail_specs=()):
     bound)`` pairs, with these exact equivalences:
 
     * L1: every reader of the L1 order (``weight_policy``, the contexts in
-      ``evaluate``, ``estimate_cycles``, ``coupled_timing``, the bias and
+      ``evaluate``, ``estimate_cycles``, the bias and
       output timing, and the interstellar access counts) tests only whether
       a loop is a reduction (IC/FX/FY), spatial (OX/OY) or OC. Loops of one
       class with equal bounds can thus swap. The innermost run of spatial
@@ -408,9 +408,9 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
 
     Weight and input prefetch overlap MAC issue, subject to resident-set and
     buffer availability. Partial sums beyond the local register capacity
-    incur SRAM reads and writes. Output bursts retain their queued work across
-    operand waits. The estimate ranks mappings without modeling command
-    serialization or unprofiled HLS pipeline stages.
+    incur SRAM reads and writes. Interacting operand and output waits use an
+    additive bound, retaining queued output work. The estimate ranks mappings
+    without modeling command serialization or unprofiled HLS pipeline stages.
     """
 
     def __init__(

@@ -1,14 +1,13 @@
 """CIM command timing from controller traffic and loop order.
 
-Operand buffers, resident weight sets, and output storage overlap at loop
-boundaries. Long repeated schedules use bounded state tracking; an unresolved
-transient falls back to a conservative bound. DRAM timing remains in the
+Operand buffers, resident weight sets, and output storage are priced with
+closed formulas. When waits interact, add their costs and the output backlog
+conservatively rather than walking the loop nest. DRAM timing remains in the
 shared runtime calculator.
 """
 
 import math
 from dataclasses import dataclass, field, replace
-from functools import lru_cache
 from math import prod
 
 import interstellar
@@ -22,11 +21,6 @@ from voyager_compiler.codegen.transform.tiling.timing.input import (
 from voyager_compiler.codegen.transform.tiling.timing.output import (
     OutputOptions,
     output_timing,
-)
-from voyager_compiler.codegen.transform.tiling.timing.overlap import (
-    BufferSlots,
-    OverlapTiming,
-    TimingBudgetExceeded,
 )
 from voyager_compiler.codegen.transform.tiling.timing.transfer import (
     ceil_div,
@@ -409,9 +403,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     drain = latency + final_output + output_forward
     runtime = startup + max(resource_cycles.values()) + drain
     if not banked:
-        # Include the same queued output drain on the independent and coupled paths.
+        # Include queued output work even when another resource dominates.
         runtime = max(runtime, startup + stream.consumer_cycles + latency)
-    coupled_readiness = {}
     output_wait = max(
         output_readiness.get("output_stall_cycles", 0),
         output_readiness.get("output_backlog_cycles", 0),
@@ -422,46 +415,19 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         bias_readiness.get("bias_wait_cycles", 0),
     )
     interacting = sum(wait > 0 for wait in (*operand_waits, output_wait)) > 1
+    additive_cycles = 0
     if not banked and interacting:
-        coupled = coupled_timing(
-            config,
-            levels,
-            policy,
-            inputs,
-            interval=issue_interval,
-            fill=weight_fill_cycles,
-            load_start=max(0, first_weight - weight_fill_cycles),
-            output_cycles_per_vector=output_cycles_per_vector,
-            output_capacity_vectors=output_readiness["output_capacity_vectors"],
-            options=options,
-            bias_bits=oc * rc.bias_width,
-            port_bits=port,
-            output_credit_delay=output_readiness["output_credit_delay_cycles"],
+        # Price interacting waits serially. This is the additive estimate
+        # used by the previous loop walk's conservative fallback.
+        waits = sum(operand_waits) + output_readiness["output_stall_cycles"]
+        additive_cycles = (
+            startup
+            + total_issue_cycles
+            + waits
+            + output_readiness["output_backlog_cycles"]
+            + latency
         )
-        coupled_readiness["coupled_timing_limit"] = coupled is None
-        if coupled is None:
-            # Unknown overlap must not give an unfinished candidate an optimistic ranking.
-            waits = sum(operand_waits) + output_readiness["output_stall_cycles"]
-            runtime = max(
-                runtime,
-                startup
-                + total_issue_cycles
-                + waits
-                + output_readiness["output_backlog_cycles"]
-                + latency,
-            )
-        else:
-            finish, output_finish, waits, steps = coupled
-            output_finish += output_forward
-            runtime = max(runtime, finish + drain, output_finish + latency)
-            coupled_readiness.update(
-                coupled_burst_steps=steps,
-                coupled_weight_wait_cycles=waits[0],
-                coupled_input_wait_cycles=waits[1],
-                coupled_bias_wait_cycles=waits[2],
-                coupled_output_stall_cycles=waits[3],
-                coupled_output_backlog_cycles=output_finish - finish,
-            )
+        runtime = max(runtime, additive_cycles)
 
     # Shared scratchpad roles queue on a bank's one port, even when their
     # controllers otherwise overlap. Retain that total-traffic lower bound.
@@ -494,7 +460,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         readiness=dict(
             **output_readiness,
             **bias_readiness,
-            **coupled_readiness,
+            additive_wait_bound_cycles=additive_cycles,
             weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
             weight_fill_cycles=weight_fill_cycles,
             weight_ready_cycles=options.weight_ready_cycles,
@@ -511,170 +477,4 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             output_bank_serialized_bound=output_bound,
             result_latency_cycles=latency,
         ),
-    )
-
-
-# Cache active loops as (bound, reduction, resident replay, bias reuse)
-@lru_cache(maxsize=4096)
-def _completion(
-    l1,
-    l2,
-    reuse,
-    bias_requests,
-    interval,
-    output_cycles_per_vector,
-    output_capacity_vectors,
-    capacity,
-    fill,
-    ready,
-    release,
-    load_start,
-    input_fill,
-    input_first,
-    bias_cycles_per_vector,
-    output_credit_delay=0,
-):
-    try:
-        weights = BufferSlots(
-            capacity,
-            fill,
-            ready_delay=ready,
-            release_delay=release,
-            load_start=load_start,
-        )
-        inputs = BufferSlots(2, input_fill, first_fill_cycles=input_first)
-        pipeline = OverlapTiming(
-            (weights, inputs),
-            output_cycles_per_vector,
-            output_capacity_vectors,
-            output_credit_delay=output_credit_delay,
-        )
-        loops = l1 + ((0, False, False, False),) + l2
-
-        # Split only first/final reduction and resident-replay phases; repeat the middle algebraically
-        def visit(
-            depth,
-            first=True,
-            final=True,
-            load=True,
-            release=True,
-            bias_first=True,
-        ):
-            if depth < 0:
-                slot = pipeline.acquire(0, load=load)
-                pipeline.produce(
-                    reuse * interval,
-                    reuse if final else 0,
-                    requests=bias_requests if first and bias_first else 0,
-                    request_cycles=bias_cycles_per_vector,
-                )
-                if release:
-                    pipeline.release(0, slot)
-                return
-            bound, reduction, replay, bias_reuse = loops[depth]
-            if bound == 0:
-                slot = pipeline.acquire(1)
-                visit(depth - 1, first, final, load, release, bias_first)
-                pipeline.release(1, slot)
-                return
-            position = weights.position
-
-            # A replay traverses the same resident slots while time and other streams advance
-            def body(at_first=True, at_last=True):
-                if replay:
-                    weights.position = position
-                visit(
-                    depth - 1,
-                    first and (not reduction or at_first),
-                    final and (not reduction or at_last),
-                    load and (not replay or at_first),
-                    release and (not replay or at_last),
-                    bias_first and (not bias_reuse or at_first),
-                )
-
-            if reduction or replay or bias_reuse:
-                body(True, False)
-                pipeline.repeat(bound - 2, lambda: body(False, False))
-                body(False, True)
-            else:
-                pipeline.repeat(bound, body)
-
-        visit(len(loops) - 1)
-        return (
-            pipeline.producer_at,
-            pipeline.consumer_at,
-            tuple(pipeline.waits),
-            pipeline.steps,
-        )
-    except TimingBudgetExceeded:
-        return None
-
-
-# Collapse consecutive spatial reuse into one burst and mark input-bank and residency boundaries.
-def coupled_timing(
-    config,
-    levels,
-    policy,
-    inputs,
-    *,
-    interval,
-    fill,
-    load_start,
-    output_cycles_per_vector,
-    output_capacity_vectors,
-    options,
-    bias_bits,
-    port_bits,
-    output_credit_delay=0,
-):
-    l1 = dict(levels[0])
-    order = tuple(loop for loop, _ in levels[0])
-    active_weights = [loop for loop in ("IC", "OC", "FX", "FY") if l1[loop] > 1]
-    reuse = {
-        loop
-        for loop in ("OX", "OY")
-        if all(
-            order.index(loop) < order.index(weight) for weight in active_weights
-        )
-    }
-    bias_reuse = {
-        loop for loop in ("OX", "OY") if order.index(loop) < order.index("OC")
-    }
-    phases = []
-    for index, (level, reader) in enumerate(
-        zip(levels, (policy.reader_l1, policy.reader_l2))
-    ):
-        phases.append(
-            tuple(
-                (
-                    bound,
-                    loop in REDUCTIONS,
-                    policy.fits and reader[getattr(le, loop)] != bound,
-                    index == 0 and loop in bias_reuse,
-                )
-                for loop, bound in level
-                if bound > 1 and not (index == 0 and loop in reuse)
-            )
-        )
-    output_vectors_per_burst = prod(l1[loop] for loop in reuse)
-    bias_requests = (
-        prod(l1[loop] for loop in reuse - bias_reuse) if bias_bits else 0
-    )
-    bias_cycles_per_vector = ceil_div(bias_bits, port_bits)
-    return _completion(
-        *phases,
-        output_vectors_per_burst,
-        bias_requests,
-        interval,
-        output_cycles_per_vector,
-        output_capacity_vectors,
-        min(config.cim_weight_sets, policy.full_set_loads),
-        fill,
-        options.weight_ready_cycles,
-        options.weight_release_cycles,
-        load_start,
-        inputs.max_fill_cycles,
-        inputs.first_fill_cycles,
-        bias_cycles_per_vector + options.memory_request_latency,
-        output_credit_delay,
     )
