@@ -89,6 +89,11 @@ def bank_partition(architecture, size_fn, layer, mapping):
 class BaseRuntimeCalculator:
     """Common memory and vector costs, with matrix compute supplied by a backend."""
 
+    # A backend whose cost models cannot tell some loop orders apart gives
+    # ``order_key(level, order, mapping)`` (see interstellar's
+    # ``opt_get_loop_order_generator``); None searches every order.
+    order_key = None
+
     def __init__(
         self,
         input_dtype_width: int,
@@ -512,8 +517,8 @@ class BaseRuntimeCalculator:
             for (dims, _), size in zip(self.tail_specs, tail_sizes)
         ]
 
-        bank_groups, scratch_slots = bank_partition(
-            architecture, layer.size_fn, layer, mapping
+        bank_groups, scratch_slots = self.bank_partition(
+            architecture, layer, mapping
         )
         matrix_cycles = self.matrix_cycles(mapping, bank_groups)
         vector_cycles = (
@@ -597,6 +602,11 @@ class BaseRuntimeCalculator:
             total_time += count * max(compute, dma)
         total_time += matrix_cycles + vector_cycles + store
         return total_time
+
+    def bank_partition(self, architecture, layer, mapping):
+        """``bank_partition`` of a scored mapping.  It reads no loop order, so
+        a backend may reuse it across the orders of one blocking."""
+        return bank_partition(architecture, layer.size_fn, layer, mapping)
 
     def matrix_cycles(self, mapping, bank_groups):
         """Backend compute cost for one L3 grid step."""

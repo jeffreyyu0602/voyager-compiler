@@ -955,7 +955,21 @@ def _order_fits_hint(order, blocking, partitioning, schedule, level):
     return True
 
 
-def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=False):
+def _first_order_of_each_key(orders, order_key, point, level):
+    """The first of ``orders`` for each ``order_key(level, order, point)``."""
+    seen = set()
+    kept = []
+    for order in orders:
+        key = order_key(level, order, point)
+        if key not in seen:
+            seen.add(key)
+            kept.append(order)
+    return kept
+
+
+def opt_get_loop_order_generator(
+    resource, layer, point, schedule=None, verbose=False, order_key=None
+):
     """
     Generator version of opt_get_best_loop_order.
 
@@ -965,6 +979,15 @@ def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=
     level's orders are filtered before the cross-product -- the product then
     builds only the mapping points the hint accepts, which are exactly the
     ones the post-hoc check used to let through, in the same sequence.
+
+    Args:
+        order_key: Optional ``order_key(level, order, point)``.  Two orders of
+            one level may have equal keys only if the runtime and the energy
+            models give them equal costs for every choice of order at the
+            other levels.  Each level then keeps only the first order of
+            each key.  The product is lexicographic, so the first mapping of
+            each class is kept, and the frontier would reject the others as
+            ties of that mapping.
     """
     num_levels = resource.buffer_levels()
     blocking = point.loop_blockings
@@ -982,6 +1005,11 @@ def opt_get_loop_order_generator(resource, layer, point, schedule=None, verbose=
         ]
         for level in range(num_levels)
     ]
+    if order_key is not None:
+        level_orders = [
+            _first_order_of_each_key(orders, order_key, point, level)
+            for level, orders in enumerate(level_orders)
+        ]
 
     for level_order_combination in itertools.product(*level_orders):
         yield MappingPoint(
@@ -999,6 +1027,7 @@ def opt_mapping_point_generator_function(
     runtime_calc_func=None,
     verbose=False,
     runtime_tolerance=0.0,
+    order_key=None,
 ):
     """
     Mapping point generator.
@@ -1014,6 +1043,8 @@ def opt_mapping_point_generator_function(
         runtime_tolerance: How much longer than the best runtime a mapping may
             take and still be considered, as a fraction.  0.0 keeps only the
             fastest mappings, and the least-energy one among them wins.
+        order_key: Groups loop orders the cost models cannot tell apart; see
+            ``opt_get_loop_order_generator``.
     """
     parallel_levels = resource.para_index
     ideal_perf = cost_model.get_ideal_performance(layer, resource)
@@ -1022,6 +1053,7 @@ def opt_mapping_point_generator_function(
     )
 
     frontier = []  # list of (runtime, energy, mapping_point)
+    fastest = float("inf")
     for blocking_partitioning in blocking_partitioning_generator:
         """
         dummy_mapping_point is used to validate the current blocking_partitioning,
@@ -1036,7 +1068,7 @@ def opt_mapping_point_generator_function(
         dummy_mapping_point = MappingPoint(None, blocking, partitioning, para_dim)
         # print "blocking_partitioning: ", blocking_partitioning
         for mapping_point in opt_get_loop_order_generator(
-            resource, layer, dummy_mapping_point, schedule, verbose
+            resource, layer, dummy_mapping_point, schedule, verbose, order_key
         ):
             if runtime_calc_func:
                 runtime = runtime_calc_func(
@@ -1046,6 +1078,14 @@ def opt_mapping_point_generator_function(
                 )
             else:
                 runtime = float("inf")
+
+            # The best runtime only falls, so a mapping slower than the
+            # tolerance allows now cannot be selected.  It can displace or
+            # keep out only frontier entries at least as slow, which cannot
+            # be selected either, so skip it before computing its energy.
+            if runtime > fastest * (1.0 + runtime_tolerance):
+                continue
+            fastest = min(fastest, runtime)
 
             cost = cost_model.get_total_cost(
                 resource,

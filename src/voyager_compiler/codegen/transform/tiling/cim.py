@@ -265,6 +265,127 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     )
 
 
+# L1 order readers test only whether a loop is a reduction, spatial or OC
+L1_CLASSES = {
+    le.IC: "R", le.FX: "R", le.FY: "R", le.OX: "S", le.OY: "S",
+    le.OC: "OC", le.ON: "ON",
+}
+
+
+def _merge_spatial_runs(tokens, innermost_only=False):
+    """Turn ``(name, bound)`` tokens into ``(name, bounds)`` tokens.
+
+    Each run of adjacent ``"S"`` tokens becomes one token with the sorted
+    bounds of the run; with ``innermost_only``, only a run that starts at
+    the innermost token.
+    """
+    merged = []
+    for name, bound in tokens:
+        if (
+            name == "S"
+            and merged
+            and merged[-1][0] == "S"
+            and not (innermost_only and len(merged) > 1)
+        ):
+            merged[-1] = ("S", merged[-1][1] + (bound,))
+        else:
+            merged.append((name, (bound,)))
+    return tuple((name, tuple(sorted(bounds))) for name, bounds in merged)
+
+
+def order_key(level, order, mapping, tail_specs=()):
+    """Key under which the cost models cannot tell ``level``'s orders apart.
+
+    ``order`` holds each loop's rank at ``level`` (0 = innermost). The key is
+    the inner-to-outer sequence of the level's non-unit loops as ``(name,
+    bound)`` pairs, with these exact equivalences:
+
+    * L1: every reader of the L1 order (``weight_policy``, the contexts in
+      ``evaluate``, ``estimate_cycles``, ``coupled_timing``, the bias and
+      output timing, and the interstellar access counts) tests only whether
+      a loop is a reduction (IC/FX/FY), spatial (OX/OY) or OC. Loops of one
+      class with equal bounds can thus swap. The innermost run of spatial
+      loops is reused inside every weight loop, and the readers use it only
+      as the product of its bounds, so its order is free.
+    * L2: OX and OY are read only as spatial loops, so they can swap when
+      their bounds are equal. IC and OC are read by name.
+    * L3: the matrix timing does not read the L3 order. The DRAM step counts
+      (``BaseRuntimeCalculator._l3_loads``) and the access counts read only
+      which loops are outside each operand's innermost loop. A split IC is
+      innermost (the hint), and the input and weight loads span it, so the
+      order is free when each fused tail operand spans every tiled output
+      loop. Otherwise adjacent OX and OY can swap when each tail operand
+      spans both or neither of them.
+
+    L0 keeps every order. ``tail_specs`` are the fused tail's ``(dims,
+    bits)`` operands.
+    """
+    b, p = mapping.loop_blockings, mapping.loop_partitionings
+    loops = sorted(
+        (d for d in range(le.NUM) if b[d][level] != 1 or p[d][level] != 1),
+        key=lambda d: order[d],
+    )
+    if level == 1:
+        return _merge_spatial_runs(
+            [(L1_CLASSES[d], b[d][1]) for d in loops], innermost_only=True
+        )
+    if level == 2:
+        return tuple(
+            ("S" if d in SPATIAL else le.table[d], b[d][2]) for d in loops
+        )
+    if level == 3:
+        if b[le.IC][3] > 1 and order[le.IC] != 0:
+            # The free orders below need the split IC innermost, as the hint
+            # requires. Without it, every L3 order keeps its own key.
+            return tuple((le.table[d], b[d][3]) for d in loops)
+        tiled = {d for d in (*OUTPUTS, le.ON) if b[d][3] > 1}
+        if b[le.IC][3] > 1 and all(
+            tiled <= set(dims) for dims, _ in tail_specs
+        ):
+            return ()
+        if all((le.OX in dims) == (le.OY in dims) for dims, _ in tail_specs):
+            return _merge_spatial_runs(
+                [("S" if d in SPATIAL else le.table[d], b[d][3]) for d in loops]
+            )
+        return tuple((le.table[d], b[d][3]) for d in loops)
+    return tuple(order)
+
+
+def _blocking_key(mapping):
+    """The blockings and partitionings of ``mapping``."""
+    return (
+        tuple(map(tuple, mapping.loop_blockings)),
+        tuple(map(tuple, mapping.loop_partitionings)),
+    )
+
+
+def _matrix_key(mapping):
+    """What ``evaluate`` and the matrix timing read from ``mapping``: the
+    blockings, the partitionings and the loop orders below L3."""
+    return (
+        *_blocking_key(mapping),
+        tuple(tuple(order[:3]) for order in mapping.loop_orders),
+    )
+
+
+class _LastResult:
+    """The result for the last key, recomputed when the key changes.
+
+    The search scores the loop orders of one blocking in a row and varies the
+    L3 order fastest, so a result that reads only part of the mapping repeats
+    across consecutive mappings.
+    """
+
+    def __init__(self):
+        self.key, self.value = object(), None
+
+    def get(self, key, compute, *args):
+        if key != self.key:
+            self.value = compute(*args)
+            self.key = key
+        return self.value
+
+
 def issue_window(config, input_width):
     """Minimum element issue spacing from CIMElement::issue_window()."""
     if config.cim_mode == 0:
@@ -300,6 +421,12 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         self.layer = layer
         self.timing_options = timing_options
         self._input_cache = {}
+        # The bank partition and the vector cycles read no loop order; the
+        # evaluation and the matrix timing read no L3 order.
+        self._partition = _LastResult()
+        self._vector_cycles = _LastResult()
+        self._evaluation = _LastResult()
+        self._matrix_cycles = _LastResult()
 
     def uses_banked_output(self, mapping):
         # A multi-beat output uses the banked path when the hardware provides
@@ -321,7 +448,15 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
             and width * self.config.pe_array_size[1] > self.sram_bandwidth
         )
 
+    def order_key(self, level, order, mapping):
+        return order_key(level, order, mapping, self.tail_specs)
+
     def evaluate(self, mapping):
+        return self._evaluation.get(
+            _matrix_key(mapping), self._evaluate, mapping
+        )
+
+    def _evaluate(self, mapping):
         return evaluate(
             self.config, self.layer, mapping,
             banked_output=self.uses_banked_output(mapping),
@@ -346,6 +481,14 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         )
 
     def matrix_cycles(self, mapping, bank_groups):
+        return self._matrix_cycles.get(
+            (_matrix_key(mapping), bank_groups),
+            self._matrix_timing_cycles,
+            mapping,
+            bank_groups,
+        )
+
+    def _matrix_timing_cycles(self, mapping, bank_groups):
         timing = self.timing(mapping, bank_groups)
         if (
             timing is None
@@ -353,3 +496,20 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         ):
             return math.inf
         return timing.runtime_cycles
+
+    def bank_partition(self, architecture, layer, mapping):
+        return self._partition.get(
+            (architecture, layer, layer.size_fn, _blocking_key(mapping)),
+            super().bank_partition,
+            architecture,
+            layer,
+            mapping,
+        )
+
+    def vector_cycles(self, mapping, bank_groups):
+        return self._vector_cycles.get(
+            (_blocking_key(mapping), bank_groups),
+            super().vector_cycles,
+            mapping,
+            bank_groups,
+        )

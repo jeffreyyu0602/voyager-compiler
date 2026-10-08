@@ -1027,6 +1027,7 @@ def _run_search(search):
             search.rc.calculate_runtime,
             verbose=False,
             runtime_tolerance=search.tiler.runtime_tolerance,
+            order_key=search.rc.order_key,
         )
     except AssertionError as e:
         # The optimizer reports "nothing fits" with a bare assert, so match
