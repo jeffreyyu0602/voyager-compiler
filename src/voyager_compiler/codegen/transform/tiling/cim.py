@@ -15,6 +15,10 @@ from voyager_compiler.codegen.transform.tiling.cim_timing import (
     TimingOptions,
     estimate_cycles,
 )
+from voyager_compiler.codegen.transform.tiling.cost import (
+    BANK_SWITCH_CYCLES,
+    strided_bank_walk,
+)
 from voyager_compiler.codegen.transform.tiling.input import input_buffer_usage
 from voyager_compiler.codegen.transform.tiling.runtime import (
     BaseRuntimeCalculator,
@@ -333,7 +337,7 @@ def _merge_spatial_runs(tokens, innermost_only=False):
     return tuple((name, tuple(sorted(bounds))) for name, bounds in merged)
 
 
-def order_key(level, order, mapping, tail_specs=()):
+def order_key(level, order, mapping, tail_specs=(), bank_walks=False):
     """Key under which the cost models cannot tell ``level``'s orders apart.
 
     ``order`` holds each loop's rank at ``level`` (0 = innermost). The key is
@@ -358,13 +362,18 @@ def order_key(level, order, mapping, tail_specs=()):
       spans both or neither of them.
 
     L0 keeps every order. ``tail_specs`` are the fused tail's ``(dims,
-    bits)`` operands.
+    bits)`` operands. ``bank_walks`` is set when a read stream can change
+    scratchpad bank (``CIMRuntimeCalculator.walks_banks``). Its bank walks
+    read every non-unit L1 and L2 loop by name, so those levels then keep
+    each order.
     """
     b, p = mapping.loop_blockings, mapping.loop_partitionings
     loops = sorted(
         (d for d in range(le.NUM) if b[d][level] != 1 or p[d][level] != 1),
         key=lambda d: order[d],
     )
+    if bank_walks and level in (1, 2):
+        return tuple((le.table[d], b[d][level]) for d in loops)
     if level == 1:
         return _merge_spatial_runs(
             [(L1_CLASSES[d], b[d][1]) for d in loops], innermost_only=True
@@ -489,7 +498,135 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         )
 
     def order_key(self, level, order, mapping):
-        return order_key(level, order, mapping, self.tail_specs)
+        return order_key(
+            level, order, mapping, self.tail_specs, self.walks_banks(mapping)
+        )
+
+    def _tail_rides(self, mapping):
+        """Whether the fused operands are fetched with the command's output
+        vectors, as in MatrixOps, rather than by a pass of their own."""
+        return (
+            bool(self.tail_specs)
+            and mapping.loop_blockings[le.IC][3] == 1
+            and (not self.single_k_tail_extra_pass or self.tail_keeps_shape)
+        )
+
+    def _walked_bytes(self, mapping):
+        """Bytes of the tile buffers the command's read streams walk: the
+        input with its halo, the weight and each riding fused operand."""
+        b = mapping.loop_blockings
+        hs, ws = self.stride
+        fy = b[le.FY][1] * b[le.FY][2]
+        rows = (b[le.OY][1] * b[le.OY][2] - 1) * hs + fy
+        cols = (b[le.OX][1] * b[le.OX][2] - 1) * ws + b[le.FX][1]
+        ic = self._extent(mapping, le.IC, 2)
+        oc = self._extent(mapping, le.OC, 2)
+        sizes = {
+            "input": rows * cols * ic * self.input_dtype_width / 8,
+            "weight": fy * b[le.FX][1] * ic * oc * self.weight_dtype_width / 8,
+        }
+        if self._tail_rides(mapping):
+            sizes["fused"] = max(self.tail_tile_sizes(mapping), default=0)
+        return sizes
+
+    def walks_banks(self, mapping):
+        """Whether a read stream can change scratchpad bank. Buffers start on
+        banks, so a walk of a buffer no larger than a bank stays in one."""
+        sizes = self._walked_bytes(mapping).values()
+        return bool(self.bank_size) and max(sizes) > self.bank_size
+
+    def _weight_bank_walk(self, mapping, policy):
+        """CIMWeightController::reader's fetch stream as ``(key_loops,
+        walk_of, held_loops)`` for _stream_switches, and the walk of one set.
+
+        A resident set fetches one weight row per input lane from the [FY,
+        FX, IC, OC] tile buffer, or one row per output lane from the [OC, IC]
+        buffer when transposed. The L1 loops run in the mapping's order with
+        the reader's bounds (``policy.reader_l1``): reused and replayed
+        spatial loops are omitted and other spatial loops repeat the inner
+        sets. A packed OC loop repeats each address once per packed lane
+        group. A sequence that does not fit is fetched once per replay. L2
+        spatial loops that reuse weights are held.
+        """
+        b, order = mapping.loop_blockings, mapping.loop_orders
+        ic, oc = self.config.pe_array_size
+        elem = self.weight_dtype_width / 8
+        ic1, oc1, fx = b[le.IC][1], b[le.OC][1], b[le.FX][1]
+        ic3 = self._extent(mapping, le.IC, 2)
+        oc3 = self._extent(mapping, le.OC, 2)
+        if self.weight_transposed:
+            pack = 1
+            row, rows, width = ic3 * elem, oc, ic * elem
+            strides = {le.IC: ic * elem, le.OC: oc * row}
+            offsets = {le.IC: ic1 * ic * elem, le.OC: oc1 * oc * row}
+        else:
+            pack = self._packed_width(oc, self.weight_dtype_width, oc1) // oc
+            row, rows, width = oc3 * elem, ic, oc * pack * elem
+            tap = ic3 * row
+            strides = {
+                le.IC: ic * row,
+                le.OC: width,
+                le.FX: tap,
+                le.FY: b[le.FY][2] * fx * tap,
+            }
+            offsets = {
+                le.IC: ic1 * ic * row,
+                le.OC: oc1 * oc * elem,
+                le.FY: fx * tap,
+            }
+        loops = [(policy.fetch_replays, 0)]
+        for d in sorted(range(le.NUM), key=lambda d: -order[d][1]):
+            bound = policy.reader_l1[d]
+            if d == le.OC and pack > 1:
+                loops += [(bound // pack, strides[d]), (pack, 0)]
+            elif bound > 1:
+                loops.append((bound, strides.get(d, 0)))
+        loops = tuple(loops) + ((rows, row),)
+
+        def weight_walk(idx):
+            offset = sum(idx.get(d, 0) * step for d, step in offsets.items())
+            return strided_bank_walk(loops, width, self.bank_size, offset)
+
+        held = tuple(
+            d for d in SPATIAL if b[d][2] > 1 and policy.reader_l2[d] == 1
+        )
+        one_set = strided_bank_walk(((rows, row),), width, self.bank_size)
+        return (le.IC, le.OC, le.FY), weight_walk, held, one_set
+
+    def bank_switch_cycles(self, mapping, policy):
+        """Cycles the command's read streams lose to scratchpad bank switches,
+        per role, and those of its first input fill and first weight set.
+
+        Each switch costs ``BANK_SWITCH_CYCLES``; a fused operand's
+        multi-beat requests overlap part of it (_tail_bank_switch_cycles).
+        The input walk is the shared InputController's (_input_bank_walk).
+        Bias reads and stores are not charged.
+        """
+        cycles, first = {}, {"input": 0, "weight": 0}
+        if not self.bank_size:
+            return cycles, first
+        sizes = self._walked_bytes(mapping)
+        if sizes["input"] > self.bank_size:
+            key_loops, walk = self._input_bank_walk(mapping)
+            cycles["input"] = BANK_SWITCH_CYCLES * self._stream_switches(
+                mapping, key_loops, walk
+            )
+            first["input"] = BANK_SWITCH_CYCLES * walk({})[0]
+        if sizes["weight"] > self.bank_size:
+            key_loops, walk, held, one_set = self._weight_bank_walk(
+                mapping, policy
+            )
+            cycles["weight"] = BANK_SWITCH_CYCLES * self._stream_switches(
+                mapping, key_loops, walk, held
+            )
+            first["weight"] = BANK_SWITCH_CYCLES * one_set[0]
+        if sizes.get("fused", 0) > self.bank_size:
+            cycles.update(
+                self._tail_bank_switch_cycles(
+                    mapping, tiled=not self.single_k_tail_extra_pass
+                )
+            )
+        return cycles, first
 
     def evaluate(self, mapping):
         return self._evaluation.get(

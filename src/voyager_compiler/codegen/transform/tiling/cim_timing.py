@@ -181,6 +181,15 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     inputs = rc._input_cache[input_key]
 
     policy = work.policy
+    # Read streams pause for a round trip when they change scratchpad bank.
+    switch_cycles, first_switch = rc.bank_switch_cycles(mapping, policy)
+    input_switch = switch_cycles.get("input", 0)
+    weight_switch = switch_cycles.get("weight", 0)
+    if first_switch["input"]:
+        inputs = replace(
+            inputs,
+            first_fill_cycles=inputs.first_fill_cycles + first_switch["input"],
+        )
     weight_pack = packing_factor(oc * rc.weight_dtype_width, port, l1["OC"])
     weight_bits = oc * rc.weight_dtype_width * weight_pack
     weight_row_cycles = transfer_cycles(
@@ -193,6 +202,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     weight_fill_cycles = (
         steady_fill_cycles if config.cim_weight_sets > 1 else first_weight
     )
+    first_weight += first_switch["weight"]
     total_weight_cycles = policy.full_set_loads * weight_fill_cycles
 
     output_width = (
@@ -254,6 +264,9 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             output_words["output"] += 2 * rc._bus_words(
                 output_elems, rc.output_dtype_width
             )
+        for role, cycles in switch_cycles.items():
+            if isinstance(role, tuple):
+                output_words[role] += cycles
     output_cycles_per_vector = max(
         options.output_cycles_per_vector,
         ceil_div(output_width * oc, port),
@@ -318,8 +331,22 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         release_delay=options.weight_release_cycles,
         load_start=max(0, first_weight - weight_fill_cycles),
     )
+    # A stream pays its bank-switch round trips in series, so its last use
+    # waits for the stream's busy time; idle stream time hides them. The
+    # first set's switches are already in its load offset.
+    if weight_switch:
+        weight_finish = max(
+            weight_finish,
+            max(0, first_weight - weight_fill_cycles)
+            + total_weight_cycles
+            + weight_switch
+            - first_switch["weight"]
+            + options.weight_ready_cycles
+            + policy.macs_per_set_use * issue_interval,
+        )
     weight_issue = weight_finish - startup
     # Uniform bank fills are exact here; irregular boundaries use a visible maximum-fill bound.
+    input_compute = work.mac_requests // inputs.fills * issue_interval
     input_finish, input_steps, input_bound = buffer_completion(
         1,
         1,
@@ -327,9 +354,14 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         2,
         inputs.max_fill_cycles,
         0,
-        work.mac_requests // inputs.fills * issue_interval,
+        input_compute,
         startup,
     )
+    if input_switch:
+        input_finish = max(
+            input_finish,
+            inputs.total_fill_cycles + input_switch + input_compute,
+        )
     input_issue = input_finish - startup
     spacing = (
         work.buffer_feedback_spacing * issue_interval
@@ -433,8 +465,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     # Shared scratchpad roles queue on a bank's one port, even when their
     # controllers otherwise overlap. Retain that total-traffic lower bound.
     bank_words = dict(
-        input=traffic.input_external_beats,
-        weight=traffic.weight_external_beats,
+        input=traffic.input_external_beats + input_switch,
+        weight=traffic.weight_external_beats + weight_switch,
         bias=traffic.bias_external_beats,
     )
     bank_words.update(output_words)
@@ -449,8 +481,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
         resource_cycles=dict(
             compute=compute,
             result_slots=total_issue_cycles,
-            input=inputs.total_fill_cycles,
-            weight=total_weight_cycles,
+            input=inputs.total_fill_cycles + input_switch,
+            weight=total_weight_cycles + weight_switch,
             accumulation=total_accumulation_cycles,
             output=total_output_cycles,
             bias=total_bias_cycles,
@@ -462,6 +494,13 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             **output_readiness,
             **bias_readiness,
             additive_wait_bound_cycles=additive_cycles,
+            input_bank_switch_cycles=input_switch,
+            weight_bank_switch_cycles=weight_switch,
+            fused_bank_switch_cycles=sum(
+                cycles
+                for role, cycles in switch_cycles.items()
+                if isinstance(role, tuple)
+            ),
             weight_wait_cycles=max(0, weight_issue - total_issue_cycles),
             weight_fill_cycles=weight_fill_cycles,
             weight_ready_cycles=options.weight_ready_cycles,

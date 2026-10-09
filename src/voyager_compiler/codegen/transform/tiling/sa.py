@@ -228,11 +228,12 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         """Cycles one L3 step's input and weight streams lose to bank
         switches, per role (``BANK_SWITCH_CYCLES`` each).
 
-        Follow the mapping's L1 input order and the weight FY/FX/IC/OC scan.
-        Packing combines adjacent channel groups into a request exactly
-        when the toolchain permits it, matching _request_words. Buffers
-        start on banks; input scales are not included.
-        A weight tile held across spatial loops is not refetched by them.
+        Follow the mapping's L1 input order (_input_bank_walk) and the
+        weight FY/FX/IC/OC scan. Packing combines adjacent channel groups
+        into a request exactly when the toolchain permits it, matching
+        _request_words. Buffers start on banks; input scales are not
+        included. A weight tile held across spatial loops is not refetched
+        by them.
         """
         if not self.bank_size:
             return {}
@@ -243,48 +244,12 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         ic1 = self._extent(mapping, le.IC, 1)
         oc1 = self._extent(mapping, le.OC, 1)
         fy, fx = b[le.FY][1], b[le.FX][1]
-        oy1, ox1 = b[le.OY][1], b[le.OX][1]
-        hs, ws = self.stride
-        y_in = (oy1 * b[le.OY][2] - 1) * hs + fy
-        x_in = (ox1 * b[le.OX][2] - 1) * ws + fx
-        pitch_in = ic3 * self.input_dtype_width / 8
-        ic_dim = mapping.loop_partitionings[le.IC][0]
         oc_dim = mapping.loop_partitionings[le.OC][0]
-
-        def packed_width(lanes, bits, count):
-            row_bits = lanes * bits
-            factor = math.lcm(row_bits, self.sram_bandwidth) // row_bits
-            return lanes * (factor if count and count % factor == 0 else 1)
-
-        input_chunk = packed_width(ic_dim, self.input_dtype_width, b[le.IC][1])
-        input_order = sorted((le.IC, le.OY, le.OX), key=lambda i: -orders[i][1])
-
-        def input_walk(idx):
-            y0 = idx.get(le.OY, 0) * oy1 * hs
-            x0 = idx.get(le.OX, 0) * ox1 * ws
-            # Filter taps expand the spatial fetch; the controller disables
-            # its separate L1 FX/FY/OC loops. Clip the last halo to the tile.
-            sy, sx = (hs if fy == 1 else 1), (ws if fx == 1 else 1)
-            ny = min(
-                oy1 if fy == 1 else oy1 * hs + fy - 1, (y_in - 1 - y0) // sy + 1
-            )
-            nx = min(
-                ox1 if fx == 1 else ox1 * ws + fx - 1, (x_in - 1 - x0) // sx + 1
-            )
-            width = input_chunk * self.input_dtype_width / 8
-            scans = {
-                le.IC: (ic1 // input_chunk, width),
-                le.OY: (ny, sy * x_in * pitch_in),
-                le.OX: (nx, sx * pitch_in),
-            }
-            loops = tuple(scans[i] for i in input_order)
-            offset = (y0 * x_in + x0) * pitch_in
-            offset += idx.get(le.IC, 0) * ic1 * self.input_dtype_width / 8
-            return strided_bank_walk(loops, width, self.bank_size, offset)
+        input_loops, input_walk = self._input_bank_walk(mapping)
 
         pitch_w = oc3 * self.weight_dtype_width / 8
         beat_w = oc1 * self.weight_dtype_width / 8
-        weight_chunk = packed_width(
+        weight_chunk = self._packed_width(
             oc_dim,
             self.weight_dtype_width,
             0 if self.weight_transposed else b[le.OC][1],
@@ -312,7 +277,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             )
         return {
             "input": BANK_SWITCH_CYCLES
-            * self._stream_switches(mapping, (le.OX, le.OY, le.IC), input_walk),
+            * self._stream_switches(mapping, input_loops, input_walk),
             "weight": BANK_SWITCH_CYCLES
             * self._stream_switches(mapping, (le.OC, le.IC), weight_walk, held),
         }

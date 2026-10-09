@@ -298,6 +298,64 @@ class BaseRuntimeCalculator:
 
         return walk(0, {})[0]
 
+    def _packed_width(self, lanes, bits, count):
+        """Elements one request of ``lanes`` elements moves: the toolchain
+        packs adjacent groups into a request exactly when the loop that
+        walks them, of ``count`` steps, divides into the packing factor,
+        matching _request_words.  A ``count`` of 0 never packs."""
+        row_bits = lanes * bits
+        factor = math.lcm(row_bits, self.sram_bandwidth) // row_bits
+        return lanes * (factor if count and count % factor == 0 else 1)
+
+    def _input_bank_walk(self, mapping):
+        """The InputController's fetch stream as ``(key_loops, walk_of)`` for
+        _stream_switches.
+
+        Follow the mapping's L1 input order. Filter taps expand the spatial
+        fetch, and the controller disables its separate L1 FX/FY/OC loops.
+        An L2 FY loop with one L1 filter row offsets the fetched rows (outer
+        FY). Buffers start on banks; input scales are not included.
+        """
+        b = mapping.loop_blockings
+        orders = mapping.loop_orders
+        ic3 = self._extent(mapping, le.IC, 2)
+        ic1 = self._extent(mapping, le.IC, 1)
+        fy, fx = b[le.FY][1], b[le.FX][1]
+        oy1, ox1 = b[le.OY][1], b[le.OX][1]
+        hs, ws = self.stride
+        y_in = (oy1 * b[le.OY][2] - 1) * hs + fy * b[le.FY][2]
+        x_in = (ox1 * b[le.OX][2] - 1) * ws + fx
+        pitch_in = ic3 * self.input_dtype_width / 8
+        ic_dim = mapping.loop_partitionings[le.IC][0]
+        input_chunk = self._packed_width(
+            ic_dim, self.input_dtype_width, b[le.IC][1]
+        )
+        input_order = sorted((le.IC, le.OY, le.OX), key=lambda i: -orders[i][1])
+
+        def input_walk(idx):
+            y0 = idx.get(le.OY, 0) * oy1 * hs + idx.get(le.FY, 0)
+            x0 = idx.get(le.OX, 0) * ox1 * ws
+            # Clip the last halo to the tile.
+            sy, sx = (hs if fy == 1 else 1), (ws if fx == 1 else 1)
+            ny = min(
+                oy1 if fy == 1 else oy1 * hs + fy - 1, (y_in - 1 - y0) // sy + 1
+            )
+            nx = min(
+                ox1 if fx == 1 else ox1 * ws + fx - 1, (x_in - 1 - x0) // sx + 1
+            )
+            width = input_chunk * self.input_dtype_width / 8
+            scans = {
+                le.IC: (ic1 // input_chunk, width),
+                le.OY: (ny, sy * x_in * pitch_in),
+                le.OX: (nx, sx * pitch_in),
+            }
+            loops = tuple(scans[i] for i in input_order)
+            offset = (y0 * x_in + x0) * pitch_in
+            offset += idx.get(le.IC, 0) * ic1 * self.input_dtype_width / 8
+            return strided_bank_walk(loops, width, self.bank_size, offset)
+
+        return (le.OX, le.OY, le.IC, le.FY), input_walk
+
     def _tail_bank_switch_cycles(self, mapping, tiled):
         """Fused-operand read latency, charged only on a finishing pass.
 
