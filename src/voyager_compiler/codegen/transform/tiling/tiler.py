@@ -411,7 +411,9 @@ def make_size_fn(
     if_scale_bits = _node_dtype_bits(node.kwargs.get("input_scale"), 0)
     fl_scale_bits = _node_dtype_bits(node.kwargs.get("weight_scale"), 0)
     of_scale_bits = get_dtype_width(of_scale_dtype) if of_scale_dtype else 0
-    stage_bits = get_dtype_width(node.value.dtype)
+    # Quantized matrix values are traced in a floating host dtype. Their
+    # tracked dtype describes the partial sums actually staged by codegen.
+    stage_bits = _node_dtype_bits(node)
     block_size = node.kwargs.get("block_size") or 1
     # A gathered-CSR entry: the outlier value and its column index, each
     # staged in its own buffer.
@@ -884,8 +886,15 @@ def _prepare_search(node, tiler, constraint=None):
         out_dtype = [
             d if d is not None else v.dtype for d, v in zip(tracked, vals)
         ]
+    # Without a tracked dtype, a fused group stores its last node's output:
+    # a float tail stores float even after an integer GEMM.
+    if out_dtype is None and sub_gm is not None:
+        last = next(n for n in sub_gm.graph.nodes if n.op == "output").args[0]
+        if isinstance(last, torch.fx.Node):
+            out_dtype = last.meta.get("dtype") or last.value.dtype
 
     key = _layer_cache_key(anchor) + (
+        _node_dtype_bits(anchor),
         tuple(out_dtype) if isinstance(out_dtype, list) else out_dtype,
         tuple(fused_specs),
         has_tail,
@@ -959,7 +968,7 @@ def _prepare_search(node, tiler, constraint=None):
         if_bits,
         fl_bits,
         of_bits,
-        32 if accumulate_fp32 else get_dtype_width(anchor.value.dtype),
+        32 if accumulate_fp32 else _node_dtype_bits(anchor),
         tiler.config.double_buffered_accum_buffer,
         sram_bandwidth,
         tiler.config.bytes_per_cycle,
