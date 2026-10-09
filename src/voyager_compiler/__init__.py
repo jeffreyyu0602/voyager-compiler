@@ -52,6 +52,7 @@ from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     flush_tensor_files,
     gen_code_bufferized,
+    gen_memory_config,
     plan_memory,
     print_bufferized_graph,
     print_layer_table,
@@ -384,6 +385,8 @@ def compile(
         f.write(text_format.MessageToString(params))
     with open(os.path.join(output_dir, "layers.txt"), "w") as f:
         f.write(print_layer_table(model, params, to_string=True))
+    with open(os.path.join(output_dir, "memory_config.txt"), "w") as f:
+        f.write(text_format.MessageToString(gen_memory_config(config)))
 
     flush_tensor_files()
     return params
