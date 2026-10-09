@@ -158,7 +158,8 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
             l1,
             l2,
             input_x=(l1["OX"] * l2["OX"] - 1) * rc.stride[1] + l1["FX"],
-            input_y=(l1["OY"] * l2["OY"] - 1) * rc.stride[0] + l1["FY"],
+            input_y=(l1["OY"] * l2["OY"] - 1) * rc.stride[0]
+            + l1["FY"] * l2["FY"],
             stride=rc.stride[0],
             lanes=ic,
             element_bits=rc.input_dtype_width,

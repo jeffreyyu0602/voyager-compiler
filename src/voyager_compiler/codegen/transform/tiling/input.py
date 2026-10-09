@@ -17,6 +17,8 @@ def input_buffer_usage(mapping, stride, capacity=None):
     height = b[le.OY][1] * (sy if fy > 1 else 1) + fy - 1
     words = width * height * b[le.IC][1]
     reasons = []
+    if b[le.FY][2] > 1 and fy != 1:
+        reasons.append("outer FY requires unit inner FY in InputController")
     if sx != sy or not 1 <= sx <= 255:
         reasons.append("InputController requires equal strides from 1 to 255")
     if max(fx, fy) > 15:

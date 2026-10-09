@@ -466,7 +466,9 @@ class BaseRuntimeCalculator:
             * blockings[le.OC][1]
             * blockings[le.OC][2]
             * blockings[le.FY][1]
+            * blockings[le.FY][2]
             * blockings[le.FX][1]
+            * blockings[le.FX][2]
         )
         output_elems = (
             partitionings[le.OC][0]

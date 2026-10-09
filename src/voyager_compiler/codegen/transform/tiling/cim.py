@@ -67,9 +67,9 @@ def build_architecture(config, dram_access_cost):
     hints = {}
     for loop in range(le.NUM):
         lanes = ic if loop == le.IC else oc if loop == le.OC else 1
-        # L0 has fixed physical lanes and no temporal work. Keep filters
-        # inside L1 and the L3 reduction innermost, as required by the current
-        # bufferized convolution/GEMM grid. L1 and L2 orders are otherwise free.
+        # L0 has fixed physical lanes and no temporal work. FX stays at L1;
+        # FY may run at L1 or L2 inside one command. The bufferized grid keeps
+        # filter loops below L3 and its channel reduction innermost.
         hints[loop] = [
             [
                 1 if loop == le.IC else 0 if loop == le.OC else None,
@@ -77,7 +77,7 @@ def build_architecture(config, dram_access_cost):
                 lanes,
             ],
             [None, None, 1],
-            [None, 1 if loop in (le.FX, le.FY) else None, 1],
+            [None, 1 if loop == le.FX else None, 1],
             [
                 0 if loop == le.IC else None,
                 1 if loop in (le.FX, le.FY) else None,
@@ -175,8 +175,8 @@ class Evaluation:
 def evaluate(config, layer, mapping, *, banked_output=False):
     """Check a mapping against CIM buffer and controller limits.
 
-    The search keeps complete filter loops at L1. Partial sums beyond the
-    local register capacity use the accumulation SRAM.
+    FX stays at L1 and FY may run at L1 or L2. Partial sums beyond the local
+    register capacity use the accumulation SRAM.
     """
     b, p, order = (
         mapping.loop_blockings,
@@ -196,8 +196,8 @@ def evaluate(config, layer, mapping, *, banked_output=False):
             break
     if any(n != 1 for n in b[le.ON]):
         reasons.append("batch must be handled outside the CIM command")
-    if any(b[d][level] != 1 for d in (le.FX, le.FY) for level in (2, 3)):
-        reasons.append("CIM mapping keeps complete filters at L1")
+    if b[le.FX][2] != 1 or b[le.FX][3] != 1 or b[le.FY][3] != 1:
+        reasons.append("CIM mapping keeps FX at L1 and FY at L1 or L2")
     if any(prod(b[d]) * prod(p[d]) != layer.sizes[d] for d in range(le.NUM)):
         reasons.append("mapping must cover the padded workload exactly")
     if any(b[d][level] > 1023 for d in range(le.NUM) for level in (1, 2)):
