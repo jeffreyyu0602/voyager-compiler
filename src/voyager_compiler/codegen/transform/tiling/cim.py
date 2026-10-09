@@ -166,10 +166,64 @@ class Evaluation:
     buffer_partial_updates: int
     input_fill_words: int
     weight_write_beats: int
+    local_reduction_steps: int = 1
+    buffer_feedback_spacing: int = 0
 
     @property
     def legal(self):
         return not self.reasons
+
+
+def accumulation_policy(config, mapping):
+    """Local reduction lifetime and SRAM traffic, matching CIMProcessor.
+
+    Registers cover the largest inner reduction with at most R live outputs.
+    Its final partial sum spills once if an outer reduction remains. When no
+    inner reduction fits, the existing first-R full-sum optimization remains.
+    """
+    b, order = mapping.loop_blockings, mapping.loop_orders
+    loops = [
+        (d, b[d][level])
+        for level in (1, 2)
+        for d in sorted(OUTPUTS + REDUCTIONS, key=lambda d: order[d][level])
+    ]
+    live, boundary = 1, -1
+    for index, (dim, bound) in enumerate(loops):
+        if dim in OUTPUTS:
+            live *= bound
+        if dim in REDUCTIONS and bound > 1 and live <= config.cim_local_accum_contexts:
+            boundary = index
+    outputs = prod(bound for dim, bound in loops if dim in OUTPUTS)
+    reductions = prod(bound for dim, bound in loops if dim in REDUCTIONS)
+    if boundary >= 0:
+        contexts = prod(bound for dim, bound in loops[:boundary + 1] if dim in OUTPUTS)
+        local_steps = prod(bound for dim, bound in loops[:boundary + 1] if dim in REDUCTIONS)
+        updates = outputs * (reductions // local_steps - 1)
+    else:
+        contexts = prod(
+            b[d][level]
+            for level in (1, 2) for d in OUTPUTS
+            if any(
+                b[r][outer] > 1 and (
+                    outer > level
+                    or (outer == level and order[d][level] < order[r][level])
+                )
+                for outer in (1, 2) for r in REDUCTIONS
+            )
+        )
+        local_steps = 1
+        updates = outputs // contexts * max(0, contexts - config.cim_local_accum_contexts) * (reductions - 1)
+    # A stored group's last contribution, rather than its first one, starts
+    # the dependency interval before the next group's first SRAM read.
+    period, local_span, spacing = 1, 0, 0
+    for index, (dim, bound) in enumerate(loops):
+        if dim in REDUCTIONS and bound > 1:
+            if index > boundary:
+                spacing = period - local_span
+                break
+            local_span += (bound - 1) * period
+        period *= bound
+    return contexts, local_steps, updates, spacing if updates else 0
 
 
 def evaluate(config, layer, mapping, *, banked_output=False):
@@ -229,24 +283,8 @@ def evaluate(config, layer, mapping, *, banked_output=False):
     if policy.compute_replays > 65535:
         reasons.append("replay count exceeds the 16-bit descriptor field")
 
-    # Count output coordinates enclosed by any non-unit reduction, matching
-    # CIMProcessor::local_accum_layout. Remaining outputs use SRAM feedback.
-    contexts = prod(
-        b[d][level]
-        for level in (1, 2) for d in OUTPUTS
-        if any(
-            b[r][outer] > 1 and (
-                outer > level
-                or (outer == level and order[d][level] < order[r][level])
-            )
-            for outer in (1, 2) for r in REDUCTIONS
-        )
-    )
+    contexts, local_steps, partial_updates, feedback_spacing = accumulation_policy(config, mapping)
     outputs = prod(b[d][level] for level in (1, 2) for d in OUTPUTS)
-    reductions = prod(b[d][level] for level in (1, 2) for d in REDUCTIONS)
-    spilled_outputs = outputs // contexts * max(
-        0, contexts - config.cim_local_accum_contexts
-    )
     # InputController loads an input tile, including its halo, on each L2
     # iteration, even when the weights remain loaded in the CIM array.
     input_fills = prod(b[d][2] for d in range(le.NUM))
@@ -258,10 +296,12 @@ def evaluate(config, layer, mapping, *, banked_output=False):
         contexts,
         macs,
         outputs,
-        spilled_outputs * (reductions - 1),
+        partial_updates,
         input_words * input_fills,
         policy.full_set_loads * ic
         * config.cim_output_axis_tiles // config.cim_b_port_tiles,
+        local_steps,
+        feedback_spacing,
     )
 
 

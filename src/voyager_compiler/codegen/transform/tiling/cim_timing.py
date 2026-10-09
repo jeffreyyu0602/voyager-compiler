@@ -332,7 +332,7 @@ def estimate_cycles(rc, mapping, work, bank_groups, interval):
     )
     input_issue = input_finish - startup
     spacing = (
-        feedback_spacing(levels) * issue_interval
+        work.buffer_feedback_spacing * issue_interval
         if traffic.buffer_accum_reads
         else 0
     )
