@@ -235,7 +235,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         included. A weight tile held across spatial loops is not refetched
         by them.
         """
-        if not self.bank_size:
+        if self.independent_memory_ports or not self.bank_size:
             return {}
         b = mapping.loop_blockings
         orders = mapping.loop_orders
@@ -298,7 +298,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
         the steps whose ping-pong slots agree: every step when the stream
         is refetched with it, else every other.
         """
-        if not bank_groups:
+        if self.independent_memory_ports or not bank_groups:
             return 0
         sweeps = mapping.loop_blockings[le.IC][2]
         steps = self._l3_blocks(mapping)
@@ -573,7 +573,7 @@ class RuntimeCalculator(BaseRuntimeCalculator):
             # several banks most consecutive gathers change bank and pay the
             # read path's round trip, as the streams above do.
             switch = 0.0
-            if self.bank_size:
+            if self.bank_size and not self.independent_memory_ports:
                 weight_tile_bytes = (
                     self._extent(mapping, le.OC, 2)
                     * k_block

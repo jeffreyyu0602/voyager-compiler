@@ -105,6 +105,11 @@ class AcceleratorConfig:
     cim_array_result_slots: Optional[int] = None
     cim_local_accum_contexts: int = 4
 
+    # Standalone interface timing for either matrix backend. Bank geometry
+    # still determines tensor placement; independent ports do not arbitrate
+    # accesses by bank address or pay the SoC bank-switch round trip.
+    independent_memory_ports: bool = False
+
     def __post_init__(self):
         """Reject a reservation the rest of the compiler could not honour.
 
@@ -113,6 +118,8 @@ class AcceleratorConfig:
 
         Also validate the selected matrix backend and its CIM configuration.
         """
+        if type(self.independent_memory_ports) is not bool:
+            raise ValueError("independent_memory_ports must be a boolean")
         if type(self.matrix_backend) is not int or self.matrix_backend not in (
             0,
             1,
@@ -309,6 +316,7 @@ class AcceleratorConfig:
             num_banks=args.num_banks,
             bank_width=args.bank_width,
             double_buffered_l2=args.double_buffered_l2,
+            independent_memory_ports=args.independent_memory_ports,
             dram_size=args.dram_size,
             dram_bandwidth=args.dram_bandwidth,
             dram_access_latency=args.dram_access_latency,

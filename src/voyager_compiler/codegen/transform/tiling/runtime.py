@@ -122,7 +122,10 @@ class BaseRuntimeCalculator:
         bank_size: Optional[int] = None,
         weight_transposed: bool = False,
         input_buffer_size: Optional[int] = None,
+        independent_memory_ports: bool = False,
     ):
+        if type(independent_memory_ports) is not bool:
+            raise ValueError("independent_memory_ports must be a boolean")
         self.input_dtype_width = input_dtype_width
         self.weight_dtype_width = weight_dtype_width
         self.output_dtype_width = output_dtype_width
@@ -149,6 +152,7 @@ class BaseRuntimeCalculator:
         self.bank_size = bank_size
         self.weight_transposed = weight_transposed
         self.input_buffer_size = input_buffer_size
+        self.independent_memory_ports = independent_memory_ports
         self.dram_bytes = {}
 
     def tail_tile_sizes(self, mapping):
@@ -172,6 +176,8 @@ class BaseRuntimeCalculator:
         nothing shares) queue on its single port.  A role the partition does
         not name keeps a port of its own.
         """
+        if self.independent_memory_ports:
+            bank_groups = None
         placed = set()
         busiest = 0
         for roles in bank_groups or ():
@@ -365,7 +371,7 @@ class BaseRuntimeCalculator:
         requests overlap part of the bank-switch drain (two beats lose
         seven cycles, versus eight for one), as in pool_bank_switch_cycles.
         """
-        if not self.bank_size:
+        if self.independent_memory_ports or not self.bank_size:
             return {}
         b, orders = mapping.loop_blockings, mapping.loop_orders
         dims_out = (le.ON, le.OY, le.OX, le.OC)

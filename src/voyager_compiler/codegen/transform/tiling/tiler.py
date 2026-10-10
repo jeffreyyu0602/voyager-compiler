@@ -171,6 +171,9 @@ def build_interstellar_tiler(
     to bytes/cycle lives on ``config.bytes_per_cycle``, read at run time).
     ``accumulate_fp32`` sizes and prices a GEMM split along K with a float32
     accumulator.
+
+    ``config.independent_memory_ports`` disables shared-bank timing for either
+    backend while preserving bank allocation.
     """
     backend = cim if config.matrix_backend == 1 else sa
     architecture, schedule = backend.build_architecture(config, dram_access_cost)
@@ -979,6 +982,7 @@ def _prepare_search(node, tiler, constraint=None):
         bank_size=tiler.config.bank_size,
         weight_transposed=transposed,
         input_buffer_size=tiler.config.input_buffer_size,
+        independent_memory_ports=tiler.config.independent_memory_ports,
         **backend_args,
     )
 

@@ -532,6 +532,8 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
     def walks_banks(self, mapping):
         """Whether a read stream can change scratchpad bank. Buffers start on
         banks, so a walk of a buffer no larger than a bank stays in one."""
+        if self.independent_memory_ports:
+            return False
         sizes = self._walked_bytes(mapping).values()
         return bool(self.bank_size) and max(sizes) > self.bank_size
 
@@ -603,7 +605,7 @@ class CIMRuntimeCalculator(BaseRuntimeCalculator):
         Bias reads and stores are not charged.
         """
         cycles, first = {}, {"input": 0, "weight": 0}
-        if not self.bank_size:
+        if self.independent_memory_ports or not self.bank_size:
             return cycles, first
         sizes = self._walked_bytes(mapping)
         if sizes["input"] > self.bank_size:

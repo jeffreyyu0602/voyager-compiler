@@ -297,6 +297,13 @@ def add_compile_args(parser=None):
         help="Memory bank width (bytes) for memory planning.",
     )
     parser.add_argument(
+        "--independent_memory_ports",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use independent external interface timing for SA or CIM; "
+        "retain banked allocation and emit INDEPENDENT harness mode.",
+    )
+    parser.add_argument(
         "--double_buffered_l2",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_DOUBLE_BUFFERED_L2,

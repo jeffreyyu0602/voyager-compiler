@@ -1238,8 +1238,10 @@ def print_layer_table(
 
 
 def gen_memory_config(config) -> MemoryConfig:
-    """Generate the memory geometry used to place the compiled tensors."""
-    banked = all((config.scratchpad_size, config.num_banks, config.bank_width))
+    """Generate the harness timing mode and tensor allocation geometry."""
+    banked = not config.independent_memory_ports and all(
+        (config.scratchpad_size, config.num_banks, config.bank_width)
+    )
     return MemoryConfig(
         mode=MemoryConfig.BANKED if banked else MemoryConfig.INDEPENDENT,
         scratchpad_size=config.scratchpad_size or 0,
