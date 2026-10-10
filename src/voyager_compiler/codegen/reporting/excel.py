@@ -256,6 +256,8 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
         "Macs / Ops",
         "Ideal cycles",
         "Utilization",
+        "Useful work fraction",
+        "Effective utilization",
         "Analytic cycles",
         "Effective cycles",
         "Calibration",
@@ -290,6 +292,8 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                     op.detail.get("macs", op.detail.get("ops", 0)),
                     op.ideal_cycles,
                     op.utilization,
+                    op.useful_work_fraction,
+                    op.effective_utilization,
                     op.analytic_cycles,
                     op.effective_cycles,
                     op.calibration,
@@ -330,6 +334,8 @@ def _operations(wb, result: ScheduleResult, rows: List[KernelRow], agg):
                     None,  # Macs / Ops is compute-only; bytes are in Read/Write B
                     ideal,
                     (ideal / e["cycles"]) if e["cycles"] and ideal else None,
+                    None,
+                    None,
                     round(e["cycles"] / n),
                     round(e["cycles"] / n),
                     "",
@@ -387,6 +393,7 @@ class OperationRow:
     power_cycles: float = 0.0  # sum of power * span, for the weighted mean
     first: int = 0
     groups: List[str] = field(default_factory=list)
+    useful_ideal: float = 0.0
 
     @property
     def power(self) -> float:
@@ -395,6 +402,10 @@ class OperationRow:
     @property
     def utilization(self) -> float:
         return self.ideal / self.cycles if self.cycles else 0.0
+
+    @property
+    def effective_utilization(self) -> float:
+        return self.useful_ideal / self.cycles if self.cycles else 0.0
 
     def seconds(self, frequency_ghz: float) -> float:
         return self.cycles / (frequency_ghz * 1e9)
@@ -418,10 +429,13 @@ def _per_kernel(result, agg) -> Dict[str, dict]:
     by_key = {op.key: op for op in result.ops}
     for key, e in agg.items():
         k = e["kernel"]
-        entry = out.setdefault(k, {"ideal": 0.0, "mma": False, "vec": False})
+        entry = out.setdefault(
+            k, {"ideal": 0.0, "useful_ideal": 0.0, "mma": False, "vec": False}
+        )
         op = by_key.get(key)
         if op is not None and op.op_type in ("gemm", "conv", "vector"):
             entry["ideal"] += op.ideal_cycles * e["count"]
+            entry["useful_ideal"] += op.useful_ideal_cycles * e["count"]
             entry["mma"] |= "mma" in op.units
             entry["vec"] |= "vector" in op.units
     return out
@@ -479,6 +493,9 @@ def operation_rows(result, rows, agg, calibration=None) -> List[OperationRow]:
         entry.ideal += (
             st["ideal"] if (st["mma"] or st["vec"]) else n_bytes / bpc
         )
+        entry.useful_ideal += (
+            st["useful_ideal"] if (st["mma"] or st["vec"]) else n_bytes / bpc
+        )
         if calibration is not None:
             entry.power_cycles += calibration.power(row.group) * row.span
 
@@ -507,9 +524,13 @@ def totals(table: List[OperationRow], total_latency: int) -> OperationRow:
         out.cycles += row.cycles
         out.bytes += row.bytes
         out.ideal += row.ideal
+        out.useful_ideal += row.useful_ideal
         out.power_cycles += row.power_cycles
     if total_latency:
         out.ideal = out.ideal / total_latency * out.cycles if out.cycles else 0
+        out.useful_ideal = (
+            out.useful_ideal / total_latency * out.cycles if out.cycles else 0
+        )
     return out
 
 
@@ -549,6 +570,7 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
         "Latency (us)",
         "DRAM Traffic (MB)",
         "Util.",
+        "Effective util.",
         "Power (W)",
         "Compute Energy (mJ)",
         "DRAM Energy (mJ)",
@@ -558,7 +580,7 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
         ws.write(0, c, h, bold)
     ws.set_column(0, 0, 30)
     ws.set_column(1, 1, 14)
-    ws.set_column(2, 9, 17)
+    ws.set_column(2, 10, 17)
     ws.freeze_panes(1, 0)
 
     # Where each build group's power lives on the Calibration sheet.
@@ -577,6 +599,7 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
         ws.write_number(r, 3, row.cycles / freq / 1000.0, f2)
         ws.write_number(r, 4, row.bytes / 1e6, f3)
         ws.write_number(r, 5, row.utilization, f2)
+        ws.write_number(r, 6, row.effective_utilization, f2)
         if refs:
             # Several groups on one display line: their span-weighted mean is
             # what the row draws, and with equal spans that is the average.
@@ -585,28 +608,28 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
                 if len(refs) == 1
                 else ("AVERAGE(" + ",".join(refs) + ")")
             )
-            ws.write_formula(r, 6, f"={expr}", f3, row.power)
+            ws.write_formula(r, 7, f"={expr}", f3, row.power)
         else:
             # Blank, not a dash: the energy columns multiply this cell, and
             # Excel returns #VALUE! for text.  A DMA-only operation has no
             # build key and so no measured power.
-            ws.write_blank(r, 6, None, f3)
+            ws.write_blank(r, 7, None, f3)
         ws.write_formula(
             r,
-            7,
-            f"=D{one}/1000000*G{one}*1000",
+            8,
+            f"=D{one}/1000000*H{one}*1000",
             f2,
             row.compute_energy(freq) * 1e3,
         )
         ws.write_formula(
             r,
-            8,
+            9,
             f"=E{one}*1000000*{jpb}*1000",
             f2,
             row.dram_energy(jpb) * 1e3,
         )
         ws.write_formula(
-            r, 9, f"=H{one}+I{one}", f2, row.energy(freq, jpb) * 1e3
+            r, 10, f"=I{one}+J{one}", f2, row.energy(freq, jpb) * 1e3
         )
     r = len(table) + 1
     one = r + 1
@@ -617,8 +640,9 @@ def _operation_table(wb, result: ScheduleResult, rows, agg, calibration):
     ws.write_number(r, 3, tot.cycles / freq / 1000.0, t2)
     ws.write_number(r, 4, tot.bytes / 1e6, t2)
     ws.write_number(r, 5, tot.utilization, t2)
-    ws.write(r, 6, "", tb)
-    for c in (7, 8, 9):
+    ws.write_number(r, 6, tot.effective_utilization, t2)
+    ws.write(r, 7, "", tb)
+    for c in (8, 9, 10):
         col = chr(ord("A") + c)
         ws.write_formula(r, c, f"=SUM({col}2:{col}{r})", t2)
 

@@ -14,7 +14,7 @@ J/B for the reporting energy columns.  The reporting model reads this object
 directly as its cost knobs.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional, Tuple
 
 DEFAULT_PE_ARRAY_SIZE = (32, 32)
@@ -49,6 +49,11 @@ class AcceleratorConfig:
     memory hierarchy. The optional DRAM capacity, bandwidth, and latency
     parameters are later system-modeling extensions, rather than parameters
     of the Voyager accelerator template described in the paper.
+
+    ``matrix_backend=1`` selects CIM in place of the systolic engine.
+    The tiling search models resident weight sequences and
+    accumulation capacity; graph lowering uses the shared vector engine and
+    NHWC/HWIO/CK operand layouts.
     """
 
     # Compute
@@ -74,12 +79,54 @@ class AcceleratorConfig:
     dram_access_latency: Optional[float] = DEFAULT_DRAM_ACCESS_LATENCY_NS
     dram_energy_per_bit: float = DEFAULT_DRAM_ENERGY_PJ_PER_BIT  # pJ/bit
 
+    # Matrix backend: matches MATRIX_BACKEND in the accelerator build.
+    # pe_array_size is the total (input, output) lane count for both backends.
+    matrix_backend: int = 0  # 0 = systolic, 1 = CIM
+    # CIM macro parameters; defaults match src/cim/CIMConfig.h.
+    cim_macro_input_lanes: int = 64
+    cim_macro_output_lanes: int = 8
+    cim_weight_sets: int = 18
+    cim_base_a_width: int = 4
+    cim_base_b_width: int = 4
+    cim_base_c_width: int = 20
+    cim_macro_write_input_lanes: int = 1
+    cim_mac_latency: int = 1
+    cim_mode: int = 0
+    cim_signed: bool = True
+    cim_tile_input_axis_elements: int = 1
+    cim_tile_output_axis_elements: int = 4
+    cim_input_axis_tiles: int = 1
+    cim_output_axis_tiles: int = 1
+    # None means the full corresponding axis, as in the hardware defaults.
+    cim_a_port_tiles: Optional[int] = None
+    cim_b_port_tiles: Optional[int] = None
+    cim_c_port_tiles: Optional[int] = None
+    cim_c_beat_layout: int = 1
+    cim_array_result_slots: Optional[int] = None
+    cim_local_accum_contexts: int = 4
+
+    # Standalone interface timing for either matrix backend. Bank geometry
+    # still determines tensor placement; independent ports do not arbitrate
+    # accesses by bank address or pay the SoC bank-switch round trip.
+    independent_memory_ports: bool = False
+
     def __post_init__(self):
         """Reject a reservation the rest of the compiler could not honour.
 
         Inert at the default of 0, so a config that names no scratchpad at
         all still constructs.
+
+        Also validate the selected matrix backend and its CIM configuration.
         """
+        if type(self.independent_memory_ports) is not bool:
+            raise ValueError("independent_memory_ports must be a boolean")
+        if type(self.matrix_backend) is not int or self.matrix_backend not in (
+            0,
+            1,
+        ):
+            raise ValueError("matrix_backend must be 0 (systolic) or 1 (CIM)")
+        if self.matrix_backend == 1:
+            self._validate_cim()
         if self.scratchpad_offset < 0:
             raise ValueError(
                 f"scratchpad_offset {self.scratchpad_offset} is negative"
@@ -103,6 +150,87 @@ class AcceleratorConfig:
                 f"scratchpad_offset {self.scratchpad_offset} is not a multiple "
                 f"of the {bank} B bank size"
             )
+
+    def _validate_cim(self):
+        """Check CIM macro parameters and controller limits."""
+        for name, axis in (
+            ("cim_a_port_tiles", self.cim_input_axis_tiles),
+            ("cim_b_port_tiles", self.cim_output_axis_tiles),
+            ("cim_c_port_tiles", self.cim_output_axis_tiles),
+            ("cim_array_result_slots", self.cim_input_axis_tiles),
+        ):
+            if getattr(self, name) is None:
+                object.__setattr__(self, name, axis)
+
+        for field in fields(self):
+            if not field.name.startswith("cim_") or field.name in (
+                "cim_mode",
+                "cim_signed",
+                "cim_c_beat_layout",
+            ):
+                continue
+            value = getattr(self, field.name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{field.name} must be a positive integer")
+        if type(self.cim_mode) is not int or self.cim_mode not in (0, 1):
+            raise ValueError("cim_mode must be 0 (parallel) or 1 (serial)")
+        if type(self.cim_signed) is not bool:
+            raise ValueError("cim_signed must be a boolean")
+        if type(self.cim_c_beat_layout) is not int or self.cim_c_beat_layout != 1:
+            raise ValueError("CIMProcessor requires output-major C beats (1)")
+        if self.cim_macro_write_input_lanes != 1:
+            raise ValueError("CIMProcessor writes one input lane per request")
+        guard_width = max(1, (self.cim_macro_input_lanes - 1).bit_length())
+        if (
+            self.cim_mode == 1
+            and self.cim_base_c_width <= self.cim_base_b_width + guard_width
+        ):
+            raise ValueError("cim_base_c_width cannot hold a bit-serial slice")
+        if self.cim_input_lanes not in (4, 8, 16, 32, 64):
+            raise ValueError("CIM input lanes must be 4, 8, 16, 32, or 64")
+        if (
+            self.pe_array_size is None
+            or self.pe_array_size[0] != self.cim_input_lanes
+        ):
+            raise ValueError(
+                "pe_array_size input lanes must match the CIM geometry: "
+                f"{self.cim_input_lanes}"
+            )
+        if self.cim_a_port_tiles != self.cim_input_axis_tiles:
+            raise ValueError("CIMProcessor requires the full input axis A port")
+        if self.cim_c_port_tiles != self.cim_output_axis_tiles:
+            raise ValueError("CIMProcessor requires a full output axis C port")
+        if self.cim_output_axis_tiles % self.cim_b_port_tiles:
+            raise ValueError(
+                "cim_b_port_tiles must divide cim_output_axis_tiles"
+            )
+        if self.cim_array_result_slots < self.cim_input_axis_tiles:
+            raise ValueError(
+                "CIM needs at least one result slot per input tile"
+            )
+        if self.cim_weight_sets > 0xFFFF:
+            raise ValueError(
+                "cim_weight_sets exceeds the 16-bit schedule limit"
+            )
+        if (
+            type(self.input_buffer_size) is not int
+            or self.input_buffer_size <= 0
+        ):
+            raise ValueError("CIM requires a positive input_buffer_size")
+        if (
+            type(self.accum_buffer_size) is not int
+            or self.accum_buffer_size < self.cim_local_accum_contexts
+        ):
+            raise ValueError("CIM local contexts must fit in the accum buffer")
+
+    @property
+    def cim_input_lanes(self) -> int:
+        """Complete CIM input axis, in logical operand lanes."""
+        return (
+            self.cim_macro_input_lanes
+            * self.cim_tile_input_axis_elements
+            * self.cim_input_axis_tiles
+        )
 
     @property
     def vector_lanes(self) -> int:
@@ -188,8 +316,15 @@ class AcceleratorConfig:
             num_banks=args.num_banks,
             bank_width=args.bank_width,
             double_buffered_l2=args.double_buffered_l2,
+            independent_memory_ports=args.independent_memory_ports,
             dram_size=args.dram_size,
             dram_bandwidth=args.dram_bandwidth,
             dram_access_latency=args.dram_access_latency,
             dram_energy_per_bit=args.dram_energy_per_bit,
+            matrix_backend=args.matrix_backend,
+            **{
+                field.name: getattr(args, field.name)
+                for field in fields(cls)
+                if field.name.startswith("cim_")
+            },
         )

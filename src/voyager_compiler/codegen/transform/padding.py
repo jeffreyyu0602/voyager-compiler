@@ -467,6 +467,7 @@ def pad_matrix_op_dimensions(
     model: GraphModule,
     pe_array_size,
     fold_cache: bool = FOLD_PAD_INTO_CACHE,
+    skip_first_conv: bool = True,
 ) -> GraphModule:
     """Pad each GEMM's operands so its channels fill the PE array.
 
@@ -478,6 +479,8 @@ def pad_matrix_op_dimensions(
         model: The graph to transform.
         pe_array_size: The PE array's ``(input, output)`` channel counts.
         fold_cache: Take a pad on a KV-cache write into the buffer.
+        skip_first_conv: Skip padding convolutions with three input
+            channels, leaving them for systolic replication.
 
     Returns:
         ``model``.
@@ -493,9 +496,11 @@ def pad_matrix_op_dimensions(
         input, weight = node.args[0], node.args[1]
         ic = input.shape[1] if is_conv else input.shape[-1]
         oc = weight.shape[-1] if is_mm else weight.shape[0]
+        # Retain logical channels for useful-work reporting after padding.
+        node.meta.setdefault("logical_channels", (ic, oc))
 
         # Skip CNN first layer with input channels equal to 3
-        if is_conv and ic == 3:
+        if skip_first_conv and is_conv and ic == 3:
             continue
 
         # The contraction pads to whole PE rows and whole MX blocks, and its

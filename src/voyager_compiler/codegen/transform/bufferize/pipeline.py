@@ -30,6 +30,7 @@ from voyager_compiler.codegen.node_info import (
     is_full_reduction,
     is_nop,
     is_reshape_op,
+    matrix_useful_work_fraction,
     quant_param_arg_nodes,
     reduced_input_grid,
     reduced_input_tiling,
@@ -2232,8 +2233,10 @@ def _stamp_anchor_meta(gm, anchor) -> None:
     nesting level (loop body, cond branch); the anchor itself is erased on
     splice.
     """
-    if (tiling := anchor.meta.get("tiling")) is None:
-        return
+    tiling = dict(anchor.meta.get("tiling", {}))
+    # The tile's shapes include padding; keep the whole operation's useful
+    # fraction so convolution borders and channel padding remain visible.
+    tiling["useful_work_fraction"] = matrix_useful_work_fraction(anchor)
     for m in gm.modules():
         if not isinstance(m, torch.fx.GraphModule):
             continue

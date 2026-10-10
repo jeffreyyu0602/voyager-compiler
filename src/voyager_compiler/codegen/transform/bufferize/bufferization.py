@@ -57,6 +57,7 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
     _single_pass_kernel,
+    _stamp_anchor_meta,
     build_conv2d,
     build_gemm,
     build_pipelined_buffers,
@@ -934,6 +935,10 @@ def bufferize_graph(
         )
         if cached is not None:
             sub_gm, n_out, group, tag_sources = cached
+            if is_gemm_op(anchor):
+                # Identical padded shapes can have different logical channels.
+                # Refresh reporting metadata before copying the cached nest.
+                _stamp_anchor_meta(sub_gm, anchor)
         else:
             if is_conv2d(anchor):
                 sub_gm = build_conv2d(

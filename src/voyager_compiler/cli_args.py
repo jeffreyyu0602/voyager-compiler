@@ -12,6 +12,7 @@ from voyager_compiler.hardware_config import (
     DEFAULT_PE_ARRAY_SIZE,
     DEFAULT_SCRATCHPAD_OFFSET,
     DEFAULT_WEIGHT_BUFFER_SIZE,
+    AcceleratorConfig,
 )
 from voyager_compiler.ops.layout import (
     DEFAULT_GEMM_WEIGHT_LAYOUT,
@@ -296,6 +297,13 @@ def add_compile_args(parser=None):
         help="Memory bank width (bytes) for memory planning.",
     )
     parser.add_argument(
+        "--independent_memory_ports",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use independent external interface timing for SA or CIM; "
+        "retain banked allocation and emit INDEPENDENT harness mode.",
+    )
+    parser.add_argument(
         "--double_buffered_l2",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_DOUBLE_BUFFERED_L2,
@@ -362,7 +370,7 @@ def add_compile_args(parser=None):
         choices=LAYOUT_POLICIES,
         default=DEFAULT_LAYOUT_POLICY,
         help="Operand layouts (activation / conv weight / matmul weight): "
-        "pytorch = NCHW/OIHW/KC, systolic = NHWC/HWIO/CK.",
+        "pytorch = NCHW/OIHW/KC, systolic or cim = NHWC/HWIO/CK.",
     )
     parser.add_argument(
         "--gemv_weight_layout",
@@ -375,7 +383,8 @@ def add_compile_args(parser=None):
         "--pe_array_size",
         type=lambda x: tuple(map(int, x.split(","))),
         default=DEFAULT_PE_ARRAY_SIZE,
-        help="Systolic PE array size (rows,cols), e.g. 16,16.",
+        help="Matrix input/output lane counts, e.g. 16,16. For CIM, these "
+        "must match the macro geometry and weight datatype.",
     )
     parser.add_argument(
         "--vector_unit_width",
@@ -400,6 +409,55 @@ def add_compile_args(parser=None):
         "(ACCUMULATOR_WIDTH); defaults to the vector unit lane count.",
     )
 
+    # -- matrix backend + CIM geometry -------------------------------------
+    parser.add_argument(
+        "--matrix_backend",
+        type=int,
+        choices=(0, 1),
+        default=AcceleratorConfig.matrix_backend,
+        help="Matrix backend: 0 = systolic, 1 = CIM.",
+    )
+    # Keep defaults on AcceleratorConfig, shared by CLI and Python callers.
+    for name, help_text in (
+        ("cim_macro_input_lanes", "Physical input lanes per macro."),
+        ("cim_macro_output_lanes", "Physical output lanes per macro."),
+        ("cim_weight_sets", "Resident weight sets per macro."),
+        ("cim_base_a_width", "Macro input width (bits)."),
+        ("cim_base_b_width", "Macro weight width (bits)."),
+        ("cim_base_c_width", "Macro accumulation width (bits)."),
+        ("cim_macro_write_input_lanes", "Input lanes per weight write (1)."),
+        ("cim_mac_latency", "Macro MAC latency (cycles)."),
+        ("cim_mode", "Macro mode: 0 = bit-parallel, 1 = bit-serial."),
+        ("cim_tile_input_axis_elements", "Elements along a tile's input axis."),
+        (
+            "cim_tile_output_axis_elements",
+            "Elements along a tile's output axis.",
+        ),
+        ("cim_input_axis_tiles", "Tiles along the array input axis."),
+        ("cim_output_axis_tiles", "Tiles along the array output axis."),
+        ("cim_a_port_tiles", "Input tiles per A beat; default: full axis."),
+        ("cim_b_port_tiles", "Output tiles per B beat; default: full axis."),
+        ("cim_c_port_tiles", "Output tiles per C beat; default: full axis."),
+        ("cim_c_beat_layout", "C beat layout; CIMProcessor requires 1."),
+        (
+            "cim_array_result_slots",
+            "Result slots per output tile; default: input tile count.",
+        ),
+        ("cim_local_accum_contexts", "Live local accumulation contexts."),
+    ):
+        parser.add_argument(
+            f"--{name}",
+            type=int,
+            default=getattr(AcceleratorConfig, name),
+            help=help_text,
+        )
+    parser.add_argument(
+        "--cim_signed",
+        action=argparse.BooleanOptionalAction,
+        default=AcceleratorConfig.cim_signed,
+        help="Signed integer operands; disable for unsigned operands.",
+    )
+
     # -- tiling / lowering --------------------------------------------------
     parser.add_argument(
         "--disable_reshape_fusion",
@@ -421,11 +479,12 @@ def add_compile_args(parser=None):
     parser.add_argument(
         "--runtime_tolerance",
         type=float,
-        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()
+        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.02) in compile()
         help="How much longer than the best modeled runtime an interstellar "
         "tiling may take and still be chosen, as a fraction; among those, the "
-        "one with the least DRAM traffic wins.  0 = only the fastest "
-        "(default: 0.01).",
+        "one with the lowest modeled access energy wins.  0 = only the "
+        "fastest, with energy breaking exact-runtime ties "
+        "(default: 0.02).",
     )
 
     # -- reporting (timing / DRAM-traffic estimator) ------------------------

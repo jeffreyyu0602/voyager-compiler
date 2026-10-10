@@ -79,6 +79,7 @@ from voyager_compiler.codegen.voyager_ir_pb2 import (
     LevelAccessCount,
     LevelTiling,
     LoopBound,
+    MemoryConfig,
     Model,
     Operation,
     PrimOp,
@@ -1234,6 +1235,21 @@ def print_layer_table(
         return text
     print(text)
     return text
+
+
+def gen_memory_config(config) -> MemoryConfig:
+    """Generate the harness timing mode and tensor allocation geometry."""
+    banked = not config.independent_memory_ports and all(
+        (config.scratchpad_size, config.num_banks, config.bank_width)
+    )
+    return MemoryConfig(
+        mode=MemoryConfig.BANKED if banked else MemoryConfig.INDEPENDENT,
+        scratchpad_size=config.scratchpad_size or 0,
+        num_banks=config.num_banks or 0,
+        bank_width=config.bank_width or 0,
+        scratchpad_offset=config.scratchpad_offset,
+        frequency_ghz=config.frequency,
+    )
 
 
 def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
