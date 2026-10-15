@@ -20,6 +20,7 @@ def opt_optimizer(
     runtime_calc_func=None,
     verbose=False,
     runtime_tolerance=0.0,
+    order_key=None,
 ):
     """
     Evaluate the cost of each mapping point,
@@ -29,11 +30,19 @@ def opt_optimizer(
         runtime_tolerance: How much longer than the best runtime a mapping may
             take and still be considered, as a fraction; see
             ``opt_mapping_point_generator_function``.
+        order_key: Groups loop orders the cost models cannot tell apart; see
+            ``mapping_point_generator.opt_get_loop_order_generator``.
     """
 
     smallest_cost, smallest_runtime, perf, best_mapping_point = (
         mapping_point_generator.opt_mapping_point_generator_function(
-            resource, layer, hint, runtime_calc_func, verbose, runtime_tolerance
+            resource,
+            layer,
+            hint,
+            runtime_calc_func,
+            verbose,
+            runtime_tolerance,
+            order_key,
         )
     )
     access_list, array_cost = cost_model.get_access(

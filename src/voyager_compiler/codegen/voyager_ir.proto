@@ -418,3 +418,18 @@ message Model {
   repeated TensorBox outputs = 3;
   repeated Operation ops = 4;
 }
+
+// Written separately as memory_config.txt using the same text format as Model.
+// Tensor addresses alone do not specify physical scratchpad bank boundaries.
+message MemoryConfig {
+  enum Mode {
+    INDEPENDENT = 0;
+    BANKED = 1;
+  }
+  optional Mode mode = 1;
+  optional uint64 scratchpad_size = 2;    // bytes
+  optional uint64 num_banks = 3;
+  optional uint64 bank_width = 4;         // bytes per bank word
+  optional uint64 scratchpad_offset = 5;  // reserved bytes at the base
+  optional double frequency_ghz = 6;
+}

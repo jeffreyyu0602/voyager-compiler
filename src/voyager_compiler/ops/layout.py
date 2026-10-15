@@ -32,7 +32,7 @@ GEMM_WEIGHT_LAYOUTS = ("kc", "ck")
 DEFAULT_GEMM_WEIGHT_LAYOUT = "kc"
 
 # Matrix-matrix only; a matrix-vector weight follows ``--gemv_weight_layout``.
-POLICY_GEMM_WEIGHT_LAYOUT = {"pytorch": "kc", "systolic": "ck"}
+POLICY_GEMM_WEIGHT_LAYOUT = {"pytorch": "kc", "systolic": "ck", "cim": "ck"}
 LAYOUT_POLICIES = tuple(POLICY_GEMM_WEIGHT_LAYOUT)
 DEFAULT_LAYOUT_POLICY = "pytorch"
 

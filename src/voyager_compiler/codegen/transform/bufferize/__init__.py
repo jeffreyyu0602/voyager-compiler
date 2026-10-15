@@ -26,6 +26,7 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
     flush_tensor_files,
     gen_code_bufferized,
     gen_compute_graph,
+    gen_memory_config,
     print_bufferized_graph,
     print_layer_table,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "flush_tensor_files",
     "gen_code_bufferized",
     "gen_compute_graph",
+    "gen_memory_config",
     "print_bufferized_graph",
     "plan_memory",
     "MemoryPlan",

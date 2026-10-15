@@ -250,7 +250,7 @@ def pool_bank_switch_cycles(node, anchor, in_tile, config):
     puts it.  A switch costs the ``BANK_SWITCH_CYCLES`` round trip less the
     fetch's beats after its first, which the drain overlaps: 7 on Sphinx, as
     measured.  0 without banking."""
-    if not config.bank_size:
+    if config.independent_memory_ports or not config.bank_size:
         return 0
     nhwc = anchor.target in NHWC_OP_VARIANTS.values()
     dims = NCHW_TO_NHWC if nhwc else None
@@ -378,7 +378,7 @@ def gemv_bank_switch_cycles(rows, reduction, weight_bits, chunk, config):
     rows over several banks, every chunk column crosses them again.  The
     tile buffer starts on a bank, where the planner puts it.  0 without
     banking."""
-    if not config.bank_size:
+    if config.independent_memory_ports or not config.bank_size:
         return 0
     block = config.pe_array_size[0]
     row_bytes = reduction * weight_bits / 8

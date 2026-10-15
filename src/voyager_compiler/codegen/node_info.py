@@ -244,6 +244,47 @@ def is_fully_connected(node: Node) -> bool:
     return False
 
 
+def matrix_useful_work_fraction(node: Node) -> float:
+    """Fraction of matrix MACs using original channels and in-bounds input.
+
+    Compute this before bufferization materializes convolution padding. The
+    fraction is averaged across tiles, including split reductions.
+    """
+    inp, out = node.args[0].shape, node.shape
+    conv = is_conv2d(node)
+    nhwc = conv and node.meta.get("transposed", False)
+    channel_dim = 1 if conv and not nhwc else -1
+    channels = (inp[channel_dim], out[channel_dim])
+    logical = node.meta.get("logical_channels", channels)
+    groups = get_arg_value(node, 6, "groups", 1) if conv else 1
+    if conv and groups == channels[0]:
+        fraction = logical[1] / channels[1]
+    else:
+        fraction = math.prod(logical) / math.prod(channels)
+    if not conv:
+        return fraction
+
+    spatial = slice(1, 3) if nhwc else slice(2, 4)
+    weight = node.args[1].shape
+    kernel = weight[:2] if nhwc and groups == 1 else weight[-2:]
+    stride = _pair(get_arg_value(node, 3, "stride", 1))
+    padding = _pair(get_arg_value(node, 4, "padding", 0))
+    dilation = _pair(get_arg_value(node, 5, "dilation", 1))
+    for size, outputs, filt, step, pad, dil in zip(
+        inp[spatial], out[spatial], kernel, stride, padding, dilation
+    ):
+        valid = sum(
+            max(
+                0,
+                min(outputs, (size - 1 + pad - k * dil) // step + 1)
+                - max(0, (pad - k * dil + step - 1) // step),
+            )
+            for k in range(filt)
+        )
+        fraction *= valid / (outputs * filt)
+    return fraction
+
+
 def is_pooling(node: Node) -> bool:
     return node.target in [
         # Core Aten IR

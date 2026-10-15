@@ -54,7 +54,9 @@ class OpInfo:
     ``utilization`` is the fraction of peak the op sustains, so it costs
     ``ceil(ideal_cycles / utilization)`` cycles.  It is compute-only (DRAM
     is modeled separately, as ``async_copy`` events) and pre-computed by
-    ``cost.py``.  A calibrated op carries the RTL-derived ``measured_cycles``
+    ``cost.py``. Padding stays in that execution cost; ``effective_utilization``
+    applies ``useful_work_fraction`` to exclude it from useful arithmetic.
+    A calibrated op carries the RTL-derived ``measured_cycles``
     instead, with ``calibration`` saying how it was derived (``exact`` for
     a one-op period, ``shared`` when the period's ops split one
     measurement pro rata).
@@ -69,6 +71,18 @@ class OpInfo:
     kernel: str = ""
     measured_cycles: Optional[int] = None
     calibration: str = ""
+    useful_work_fraction: float = 1.0
+
+    @property
+    def useful_ideal_cycles(self) -> float:
+        """Ideal cycles for useful arithmetic, excluding padding."""
+        return self.ideal_cycles * self.useful_work_fraction
+
+    @property
+    def effective_utilization(self) -> float:
+        """Useful arithmetic per cycle relative to peak throughput."""
+        cycles = self.effective_cycles
+        return self.useful_ideal_cycles / cycles if cycles else 0.0
 
     @property
     def analytic_cycles(self) -> int:
