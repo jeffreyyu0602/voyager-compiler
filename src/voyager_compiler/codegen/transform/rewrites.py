@@ -1,10 +1,10 @@
 import logging
 import re
-from typing import Dict, List, Tuple, Union
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch.fx import Graph, GraphModule, Interpreter, Node
+from torch.fx import GraphModule, Interpreter, Node
 from torch.fx.node import map_arg
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torch.library import Library, impl
@@ -31,8 +31,6 @@ from voyager_compiler.shape_prop import (
     fetch_attr,
     propagate_shape,
     set_node_value,
-    written_buffers,
-    run_op,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,8 +43,8 @@ __all__ = [
     "extract_input_preprocessor",
     "inline_autocast_modules",
     "fold_constant_generators",
-    "remove_fp32_casts",
     "remove_prunable_ops",
+    "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
 ]
 
@@ -448,27 +446,6 @@ def inline_autocast_modules(model: torch.fx.GraphModule):
     model.recompile()
 
 
-def _producer_graph(node: Node, producers: Dict[Node, Graph]) -> Graph:
-    """The graph computing ``node``'s constant from the model's own buffers:
-    ``node`` over its inputs, each a ``get_attr`` of an original buffer or
-    the copied-in producer of a constant this pass folded earlier."""
-    graph = Graph()
-    remap = {}
-    for inp in node.all_input_nodes:
-        src = producers.get(inp)
-        if src is None:
-            remap[inp] = graph.get_attr(inp.target)
-            continue
-        local = {}
-        for n in src.nodes:
-            if n.op == "output":
-                remap[inp] = local[n.args[0]]
-                break
-            local[n] = graph.node_copy(n, lambda x: local[x])
-    graph.output(graph.node_copy(node, lambda x: remap[x]))
-    return graph
-
-
 def fold_constant_generators(model: GraphModule):
     """Constant-fold ``call_function`` nodes whose inputs are all constants:
     input-free generators (``arange`` / ``zeros`` / …) and, transitively, any op
@@ -477,85 +454,45 @@ def fold_constant_generators(model: GraphModule):
     ``get_attr`` buffer and is not lowered or scheduled as a compute op.
 
     Walking in program order, a node is constant iff every FX-Node input is a
-    ``get_attr`` (an initial buffer or one this pass just created) that the
-    graph never writes.  A ``full_like`` reads only its input's shape, so it
-    becomes a ``full`` of that shape first.  A constant is evaluated by the
-    shape-propagation rule: real when it descends from parameters alone, a
-    fake stand-in when it descends from a generator, as a causal mask does.
-    Either way the chain that produced it is kept on the new ``get_attr``
-    node as ``meta['producer']``, a graph over the model's own buffers, so a
-    real run can compute the tensor when it needs it.  A buffer this pass
-    created is deleted as soon as its last reader folds; its producer lives
-    on inside its readers'.
-
-    Args:
-        model: The graph to fold, in place.
+    ``get_attr`` (an initial buffer or one this pass just created); it is then
+    evaluated with the real buffer values and replaced by a ``get_attr`` to the
+    result.  Orphaned constant ancestors are dropped by dead-code elimination.
     """
     graph = model.graph
-    # A buffer the graph writes -- a KV cache, or a ``cond`` operand -- is
-    # not a constant: what reads it must run every step.
-    written = written_buffers(graph)
-    constants = {
-        n for n in graph.nodes if n.op == "get_attr" and n.target not in written
-    }
-    producers: Dict[Node, Graph] = {}
+    constants = {n for n in graph.nodes if n.op == "get_attr"}
 
     def resolve(n: Node):
         return fetch_attr(model, n.target)
 
     for node in list(graph.nodes):
-        if node.target is torch.ops.aten.full_like.default:
-            value = node.value
-            with graph.inserting_before(node):
-                full = graph.call_function(
-                    torch.ops.aten.full.default,
-                    (list(value.shape), node.args[1]),
-                    {"dtype": value.dtype, "device": value.device},
-                )
-            propagate_shape(full, model)
-            node.replace_all_uses_with(full)
-            graph.erase_node(node)
-            node = full
         if node.op != "call_function" or any(
             inp not in constants for inp in node.all_input_nodes
         ):
             continue
-        # Folding a dequantize offsets the benefit of quantizing the params.
-        if node.target is torch.ops.quantized_ops.dequantize.default:
+        # Folding a dequantize offsets the benefit of quantizing the params;
+        # folding an expand materializes the replication it stands for.
+        if node.target in [
+            torch.ops.quantized_ops.dequantize.default,
+            torch.ops.aten.expand.default,
+        ]:
+            continue
+        # Bufferization pass can absorb expand into indexing to avoid copying.
+        if any(u.target is torch.ops.aten.expand.default for u in node.users):
             continue
         if not isinstance(getattr(node, "value", None), torch.Tensor):
             continue
-        # Folding a real expand materializes the replication it stands for,
-        # which bufferization would otherwise absorb into indexing; one that
-        # only fills in ``-1`` dims is a view of its input and folds through.
-        if (
-            node.target is torch.ops.aten.expand.default
-            and node.value.shape != node.args[0].value.shape
-        ):
-            continue
-        args = map_arg(node.args, resolve)
-        kwargs = map_arg(node.kwargs, resolve)
-        const = run_op(node.target, args, kwargs)
-        inputs = node.all_input_nodes
-        producer = _producer_graph(node, producers)
-        src = next((n.target for n in inputs), "const")
+        const = node.target(
+            *map_arg(node.args, resolve), **map_arg(node.kwargs, resolve)
+        )
+        src = next((n.target for n in node.all_input_nodes), "const")
         prefix = re.sub(r"_folded(_\d+)?$", "", str(src)) + "_folded"
         with graph.inserting_before(node):
-            attr = create_getattr_from_value(
-                model, graph, prefix, const, GraphModule(model, producer)
-            )
+            attr = create_getattr_from_value(model, graph, prefix, const)
         attr.meta["dtype"] = node.meta.get("dtype")
         set_node_value(attr, const)
         node.replace_all_uses_with(attr)
         graph.erase_node(node)
         constants.add(attr)
-        producers[attr] = producer
-        for inp in inputs:
-            if inp in producers and not inp.users:
-                delattr(model, inp.target)
-                graph.erase_node(inp)
-                del producers[inp]
-                constants.discard(inp)
 
     graph.eliminate_dead_code()
     graph.lint()
@@ -606,97 +543,11 @@ def remove_zero_attention_mask(model: GraphModule, example_inputs):
     return model
 
 
-# Ops that cast a tensor to another dtype.
-_CASTS = (
-    torch.ops.aten._to_copy.default,
-    torch.ops.aten.to.dtype,
-    torch.ops.aten.to.dtype_layout,
-)
-
-_HALF = (torch.bfloat16, torch.float16)
-
-
-def remove_fp32_casts(model: torch.fx.GraphModule):
-    """Compute in 16-bit float where the model casts up to float32.
-
-    For an accelerator with no float32 datapath: a ``softmax`` asked for a
-    float32 result gives it in its input's dtype, and a cast of a bfloat16
-    or float16 tensor to float32 is dropped, so what reads it computes in
-    the narrower dtype.  A float32 tensor that then meets a 16-bit one is
-    made in 16-bit too, back through whatever built it from constants and
-    integers -- a ``full``, a cast of integers -- or it would carry the
-    computation back to float32: a loss's gradient starts as one, and an
-    embedding's backward accumulates into one.  The casts back down then
-    convert nothing, and ``remove_prunable_ops`` drops them.  Float32 that
-    meets no 16-bit tensor -- a float32 buffer, or RoPE's frequencies made
-    from integers -- stays float32, as does a 0-d tensor, which does not
-    decide the dtype of what it meets.
-
-    Args:
-        model: The graph to rewrite in place.
-
-    Returns:
-        ``model``.
-    """
+def remove_softmax_dtype_cast(model: torch.fx.GraphModule):
     graph = model.graph
-    # The dtype a node computes in once the casts are gone, where that is
-    # not the one it was traced with.
-    narrowed = {}
-
-    def value(node):
-        return getattr(node, "value", node.meta.get("val"))
-
-    def dtype(node):
-        return narrowed.get(node, getattr(value(node), "dtype", None))
-
-    def floats(node):
-        return [
-            a
-            for a in node.all_input_nodes
-            if dtype(a) is not None and dtype(a).is_floating_point
-        ]
-
-    def narrow(node, half):
-        """Build ``node``, a float32 tensor, in ``half``: a cast or a
-        generator through its dtype argument, any other op from its
-        operands, back to the graph's inputs."""
-        stack = [node]
-        while stack:
-            node = stack.pop()
-            if node.op != "call_function" or dtype(node) != torch.float32:
-                continue
-            narrowed[node] = half
-            if "dtype" in node.kwargs:
-                node.update_kwarg("dtype", half)
-            elif node.target in _CASTS:
-                node.update_arg(1, half)
-            else:
-                stack.extend(floats(node))
-
-    for node in list(graph.nodes):
+    for node in list(model.graph.nodes):
         if node.target == torch.ops.aten.softmax.int:
             node.args = node.args[:2]
-            narrowed[node] = dtype(node.args[0])
-            continue
-        if (
-            node.target in _CASTS
-            and get_arg_value(node, 1, "dtype") == torch.float32
-            and dtype(node.args[0]) in _HALF
-        ):
-            node.replace_all_uses_with(node.args[0])
-            graph.erase_node(node)
-            continue
-        if dtype(node) != torch.float32 or "dtype" in node.kwargs:
-            continue
-        inputs = [a for a in floats(node) if value(a).ndim]
-        half = {dtype(a) for a in inputs} & set(_HALF)
-        if len(half) != 1:
-            continue
-        (half,) = half
-        for a in inputs:
-            narrow(a, half)
-        if all(dtype(a) == half for a in inputs):
-            narrowed[node] = half
 
     graph.lint()
     model.recompile()

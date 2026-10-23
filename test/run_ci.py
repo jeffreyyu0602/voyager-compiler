@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Local pre-push CI for the voyager codegen commands.
 
 Runs every actively-used ``test_codegen.py`` invocation (the ones reached
@@ -61,13 +64,13 @@ SCHEME_ARGS = {
         "--calibration_steps 3 --layout_policy systolic"
     ),
     "MXINT8": (
-        "--activation int8,qs=microscaling,bs=16,pot=1 "
-        "--weight int8,qs=microscaling,bs=16,pot=1 "
+        "--activation int8,qs=microscaling,bs=16 "
+        "--weight int8,qs=microscaling,bs=16 --force_scale_power_of_two "
         "--bf16 --layout_policy systolic"
     ),
     "MXNF4": (
-        "--activation lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 "
-        "--weight lut4_to_int6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
+        "--activation nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 "
+        "--weight nf4_6,qs=microscaling,bs=64,scale=fp8_e5m3 --bf16 "
         "--residual fp8_e4m3 --quantize_fc --layout_policy systolic "
         "--scratchpad_size 2097152 --num_banks 16 --conv2d_im2col"
     ),
@@ -92,14 +95,10 @@ SCHEME_INPUT_BYTES = {
 assert SCHEME_INPUT_BYTES.keys() == SCHEME_ARGS.keys()
 
 # Reused per-command extra-flag groups.
-_SINGLE = "--num_hidden_layers 1"
-_FP16 = "--remove_fp32_casts"
-_LLM = (
-    "--context_length 1024 --num_hidden_layers 1 --quantize_attention_mask "
-    + _FP16
-)
-_LLM_MP = _LLM + " --qconfig mxlut4_int6_e5m3_attn_head_int6"
-_LLM_SPMM = _LLM + " --qconfig mxlut4_int6_e5m3_outlier"
+_SINGLE = "--compile_single_layer"
+_LLM = "--context_length 1024 --compile_single_layer --quantize_attention_mask"
+_LLM_MP = _LLM + " --enable_mixed_precision"
+_LLM_SPMM = _LLM_MP + " --outlier_pct 0.01"
 _DB = "--double_buffered_l2"
 _LLM_DB = _LLM + " " + _DB
 _LLM_SPMM_DB = _LLM_SPMM + " " + _DB
@@ -135,23 +134,23 @@ COMMANDS = [
     Command("mobilebert", "MXINT8", "16,16", "mobilebert_encoder", _SINGLE),
     Command("mobilenet_v2", "MXINT8", "16,16"),
     # -- MXNF4 (llama) --
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill", _LLM),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
-    Command("llama_decode", "MXNF4", "64,64", "llama_decode", _LLM),
-    Command("llama_decode_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
+    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill", _LLM),
+    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_mp", _LLM_MP),
+    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_spmm", _LLM_SPMM),
+    Command("llm_decode", "MXNF4", "64,64", "llama_decode", _LLM),
+    Command("llm_kivi", "MXNF4", "64,64", "llama_decode_kivi", _LLM),
     # -- MXNF4 (vision / bert) --
     Command("resnet18", "MXNF4", "64,64"),
     Command("resnet50", "MXNF4", "64,64"),
-    Command("vit", "MXNF4", "64,64", extra=_FP16),
+    Command("vit", "MXNF4", "64,64"),
     Command("bert", "MXNF4", "64,64"),
     # -- double-buffered L2 (conv / prefill / decode / sparse prefill each
     # pipeline apart) --
     Command("resnet18", "MXNF4", "64,64", "resnet18_db", _DB),
-    Command("llama_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
-    Command("llama_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
+    Command("llm_prefill", "MXNF4", "64,64", "llama_prefill_db", _LLM_DB),
+    Command("llm_decode", "MXNF4", "64,64", "llama_decode_db", _LLM_DB),
     Command(
-        "llama_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
+        "llm_prefill", "MXNF4", "64,64", "llama_prefill_spmm_db", _LLM_SPMM_DB
     ),
 ]
 
@@ -358,20 +357,45 @@ def main():
         suffix = "" if status == "ok" else f" ({status})"
         print(f"{verdict}{suffix}")
 
-    report = _build_report(results, run_dir, prev_run)
+    missing = _missing_labels(results, prev_run)
+    filtered = bool(args.only)
+    report = _build_report(results, run_dir, prev_run, missing, filtered)
     (run_dir / "report.txt").write_text(report)
     print("\n" + report)
 
-    # Gate: fail on any compile failure or model.txt mismatch.
+    # Gate: a compile failure, a model.txt mismatch, or -- on an unfiltered
+    # run -- a label the baseline has that this run never produced. That last
+    # one used to pass silently, so a run whose llama labels died of memory
+    # pressure reported ``MATCH=18 / RESULT: PASS`` while covering 18 of 26.
     bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]
-    return 1 if bad else 0
+    return 1 if bad or (missing and not filtered) else 0
 
 
-def _build_report(results, run_dir, prev_run):
+def _missing_labels(results, prev_run):
+    """Labels the baseline compiled that this run produced no ``model.txt`` for.
+
+    Absence is ambiguous on its own -- ``--only llama`` omits eighteen labels
+    on purpose -- so this only reports it. Whether it is a failure is the
+    caller's question, and the answer is "yes unless the run was filtered".
+    """
+    if prev_run is None:
+        return []
+    current = {r[0] for r in results}
+    return sorted(
+        label
+        for p in prev_run.rglob("model.txt")
+        for label in (str(p.parent.relative_to(prev_run)),)
+        if label not in current
+    )
+
+
+def _build_report(results, run_dir, prev_run, missing=(), filtered=False):
     """Render the human-readable summary written to report.txt + stdout."""
     counts = {}
     for _, _, verdict, _ in results:
         counts[verdict] = counts.get(verdict, 0) + 1
+    if missing:
+        counts["MISSING"] = len(missing)
 
     lines = []
     lines.append("=" * 70)
@@ -408,16 +432,21 @@ def _build_report(results, run_dir, prev_run):
             lines.append(f"  - {status}: {label} [see {label}/run.log]")
 
     # Labels present in the previous run but absent now.
-    if prev_run is not None:
-        current_labels = {r[0] for r in results}
-        for p in sorted(prev_run.rglob("model.txt")):
-            label = str(p.parent.relative_to(prev_run))
-            if label not in current_labels:
-                lines.append(f"  - MISSING: {label} (in {prev_run.name})")
+    if missing:
+        lines.append("")
+        for label in missing:
+            lines.append(f"  - MISSING: {label} (in {prev_run.name})")
+        lines.append(
+            "    (expected: the run was filtered)"
+            if filtered
+            else "    (not expected: an unfiltered run must cover the baseline)"
+        )
 
     bad = [r for r in results if r[2] in ("FAILED", "MISMATCH")]
     lines.append("")
-    lines.append("RESULT: FAIL" if bad else "RESULT: PASS")
+    lines.append(
+        "RESULT: FAIL" if bad or (missing and not filtered) else "RESULT: PASS"
+    )
     return "\n".join(lines)
 
 

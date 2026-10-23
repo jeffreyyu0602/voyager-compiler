@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Unified Pallas-``pallas_call``-style kernel scheduler.
 
 One scheduler subsuming the pointwise / pooling / GEMM bufferization builders:
@@ -19,7 +22,6 @@ from torch._higher_order_ops.while_loop import while_loop
 
 from voyager_compiler.codegen.node_info import (
     _pair,
-    activation_transforms,
     ancestors,
     bound_operands,
     compute_output_tiled_shapes,
@@ -27,16 +29,9 @@ from voyager_compiler.codegen.node_info import (
     get_arg_value,
     is_bmm,
     is_conv2d,
-    is_depthwise_conv,
-    is_full_reduction,
-    is_nop,
-    is_reshape_op,
     quant_param_arg_nodes,
-    reduced_input_grid,
-    reduced_input_tiling,
     reduction_op,
     reduction_scratch,
-    relayout_view_shape,
     stream_breaking_quantize,
     trailing_mha_perm,
     weight_is_ck,
@@ -75,11 +70,12 @@ from voyager_compiler.codegen.transform.tiling.tiler import (
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.ops.layout import (
     NCHW_TO_NHWC,
+    NHWC_OP_VARIANTS,
     OIHW_TO_HWIO,
     project,
     unproject,
 )
-from voyager_compiler.shape_prop import ShapeProp, fake_like, set_node_value
+from voyager_compiler.shape_prop import ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
 
@@ -865,12 +861,6 @@ class AsyncPipelinedKernel(PipelinedKernel):
     in the loop; the only loop-level wait is the lagged retire on compute-done.
     Inputs prefetch ``num_slots - 2`` ahead (one less than the base), so a slot
     a load overwrites was already retired — reuse-WAR-safe.
-
-    A commit that reads what the previous step's commit wrote, with no unit
-    ordering the two, waits that step's compute-done as a dependency instead
-    (``prev_post``; see ``_gemm_scratch_and_kernel``).  The kernel returns
-    the predicate under which it did not, and the lagged retire runs only
-    there: each post is consumed once.
     """
 
     _async_pipeline = True
@@ -979,18 +969,11 @@ class AsyncPipelinedKernel(PipelinedKernel):
 
             post = get_slot(done_sem, step % _DONE_DEPTH)
 
-            # Built where it is used, so a step that never waits it carries
-            # no slot arithmetic.
-            def prev_post():
-                return get_slot(done_sem, (step - 1) % _DONE_DEPTH)
-
             # 3. Dispatch the tile's compute: the async kernel issues the
             #    ``commit`` itself — waiting the input load semaphores and, on
             #    the round it writes the output, that slot's store semaphore
             #    free (seeded with a credit, so first uses never underflow).
-            #    It returns ``None``, or the predicate under which its commit
-            #    did not also wait the previous step's compute-done.
-            pending = self.kernel(
+            self.kernel(
                 ctx.cur,
                 in_slots,
                 out_slots,
@@ -998,19 +981,20 @@ class AsyncPipelinedKernel(PipelinedKernel):
                 in_sems,
                 out_sems,
                 post,
-                prev_post,
             )
 
             # 4. Lagged retire of tile step-1 (nothing at step 0): wait its
-            #    compute-done unless the commit just dispatched waited it, and
-            #    store each output once its *own* block has finished (slot
-            #    ordinal one behind the tile committed now).  Flat conds — a
-            #    ``SymBool`` predicate cannot be captured into an outer cond's
-            #    operands, so ``step >= 1`` folds into the store predicate.
-            retire = step >= 1
-            if pending is not None:
-                retire = retire & pending
-            effect_cond(retire, lambda: voyager.async_wait(prev_post()))
+            #    compute-done every step, and store each output once its *own*
+            #    block has finished (slot ordinal one behind the tile committed
+            #    now).  Flat conds — a ``SymBool`` predicate cannot be captured
+            #    into an outer cond's operands, so ``step >= 1`` folds into the
+            #    store predicate.
+            effect_cond(
+                step >= 1,
+                lambda: voyager.async_wait(
+                    get_slot(done_sem, (step - 1) % _DONE_DEPTH)
+                ),
+            )
 
             # 5. Retire (store) + advance the finished-tile count, per output.
             #    An output that advances every step stores every step (guard
@@ -1151,10 +1135,9 @@ def build_pipelined_buffers(
 # ``GraphModule`` (a rolled ``while_loop`` of ``voyager.*`` primitives) that
 # substitutes for the node, or ``None`` when uncovered.  They mirror
 # ``bufferization._build_for_*`` but target the pipelined scheduler: a
-# return-style per-tile ``compute`` is wrapped mutate-style by
-# ``_single_pass_kernel`` (each result written into its output slot),
-# accumulating across the reduction grid dim for a GEMM / conv and
-# overwriting for a map.
+# return-style per-tile ``compute`` is wrapped mutate-style by ``_map_kernel``
+# (each result written into its output slot), accumulating across the reduction
+# grid dim for a GEMM / conv and overwriting for a map.
 # ---------------------------------------------------------------------------
 
 
@@ -1380,7 +1363,7 @@ def parse_fused_submodule(node, tiler=None) -> Optional["_FusedInfo"]:
     )
 
 
-def _single_pass_kernel(
+def _map_kernel(
     compute: Callable,
     num_outputs: int,
     num_scratch: int = 0,
@@ -1425,14 +1408,7 @@ def _single_pass_kernel(
         return inner
 
     def kernel(
-        grid_index,
-        in_slots,
-        out_slots,
-        scratch,
-        in_sems,
-        out_sems,
-        post,
-        prev_post,
+        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
         commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
@@ -1440,126 +1416,8 @@ def _single_pass_kernel(
     return kernel
 
 
-def _running_max_kernel(compute: Callable):
-    """Kernel for a max of the whole grid into one output tile.
-
-    Each step stores its tile's max in the scratch ref; the first step moves
-    it into the output slot, and each later one folds it in.  The output
-    block never changes, so the scheduler stores it once, after the last
-    step.
-    """
-
-    def inner(grid_index, *args):
-        *in_slots, out_slot, tile_max = args
-        voyager.insert(compute(*in_slots), tile_max)
-        first = grid_index[0] == 0
-        for coord in grid_index[1:]:
-            first = first & (coord == 0)
-
-        def init():
-            return tile_max.clone()
-
-        def fold(prev=out_slot):
-            return torch.maximum(tile_max, prev)
-
-        voyager.insert(torch.cond(first, init, fold), out_slot)
-
-    return inner
-
-
-def _inplace_tail_kernel(
-    compute: Callable,
-    fused_gm,
-    fused_operand_indices,
-    async_pipeline: bool = False,
-):
-    """Kernel for a single-round op whose tail the drain cannot hold in one
-    pass but which keeps the tile's shape: the op writes its output slot,
-    and the tail runs a second pass over that slot in place.  No scratch is
-    needed -- the slot rotates per tile, so nothing reads it before its
-    store -- and the staged tile is in the output's dtype either way.
-
-    ``compute(in_slots, first)`` is the bare op; ``fused_gm`` takes the
-    tile and the operands ``fused_operand_indices`` name in the input
-    slots.  ``async_pipeline=True`` dispatches both passes as one commit,
-    waiting the input loads and the slot's store free, as
-    ``_single_pass_kernel`` does.
-    """
-
-    def inner(grid_index, *args):
-        *in_slots, out_slot = args
-        voyager.insert(compute(in_slots, True).to(out_slot.dtype), out_slot)
-        fused = [in_slots[i] for i in fused_operand_indices]
-        voyager.insert(fused_gm(out_slot, *fused), out_slot)
-
-    if not async_pipeline:
-        return inner
-
-    def kernel(
-        grid_index,
-        in_slots,
-        out_slots,
-        scratch,
-        in_sems,
-        out_sems,
-        post,
-        prev_post,
-    ):
-        operands = [grid_index, *in_slots, *out_slots]
-        commit(inner, operands, dependencies=[*in_sems, *out_sems], post=post)
-
-    return kernel
-
-
-def _commit_round(body, operands, dependencies, post, prev_post, wait, on=None):
-    """``commit`` one reduction round, also waiting the previous step's
-    compute-done (``prev_post()``) when ``wait`` is set.
-
-    ``on``, if given, returns the predicate on the grid coordinate that
-    limits the wait to the rounds where it holds.  It is called inside the
-    caller's branch, since a ``SymBool`` cannot enter a cond as an operand.
-    """
-
-    def ordered():
-        commit(
-            body,
-            operands,
-            dependencies=[*dependencies, prev_post()],
-            post=post,
-        )
-        return 0
-
-    def unordered():
-        commit(body, operands, dependencies=dependencies, post=post)
-        return 0
-
-    if not wait:
-        unordered()
-    elif on is None:
-        ordered()
-    else:
-        torch.cond(on(), ordered, unordered)
-
-
-def _retire_pending(grid_index, reduction_dim, wait_partial):
-    """A reduction kernel's answer to :class:`AsyncPipelinedKernel`: ``None``
-    when no round waits the previous step's compute-done, else the predicate
-    under which this step's commit did not -- every coord but ``1``.  The
-    step before the ``1`` coord is the ``0`` round of the same tile only
-    because the reduction dim is the grid's innermost.
-    """
-    if not wait_partial:
-        return None
-    assert reduction_dim == len(grid_index) - 1, "reduction dim not innermost"
-    return grid_index[reduction_dim] != 1
-
-
 def _reduction_inplace_kernel(
-    compute: Callable,
-    reduction_dim: int,
-    async_pipeline: bool = False,
-    last_idx: Optional[int] = None,
-    wait_partial: bool = False,
+    compute: Callable, reduction_dim: int, async_pipeline: bool = False
 ):
     """Kernel for a reduction with nothing left to do once it completes — no
     cast (the accumulator's dtype is the output's) and no fused tail.  It
@@ -1571,10 +1429,7 @@ def _reduction_inplace_kernel(
 
     ``async_pipeline=True`` returns the :class:`AsyncPipelinedKernel` variant:
     the accumulator *is* the output slot, first written on the ``0`` reduction
-    coord, so the commit dispatch waits the slot free there.  With
-    ``wait_partial`` the round on the ``1`` coord also waits the ``0``
-    round's compute-done (see ``_gemm_scratch_and_kernel``); ``last_idx``, the
-    final reduction coord, drops that round's predicate when it is ``1``.
+    coord, so the commit dispatch waits the slot free there.
     """
 
     def inner(grid_index, *args):
@@ -1607,14 +1462,7 @@ def _reduction_inplace_kernel(
         voyager.insert(compute(in_slots, False) + out_slot, out_slot)
 
     def kernel(
-        grid_index,
-        in_slots,
-        out_slots,
-        scratch,
-        in_sems,
-        out_sems,
-        post,
-        prev_post,
+        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
 
@@ -1627,25 +1475,13 @@ def _reduction_inplace_kernel(
             )
             return 0
 
-        def round_1():
-            return grid_index[reduction_dim] == 1
-
         def not_first():
-            # Round 1 is the only reader of a round-0 partial; with two
-            # rounds it is the only round here.
-            _commit_round(
-                accumulate_body,
-                operands,
-                in_sems,
-                post,
-                prev_post,
-                wait_partial,
-                None if last_idx == 1 else round_1,
+            commit(
+                accumulate_body, operands, dependencies=[*in_sems], post=post
             )
             return 0
 
         torch.cond(grid_index[reduction_dim] == 0, on_first, not_first)
-        return _retire_pending(grid_index, reduction_dim, wait_partial)
 
     return kernel
 
@@ -1661,11 +1497,6 @@ def _split_part(fused_gm, part_ops, root, name, result):
         remap[p] = pg.placeholder(p.name)
     for n in part_ops:
         remap[n] = pg.node_copy(n, lambda x: remap[x])
-    # Re-rooting changes no shapes: keep the tail's tile-granularity values,
-    # which ``node_copy`` drops.
-    for src, dst in remap.items():
-        if hasattr(src, "value"):
-            set_node_value(dst, src.value)
     pg.output(
         tuple(remap[r] for r in result)
         if isinstance(result, (tuple, list))
@@ -1675,66 +1506,14 @@ def _split_part(fused_gm, part_ops, root, name, result):
     return torch.fx.GraphModule(torch.nn.Module(), pg)
 
 
-def _stamp_tail_shapes(
-    fused_gm, acc_shape, acc_dtype, inputs, in_specs, fused_idx
-):
-    """Give the fused tail its tile-granularity shapes, and respell a
-    relayout that only renames the tile's dims as a view.
-
-    The tail arrives without values (its nodes were copied from a submodule
-    whose shapes are whole-tensor anyway), so run it once on fakes of what
-    the kernel hands it: the accumulator tile and each fused operand's tile
-    (the operand itself when it is passed whole).  At that shape an MHA
-    context matmul's ``transpose(1, 2)`` moves nothing (it lifts the head
-    past the sequence, but a tile holds one head): as a view it breaks no
-    stream, and no consumer mistakes it for a real permute.
-    """
-    if not isinstance(fused_gm, torch.fx.GraphModule):
-        return
-    acc = fake_like(torch.empty(tuple(acc_shape), dtype=acc_dtype))
-    tiles = []
-    for i in fused_idx:
-        spec = in_specs[i]
-        if spec is None:
-            tiles.append(fake_like(inputs[i]))
-        else:
-            tile = torch.empty(tuple(spec.tile_sizes), dtype=inputs[i].dtype)
-            tiles.append(fake_like(tile))
-    ShapeProp(fused_gm).propagate(acc, *tiles)
-
-    graph = fused_gm.graph
-    renames = [
-        n
-        for n in graph.nodes
-        if is_reshape_op(n)
-        and relayout_view_shape([n], tuple(n.args[0].value.shape)) is not None
-    ]
-    for n in renames:
-        # A view feeding the rename folds in: one view from its source.
-        src = n.args[0]
-        while src.target is torch.ops.aten.view.default and len(src.users) == 1:
-            src = src.args[0]
-        with graph.inserting_before(n):
-            view = graph.call_function(
-                torch.ops.aten.view.default, (src, list(n.value.shape))
-            )
-        set_node_value(view, src.value.view(n.value.shape))
-        n.replace_all_uses_with(view)
-        graph.erase_node(n)
-    if renames:
-        graph.eliminate_dead_code()
-        graph.lint()
-        fused_gm.recompile()
-
-
 def _split_stream_break(fused_gm):
     """Split a fused tail whose ``quantize_mx`` cannot ride the compute pass.
 
-    The quantize breaks the stream when its scale axis is not the last
-    (the scale unit groups along the stream, so the tile must be
-    materialized first) or when a relayout that moves elements feeds it
-    (the store folds a permute into the value's addressing but writes the
-    scales in stream order).
+    ``stream_breaking_quantize`` decides: a non-last scale axis always
+    breaks (the scale unit groups along the stream, so the tile must be
+    materialized first), as does a relayout that moves elements (the store
+    folds a permute into the value's addressing but writes the scales in
+    stream order).
 
     The cut lands *before* the relayout chain feeding the quantize: the
     staged tile keeps the accumulator's layout and the relayout rides the
@@ -1759,8 +1538,9 @@ def _split_stream_break(fused_gm):
     quant, relayout, spine = broken
     graph = fused_gm.graph
     phs = [n for n in graph.nodes if n.op == "placeholder"]
-    relayout.reverse()
     ops = [n for n in graph.nodes if n.op == "call_function"]
+
+    relayout.reverse()
     head_ops = [n for n in ops[:-1] if n not in relayout]
     head_gm = _split_part(fused_gm, head_ops, phs[0], "acc", spine)
     quant_gm = _split_part(fused_gm, relayout + [quant], spine, "staged", quant)
@@ -1794,11 +1574,9 @@ def _split_leading_dequantize(fused_gm):
         ``None`` when the tail does not scale the accumulated value with a
         dequantize, else ``(dequantize, rest_gm)``: a call scaling one
         partial, and the tail's remaining ops on the accumulated value, both
-        taking the same operand list as ``fused_gm`` -- ``None`` when the
-        dequantize was the whole tail, so the caller sees no tail at all.
-        The scale is a direct op call rather than a graph module because it
-        runs inside the reduction's ``torch.cond`` branches, which capture
-        no submodules.
+        taking the same operand list as ``fused_gm``.  The scale is a direct
+        op call rather than a graph module because it runs inside the
+        reduction's ``torch.cond`` branches, which capture no submodules.
     """
     if not isinstance(fused_gm, torch.fx.GraphModule):
         return None
@@ -1822,10 +1600,8 @@ def _split_leading_dequantize(fused_gm):
             *[a if i is None else operands[i] for i, a in scale_args],
         )
 
-    rest = [n for n in ops if n is not node]
-    if not rest:
-        return dequantize, None
     out = next(n for n in graph.nodes if n.op == "output").args[0]
+    rest = [n for n in ops if n is not node]
     rest_gm = _split_part(fused_gm, rest, node, "acc", out)
     # The tail mutated the scale's own result in place; rooted on the
     # accumulator it would mutate the buffer it reads, which a region cannot do.
@@ -1850,52 +1626,51 @@ def _reduction_fused_kernel(
     fused_operand_indices: List[int] = (),
     scratch_slots: int = 1,
     async_pipeline: bool = False,
-    wait_partial: bool = False,
 ):
-    """Kernel for an op whose finished tile passes through scratch: a
-    reduction over several K tiles, or a single round whose tail cannot ride
-    the compute pass (``_single_pass_kernel`` handles the one that can).
+    """Kernel for an op that stages its result in scratch: a reduction that
+    needs > 1 tile (num_k > 1 GEMM / conv), or a single-tile one whose fused
+    tail must read a materialized tile (the num_k == 1 case whose tail rides
+    the compute pass uses ``_map_kernel``).
 
-    Every round but the last accumulates into the scratch ref.  What the
-    last round does depends on ``chain_tail`` and ``split``::
+    The partial accumulates into a scratch ref; the last step casts it to
+    ``op_dtype`` and maps it through the fused tail (if any) into the out
+    slot(s).  The bias rides only the first step — the same step that
+    initializes the accumulator — so bias gate and reduction init share the
+    single reduction ``torch.cond``.
 
-        chain_tail  split   last round
-        ----------  ------  --------------------------------------------
-        True        None    whole tail chained on the live value, stored
-        True        given   head chained on the live value into scratch;
-                            the relayout + quantize run as a staged pass
-        False       any     live value written to scratch; the whole tail
-                            runs as a staged pass
-
-    The bias rides the first round only, the one that initializes the
-    accumulator.  Both nests share this logic; the async variant dispatches
-    each round as a ``commit``.
+    A ``chain_tail`` finalize runs the tail chained on the live value —
+    whole (``split is None``), or its layout-preserving head only, with the
+    split-off ``quantize_mx`` reading the staged tile in the accumulator's
+    own layout, the relayout (if any) folded into that pass.  An unchained
+    tail reads the completed accumulator back from scratch.  Both nests
+    share this logic; the async variant dispatches each round as a
+    ``commit``.
 
     Args:
-        compute: ``compute(in_slots, first)``, the bare op on the current
-            tiles; ``first`` folds the bias into the op.
+        compute: ``compute(in_slots, first)`` — the bare op on the current
+            tiles; ``first`` folds the bias straight into the op.
         reduction_dim: Grid dim of the cross-tile reduction (K / C).
         last_idx: Final coordinate along ``reduction_dim`` (``num_k - 1``);
-            0 selects the single-round variant.
-        op_dtype: Dtype the finished accumulator is cast to, or ``None``
-            when it already accumulates in the output dtype.
+            0 selects the single-round staging variant.
+        op_dtype: Output dtype the finished accumulator is cast to, or
+            ``None`` when it already accumulates in the output dtype.
         num_outputs: Number of output tiles the kernel writes.
         fused_gm: The fused tail ``[acc, *operands] -> output(s)``, or
             ``None``.
-        chain_tail: Run the tail (or its head) on the live accumulated
-            value rather than from scratch; see the table.
-        split: The tail's ``_split_stream_break`` classification, or
-            ``None`` when nothing in it breaks the stream.
+        chain_tail: Finalize the fused tail on the live accumulated value
+            instead of materializing it into scratch first
+            (``meta['accumulate_fusible']``).  Honored by both nests for a
+            multi-round reduction; the sync single-round case keeps the
+            staged shape.
+        split: The tail's ``_split_stream_break`` classification, from the
+            caller — ``None`` chains the tail whole.
         fused_operand_indices: Positions of the tail's extra operands in the
             kernel's input-slot list.
-        scratch_slots: Slots of the scratch accumulator, 1 or 2; with 2 the
-            staged pass stays inside the commit, with 1 it runs bare after
-            it (async variant only).
+        scratch_slots: Slot count of the scratch accumulator — how the
+            scratch re-read race is closed (see ``on_last``); only 1 and 2
+            are meaningful, and only for the async variant.
         async_pipeline: Return the :class:`AsyncPipelinedKernel` variant
             instead of the synchronous body.
-        wait_partial: The round on the ``1`` coord also waits the ``0``
-            round's compute-done before it reads the partial (async variant
-            only; see ``_gemm_scratch_and_kernel``).
 
     Returns:
         The kernel callable for ``build_pipelined_buffers``.
@@ -2016,25 +1791,16 @@ def _reduction_fused_kernel(
                 _staged_quantize(in_slots, out_slots, scratch)
 
     def kernel(
-        grid_index,
-        in_slots,
-        out_slots,
-        scratch,
-        in_sems,
-        out_sems,
-        post,
-        prev_post,
+        grid_index, in_slots, out_slots, scratch, in_sems, out_sems, post
     ):
         operands = [grid_index, *in_slots, *out_slots, *scratch]
 
         def on_last():
-            _commit_round(
+            commit(
                 finalize_body,
                 operands,
-                [*in_sems, *out_sems],
-                post,
-                prev_post,
-                wait_partial and last_idx == 1,
+                dependencies=[*in_sems, *out_sems],
+                post=post,
             )
             # With one scratch slot the next sweep's round-0 accumulate
             # would overwrite the tile this tail still reads, so the tail
@@ -2047,29 +1813,17 @@ def _reduction_fused_kernel(
                     _staged_quantize(in_slots, out_slots, scratch[0])
             return 0
 
-        def round_1():
-            return grid_index[reduction_dim] == 1
-
         def not_last():
-            # Round 1 is the only reader of a round-0 partial; with two
-            # rounds it is the last round, which ``on_last`` commits.
-            _commit_round(
-                accumulate_body,
-                operands,
-                in_sems,
-                post,
-                prev_post,
-                wait_partial and last_idx > 1,
-                round_1,
+            commit(
+                accumulate_body, operands, dependencies=[*in_sems], post=post
             )
             return 0
 
         if single_round:
             # Every step completes its tile: skip the constant-predicate cond.
             on_last()
-            return None
+            return
         torch.cond(grid_index[reduction_dim] == last_idx, on_last, not_last)
-        return _retire_pending(grid_index, reduction_dim, wait_partial)
 
     return kernel
 
@@ -2126,7 +1880,9 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
     assigned = [None] * len(ordered)
     scratch_group = None
 
-    node_specs = {n: spec for n, spec in zip(node.all_input_nodes, in_specs)}
+    node_specs = {
+        n: spec for n, spec in zip(node.all_input_nodes, in_specs)
+    }
 
     def tag(spec, group):
         if spec is not None and id(spec) in index_of:
@@ -2155,7 +1911,7 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
             if role == "output":
                 return node
             if role == "input":
-                return src(activation_transforms(anchor.args[0])[0])
+                return src(anchor.args[0])
             if role == "weight":
                 return src(weight_transforms(anchor.args[1])[0])
             if role == "bias":
@@ -2195,25 +1951,6 @@ def _bank_group_list(node, in_specs, out_specs, scratch_specs=()):
 _CLASSIFY = object()
 
 
-def _array_writes_memory(anchor, acc_shape) -> bool:
-    """Whether the bare ``anchor`` op's output tile goes from the matrix unit
-    straight to memory, with no vector pass behind it.
-
-    The toolchain sends the array's output through the vector unit for a
-    matrix-vector product (an input tile of one row), a depthwise conv, a
-    fused SpMM, and any op that carries a second one, such as a weight
-    decode (``output_to_memory`` in ``test/toolchain/MatrixOps.h``).  The
-    input tile's rows are the accumulator tile's leading dims.
-    """
-    if is_conv2d(anchor):
-        return not is_depthwise_conv(anchor)
-    if anchor.kwargs.get("A_indptr") is not None:
-        return False
-    if weight_transforms(anchor.args[1])[3] is not None:
-        return False
-    return math.prod(acc_shape[:-1]) != 1
-
-
 def _gemm_scratch_and_kernel(
     gemm_kernel,
     fused_gm,
@@ -2226,11 +1963,11 @@ def _gemm_scratch_and_kernel(
     fused_idx,
     anchor,
     accumulate_fp32,
+    chain_tail,
     async_pipeline,
     single_buffer_tail=False,
     split=_CLASSIFY,
-    single_k_tail_fusible=True,
-    split_k_tail_fusible=False,
+    staged=False,
 ):
     """The scheduler kernel and scratch specs a tiled reduction op needs —
     shared by the dense / sparse GEMM and conv builders.
@@ -2248,18 +1985,17 @@ def _gemm_scratch_and_kernel(
         anchor: The op node, carrying the tiler's ``scratch_slots`` meta.
         accumulate_fp32: Accumulate the reduction in fp32 rather than the
             output dtype.
+        chain_tail: Whether the tail chains into the async finalize pass.
         async_pipeline: The async kernel variants, or the sync ones.
         single_buffer_tail: Collapse a sync reduction's operand banks to one.
         split: The tail's ``_split_stream_break`` result, precomputed by a
             caller whose kernel is rebuilt under export tracing (the sparse
             GEMM), where the classification's graph walk cannot run; the
             sentinel classifies here.
-        single_k_tail_fusible: The tail rides a single round's pass.
-            Otherwise it runs a second pass over the finished tile: in
-            place on the output slot if it keeps the tile's shape, else
-            through scratch.
-        split_k_tail_fusible: The tail chains into a split reduction's
-            finalize pass.
+        staged: Force the staged path even for an unsplit single round —
+            the tail re-reads its tile from scratch (a CSR-producing
+            epilogue staging its prefix result), so the ``num_k == 1``
+            map shortcut must not apply.
 
     Returns:
         ``(scratch_specs, kernel)``.
@@ -2273,22 +2009,7 @@ def _gemm_scratch_and_kernel(
         return result
 
     out_dtype = anchor.value.dtype
-    # A single round has no running sum to widen.
-    acc_dtype = torch.float32 if accumulate_fp32 and num_k > 1 else out_dtype
-    # Round 1 reads back the partial round 0 wrote to L2.  When round 0 is the
-    # bare op on the array, the matrix unit writes that partial to memory by
-    # itself, and nothing orders round 1's read behind the writes: the vector
-    # unit's start waits only for the previous vector pass, and round 1's
-    # commit for its own input loads.  So round 1 also waits round 0's
-    # compute-done.  A round 0 with a vector pass of its own (the dequantize
-    # head below, a fused SpMM) is already ordered by that gate.  A caller
-    # that passes ``split`` (the sparse GEMM) rebuilds its kernel under export
-    # tracing, where this check cannot read the graph.
-    wait_partial = (
-        split is _CLASSIFY
-        and num_k > 1
-        and _array_writes_memory(anchor, acc_shape)
-    )
+    acc_dtype = torch.float32 if accumulate_fp32 else out_dtype
     # A multi-round reduction accumulates in L2, so its partials have to reach
     # the accumulator already scaled -- the psum type lives on chip only.  Every
     # round scales its own partial, so the head rides the op rather than the
@@ -2299,48 +2020,18 @@ def _gemm_scratch_and_kernel(
         and (dequant_split := _split_leading_dequantize(fused_gm))
     ):
         dequantize, fused_gm = dequant_split
-        wait_partial = False
 
         def gemm_kernel(in_tiles, first, op=gemm_kernel):
             return dequantize(
                 op(in_tiles, first), *[in_tiles[i] for i in fused_idx]
             )
 
-    # A tail that only regroups the tile's dims computes nothing: each
-    # round's partial takes the output's shape, and the reduction runs as
-    # one with no tail.  A caller rebuilding its kernel under export tracing
-    # (``split`` given) cannot walk the tail's graph, so keeps it.
-    if (
-        split is _CLASSIFY
-        and fused_gm is not None
-        and not fused_idx
-        and acc_dtype == out_dtype
-        and all(
-            is_nop(n) for n in fused_gm.graph.nodes if n.op == "call_function"
-        )
-    ):
-        reshape, fused_gm = fused_gm, None
-
-        def gemm_kernel(in_tiles, first, op=gemm_kernel):
-            return reshape(op(in_tiles, first))
-
     if split is _CLASSIFY:
         split = _split_stream_break(fused_gm)
-    if num_k == 1 and split is None and single_k_tail_fusible:
+    if num_k == 1 and split is None and not staged:
         scratch_specs = []
-        kernel = _single_pass_kernel(
+        kernel = _map_kernel(
             compute, len(out_specs), async_pipeline=async_pipeline
-        )
-    elif (
-        num_k == 1
-        and split is None
-        and fused_gm is not None
-        and len(out_specs) == 1
-        and tuple(out_specs[0].tile_sizes) == tuple(acc_shape)
-    ):
-        scratch_specs = []
-        kernel = _inplace_tail_kernel(
-            gemm_kernel, fused_gm, fused_idx, async_pipeline=async_pipeline
         )
     elif fused_gm is None and acc_dtype == out_dtype:
         scratch_specs = []
@@ -2348,8 +2039,6 @@ def _gemm_scratch_and_kernel(
             gemm_kernel,
             reduction_dim=reduction_dim,
             async_pipeline=async_pipeline,
-            last_idx=num_k - 1,
-            wait_partial=wait_partial,
         )
     else:
         if single_buffer_tail and not async_pipeline and num_k > 1:
@@ -2362,7 +2051,7 @@ def _gemm_scratch_and_kernel(
         # second slot; a chained-whole tail never races and keeps one.  The
         # count is the tiler's per-node call (the scratch ladder winner,
         # stamped with the tiling).
-        sync = not split_k_tail_fusible or split is not None
+        sync = not chain_tail or split is not None
         scratch_slots = anchor.meta.get("tiling", {}).get("scratch_slots", 1)
         slots = scratch_slots if sync else 1
         scratch_specs = [_ScratchSpec(acc_shape, acc_dtype, num_slots=slots)]
@@ -2373,19 +2062,18 @@ def _gemm_scratch_and_kernel(
             num_outputs=len(out_specs),
             op_dtype=(out_dtype if acc_dtype != out_dtype else None),
             fused_gm=fused_gm,
-            chain_tail=split_k_tail_fusible,
+            chain_tail=chain_tail,
             split=split,
             fused_operand_indices=fused_idx,
             scratch_slots=slots,
             async_pipeline=async_pipeline,
-            wait_partial=wait_partial,
         )
     return scratch_specs, kernel
 
 
 def _stamp_anchor_meta(gm, anchor) -> None:
-    """Copy the anchor's interstellar results -- the mapping and calculator the
-    reporting model prices a tile with, and the mapping / architecture the
+    """Copy the anchor's interstellar results -- the per-tile compute cycles the
+    reporting model turns into a utilization, and the mapping / architecture the
     proto emitter turns into a ``Tiling`` -- onto the nest just built, at every
     nesting level (loop body, cond branch); the anchor itself is erased on
     splice.
@@ -2623,10 +2311,9 @@ def build_conv2d(
         fused_idx=fused_idx,
         anchor=anchor,
         accumulate_fp32=accumulate_fp32,
+        chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
-        single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
-        split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
     gm = build_pipelined_buffers(
         kernel,
@@ -2732,9 +2419,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         return None
     anchor = info.anchor if info is not None else node
 
-    act_node, act_transposed = activation_transforms(anchor.args[0])
-    weight_node, weight_transposed, weight_repeat, weight_dequant = (
-        weight_transforms(anchor.args[1])
+    weight_node, transposed, weight_repeat, dequant = weight_transforms(
+        anchor.args[1]
     )
 
     act = anchor.args[0].value.clone()
@@ -2807,9 +2493,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         )
 
     act_spec = _spec(act.shape, (tm, tk), (gm, gk))
-    act_spec.transposed = act_transposed
     weight_spec = _spec(weight.shape, _proj(tn, tk), _proj(gn, gk))
-    weight_spec.transposed = weight_transposed
+    weight_spec.transposed = transposed
     weight_spec.repeat = weight_repeat
     bias_spec = _InputSpec((tn,), (gn,), (False,))
     # The output(s) tile onto the M/N grid dims (K reduction ``gk`` dropped); a
@@ -2827,7 +2512,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     bound = bound_operands(node, node.meta.get("submodule"))
     src = lambda n: bound.get(n, n)
     node_to_spec = {
-        src(act_node): (act_node.value.clone(), act_spec),
+        src(anchor.args[0]): (act, act_spec),
         src(weight_node): (weight, weight_spec),
     }
 
@@ -2874,7 +2559,6 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         )
         add_kw_input("input_code", None)
         add_kw_input("weight_code", None)
-        add_kw_input("alpha", None)
 
     # An outlier CSR rides the GEMM as three kwargs. The row pointers are one
     # continuous array per K slice, so this tile is a row *range* of it: tm+1
@@ -2899,11 +2583,9 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     # so they dice with it, that axis divided by the block; the codebook, indexed
     # by value rather than by position, loads whole.
     dq_nodes = {}
-    if weight_dequant is not None:
-        dq_axes = {
-            a % weight.ndim for a in get_arg_value(weight_dequant, 3, "axes")
-        }
-        dq_bs = get_arg_value(weight_dequant, 4, "block_size")
+    if dequant is not None:
+        dq_axes = {a % weight.ndim for a in get_arg_value(dequant, 3, "axes")}
+        dq_bs = get_arg_value(dequant, 4, "block_size")
         k_dim, n_dim = (
             (weight.ndim - 2, weight.ndim - 1)
             if ck
@@ -2913,8 +2595,8 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
             tn // dq_bs if n_dim in dq_axes else tn,
             tk // dq_bs if k_dim in dq_axes else tk,
         )
-        tables = quant_param_arg_nodes(weight_dequant)
-        for i, v in enumerate(weight_dequant.args):
+        tables = quant_param_arg_nodes(dequant)
+        for i, v in enumerate(dequant.args):
             if i == 0 or not isinstance(v, torch.fx.Node):
                 continue
             spec = None
@@ -2940,7 +2622,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     inputs = [node_to_spec[n][0] for n in node.all_input_nodes]
     in_specs = [node_to_spec[n][1] for n in node.all_input_nodes]
 
-    act_idx = order[src(act_node)]
+    act_idx = order[src(anchor.args[0])]
     weight_idx = order[src(weight_node)]
     bias_idx = order[src(bias_n)] if bias_n is not None else None
     kw_idx = {name: order[n] for name, n in kw_nodes.items()}
@@ -2951,14 +2633,14 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
     # there — so read the dequantize's call apart here: its scalar args as plain
     # Python, and the tile slot each of its tensor args comes from.
     dq_idx = {i: order[n] for i, n in dq_nodes.items()}
-    dq_target = weight_dequant.target if weight_dequant is not None else None
+    dq_target = dequant.target if dequant is not None else None
     dq_args = [
         (
             None
             if isinstance(a, torch.fx.Node)
             else tuple(a) if isinstance(a, (list, tuple)) else a
         )
-        for a in (weight_dequant.args if weight_dequant is not None else ())
+        for a in (dequant.args if dequant is not None else ())
     ]
 
     op = anchor.target
@@ -2987,17 +2669,12 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         bias = in_tiles[bias_idx] if first else None
         return op(act_tile, weight_tile, bias, **kw)
 
-    acc_shape = tuple(tb) + (tm, tn)
-    _stamp_tail_shapes(
-        fused_gm, acc_shape, anchor.value.dtype, inputs, in_specs, fused_idx
-    )
-
     return _GemmPlan(
         anchor=anchor,
         grid=grid,
         grid_dims=(gm, gn, gk),
         tile_k=tk,
-        acc_shape=acc_shape,
+        acc_shape=tuple(tb) + (tm, tn),
         inputs=tuple(inputs),
         in_specs=in_specs,
         out_specs=out_specs,
@@ -3005,7 +2682,7 @@ def _gemm_plan(node, tiler=None, k_tiles=None) -> Optional[_GemmPlan]:
         gemm_kernel=gemm_kernel,
         fused_gm=fused_gm,
         fused_idx=fused_idx,
-        outline_dps=num_k > 1 or info is not None or weight_dequant is not None,
+        outline_dps=num_k > 1 or info is not None or dequant is not None,
     )
 
 
@@ -3039,10 +2716,9 @@ def build_gemm(
         fused_idx=plan.fused_idx,
         anchor=plan.anchor,
         accumulate_fp32=accumulate_fp32,
+        chain_tail=node.meta.get("accumulate_fusible", False),
         async_pipeline=async_pipeline,
         single_buffer_tail=single_buffer_tail,
-        single_k_tail_fusible=node.meta.get("single_k_tail_fusible", True),
-        split_k_tail_fusible=node.meta.get("split_k_tail_fusible", False),
     )
     gm = build_pipelined_buffers(
         kernel,
@@ -3130,9 +2806,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     """Pipeline builder for a pointwise / batched-reduction node (elementwise
     ops, layernorm·softmax whose reduction dim is kept whole in the tile, and a
     standalone ``transpose`` / ``permute`` relayout).  Tiles the output grid and
-    writes each output tile once (no cross-tile reduction) -- except a max of
-    a whole tensor into one value (``is_full_reduction``), which tiles its
-    input and folds every tile into that value (``_running_max_kernel``).
+    writes each output tile once (no cross-tile reduction).
 
     A batched reduction also reserves the on-chip regions its backend kernel
     keeps beside its tiles (``reduction_scratch``); the kernel ignores them, so
@@ -3140,6 +2814,8 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     """
     anchor = get_anchor_node(node)
     tiling = vector_op_tiling(node, tiler.config)
+    if node.op != "call_module" and tiling is None:
+        return None
 
     in_nodes = node.all_input_nodes
     inputs = [n.value.clone() for n in in_nodes]
@@ -3148,6 +2824,8 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     outputs = val if isinstance(val, (list, tuple)) else (val,)
 
     output_shape = tuple(outputs[-1].shape)
+    if tiling is None:
+        tiling = (1,) * len(output_shape)
     grid = tuple(tiling)
     # ``compute_output_tiled_shapes`` dices each output by ``tiling``, with the
     # sparse-output handling a per-output ``compute_tiled_shape`` would miss.
@@ -3227,11 +2905,9 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         )
         in_specs = [_InputSpec(in_tile, in_imap, (False,) * ndim)]
     else:
-        in_tiling = reduced_input_tiling(anchor, tiling)
-        in_grid = reduced_input_grid(anchor)
         in_specs = [
             (
-                _compute_input_spec(in_tiling, tuple(n.shape), in_grid)
+                _compute_input_spec(tiling, tuple(n.shape))
                 if n not in codebooks
                 else None
             )
@@ -3242,12 +2918,7 @@ def build_pointwise(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         for o, ts in zip(outputs, tiled_shape)
     ]
     scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
-    if is_full_reduction(anchor):
-        # Each tile's max, beside the running one.
-        scratch_specs.append(_ScratchSpec((), outputs[-1].dtype))
-        kernel = _running_max_kernel(compute)
-    else:
-        kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
+    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,
@@ -3268,6 +2939,8 @@ _POOL2D_SUPPORTED = {
     torch.ops.aten.max_pool2d.default,
     torch.ops.aten.avg_pool2d.default,
     torch.ops.quantized_ops.max_pool2d.default,
+    torch.ops.aten.adaptive_avg_pool2d.default,
+    torch.ops.quantized_ops.adaptive_avg_pool2d.default,
 }
 
 
@@ -3286,6 +2959,13 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     anchor = get_anchor_node(node)
     if anchor.target not in _POOL2D_SUPPORTED:
         return None
+    if "adaptive" in str(anchor.target) and not (
+        tiler is not None and tiler.config.tiles_adaptive_pooling
+    ):
+        # Left whole unless the target asks for it tiled: the untiled path is
+        # what every existing lane emits, and tiling would change their
+        # collateral to fit a constraint they do not have.
+        return None
 
     tiling = pool_op_tiling(node, tiler.config)
     if node.op != "call_module" and tiling is None:
@@ -3299,10 +2979,26 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     outputs = val if isinstance(val, (list, tuple)) else (val,)
     output_shape = tuple(outputs[-1].shape)
 
-    in_dims = NCHW_TO_NHWC if anchor.meta.get("transposed", False) else None
+    # Layout is read from the op's identity, as everywhere else that unpacks a
+    # pool shape: ``pool_op_tiling`` decides the same way, and this builder
+    # consumes the tiling it produced, so the two must not disagree.  The
+    # ``transposed`` meta is set alongside the retarget in ``data_layout``, so
+    # the two agree today -- but only one of them is the fact, and keeping a
+    # second copy is how they drift.
+    in_dims = NCHW_TO_NHWC if anchor.target in NHWC_OP_VARIANTS.values() else None
     N, C, H, W = unproject(output_shape, in_dims)
+
+    # An adaptive pool's window is proportional to H_in / H_out, so a spatial
+    # tile does not map to a fixed input window and only (N, C) may be tiled --
+    # ``pool_op_tiling`` returns a 2-tuple for one accordingly.  Where the
+    # extents divide, the op *is* an average pool of that ratio, so deriving
+    # its geometry lets it share the whole halo path below rather than needing
+    # a builder of its own.
+    is_adaptive = "adaptive" in str(anchor.target)
     if tiling is None:
         nN, nH, nW, nC = 1, 1, 1, 1
+    elif is_adaptive:
+        (nN, nC), nH, nW = tiling, 1, 1
     else:
         nN, nH, nW, nC = tiling
     tn, tc, toh, tow = N // nN, C // nC, H // nH, W // nW
@@ -3312,10 +3008,21 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
     # Geometry params, to size the halo / output / strides.  Only ``max_pool``
     # has a dilation arg; ``avg_pool``'s is implicitly 1.
     is_max = "max_pool" in str(anchor.target)
-    kernel_size = get_arg_value(anchor, 1, "kernel_size")
-    stride = get_arg_value(anchor, 2, "stride", [])
-    padding = get_arg_value(anchor, 3, "padding", 0)
-    dilation = get_arg_value(anchor, 4, "dilation", 1) if is_max else 1
+    if is_adaptive:
+        # No kernel / stride args to read: an adaptive pool states its output
+        # extent and the window follows.  Non-divisible extents give windows
+        # that differ per output position, which this fixed-halo map cannot
+        # express, so those are left to the untiled path.
+        _, _, in_H, in_W = unproject(tuple(input_t.shape), in_dims)
+        if H == 0 or W == 0 or in_H % H or in_W % W:
+            return None
+        kernel_size = stride = (in_H // H, in_W // W)
+        padding, dilation = 0, 1
+    else:
+        kernel_size = get_arg_value(anchor, 1, "kernel_size")
+        stride = get_arg_value(anchor, 2, "stride", [])
+        padding = get_arg_value(anchor, 3, "padding", 0)
+        dilation = get_arg_value(anchor, 4, "dilation", 1) if is_max else 1
     pad_value = float("-inf") if is_max else 0.0
 
     kH, kW = _pair(kernel_size)
@@ -3346,13 +3053,37 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
 
         # Reuse the op's trailing args verbatim; bound here, not inside
         # ``compute`` — dynamo can't trace an FX-node attribute read.
-        extra = tuple(anchor.args[4:])
+        #
+        # Sequences among them arrive as FX ``immutable_list``, which has no
+        # ``as_proxy()``.  Dynamo cannot capture an op call that takes one, so
+        # a pool carrying an explicit ``dilation`` breaks the pipeline loop's
+        # graph while the plain literals beside it trace fine.  Plain lists.
+        extra = tuple(
+            list(arg) if isinstance(arg, (list, tuple)) else arg
+            for arg in anchor.args[4:]
+        )
+
+        # An adaptive pool states an output extent, not a window, so it has no
+        # signature to pass one to.  Over a divisible tile it *is* an average
+        # pool of the derived ratio, which does -- so the per-tile call is that
+        # op.  Only the kernel is retargeted; the graph node is untouched.
+        #
+        # It must be the average pool of the *same layout*.  ``avg_pool2d``
+        # reduces the last two dimensions, so calling the NCHW op on a physical
+        # NHWC tile pools (W, C) and averages across channels: a 7x7x512 tail
+        # comes back with floor((512 - 7) / 7) + 1 = 73 channels instead of 512.
+        pool_op = anchor.target
+        if is_adaptive:
+            pool_op = torch.ops.aten.avg_pool2d.default
+            if in_dims is not None:
+                pool_op = NHWC_OP_VARIANTS[pool_op]
+        pool_extra = () if is_adaptive else extra
 
         def compute(tile):
             # Padding zeroed (folded into the halo load).
-            return anchor.target(tile, [kH, kW], [sh, sw], [0, 0], *extra)
+            return pool_op(tile, [kH, kW], [sh, sw], [0, 0], *pool_extra)
 
-        kernel = _single_pass_kernel(compute, 1)
+        kernel = _map_kernel(compute, 1)
         return build_pipelined_buffers(
             kernel,
             grid,
@@ -3395,7 +3126,7 @@ def build_pool(node, *, num_slots: int = _DEFAULT_NUM_SLOTS, tiler=None):
         _OutputSpec(tuple(o.shape), ts, tuple(range(o.ndim)), o.dtype)
         for o, ts in zip(outputs, tiled_shape)
     ]
-    kernel = _single_pass_kernel(submod, len(outputs))
+    kernel = _map_kernel(submod, len(outputs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

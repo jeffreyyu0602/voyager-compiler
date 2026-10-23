@@ -137,8 +137,11 @@ def main(args):
 
     quantizer = get_default_quantizer(
         input_activation=args.activation,
+        output_activation=args.output_activation,
         weight=args.weight,
         bias=args.bias,
+        record_histogram=args.record_histogram,
+        force_scale_power_of_two=args.force_scale_power_of_two,
     )
     example_args = (dataset[0]["pixel_values"].to(device),)
     model = prepare_pt2e(model, quantizer, example_args)

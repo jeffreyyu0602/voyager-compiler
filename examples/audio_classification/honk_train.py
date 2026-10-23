@@ -19,10 +19,12 @@ from tqdm import tqdm
 from transformers import set_seed
 
 from honk_model import SpeechResModel, configs
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
-    disable_observers,
-    prepare_from_args,
+    get_default_quantizer,
+    prepare_pt2e,
+    quantize,
     with_execution_context,
 )
 
@@ -281,36 +283,44 @@ def main(args):
     model = SpeechResModel(configs["res8-narrow"])
     model.to(device)
 
-    quantized = any(
-        spec is not None
-        for spec in (
-            args.activation,
-            args.weight,
-            args.error,
-        )
-    )
-    if quantized:
+    if args.qat:
+        modules_to_fuse = [[f'conv{i}', f'bn{i}'] for i in range(1, 7)]
+        model = torch.ao.quantization.fuse_modules_qat(model, modules_to_fuse)
+
+        quantize(model, args)
         batch = next(iter(train_dataloader))
-        example_args = (batch["input_values"].to(device),)
-        batch_size = torch.export.Dim("batch", max=args.batch_size)
-        dynamic_shapes = {"x": {0: batch_size}}
-        model = prepare_from_args(
-            model, args, example_args, dynamic_shapes=dynamic_shapes
-        )
+        with torch.no_grad():
+            model(batch["input_values"].to(device))
 
     if args.model_id is not None:
-        # A float checkpoint has no fake-quant state; a QAT one has it all.
         checkpoint = torch.load(args.model_id, map_location=device)
-        result = model.load_state_dict(checkpoint, strict=False)
-        assert not result.unexpected_keys, result.unexpected_keys
+        model.load_state_dict(checkpoint)
 
-    if quantized and not args.qat:
-        # Post-training quantization: observe the scales, then fix them.
-        model.eval()
-        with torch.no_grad():
+    if args.pt2e:
+        print("PyTorch 2 Export quantization")
+        modules_to_fuse = [[f'conv{i}', f'bn{i}'] for i in range(1, 7)]
+        model = torch.ao.quantization.fuse_modules(model.eval(), modules_to_fuse)
+
+        quantizer = get_default_quantizer(
+            input_activation=args.activation,
+            weight=args.weight,
+            record_histogram=args.record_histogram,
+            force_scale_power_of_two=args.force_scale_power_of_two,
+        )
+        batch = next(iter(train_dataloader))
+        example_args = ({k: v.to(device) for k, v in batch.items()},)
+        dynamic_shapes = {"x": {0: torch.export.Dim("batch")}}
+        model = prepare_pt2e(model, quantizer, example_args, dynamic_shapes=dynamic_shapes)
+
+        def calibrate(model):
             for batch in tqdm(train_dataloader):
-                model(batch["input_values"].to(device))
-        disable_observers(model)
+                with torch.no_grad():
+                    model(batch["input_values"].to(device))
+        calibrate(model)
+
+        for module in model.modules():
+            if isinstance(module, FakeQuantizeBase):
+                module.disable_observer()
 
     def map_to_pred(batch):
         input_values = torch.tensor(batch["audio"])

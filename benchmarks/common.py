@@ -15,43 +15,29 @@ bit-width:
 
 * 16 -> BF16 (unquantized, runs on a bf16 PE array)
 * 8  -> MXINT8 with a power-of-two block scale (the baseline)
-* 4  -> MXFP4 (``fp4_e2m1`` element, ``fp8_e5m3`` block scale)
+* 4  -> MXFP4 (``fp4_e2m1`` element, ``fp8_e4m3`` block scale)
 
 The MX group (block) size is not a free knob -- it must match the PE array, so
 ``group = max(pe)``.
 
-Decode always runs over a split KV cache (``build_decode`` ->
-``split_kv_cache``): the main cache holds whole chunks of ``group`` positions,
-a full-precision residual holds the chunk being filled, and the residual halves
-of the attention stay unquantized.  ``quant_folding`` bakes the main cache in
-the format its read is quantized to and quantizes each chunk as it completes;
-``kv_bits`` picks that format:
-
-* 16    -> the cache takes the attention matmuls' operand spec, i.e.
-  ``act_bits``' MX format, and is bf16 only when ``act_bits`` is 16
-* 4 / 2 -> KIVI: ``_annotate_kv_cache`` annotates the read ``uint4`` / ``uint2``
-  ``group_wise_affine``, keys grouped along the sequence and values along the
-  head dim, scale and zero point in ``fp8_e4m3``
-
-The attention matmuls re-encode a KIVI cache to ``act_bits``' MX format in
-square ``group`` x ``group`` blocks, which keep the re-encode's scale constant
-across each key and each value group (``build_quantizer``).  Prefill has no
-persistent cache, so ``kv_bits`` does not apply to it.
+The KV cache is kept BF16 (unquantized) for now: microscaling a stored KV cache
+is unsupported (it feeds a repeat_kv slice, not an MXU op).  A 16-bit cache uses
+the simple HF export; the KIVI split-cache + ``group_wise_affine`` machinery for
+quantized KV is kept (see ``build_decode`` / ``_annotate_kv_cache``) but off
+until the bufferizer can lower an in-place cache-write cone.
 """
 
 import argparse
-import json
-import functools
 import multiprocessing
 import operator
 import os
 import re
+import signal
 import subprocess
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from typing import (
     Optional,
     Tuple,
@@ -60,7 +46,6 @@ from typing import (
     get_origin,
     get_type_hints,
 )
-from unittest.mock import patch
 
 import torch
 from datasets import load_dataset
@@ -68,10 +53,8 @@ from torch._export.utils import _disable_aten_to_metadata_assertions
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
     AutoTokenizer,
     GenerationConfig,
-    masking_utils,
 )
 from transformers.integrations.executorch import (
     convert_and_export_with_cache,
@@ -80,41 +63,36 @@ from transformers.integrations.executorch import (
 import voyager_compiler  # noqa: F401  registers voyager.*
 from voyager_compiler import (
     OpMatcher,
-    QScheme,
     QuantizationSpec,
+    convert_and_export_with_split_cache,
     convert_pt2e,
     export_model,
     gen_compute_graph,
     get_default_quantizer,
     prepare_pt2e,
+    remove_softmax_dtype_cast,
     replace_rmsnorm_with_layer_norm,
-    split_kv_cache,
+    swap_llama_attention,
     transform,
 )
 from voyager_compiler.codegen.aten_classifier import is_compute_op
 from voyager_compiler.codegen.node_info import is_fully_connected
 from voyager_compiler.codegen.reporting import (
+    compress_schedule,
     estimate_schedule,
-    kernel_rows,
-    load_calibration,
     write_excel_report,
     write_perfetto,
 )
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
     plan_memory,
-    print_bufferized_graph,
 )
 from voyager_compiler.codegen.transform.tiling.tiler import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
 from voyager_compiler.hardware_config import AcceleratorConfig
-from voyager_compiler.quantization.fake_quantize import (
-    FakeQuantizeBase,
-    FusedAmaxObsFakeQuantize,
-)
-from voyager_compiler.shape_prop import ShapeProp, fake_like
+from voyager_compiler.shape_prop import ShapeProp
 
 try:
     # torchao helper the KIVI 2-bit KV path annotates cache buffers with.
@@ -145,20 +123,29 @@ BASELINE_PROMPT_LEN = 1024
 
 # Max generation length added to the decode KV cache: the cache must hold the
 # ``kv_len`` context plus room for generation, so ``max_cache_len = kv_len +
-# DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).
+# DECODE_MAX_GEN`` (matching test_codegen's ``context + 128``).  For the KIVI
+# split cache this is also the residual window (``max_new_tokens``).
 DECODE_MAX_GEN = 128
 
 
 # -------------------------------------------------------------------------
-# Operator-fusion pipeline (copied verbatim from test_codegen.py): fold each
-# MXU op's trailing dequant / activation / requantization into one fused
+# Operator-fusion pipeline (copied verbatim from test_llama_report.py): fold
+# each MXU op's trailing dequant / activation / requantization into one fused
 # kernel.  Stages that match no node are skipped.
 # -------------------------------------------------------------------------
-def _can_fuse(node):
-    # A bf16 FC runs on the vector unit itself, so nothing chains after it.
+def _is_spmm(node):
+    return node.kwargs.get("A_data") is not None
+
+
+def _is_bf16_fc(node):
+    # bf16 FCs run on the vector unit and thus cannot be fused.
     if hasattr(node, "value") and is_fully_connected(node):
-        return node.args[0].meta.get("dtype") is not None
-    return True
+        return node.args[0].meta.get("dtype") is None
+    return False
+
+
+def _can_fuse(node):
+    return not _is_spmm(node) and not _is_bf16_fc(node)
 
 
 def _is_constant_div(node):
@@ -171,18 +158,7 @@ def _is_constant_div(node):
 
 
 MXU_OPS = ["conv2d", "linear", "matmul", "conv2d_mx", "linear_mx", "matmul_mx"]
-QUANT_OPS = [
-    "quantize",
-    "quantize_mx",
-    "quantize_mx_outlier",
-    "quantize_affine",
-]
-# Requantizations a GEMM's fused tail may end in.  ``quantize_mx_outlier`` is
-# not one: an epilogue emitting an outlier CSR cuts its slices from the GEMM's
-# own column tile, which pins every consumer's reduction tile to it.  The
-# outlier quantize runs as its own row-swept nest, or fused onto a whole-row
-# op, and its slice width follows the consumers.
-GEMM_QUANT_OPS = [op for op in QUANT_OPS if op != "quantize_mx_outlier"]
+QUANT_OPS = ["quantize", "quantize_mx", "quantize_mx_outlier"]
 
 FUSION_PIPELINE = [
     [
@@ -191,13 +167,13 @@ FUSION_PIPELINE = [
         OpMatcher("add", "sub", "mul", "div", predicate=_is_constant_div),
         OpMatcher("exp", "abs", "relu"),
         OpMatcher("add", "mul", "div", predicate=_is_constant_div),
-        OpMatcher(*GEMM_QUANT_OPS),
+        OpMatcher(*QUANT_OPS, "mul", "div"),
     ],
     [
         OpMatcher(*MXU_OPS, predicate=_can_fuse),
         OpMatcher("dequantize"),
         OpMatcher("gelu", "sigmoid", "silu", "tanh", "hardtanh"),
-        OpMatcher(*GEMM_QUANT_OPS),
+        OpMatcher(*QUANT_OPS, "mul", "div"),
     ],
     [
         OpMatcher("layer_norm", "softmax"),
@@ -216,28 +192,7 @@ class SweepConfig:
     ``mode`` selects the graph shape: ``"prefill"`` feeds the whole model an
     ``input_ids`` of length ``prompt_len`` (``use_cache=False``); ``"decode"``
     measures one token over a KIVI split cache whose main cache holds ``kv_len``
-    entries.  ``weight_bits`` and ``act_bits`` are each one of {16, 8, 4};
-    ``kv_bits`` is 16, where the cache follows ``act_bits``, or a KIVI width,
-    4 or 2.
-
-    ``pipelined`` and ``fuse_operators`` are the two lowering switches: off,
-    ``pipelined`` single-buffers every L2 tile (no prefetch overlap) and
-    ``fuse_operators`` skips ``fuse_operator`` entirely, so an MXU op's
-    dequant / activation / requantize tail becomes separate kernels and the
-    GQA KV repeat is materialised in memory instead of folding into the
-    block index.  ``bool_mask`` stores prefill's causal mask as int1, the
-    way ``test_codegen --quantize_attention_mask`` does: eager's mask
-    tensor, or under sdpa the flash-attention kernel's own causal table;
-    decode rebuilds its mask every step and keeps bf16.
-    ``double_buffered_accum_buffer`` gives the PE array a second accumulator
-    bank to park a finished output tile in while it drains.
-
-    ``calibration`` names a filled-in RTL calibration form (see
-    ``write_calibration_form``) whose measured kernel cycles price the
-    compute ops; ``calibration_rows_dir`` makes each point dump its kernel
-    rows there, the input for writing such a form.  ``full_walk`` makes the
-    estimator walk every loop iteration instead of folding steady states;
-    the totals are the same either way."""
+    entries.  Bit-widths are each one of {16, 8, 4} (and 2 for KV only)."""
 
     model_id: str = DEFAULT_MODEL
     mode: str = "prefill"  # "prefill" | "decode"
@@ -253,29 +208,21 @@ class SweepConfig:
     scratchpad_size: int = BASELINE_SCRATCHPAD_SIZE
     num_banks: int = BASELINE_NUM_BANKS
     bank_width: Optional[int] = None
-    double_buffered_accum_buffer: bool = True
     frequency_ghz: float = BASELINE_FREQUENCY_GHZ
     dram_bandwidth_gbs: float = BASELINE_DRAM_BANDWIDTH_GBS
     dram_access_latency_ns: float = BASELINE_DRAM_ACCESS_LATENCY_NS
 
     attn_implementation: str = "eager"
-    pipelined: bool = True
-    fuse_operators: bool = True
-    bool_mask: bool = True
     single_buffer_tail: bool = False
     num_layers_override: Optional[int] = None
 
     runtime_tolerance: float = DEFAULT_RUNTIME_TOLERANCE
     dump_dir: Optional[str] = None
-    calibration: Optional[str] = None
-    calibration_rows_dir: Optional[str] = None
-    full_walk: bool = False
 
     @property
     def acc_config(self) -> AcceleratorConfig:
-        """The accelerator description this sweep point compiles for.  Under
-        ``pipelined`` L2 is double-buffered, so a buffer occupies two of
-        ``num_banks`` banks rather than one."""
+        """The accelerator description this sweep point compiles for.  L2 is
+        double-buffered, so a buffer occupies two of ``num_banks`` banks."""
         return AcceleratorConfig(
             pe_array_size=self.pe,
             scratchpad_size=self.scratchpad_size,
@@ -288,8 +235,7 @@ class SweepConfig:
             input_buffer_size=1024,
             weight_buffer_size=1024,
             accum_buffer_size=1024,
-            double_buffered_accum_buffer=self.double_buffered_accum_buffer,
-            double_buffered_l2=self.pipelined,
+            double_buffered_l2=True,
             dram_size=64.0,
             dram_bandwidth=self.dram_bandwidth_gbs,
             dram_access_latency=self.dram_access_latency_ns,
@@ -379,7 +325,7 @@ def config_from_args(args, **overrides) -> "SweepConfig":
     """Build a SweepConfig from parsed args; ``overrides`` win."""
     names = {f.name for f in fields(SweepConfig)}
     kw = {k: v for k, v in vars(args).items() if k in names}
-    kw["dump_dir"] = os.path.join(args.log_dir or args.out, "graphs")
+    kw["dump_dir"] = args.log_dir or args.out
     kw.update(overrides)
     if isinstance(kw.get("pe"), list):
         kw["pe"] = tuple(kw["pe"])
@@ -395,46 +341,31 @@ def dtype_spec(bits: int, group: int) -> Optional[str]:
     if bits == 16:
         return None
     if bits == 8:
-        return f"int8,qs=microscaling,bs={group},pot=1"
+        return f"int8,qs=microscaling,bs={group}"
     if bits == 4:
-        return f"fp4_e2m1,qs=microscaling,bs={group},scale=fp8_e5m3"
+        return f"fp4_e2m1,qs=microscaling,bs={group}"
     raise ValueError(f"unsupported weight/activation bits: {bits}")
 
 
-def _kv_cache_spec(bits: int, group: int, role: str) -> str:
-    """The KIVI dtype string for one main KV cache at ``bits``.
-
-    KIVI quantizes the ``(N, H, S, D)`` cache group-wise affine: keys per
-    channel, in groups along the sequence (``ax=-2``), and values per token,
-    in groups along the head dim (``ax=-1``).  Scale and zero point are both
-    stored as ``fp8_e4m3``.
-
-    Args:
-        bits: Entry width of the stored cache, 4 or 2.
-        group: Entries per affine group.
-        role: ``"key"`` or ``"value"``.
-
-    Returns:
-        The spec string that quantizes that cache.
-
-    Raises:
-        ValueError: ``bits`` is not a KIVI width.
+def _kv_cache_spec(bits: int, group: int, role: str) -> Optional[str]:
+    """The dtype string for a *main* KV-cache tensor at ``bits``.  KIVI
+    quantizes keys per-channel (``ax=-2``) and values per-token (``ax=-1``) of
+    the ``(N, H, S, D)`` cache.  Returns ``None`` for 16-bit (full precision).
     """
     ax = -2 if role == "key" else -1
+    if bits == 16:
+        return None
+    if bits == 8:
+        return f"int8,qs=microscaling,bs={group},ax={ax}"
     if bits == 4:
-        return f"uint4,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e4m3"
+        return f"fp4_e2m1,qs=microscaling,bs={group},ax={ax},scale=fp8_e4m3"
     if bits == 2:
-        return f"uint2,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e4m3"
+        return f"uint2,qs=group_wise_affine,bs={group},ax={ax},scale=fp8_e5m3"
     raise ValueError(f"unsupported kv bits: {bits}")
 
 
-NON_DESIGN_FIELDS = ("dump_dir", "calibration_rows_dir")
+NON_DESIGN_FIELDS = ("dump_dir",)
 _UNUSED_BY_MODE = {"prefill": "kv_len", "decode": "prompt_len"}
-# The rotary embedding's scope.  A regex, because the nesting above it varies:
-# the decode wrapper adds a ``model.`` level and a vision-language model a
-# ``language_model.`` one -- and a name matching nothing exempts nothing,
-# silently.
-_ROTARY_SCOPE = r"model\.rotary_emb"
 _PROBE_FIELDS = ("num_layers_override",)
 
 
@@ -464,56 +395,20 @@ def _cfg_stem(cfg: SweepConfig) -> str:
 
 
 def build_quantizer(cfg: SweepConfig):
-    """A quantizer for ``cfg``'s weight / activation precision.
-
-    Weights and activations are microscaling at 8 / 4 bits and unquantized
-    bf16 at 16.  The rotary embedding's matmul is exempted by the scope
-    ``cfg.mode``'s export records for it.  In decode the residual halves of
-    the attention stay unquantized, and over a KIVI cache the main halves
-    take their cache operand in square ``group`` x ``group`` blocks of
-    ``act_bits``' format.  The cache's stored format is not set here:
-    ``_annotate_kv_cache`` annotates its read.
-
-    Args:
-        cfg: The design point.
-
-    Returns:
-        The configured quantizer.
+    """A quantizer for ``cfg``'s weight / activation precision (microscaling for
+    8/4-bit, unquantized bf16 for 16-bit).  KV-cache precision is *not* set here
+    -- it is applied by annotating the main cache tensors in
+    ``_annotate_kv_cache`` (KIVI keeps the full-precision residual untouched).
     """
     group = cfg.group
     quantizer = get_default_quantizer(
         input_activation=dtype_spec(cfg.act_bits, group),
         weight=dtype_spec(cfg.weight_bits, group),
+        force_scale_power_of_two=True,
     )
     quantizer.set_module_name_object_type_order(
-        _ROTARY_SCOPE,
-        torch.ops.aten.matmul.default,
-        0,
-        None,
+        "model.model.rotary_emb", torch.ops.aten.matmul.default, 0, None
     )
-    if cfg.mode == "decode":
-        # The split caches' residual halves of the attention (matmul orders
-        # 1 and 3 within a layer) stay unquantized.
-        for order in (1, 3):
-            quantizer.set_module_name_object_type_order(
-                "self_attn", torch.ops.aten.matmul.default, order, None
-            )
-        if cfg.kv_bits != 16 and cfg.act_bits != 16:
-            # A KIVI cache is decoded and re-encoded to the matmul's MX format
-            # in one fused dequantize, which needs the MX scale constant across
-            # each affine group.  Square blocks on the main halves' cache
-            # operand (orders 0 and 2) cover both the keys' groups along the
-            # sequence and the values' along the head dim.  A bf16 attention
-            # has no re-encode.
-            default = quantizer.object_type_config[
-                torch.ops.aten.matmul.default
-            ]
-            cache = replace(default.weight, ch_axis=(-2, -1))
-            main = replace(default, weight=cache)
-            for order in (0, 2):
-                quantizer.set_module_name_object_type_order(
-                    "self_attn", torch.ops.aten.matmul.default, order, main
-                )
     return quantizer
 
 
@@ -521,22 +416,14 @@ def build_quantizer(cfg: SweepConfig):
 # Model / graph builders
 # -------------------------------------------------------------------------
 def _load_model(cfg: SweepConfig):
-    """Load ``cfg.model_id``, truncated to ``cfg.num_layers_override`` decoder
-    layers when set.  A vision-language checkpoint registers only under the
-    image-text-to-text auto class, and is driven text-only."""
-    config = AutoConfig.from_pretrained(cfg.model_id)
+    extra = {}
     if cfg.num_layers_override is not None:
-        config.get_text_config().num_hidden_layers = cfg.num_layers_override
-    auto_class = (
-        AutoModelForCausalLM
-        if type(config) in AutoModelForCausalLM._model_mapping
-        else AutoModelForImageTextToText
-    )
-    return auto_class.from_pretrained(
+        extra["num_hidden_layers"] = cfg.num_layers_override
+    return AutoModelForCausalLM.from_pretrained(
         cfg.model_id,
-        config=config,
         torch_dtype=torch.bfloat16,
         attn_implementation=cfg.attn_implementation,
+        **extra,
     ).eval()
 
 
@@ -549,75 +436,43 @@ def _prompt_ids(cfg: SweepConfig, tokenizer, length: int):
     return ids
 
 
-@contextmanager
-def _sdpa_is_causal():
-    """Export sdpa attention with ``is_causal`` instead of a materialized
-    causal mask.  transformers builds the mask whenever it is tracing: it
-    refuses the ``is_causal`` skip, since a baked-in flag would be wrong for
-    a variable-length graph, and it cannot run the check that the batch
-    holds no packed sequences.  A fixed-length, single-sequence prefill
-    export wants the flag and has no packing."""
-
-    def skip(padding_mask, query_length, kv_length, *args, **kwargs):
-        return query_length == kv_length and (
-            padding_mask is None or bool(padding_mask.all())
-        )
-
-    with (
-        patch.object(masking_utils, "_ignore_causal_mask_sdpa", skip),
-        patch.object(
-            masking_utils, "find_packed_sequence_indices", lambda ids: None
-        ),
-    ):
-        yield
-
-
 def build_prefill(cfg: SweepConfig):
     """Export a prefill graph: the whole ``AutoModelForCausalLM`` fed
     ``input_ids`` of shape ``(batch, prompt_len)`` with ``use_cache=False``.
-    Under ``attn_implementation="sdpa"`` the attention runs ``is_causal``
-    with no mask tensor, so the flash-attention kernel skips the fully
-    masked tiles.
-
-    ``logits_to_keep=1`` keeps only the last position's logits -- all that
-    generation reads.  The graph then slices the hidden states before
-    ``lm_head``, so the vocabulary projection lowers as a matrix-vector product
-    instead of a GEMM over every position, which both drops the discarded
-    logit rows and removes the weight re-fetch that tiling the rows forces.
-    A full-sequence objective (training, perplexity) needs every position and
-    must not export this way.
-
     Returns ``(gm, model, example_args, example_kwargs)`` -- the exported graph
     module and the underlying model."""
     model = _load_model(cfg)
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     input_ids = _prompt_ids(cfg, tokenizer, cfg.prompt_len)
     example_args = (input_ids,)
-    example_kwargs = {
-        "return_dict": False,
-        "use_cache": False,
-        "logits_to_keep": 1,
-    }
-    if cfg.attn_implementation == "sdpa":
-        with _sdpa_is_causal():
-            gm = export_model(model, example_args, example_kwargs)
-    else:
-        gm = export_model(model, example_args, example_kwargs)
+    example_kwargs = {"return_dict": False, "use_cache": False}
+    gm = export_model(model, example_args, example_kwargs)
     return gm, model, example_args, example_kwargs
 
 
 def build_decode(cfg: SweepConfig):
-    """Export a single decode step over a KV cache of length ``kv_len``: the
-    whole model -- embeddings, every layer, final norm, lm_head -- via HF's
-    ``convert_and_export_with_cache``.  ``split_kv_cache`` keeps the chunk
-    being filled in a full-precision residual of one ``cfg.group`` block;
-    the main cache is quantized on its read -- by the attention matmuls'
-    activation spec, or by the KIVI spec ``_annotate_kv_cache`` puts there
-    -- and ``transform`` bakes it quantized and quantizes each chunk as it
-    completes (``quant_folding``).  The cache holds the ``kv_len`` context plus
-    ``DECODE_MAX_GEN`` generation slots, rounded up to the MX ``block_size``
-    (= ``cfg.group``) so the KV tensors stay block-aligned and need no
-    attention padding.  The decode token is at ``cache_position =
+    """Export a single decode step over a KV cache of length ``kv_len``.
+
+    A **BF16 (16-bit) cache** does not need the KIVI split cache, so it takes
+    the simpler HF export (``_build_decode_bf16``).  A **quantized cache** needs
+    the split cache -- a quantizable main cache plus a full-precision residual,
+    exported via ``_build_decode_split``.  KV quant is off for now (kv_bits is
+    always 16), but the split path is kept for when the bufferizer can lower an
+    in-place cache write.
+
+    Returns ``(gm, model, example_args, example_kwargs)``."""
+    if cfg.kv_bits == 16:
+        return _build_decode_bf16(cfg)
+    return _build_decode_split(cfg)
+
+
+def _build_decode_bf16(cfg: SweepConfig):
+    """Simple full-model decode export for a BF16 cache, via HF's
+    ``convert_and_export_with_cache`` (whole model -- embeddings, every layer,
+    final norm, lm_head -- no residual / KIVI swap).  The cache holds the
+    ``kv_len`` context plus ``DECODE_MAX_GEN`` generation slots, rounded up to
+    the MX ``block_size`` (= ``cfg.group``) so the KV tensors stay block-aligned
+    and need no attention padding.  The decode token is at ``cache_position =
     [kv_len]``.  Contents don't affect the estimate, only shapes."""
     model = _load_model(cfg)
     block = cfg.group
@@ -635,9 +490,9 @@ def build_decode(cfg: SweepConfig):
     input_ids = torch.ones((cfg.batch, 1), dtype=torch.long)
     cache_position = torch.tensor([cfg.kv_len], dtype=torch.long)
     # Strict export bakes in aten._assert_tensor_metadata guards (e.g. the
-    # attention softmax's dtype=float32); ``remove_fp32_casts`` later
+    # attention softmax's dtype=float32); ``remove_softmax_dtype_cast`` later
     # rewrites that softmax to bf16, so those stale guards must be suppressed at
-    # export.
+    # export or they fail at calibration.
     with _disable_aten_to_metadata_assertions():
         ep = convert_and_export_with_cache(
             model,
@@ -645,23 +500,65 @@ def build_decode(cfg: SweepConfig):
             example_cache_position=cache_position,
         )
     gm = ep.module()
-    split_kv_cache(gm, block, cfg.kv_len)
     example_kwargs = {"input_ids": input_ids, "cache_position": cache_position}
     return gm, model, (), example_kwargs
 
 
-# The exported KV-cache buffers (``key_cache_0`` ...); their reads carry the
-# KIVI spec.
-_KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
+def _build_decode_split(cfg: SweepConfig):
+    """KIVI split-cache decode export (for a *quantized* KV cache).
+
+    ``convert_and_export_with_split_cache`` (llm_utils) exports the whole model
+    with a quantizable **main** cache of length ``kv_len`` plus a full-precision
+    **residual** cache of length ``DECODE_MAX_GEN`` (the recent-token
+    window KIVI keeps full precision).  Attention is swapped to
+    ``LlamaAttentionKIVI`` and the causal mask is passed in precomputed, so no
+    in-graph mask control flow is traced.  One step at ``cache_position =
+    [kv_len]``; contents don't affect the estimate, only shapes."""
+    model = _load_model(cfg)
+    swap_llama_attention(model)
+
+    max_len = cfg.kv_len
+    max_new = DECODE_MAX_GEN
+    max_cache_len = max_len + max_new
+
+    input_ids = torch.ones((cfg.batch, 1), dtype=torch.long)
+    cache_position = torch.tensor([cfg.kv_len], dtype=torch.long)
+    cache_position_residual = torch.tensor([0], dtype=torch.long)
+    attention_mask = torch.ones((cfg.batch, max_cache_len), dtype=model.dtype)[
+        None, None, :, :
+    ]
+
+    with _disable_aten_to_metadata_assertions():
+        ep = convert_and_export_with_split_cache(
+            model,
+            max_len=max_len,
+            max_new_tokens=max_new,
+            example_input_ids=input_ids,
+            example_cache_position=cache_position,
+            example_cache_position_residual=cache_position_residual,
+            example_attention_mask=attention_mask,
+        )
+    gm = ep.module()
+
+    example_kwargs = {
+        "input_ids": input_ids,
+        "cache_position": cache_position,
+        "cache_position_residual": cache_position_residual,
+        "attention_mask": attention_mask,
+    }
+    return gm, model, (), example_kwargs
+
+
+# Main KV-cache buffers only (``key_cache_0`` ...); the ``key_cache_residual_*``
+# tensors are deliberately excluded -- KIVI keeps the residual full precision.
+_MAIN_KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
 
 
 def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
-    """Annotate each main KV cache's read into the attention with
-    ``cfg.kv_bits``' KIVI spec (keys per-channel, values per-token), so
-    ``quant_folding`` bakes the cache quantized and quantizes each chunk on
-    its fold.  The residual buffers, and the fold's own handle on the cache,
-    are left alone.  A no-op for 16-bit KV.  Raises if the graph names the
-    cache buffers unexpectedly so a mismatch surfaces loudly."""
+    """Annotate the *main* KV-cache tensors with ``cfg.kv_bits``' KIVI spec
+    (keys per-channel, values per-token), leaving the full-precision residual
+    cache untouched.  A no-op for 16-bit KV.  Raises if the graph names the
+    cache tensors unexpectedly so a mismatch surfaces loudly."""
     if cfg.kv_bits == 16:
         return 0
     if _annotate_output_qspec is None:
@@ -674,22 +571,17 @@ def _annotate_kv_cache(gm, cfg: SweepConfig) -> int:
     )
     n = 0
     for node in gm.graph.nodes:
-        if node.op != "get_attr":
-            continue
-        m = _KV_CACHE.match(str(node.target))
-        if m is None or any(
-            u.target is torch.ops.aten.index_copy_.default for u in node.users
-        ):
-            continue
-        _annotate_output_qspec(
-            node, key_qspec if m.group(1) == "key" else value_qspec
-        )
-        n += 1
+        m = _MAIN_KV_CACHE.match(str(node.target))
+        if node.op == "get_attr" and m is not None:
+            _annotate_output_qspec(
+                node, key_qspec if m.group(1) == "key" else value_qspec
+            )
+            n += 1
     if n == 0:
         raise RuntimeError(
-            "KV quant: no key/value cache write matched -- the exported "
-            "decode graph names the caches differently; inspect the graph "
-            "and update _KV_CACHE"
+            "KV quant: no main key/value cache get_attrs matched -- the "
+            "exported decode graph names them differently; inspect the graph "
+            "and update _MAIN_KV_CACHE"
         )
     return n
 
@@ -756,72 +648,6 @@ def _scale(m: "Metrics", count: int) -> "Metrics":
     )
 
 
-MASK_QSPEC = "int1,qs=per_tensor_symmetric,qmax=1"
-
-
-def _annotate_attention_mask(gm) -> int:
-    """Annotate prefill's causal mask int1, as ``test/utils/models/llama.py``
-    does: the HF export builds the mask in-graph as a ``where`` that the
-    attention scores' ``add`` reads, and ``convert_pt2e`` then leaves an int1
-    constant plus its dequantize.  Returns how many masks were annotated;
-    raises if the graph has none."""
-    qspec = QuantizationSpec.from_str(MASK_QSPEC)
-    masks = [
-        n
-        for n in gm.graph.nodes
-        if n.target is torch.ops.aten.where.ScalarOther
-        and any(u.target is torch.ops.aten.add.Tensor for u in n.users)
-    ]
-    if not masks:
-        raise RuntimeError("no causal-mask where node feeds an add")
-    for mask in masks:
-        _annotate_output_qspec(mask, qspec)
-    return len(masks)
-
-
-def _stateless(fq) -> bool:
-    """A fake-quant module that records nothing in a calibration pass:
-    microscaling computes its block scales per call."""
-    return (
-        isinstance(fq, FusedAmaxObsFakeQuantize)
-        and fq.qscheme == QScheme.MICROSCALING
-        and fq.outlier_pct is None
-        and not fq.record_histogram
-    )
-
-
-def _calibrate(gm, example_args, example_kwargs, mask_dtype):
-    """Run the two calibration passes.  The mask's per-tensor observer is fed
-    the two values the constant mask holds, ``0`` and ``mask_dtype``'s
-    minimum, and then disabled.  When no other observer records state, the
-    passes run node by node through ``ShapeProp``, whose large results stay
-    fake, so a long prefill never materializes its attention scores; any
-    other observer keeps the real forward passes."""
-    modules = dict(gm.named_modules())
-    real = False
-    for node in gm.graph.nodes:
-        if node.op != "call_module":
-            continue
-        fq = modules[node.target]
-        if not isinstance(fq, FakeQuantizeBase) or _stateless(fq):
-            continue
-        if node.args[0].target is torch.ops.aten.where.ScalarOther:
-            edge = torch.tensor([0.0, torch.finfo(mask_dtype).min])
-            for _ in range(2):
-                fq(edge)
-            fq.disable_observer()
-            continue
-        real = True
-    flat_args, _ = torch.utils._pytree.tree_flatten(
-        (example_args, example_kwargs)
-    )
-    for _ in range(2):
-        if real:
-            gm(*example_args, **example_kwargs)
-        else:
-            ShapeProp(gm).propagate(*map(fake_like, flat_args))
-
-
 def _frontend(cfg: SweepConfig):
     """Export -> quantize -> transform -> ShapeProp for ``cfg``, and build the
     interstellar tiler.  Returns ``(gm, model, tiler)`` -- the graph is
@@ -829,31 +655,31 @@ def _frontend(cfg: SweepConfig):
     whole-graph and the per-module paths can share this."""
     is_decode = cfg.mode == "decode"
     # The builders return an already-exported graph (prefill via export_model,
-    # decode via convert_and_export_with_cache).
+    # decode via convert_and_export_with_split_cache).
     if is_decode:
         gm, model, example_args, example_kwargs = build_decode(cfg)
     else:
         gm, model, example_args, example_kwargs = build_prefill(cfg)
 
-    # get_decoder() is the text decoder, wherever the model nests it.
-    layernorm = model.get_decoder().layers[0].input_layernorm
-    seq = 1 if is_decode else 128
-    example_input = torch.randn(
-        1, seq, layernorm.weight.shape[-1], dtype=model.dtype
-    )
-    replace_rmsnorm_with_layer_norm(gm, layernorm, (example_input,))
+    remove_softmax_dtype_cast(gm)
 
-    # KV-cache precision is applied by annotating the cache reads (KIVI); it
-    # only exists in decode.  Prefill has no persistent cache, so kv_bits is
-    # not applicable there.  sdpa prefill has no mask tensor to annotate.
+    hidden = model.model.layers[0].input_layernorm.weight.shape[-1]
+    seq = 1 if is_decode else 128
+    example_input = torch.randn(1, seq, hidden, dtype=model.dtype)
+    replace_rmsnorm_with_layer_norm(
+        gm, model.model.layers[0].input_layernorm, (example_input,)
+    )
+
+    # KV-cache precision is applied by annotating the main cache tensors (KIVI);
+    # it only exists in decode.  Prefill has no persistent cache, so kv_bits is
+    # not applicable there.
     if is_decode:
         _annotate_kv_cache(gm, cfg)
-    elif cfg.bool_mask and cfg.attn_implementation != "sdpa":
-        _annotate_attention_mask(gm)
 
     quantizer = build_quantizer(cfg)
     gm = prepare_pt2e(gm, quantizer, example_args, example_kwargs)
-    _calibrate(gm, example_args, example_kwargs, model.dtype)
+    for _ in range(2):
+        gm(*example_args, **example_kwargs)
     convert_pt2e(gm, None)
 
     transform(
@@ -861,21 +687,35 @@ def _frontend(cfg: SweepConfig):
         example_args,
         example_kwargs=example_kwargs,
         patterns=FUSION_PIPELINE,
-        skip_op_fusion=not cfg.fuse_operators,
         config=cfg.acc_config,
         layout_policy="systolic",
-        keep_fp32=False,
+        context_len=cfg.kv_len if is_decode else None,
+        max_new_tokens=DECODE_MAX_GEN if is_decode else None,
     )
 
     if cfg.dump_dir is not None:
         os.makedirs(cfg.dump_dir, exist_ok=True)
         path = os.path.join(cfg.dump_dir, _cfg_stem(cfg))
-        gen_compute_graph(gm, path, timeout=60)
+
+        # gen_compute_graph shells out to graphviz, which can hang on a large
+        # graph; cap it so a stuck render never stalls the sweep.
+        def _timeout(signum, frame):
+            raise TimeoutError
+
+        old = signal.signal(signal.SIGALRM, _timeout)
+        signal.alarm(60)
+        try:
+            gen_compute_graph(gm, path)
+        except TimeoutError:
+            print(f"  [skip] compute graph dump timed out: {path}", flush=True)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
 
     flat_args, _ = torch.utils._pytree.tree_flatten(
         (example_args, example_kwargs)
     )
-    ShapeProp(gm).propagate(*map(fake_like, flat_args))
+    ShapeProp(gm).propagate(*flat_args)
 
     tiler = build_interstellar_tiler(
         cfg.acc_config, runtime_tolerance=cfg.runtime_tolerance
@@ -885,23 +725,15 @@ def _frontend(cfg: SweepConfig):
 
 def _compile(cfg: SweepConfig):
     """Front end + whole-graph bufferize + memory plan for ``cfg``.
-    Returns ``(gm, model, plan)`` ready for ``estimate_schedule``.  With
-    ``dump_dir`` set, also writes the bufferized graph -- the emitted
-    program, nests and fused passes annotated with their memory spaces --
-    to ``<dump_dir>/<stem>.bufferized.txt`` beside the compute graph."""
+    Returns ``(gm, model, plan)`` ready for ``estimate_schedule``."""
     gm, model, tiler = _frontend(cfg)
     bufferize_graph(
         gm,
-        pipelined=cfg.pipelined,
+        pipelined=True,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
-        bool_mask=cfg.bool_mask,
     )
     plan = plan_memory(gm, cfg.acc_config)
-    if cfg.dump_dir is not None:
-        path = os.path.join(cfg.dump_dir, _cfg_stem(cfg) + ".bufferized.txt")
-        with open(path, "w") as f:
-            f.write(print_bufferized_graph(gm, to_string=True))
     return gm, model, plan
 
 
@@ -909,45 +741,10 @@ def _num_params(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-@functools.lru_cache(maxsize=None)
-def _calibration(path):
-    """The RTL calibration at ``path``, loaded once per process."""
-    return load_calibration(path) if path else None
-
-
-def point_label(cfg: SweepConfig) -> str:
-    """The design point a config describes, without its layer count, so a
-    ``--fast`` run's two probes name the same point."""
-    length = cfg.prompt_len if cfg.mode == "prefill" else cfg.kv_len
-    return f"{cfg.mode} {length}"
-
-
-def _dump_kernel_rows(cfg: SweepConfig, result) -> None:
-    """Write the point's kernel rows (the calibration form's input) as JSON
-    under ``cfg.calibration_rows_dir``."""
-    os.makedirs(cfg.calibration_rows_dir, exist_ok=True)
-    label = point_label(cfg)
-    stem = re.sub(r"[^\w.-]+", "_", label) + f"_L{cfg.num_layers_override}"
-    path = os.path.join(cfg.calibration_rows_dir, f"{stem}.json")
-    with open(path, "w") as f:
-        json.dump(
-            {"point": label, "rows": [asdict(r) for r in kernel_rows(result)]},
-            f,
-        )
-
-
 def run_design_point(cfg: SweepConfig) -> Metrics:
-    """Compile ``cfg`` and return its ideal latency + DRAM traffic, priced by
-    ``cfg.calibration`` when one is given."""
+    """Compile ``cfg`` and return its ideal latency + DRAM traffic."""
     gm, model, plan = _compile(cfg)
-    r = estimate_schedule(
-        gm,
-        cfg.acc_config,
-        full_walk=cfg.full_walk,
-        calibration=_calibration(cfg.calibration),
-    )
-    if cfg.calibration_rows_dir is not None:
-        _dump_kernel_rows(cfg, r)
+    r = estimate_schedule(gm, cfg.acc_config)
     return Metrics(
         total_latency=r.total_latency,
         dram_read_bytes=r.dram_read_bytes,
@@ -956,7 +753,7 @@ def run_design_point(cfg: SweepConfig) -> Metrics:
         dram_activation_bytes=r.dram_activation_bytes,
         dram_kv_bytes=r.dram_kv_bytes,
         scratchpad_bytes=plan.scratchpad_bytes,
-        num_layers=model.config.get_text_config().num_hidden_layers,
+        num_layers=model.config.num_hidden_layers,
         num_params=_num_params(model),
     )
 
@@ -975,8 +772,7 @@ def run_design_point_fast(
         raise ValueError(
             f"probe_layers must satisfy 0 < k1 < k2, got {probe_layers}"
         )
-    config = AutoConfig.from_pretrained(cfg.model_id)
-    n = config.get_text_config().num_hidden_layers
+    n = AutoConfig.from_pretrained(cfg.model_id).num_hidden_layers
     m1 = run_design_point(replace(cfg, num_layers_override=k1))
     m2 = run_design_point(replace(cfg, num_layers_override=k2))
 
@@ -1195,12 +991,37 @@ def _extract_standalone(gm, node):
     return sub
 
 
+def _union_len(intervals):
+    """Wall-clock covered by ``[start, end)`` intervals (their union)."""
+    total = cur_end = 0
+    started = False
+    for s, e in sorted(intervals):
+        if not started or s > cur_end:
+            total += e - s
+            cur_end = e
+            started = True
+        elif e > cur_end:
+            total += e - cur_end
+            cur_end = e
+    return total
+
+
 def _time_split(result):
     """Split a schedule's makespan into ``(compute, memory, overlap, stall)``
-    cycles, from the exact busy-lane unions the walk keeps."""
-    c, m = result.busy_compute, result.busy_dram
-    overlap = c + m - result.busy_any
-    stall = max(0, result.total_latency - result.busy_any)
+    cycles.  Must be called on the *uncompressed* estimate."""
+    comp = [
+        (r.start, r.end)
+        for r in result.records
+        if r.latency_kind == "compute" and r.end > r.start
+    ]
+    dram = [
+        (r.start, r.end)
+        for r in result.records
+        if r.latency_kind == "dram" and r.end > r.start
+    ]
+    c, m = _union_len(comp), _union_len(dram)
+    overlap = c + m - _union_len(comp + dram)
+    stall = max(0, result.total_latency - (c + m - overlap))
     return c - overlap, m - overlap, overlap, stall
 
 
@@ -1227,16 +1048,17 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
     sub = _extract_standalone(gm, node)
     bufferize_graph(
         sub,
-        pipelined=cfg.pipelined,
+        pipelined=True,
         tiler=tiler,
         single_buffer_tail=cfg.single_buffer_tail,
-        bool_mask=cfg.bool_mask,
     )
     plan = plan_memory(sub, acc_config)
-    r = estimate_schedule(sub, acc_config, full_walk=cfg.full_walk)
+    # Split off the *uncompressed* estimate, then compress + dump.
+    r = estimate_schedule(sub, acc_config)
     compute, memory, overlap, stall = _time_split(r)
     if dump_dir is not None:
         os.makedirs(dump_dir, exist_ok=True)
+        compress_schedule(r)
         write_excel_report(r, os.path.join(dump_dir, f"{node.name}.xlsx"))
         write_perfetto(r, os.path.join(dump_dir, f"{node.name}.perfetto.json"))
     return Metrics(
@@ -1247,7 +1069,7 @@ def _estimate_block(cfg, model, gm, tiler, node, acc_config, dump_dir):
         dram_activation_bytes=r.dram_activation_bytes,
         dram_kv_bytes=r.dram_kv_bytes,
         scratchpad_bytes=plan.scratchpad_bytes,
-        num_layers=model.config.get_text_config().num_hidden_layers,
+        num_layers=model.config.num_hidden_layers,
         num_params=_num_params(model),
         compute=compute,
         memory=memory,
@@ -1266,13 +1088,9 @@ def report_per_module(cfg, layer, dump_dir=None):
     Each block's additive metrics are scaled to their whole-model contribution
     by its ``count`` -- ``num_hidden_layers`` for a decoder-layer block (it
     repeats identically in every layer), 1 for a tail block (norm / lm_head).
-    Only ``layer + 2`` decoder layers are compiled: every layer lowers alike,
-    and the one after ``layer`` bounds its blocks off the tail's.  With
-    ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
-    config = AutoConfig.from_pretrained(cfg.model_id)
-    n_layers = config.get_text_config().num_hidden_layers
-    cfg = replace(cfg, num_layers_override=layer + 2)
+    With ``dump_dir`` set, also write an xlsx + perfetto pair per block."""
     gm, model, tiler = _frontend(cfg)
+    n_layers = model.config.num_hidden_layers
     acc_config = cfg.acc_config
     rows = []
     for node in _layer_block_nodes(gm, layer):

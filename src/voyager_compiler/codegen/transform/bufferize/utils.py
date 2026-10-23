@@ -5,10 +5,8 @@ Shared helpers for the bufferization builders (``gemm`` / ``pointwise`` /
 Tile DMA goes through ``voyager.async_copy`` (the guarded prefetch / store) and
 ``voyager.insert`` (the in-kernel whole-slot writes); the helpers here are
 the remaining shared pieces: the fused pointwise tail, the lenient export
-verifier, exported-graph cleanup, tagging each ``while_loop`` with its
-per-dimension tile-grid extents (consumed by the loop-aware code generator),
-and stamping a CSR block copy with the occupancy the reporting model prices
-it at.
+verifier, exported-graph cleanup, and tagging each ``while_loop`` with its
+per-dimension tile-grid extents (consumed by the loop-aware code generator).
 """
 
 import contextlib
@@ -22,7 +20,6 @@ from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
     compute_tiled_shape,
-    get_arg_value,
     is_nop,
     quant_param_arg_nodes,
 )
@@ -32,10 +29,6 @@ voyager = torch.ops.voyager
 _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
-# Stamped on a CSR block's ``async_copy`` -- sized at the block's budget but
-# moving ``count`` entries at run time -- as the budget's mean occupancy over
-# the example input, so the reporting model prices the bytes actually moved.
-CSR_FILL_META = "csr_fill"
 
 
 def effect_cond(
@@ -536,51 +529,27 @@ def _finalize_exported_gm(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
     return gm
 
 
-def _tag_loop_extents(gm, extents_per_level, depth=0) -> bool:
-    """Tag the nested ``while_loop`` chain with the per-dimension tile-grid
+def _tag_loop_extents(gm, extents_per_level, depth=0):
+    """
+    Tag the nested ``while_loop`` chain with the per-dimension tile-grid
     extents.
 
     ``extents_per_level[d]`` is the list of extents (each a bare ``end`` count
     or an ``(start, end, step)`` tuple) for the while_loop at nesting depth
     ``d``.  The builders flatten an N-D grid into one ``while_loop``, so a level
     with N extents is later emitted as N nested ``Loop`` protos.  Assumes one
-    loop per nesting level (a linear chain), which holds for these builders;
-    a level's loop may sit inside a ``cond`` branch, as a guarded gather does.
-
-    Returns:
-        Whether a loop at depth ``depth`` was found in ``gm``.
+    loop per nesting level (a linear chain), which holds for these builders.
     """
     if depth >= len(extents_per_level):
-        return False
+        return
     named = dict(gm.named_modules())
     for n in gm.graph.nodes:
-        if n.op != "call_function":
-            continue
-        if n.target is torch.ops.higher_order.while_loop:
+        if (
+            n.op == "call_function"
+            and n.target is torch.ops.higher_order.while_loop
+        ):
             n.meta["loop_extents"] = extents_per_level[depth]
             body = named.get(str(n.args[1].target))
             if isinstance(body, torch.fx.GraphModule):
                 _tag_loop_extents(body, extents_per_level, depth + 1)
-            return True
-        if n.target is torch.ops.higher_order.cond:
-            for branch in n.args[1:3]:
-                sub = named.get(str(branch.target))
-                if not isinstance(sub, torch.fx.GraphModule):
-                    continue
-                if _tag_loop_extents(sub, extents_per_level, depth):
-                    return True
-    return False
-
-
-def stamp_csr_fill(gm, fill: float) -> None:
-    """Stamp ``CSR_FILL_META`` on every counted ``async_copy`` in ``gm``."""
-    for m in gm.modules():
-        if not isinstance(m, torch.fx.GraphModule):
-            continue
-        for n in m.graph.nodes:
-            if (
-                n.op == "call_function"
-                and n.target is voyager.async_copy.default
-                and get_arg_value(n, 11, "count", None) is not None
-            ):
-                n.meta[CSR_FILL_META] = fill
+            return

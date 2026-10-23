@@ -1,17 +1,12 @@
 """Quantization: choose a spec per node, observe, then bake in quant/dequant.
 
-Everything runs through PT2E (``quantize_pt2e``), configured with the
-comma-separated spec strings ``QuantizationSpec.from_str`` parses.
-Training -- QAT, or with the backward pass quantized too -- is set up by
-``training``.
+The PT2E flow (``quantize_pt2e``) is the one the compiler consumes; the eager
+module-swap flow (``quantize``) is for QAT experiments.  Both are configured
+with the comma-separated spec strings ``QuantizationSpec.from_str`` parses.
 """
 
 from voyager_compiler.quantization.fake_quantize import (
-    DirectCastFakeQuantize,
     FusedAmaxObsFakeQuantize,
-    GroupWiseAffineFakeQuantize,
-    MXFakeQuantize,
-    fake_quantize_class,
     get_quantization_map,
 )
 from voyager_compiler.quantization.gptq import (
@@ -19,37 +14,35 @@ from voyager_compiler.quantization.gptq import (
     compensate_weight,
     gptq,
 )
-from voyager_compiler.quantization.codebook_optimizer import (
-    Weighting,
+from voyager_compiler.quantization.lcq import (
+    CodebookGrid,
     Histogram,
     codebook_qmap,
     fit_codebooks,
     load_codebooks,
+    normal_float_levels,
     optimal_codebook,
+    unit_scale,
+    weighted_lloyd,
 )
-from voyager_compiler.quantization.qspec import QScheme, parse_codebook_dtype
+from voyager_compiler.quantization.qconfig import QConfig, get_qconfig
+from voyager_compiler.quantization.qspec import QScheme
+from voyager_compiler.quantization.quantize import (
+    convert,
+    get_conv_bn_layers,
+    prepare,
+    propagate_config,
+    quantize,
+    replace_softmax,
+)
 from voyager_compiler.quantization.quantize_pt2e import (
     convert_pt2e,
     derive_bias_qparams_fn,
-    fold_conv_bn_qat,
-    freeze_cache_reads,
-    freeze_weights,
+    finalize_pt2e_calibration,
     get_default_quantizer,
     prepare_pt2e,
-    prepare_qat_pt2e,
-    set_batch_norm_training,
-    set_training,
     sink_obs_or_fq,
     swap_matmul_inputs,
-)
-from voyager_compiler.quantization.training import (
-    TrainingQuantizers,
-    capture_training,
-    disable_observers,
-    gradient_program,
-    prepare_from_args,
-    prepare_training,
-    update_program,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
@@ -61,42 +54,36 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
 
 __all__ = [
     "CACHE_RESERVE",
-    "Weighting",
+    "CodebookGrid",
     "Histogram",
     "DerivedQuantizationSpec",
-    "DirectCastFakeQuantize",
     "FusedAmaxObsFakeQuantize",
-    "GroupWiseAffineFakeQuantize",
-    "MXFakeQuantize",
+    "QConfig",
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
-    "TrainingQuantizers",
-    "capture_training",
     "codebook_qmap",
     "compensate_weight",
+    "convert",
     "convert_pt2e",
     "derive_bias_qparams_fn",
-    "disable_observers",
-    "fake_quantize_class",
+    "finalize_pt2e_calibration",
     "fit_codebooks",
-    "fold_conv_bn_qat",
-    "freeze_cache_reads",
-    "freeze_weights",
+    "get_conv_bn_layers",
     "get_default_quantizer",
+    "get_qconfig",
     "get_quantization_map",
     "gptq",
-    "gradient_program",
     "load_codebooks",
+    "normal_float_levels",
     "optimal_codebook",
-    "parse_codebook_dtype",
-    "prepare_from_args",
+    "prepare",
     "prepare_pt2e",
-    "prepare_qat_pt2e",
-    "prepare_training",
-    "set_batch_norm_training",
-    "set_training",
+    "propagate_config",
+    "quantize",
+    "replace_softmax",
     "sink_obs_or_fq",
     "swap_matmul_inputs",
-    "update_program",
+    "unit_scale",
+    "weighted_lloyd",
 ]

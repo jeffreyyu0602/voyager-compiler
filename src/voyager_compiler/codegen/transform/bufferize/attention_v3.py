@@ -11,84 +11,21 @@ accumulate/rescale are synchronous.  Each async matmul is dispatched with
 posts a done-semaphore (``sem_scores`` for QKᵀ, ``sem_pv`` for P@V) that
 ``voyager.async_wait`` consumes where a synchronous op reads the result.
 
-The loop walks the live (Q tile, KV block) pairs: every pair under an
-explicit mask; under ``is_causal`` only the blocks up to each Q tile's last
-row, the rest being fully masked.  It carries the sweep (the Q tile's index
-over ``[*kv_batch, num_q_blocks]``) and ``kv``, the block within the sweep,
-and advances them each step past the sweep's last block (``_kv_last``).
-Per iteration (``N = num_kv_blocks``), in program order:
+Per loop iteration (``N = num_kv_blocks``, ``kv = cur[gkv]``), in program order:
 
   [A] S = (Q @ Kᵀ)·scale (+ mask) -> s_buf[step % 2];  commit, post sem_scores
-  [B] pv_buf = p_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
-  [C] kv == 0 only (a Q-tile boundary): fresh state for the new tile, m =
-      -inf and l[sweep % 2] = 0.  The sum ``l`` is double-buffered by sweep
-      parity so the tile that just ended keeps its own for [E]; m and o are
-      not, since [E] never reads m and zeroes o before the next [F].
-  [D] wait sem_scores;  softmax chain (rowmax, m, alpha, P, rowsum, l).
-  [E] kv == 0 only: wait sem_pv; o += pv_buf; drain the previous output
-      store; (o / l[(sweep + 1) % 2]) -> o_slots; store o_slots to the
-      PREVIOUS tile's DRAM rows (the finalize belongs to the tile that just
-      ended); o = 0.  After [D], so the vector unit is not held on sem_pv
-      before the softmax that overlaps [B].
-  [F] kv >= 1 only (vector unit, after [D]): wait sem_pv;  the deferred
+  [B] pv_buf = s_buf[(step-1) % 2] @ V_prev;  commit (dep V DMA), post sem_pv
+  [D] kv == 0 only (a Q-tile boundary): wait sem_pv; o += pv_buf; drain the
+      previous output store; (o / l) -> o_slots; store o_slots to the PREVIOUS
+      tile's DRAM rows (the finalize belongs to the tile that just ended);
+      reset m/o/l.
+  [C] wait sem_scores;  softmax chain (rowmax, m, alpha, P, rowsum, l).
+  [E] kv >= 1 only (vector unit, after [C]): wait sem_pv;  the deferred
       rescale fused with the accumulate, o = alpha·(o + pv_buf).
-
-The probabilities ``p_buf`` are ``s_buf`` itself -- [D] exponentiates the
-scores in place -- unless the softmax runs at a different dtype than the
-operands (``accumulate_fp32`` over bf16 inputs), when P is written to its
-own buffer at V's dtype so the matrix unit reads it as an operand.
-
-Microscaling operands (an ``sdpa_mx`` node): Q, K and V are codes with
-block scales, and each scale streams through slots of its own beside its
-data, K's transposed by the DMA like K.  Both products are ``matmul_mx``.
-[D] exponentiates S in place, sums the exact exponentials into ``l``, then
-one more vector pass quantizes them along the keys with the query's
-parameters into P's codes (``p_buf``) and block scales (``p_scale``).
-
-``is_causal`` (no mask tensor): [A] adds a mask tile read from
-``causal_mask``, a constant table of every tile a live pair can need --
-under ``bool_mask`` int1 codes (0 keeps, -1 drops) that a per-tensor scale
-dequantizes to the fill in the same pass, as the eager path's quantized
-mask is added, else the fill itself at the accumulation dtype.  A
-pair's tile depends only on how far its Q tile's first row sits past its KV
-block's first key, ``(q·tq) mod sq - kv·tkv``, a multiple of ``gcd(tq,
-tkv)``; the table holds one tile per multiple from ``gcd - tq`` up to ``sq -
-tq``, a block wholly below the diagonal reading an all-true entry.  A Q tile
-must not straddle a head under the GQA fold (``tq`` divides ``sq``), so a
-row's position in its head is ``(q·tq) mod sq + r``.
-
-A decode step over a split KV cache (``split_kv_cache``) attends one more
-block per sweep: the chunk of the cache being filled, kept in full
-precision beside the quantized main cache and handed to the node as
-``key_residual`` / ``value_residual`` with ``query_residual`` (the query,
-unquantized) and ``residual_mask`` (the chunk's slice of the mask; the main
-mask drops the chunk's window).  An online softmax is additive over key
-blocks, so the residual is folded in at the sweep's boundary, after [E] has
-landed the sweep's last P@V and before the finalize: its QKᵀ, the softmax
-chain over the running state the sweep leaves -- its max snapshotted before
-[C] resets it for the next tile -- and P@V, then ``o = alpha·o + pv``.  Both
-products are plain matmuls, ``R`` (the residual's positions) wide, and the
-residual's P is not quantized.  The residual's tiles stream through slots
-of their own, one per sweep parity: a sweep's residual is fetched on its
-last step and consumed at the next sweep's boundary (or the epilogue),
-which under a single KV block is the same iteration as the next fetch.
-
-A head narrower than the PE array is padded on chip to the width the
-products need (``attention_head_pad``): Q, K, V and their block scales are
-held at the padded head and the products run at it, DRAM keeping the real
-head.  The pad is zeros.  A column-padded tile (Q, V, their scales, the
-residual's Q and V) is zero-filled by its own DMA (``async_copy``'s
-``pad``, the read clipped at the source's edge); a transposed tile (Kᵀ, its
-scales, the residual's Kᵀ) is row-padded, so its DMA lands the block in the
-slot's top rows and the pad rows are zeroed once, before the first load.
-P@V's pad columns come out zero and are never read: the accumulate, rescale
-and finalize run on the product's real columns, so ``o`` and the output
-tile keep the real head.
 """
 
 import logging
 import math
-from types import SimpleNamespace
 
 import torch
 from torch._higher_order_ops.while_loop import while_loop
@@ -115,32 +52,10 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _tag_loop_extents,
     voyager,
 )
-from voyager_compiler.codegen.transform.tiling import (
-    attention_head_pad,
-    attention_kv_last,
-    attention_op_tiling,
-)
 from voyager_compiler.export_utils import export_model
 from voyager_compiler.shape_prop import ShapeProp
 
 _SRAM = int(MemoryLevel.SRAM)
-_ATTENTION_OPS = (
-    torch.ops.aten.scaled_dot_product_attention.default,
-    torch.ops.quantized_ops.sdpa_mx.default,
-)
-_QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
-# The optional positional operands of an attention node, by position.
-_OPTIONAL_OPERANDS = {
-    3: "attn_mask",
-    6: "query_residual",
-    7: "key_residual",
-    8: "value_residual",
-    9: "residual_mask",
-}
-_PRODUCT_OPS = (
-    torch.ops.aten.matmul.default,
-    torch.ops.quantized_ops.matmul_mx.default,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -153,17 +68,6 @@ def _unravel(flat, basis):
         out[d] = flat % basis[d]
         flat //= basis[d]
     return out
-
-
-def _causal_mask_table(tq, tkv, sq):
-    """The bool mask tiles ``is_causal`` attention reads (module
-    docstring): entry ``k`` keeps key ``c`` of row ``r`` when ``c <= r +
-    delta`` for ``delta = gcd(tq, tkv)·(k + 1) - tq``."""
-    g = math.gcd(tq, tkv)
-    deltas = torch.arange(sq // g) * g + (g - tq)
-    rows = torch.arange(tq).view(1, tq, 1)
-    cols = torch.arange(tkv).view(1, 1, tkv)
-    return (cols <= rows + deltas.view(-1, 1, 1)).unsqueeze(1)
 
 
 class _FA3Pipeline(torch.nn.Module):
@@ -180,12 +84,10 @@ class _FA3Pipeline(torch.nn.Module):
         tq,
         tkv,
         head_dim,
-        head_pad,
         scale,
         has_mask,
+        mask_is_bool,
         mask_dyn,
-        is_causal,
-        bool_mask,
         out_shape,
         out_dtype,
         acc_dtype,
@@ -195,20 +97,8 @@ class _FA3Pipeline(torch.nn.Module):
         out_unfold_shape,
         mask_broadcast,
         mask_fold_shape,
-        operand_index,
-        block_size,
-        probs_quant_max,
-        force_scale_power_of_two,
     ):
         super().__init__()
-        # ``forward`` takes the node's operands in ``all_input_nodes`` order;
-        # ``operand_index`` names each position.  ``block_size`` is the MX
-        # block along the contraction axes, ``None`` for unquantized
-        # operands; the rest is what P's ``quantize_mx`` takes.
-        self.operand_index = operand_index
-        self.block_size = block_size
-        self.probs_quant_max = probs_quant_max
-        self.force_scale_power_of_two = force_scale_power_of_two
         # GQA fold: the ``g_head`` query heads sharing a KV head are folded
         # into the query rows (see ``build_attention_fa3``), so the pipeline
         # runs plain MHA over the KV-head batch and K/V load once per KV head.
@@ -222,15 +112,14 @@ class _FA3Pipeline(torch.nn.Module):
             tuple(mask_fold_shape) if mask_fold_shape is not None else None
         )
         self.grid = tuple(grid)  # (*kv_batch, num_q_blocks, num_kv_blocks)
+        self.num_steps = math.prod(grid)
         self.N = num_kv_blocks
         self.nb = len(grid) - 2
         self.gq, self.gkv = self.nb, self.nb + 1
         self.tq, self.tkv, self.d = tq, tkv, head_dim
-        # The head the tiles hold on chip (module docstring); DRAM keeps
-        # ``head_dim``.
-        self.d_pad = head_pad
         self.scale = scale
         self.has_mask = has_mask
+        self.mask_is_bool = mask_is_bool
         # Mask: list of (dram_dim, grid_dim) pairs for its dynamic dims
         # (broadcast batch dims are pinned static-0 and never appear).
         self.mask_dyn = mask_dyn
@@ -241,38 +130,6 @@ class _FA3Pipeline(torch.nn.Module):
         # dynamic dims are the >1-block batch dims plus (for the >1 case)
         # the sequence dim; ``head_dim`` is always loaded whole.
         self.batch_dyn = [i for i in range(self.nb) if grid[i] > 1]
-        # The walk (module docstring): ``sweeps`` over ``grid[:-1]``, each
-        # running the KV blocks up to ``_kv_last``; under ``is_causal`` the
-        # mask tiles come from ``causal_mask``.
-        self.causal = is_causal
-        self.sweeps = math.prod(self.grid[:-1])
-        # The causal table's tiles are added to the scores (module
-        # docstring): int1 codes with the fill as their scale, or the fill.
-        self.mask_scaled = is_causal and bool_mask
-        if is_causal:
-            self.causal_gcd = math.gcd(tq, tkv)
-            keep = _causal_mask_table(tq, tkv, sq_orig)
-            if bool_mask:
-                codes = torch.where(keep, 0.0, -1.0).to(acc_dtype)
-                self.register_buffer("causal_mask", codes)
-                self.register_buffer(
-                    "mask_scale", torch.tensor(-_MASK_FILL, dtype=acc_dtype)
-                )
-            else:
-                self.register_buffer(
-                    "causal_mask",
-                    torch.where(keep, 0.0, _MASK_FILL).to(acc_dtype),
-                )
-        self.num_steps = math.prod(self.grid[: self.gq]) * sum(
-            self._kv_last(q) + 1 for q in range(self.grid[self.gq])
-        )
-
-    def _kv_last(self, q_block):
-        """The last live KV block of Q tile ``q_block`` (an int, or the
-        loop's SymInt)."""
-        if not self.causal:
-            return self.N - 1
-        return attention_kv_last(q_block, self.tq, self.tkv, self.sq_orig)
 
     # --- DMA helpers (all take explicit coords; slots may be SymInts) ---
 
@@ -289,73 +146,53 @@ class _FA3Pipeline(torch.nn.Module):
             idx.append(coords[grid_dim])
         return dims, idx
 
-    def _load_sweep(self, src, slots, slot, sem, coords, tile, pad=False):
-        """DMA ``src``'s ``tile`` at ``coords``' query block into
-        ``slots[slot]``.  The block is loaded once per sweep but read on
-        every one of the sweep's live steps, so its semaphore posts once
-        per step to balance the per-step [A] consume -- exactly, or a
-        stale post would let a later sweep's [A] run before its tile
-        landed.  ``pad`` has the DMA zero-fill what ``tile`` extends past
-        the source's edge (a column-padded head)."""
+    def _load_q(self, q, slots, slot, sem, coords):
         dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
+        unit = (1,) * self.nb
+        # Q is loaded once per sweep but read on every one of the sweep's N
+        # steps; post its load semaphore N times so the per-step [A] commit
+        # consume balances the single load.
         voyager.async_copy(
-            src,
+            q,
             get_slot(slots, slot),
             idx,
-            (1,) * self.nb + tuple(tile),
+            unit + (self.tq, self.d),
             get_slot(sem, slot),
             dims,
-            pad=[0] * (self.nb + len(tile)) if pad else None,
-            post_count=self._kv_last(coords[self.gq]) + 1,
+            post_count=self.N,
         )
 
-    def _load_step(
-        self,
-        src,
-        slots,
-        slot,
-        sem,
-        coords,
-        tile,
-        transposed,
-        pad=False,
-        rows=None,
-    ):
-        """DMA ``src``'s ``tile`` at ``coords``' key block into
-        ``slots[slot]``.  ``tile`` is the DRAM block in the buffer's own
-        order; ``transposed`` has the DMA ``.mT`` it into the slot (the Kᵀ
-        tiles, as ``PipelinedKernel._load_tile`` does).  ``pad`` has the
-        DMA zero-fill what ``tile`` extends past the source's edge (a
-        column-padded head); ``rows`` lands the block in the slot's top
-        ``rows`` rows (a row-padded head, whose pad rows are zeroed
-        once)."""
+    def _load_k(self, k, slots, slot, sem, coords):
+        # Transposed load: the DRAM buffer is K's own [.., tkv, d] block,
+        # ``.mT``-ed into the slot's Kᵀ [.., d, tkv] tile by the DMA.
         dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
-        dst = get_slot(slots, slot)
-        if rows is not None:
-            dst = self._rows(dst, rows)
+        unit = (1,) * self.nb
         voyager.async_copy(
-            src,
-            dst,
+            k,
+            get_slot(slots, slot),
             idx,
-            (1,) * self.nb + tuple(tile),
+            unit + (self.d, self.tkv),
             get_slot(sem, slot),
             dims,
-            transposed=transposed,
-            pad=[0] * (self.nb + len(tile)) if pad else None,
+            None,
+            True,
+        )
+
+    def _load_v(self, v, slots, slot, sem, coords):
+        dims, idx = self._block_address(coords, self.gkv, self.grid[self.gkv])
+        unit = (1,) * self.nb
+        voyager.async_copy(
+            v,
+            get_slot(slots, slot),
+            idx,
+            unit + (self.tkv, self.d),
+            get_slot(sem, slot),
+            dims,
         )
 
     def _load_mask(self, mask, slots, slot, sem, coords):
-        """DMA the mask tile of the pair at ``coords`` into
-        ``slots[slot]``: the explicit mask's block, or under ``is_causal``
-        the ``causal_mask`` entry for the pair's offset (module
-        docstring)."""
-        if self.causal:
-            q, kv = coords[self.gq], coords[self.gkv]
-            offset = (q * self.tq) % self.sq_orig + self.tq - kv * self.tkv
-            dims, idx = [0], [offset // self.causal_gcd - 1]
-        else:
-            dims = [d for d, _ in self.mask_dyn]
-            idx = [coords[g] for _, g in self.mask_dyn]
+        dims = [d for d, _ in self.mask_dyn]
+        idx = [coords[g] for _, g in self.mask_dyn]
         munit = (1,) * (mask.ndim - 2)
         voyager.async_copy(
             mask,
@@ -373,293 +210,61 @@ class _FA3Pipeline(torch.nn.Module):
             tile, out, idx, unit + (self.tq, self.d), get_slot(sem, 0), dims
         )
 
-    @staticmethod
-    def _rows(tile, rows):
-        """The top ``rows`` rows of an SRAM ``tile``, as a subview."""
-        shape = list(tile.shape)
-        return voyager.subview(
-            tile,
-            [0] * len(shape),
-            shape[:-2] + [rows, shape[-1]],
-            [1] * len(shape),
-        )
-
-    @staticmethod
-    def _cols(tile, cols):
-        """The first ``cols`` columns of an SRAM ``tile``, as a subview."""
-        shape = list(tile.shape)
-        return voyager.subview(
-            tile, [0] * len(shape), shape[:-1] + [cols], [1] * len(shape)
-        )
-
     # --- compute helpers (shared by prologue / loop / epilogue) ---------
 
-    def _matmul(self, *tiles):
-        """The matrix unit's product of two tiles, ``a @ b``: ``(a, b)``, or
-        under MX ``(a, a_scale, b, b_scale, a_code, b_code)`` -- each
-        operand's codes, then its block scales, then the codebooks, which
-        a format without one (``fp4``) leaves out."""
-        if self.block_size is None:
-            a, b = tiles
-            return torch.matmul(a, b)
-        a, a_scale, b, b_scale, *codes = tiles
-        a_code, b_code = codes or (None, None)
-        return torch.ops.quantized_ops.matmul_mx(
-            a,
-            b,
-            input_scale=a_scale,
-            weight_scale=b_scale,
-            block_size=self.block_size,
-            input_code=a_code,
-            weight_code=b_code,
-        )
-
-    def _matmul_qk(self, operands, s_slot, sem_scores, deps):
-        """[A]: commit S = (Q @ Kᵀ)·scale (+ mask) -> s_slot.  ``operands``
-        are the product's tiles (``_matmul``), then the mask tile when
-        there is one and, for int1 codes, its scale, which a dequantize in
-        the same pass turns into the additive fill; ``deps`` the load
-        semaphores it waits on.  It posts ``sem_scores`` when the matmul
-        retires.  The body branches on ``has_mask`` at build time, so the
+    def _matmul_qk(self, q_tile, k_tile, mask_tile, s_slot, sem_scores, deps):
+        """[A]: commit S = (Q @ Kᵀ)·scale (+ mask) -> s_slot.  ``deps`` are the
+        input load semaphores it waits on; it posts ``sem_scores`` when the
+        matmul retires.  The body branches on ``has_mask`` at build time, so the
         traced subgraph carries no runtime cond."""
-        scale, has_mask = self.scale, self.has_mask
-        mask_scaled, matmul = self.mask_scaled, self._matmul
+        scale = self.scale
+        if self.has_mask:
+            mask_is_bool = self.mask_is_bool
 
-        def body(*args):
-            *tiles, s = args
-            if mask_scaled:
-                *tiles, mask, mask_scale = tiles
-                mask = torch.ops.quantized_ops.dequantize(mask, mask_scale)
-            elif has_mask:
-                *tiles, mask = tiles
-            out = matmul(*tiles) * scale
-            if has_mask:
-                out = out + mask
-            voyager.insert(out, s)
+            def body(q, k, mask, s):
+                out = torch.matmul(q, k) * scale
+                if mask_is_bool:
+                    out = torch.where(mask, out, _MASK_FILL)
+                else:
+                    out = out + mask
+                voyager.insert(out, s)
 
-        commit(body, [*operands, s_slot], dependencies=deps, post=sem_scores)
+            operands = [q_tile, k_tile, mask_tile, s_slot]
+        else:
 
-    def _matmul_pv(self, operands, pv_buf, sem_pv, deps):
-        """[B]: commit pv_buf = P @ V on the matrix unit; ``operands`` are
-        the product's tiles (``_matmul``).  ``deps`` are the V load
-        semaphores; it posts ``sem_pv`` when the matmul retires (the
-        probabilities are written synchronously, so need no dep)."""
-        matmul = self._matmul
+            def body(q, k, s):
+                voyager.insert(torch.matmul(q, k) * scale, s)
 
-        def body(*args):
-            *tiles, pv = args
-            voyager.insert(matmul(*tiles), pv)
+            operands = [q_tile, k_tile, s_slot]
+        commit(body, operands, dependencies=deps, post=sem_scores)
 
-        commit(body, [*operands, pv_buf], dependencies=deps, post=sem_pv)
+    def _matmul_pv(self, s_tile, v_tile, pv_buf, sem_pv, deps):
+        """[B]: commit pv_buf = s_tile @ v_tile on the matrix unit.  ``deps`` is
+        the V load semaphore; it posts ``sem_pv`` when the matmul retires (the
+        probabilities in ``s_tile`` are written synchronously, so need no dep).
+        """
 
-    def _softmax(
-        self, s_slot, p_slot, m, l, row_tmp, alpha, sem_scores, p_scale, probs
-    ):
-        """[D]'s chain: waits for S, then rowmax / m / alpha / P / rowsum
-        / l (the baseline passes 2-7).  Unquantized, P lands in ``p_slot``
-        -- ``s_slot`` itself unless the probabilities have their own buffer
-        -- and the rowsum reads it back, so ``l`` sums the P the matmul
-        will see.  Under MX, S is exponentiated in place and summed exact,
-        then one more pass quantizes it along the keys with the query's
-        parameters -- ``probs``: the lookup table, the scale codebook and
-        the midpoints -- into ``p_slot``'s codes and ``p_scale``."""
-        mx = probs is not None
+        def body(s, v, pv):
+            voyager.insert(torch.matmul(s, v), pv)
+
+        commit(body, [s_tile, v_tile, pv_buf], dependencies=deps, post=sem_pv)
+
+    def _softmax(self, s_slot, m, l, row_tmp, alpha, sem_scores):
+        """[C]'s chain: waits for S, then rowmax / m / alpha / P / rowsum
+        / l on ``s_slot`` in place (the baseline passes 2-7)."""
         voyager.async_wait(sem_scores)
         voyager.insert(torch.amax(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(torch.maximum(m, row_tmp), row_tmp)
         voyager.insert(torch.exp(m - row_tmp), alpha)
         voyager.insert(row_tmp.clone(), m)
-        exp_slot = s_slot if mx else p_slot
-        voyager.insert(torch.exp(s_slot - row_tmp), exp_slot)
-        voyager.insert(torch.sum(exp_slot, dim=-1, keepdim=True), row_tmp)
+        voyager.insert(torch.exp(s_slot - row_tmp), s_slot)
+        voyager.insert(torch.sum(s_slot, dim=-1, keepdim=True), row_tmp)
         voyager.insert(alpha * l + row_tmp, l)
-        if mx:
-            qmap, scale_qmap, code = probs
-            scale, codes = torch.ops.quantized_ops.quantize_mx(
-                s_slot,
-                qmap,
-                [-1],
-                self.block_size,
-                self.probs_quant_max,
-                self.force_scale_power_of_two,
-                scale_qmap,
-                code,
-            )
-            voyager.insert(scale, p_scale)
-            voyager.insert(codes, p_slot)
 
-    def _reset(self, m, l):
-        """[C]: the running max and sum a new Q tile starts from."""
+    def _reset(self, m, l, o):
         voyager.insert(torch.full_like(m, _MASK_FILL), m)
         voyager.insert(torch.zeros_like(l), l)
-
-    # --- the split cache's residual (module docstring) ------------------
-
-    def _residual_setup(self, operands, acc, q):
-        """The residual's operands and on-chip state, or ``None`` without
-        one.  ``q`` is the main query as folded: an unquantized attention
-        reads it as the residual query too (one operand serving both
-        names), and the kernel must not take two views of it."""
-        index = self.operand_index
-        if "key_residual" not in index:
-            return None
-        k, v, mask = (
-            operands[index[n]]
-            for n in ("key_residual", "value_residual", "residual_mask")
-        )
-        length = k.shape[-2]
-        if index["query_residual"] != index["query"]:
-            q = operands[index["query_residual"]]
-            if self.g_head > 1:
-                q = q.reshape(self.q_fold_shape)
-        if self.g_head > 1:
-            mask = fold_mask_tensor(
-                mask,
-                mask_broadcast=self.mask_broadcast,
-                sq_orig=self.sq_orig,
-                g_head=self.g_head,
-                mask_fold_shape=(*self.mask_fold_shape[:-1], length),
-            )
-        unit = (1,) * self.nb
-        tq, d_pad = self.tq, self.d_pad
-
-        def stream(src, tile):
-            slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
-            return slots, voyager.zeros([], torch.int64, num_slots=2)
-
-        q_slots, q_sem = stream(q, (tq, d_pad))
-        k_slots, k_sem = stream(k, (d_pad, length))
-        v_slots, v_sem = stream(v, (length, d_pad))
-        munit = (1,) * (mask.ndim - 2)
-        m_slots = voyager.alloc([*munit, tq, length], mask.dtype, _SRAM, 2)
-        m_sem = voyager.zeros([], torch.int64, num_slots=2)
-        s = voyager.alloc([*unit, tq, length], acc, _SRAM)
-        p = s
-        if acc != v.dtype:
-            p = voyager.alloc([*unit, tq, length], v.dtype, _SRAM)
-        return SimpleNamespace(
-            q=q,
-            k=k,
-            v=v,
-            mask=mask,
-            length=length,
-            q_slots=q_slots,
-            q_sem=q_sem,
-            k_slots=k_slots,
-            k_sem=k_sem,
-            v_slots=v_slots,
-            v_sem=v_sem,
-            m_slots=m_slots,
-            m_sem=m_sem,
-            s=s,
-            p=p,
-            pv=voyager.alloc([*unit, tq, d_pad], acc, _SRAM),
-            m_prev=voyager.alloc([*unit, tq, 1], acc, _SRAM),
-            sem_scores=voyager.zeros([1], torch.int64),
-            sem_pv=voyager.zeros([1], torch.int64),
-        )
-
-    def _residual_prefetch(self, res, slot, coords):
-        """DMA the residual's tiles of the sweep at ``coords`` into slot
-        ``slot``: the query tile like Q's, K and V whole (K transposed),
-        and the mask's block, whole along the keys."""
-        unit = (1,) * self.nb
-        tq, d, d_pad, length = self.tq, self.d, self.d_pad, res.length
-        pad = [0] * (self.nb + 2) if d_pad != d else None
-        dims, idx = self._block_address(coords, self.gq, self.grid[self.gq])
-        voyager.async_copy(
-            res.q,
-            get_slot(res.q_slots, slot),
-            idx,
-            unit + (tq, d_pad),
-            get_slot(res.q_sem, slot),
-            dims,
-            pad=pad,
-        )
-        dims, idx = self._block_address(coords, self.gkv, 1)
-        k_tile = get_slot(res.k_slots, slot)
-        if d_pad != d:
-            k_tile = self._rows(k_tile, d)
-        voyager.async_copy(
-            res.k,
-            k_tile,
-            idx,
-            unit + (length, d),
-            get_slot(res.k_sem, slot),
-            dims,
-            transposed=True,
-        )
-        voyager.async_copy(
-            res.v,
-            get_slot(res.v_slots, slot),
-            idx,
-            unit + (length, d_pad),
-            get_slot(res.v_sem, slot),
-            dims,
-            pad=pad,
-        )
-        dyn = [(j, g) for j, g in self.mask_dyn if g != self.gkv]
-        munit = (1,) * (res.mask.ndim - 2)
-        voyager.async_copy(
-            res.mask,
-            get_slot(res.m_slots, slot),
-            [coords[g] for _, g in dyn],
-            munit + (tq, length),
-            get_slot(res.m_sem, slot),
-            [j for j, _ in dyn],
-        )
-
-    def _residual_snapshot(self, res, m):
-        voyager.insert(m.clone(), res.m_prev)
-
-    def _residual_step(self, res, slot, l_slot, o, row_tmp, alpha):
-        """Fold the residual block of the sweep that just ended into its
-        state: S = (q @ Kᵀ)·scale + mask on the matrix unit, the softmax
-        chain from the snapshotted max, P @ V, then ``o = alpha·o + pv``."""
-        scale = self.scale
-
-        def scores(q, k, mask, s):
-            voyager.insert(torch.matmul(q, k) * scale + mask, s)
-
-        commit(
-            scores,
-            [
-                get_slot(res.q_slots, slot),
-                get_slot(res.k_slots, slot),
-                get_slot(res.m_slots, slot),
-                res.s,
-            ],
-            dependencies=[
-                get_slot(res.q_sem, slot),
-                get_slot(res.k_sem, slot),
-                get_slot(res.m_sem, slot),
-            ],
-            post=res.sem_scores,
-        )
-        self._softmax(
-            res.s,
-            res.p,
-            res.m_prev,
-            l_slot,
-            row_tmp,
-            alpha,
-            res.sem_scores,
-            None,
-            None,
-        )
-
-        def context(p, v, pv):
-            voyager.insert(torch.matmul(p, v), pv)
-
-        commit(
-            context,
-            [res.p, get_slot(res.v_slots, slot), res.pv],
-            dependencies=[get_slot(res.v_sem, slot)],
-            post=res.sem_pv,
-        )
-        voyager.async_wait(res.sem_pv)
-        pv = self._cols(res.pv, self.d) if self.d_pad != self.d else res.pv
-        voyager.insert(alpha * o + pv, o)
+        voyager.insert(torch.zeros_like(o), o)
 
     def _fold_mask(self, mask):
         return fold_mask_tensor(
@@ -672,279 +277,91 @@ class _FA3Pipeline(torch.nn.Module):
 
     # --------------------------------------------------------------------
 
-    def forward(self, *operands):
-        index = self.operand_index
-        q, k, v = (operands[index[n]] for n in ("query", "key", "value"))
-        mask = operands[index["attn_mask"]] if "attn_mask" in index else None
-        if self.causal:
-            mask = self.causal_mask
-        bs = self.block_size
-        mx = bs is not None
-        if mx:
-            q_scale, k_scale, v_scale = (
-                operands[index[n]]
-                for n in ("query_scale", "key_scale", "value_scale")
-            )
-            codes = [
-                operands[index[n]]
-                for n in ("input_code", "weight_code")
-                if n in index
-            ]
-            probs = tuple(
-                operands[index[n]] if n in index else None
-                for n in ("probs_qmap", "probs_scale_qmap", "probs_code")
-            )
+    def forward(self, q, k, v, mask=None):
         # GQA fold: reshape q (and mask) so the shared query heads become extra
         # query rows; the output is reshaped back at the end.
         if self.g_head > 1:
             q = q.reshape(self.q_fold_shape)
-            if mx:
-                q_scale = q_scale.reshape(
-                    (*self.q_fold_shape[:-1], q_scale.shape[-1])
-                )
-            if mask is not None and not self.causal:
+            if mask is not None:
                 mask = self._fold_mask(mask)
         grid, N, nb = self.grid, self.N, self.nb
         num_steps = self.num_steps
         unit = (1,) * nb
-        tq, tkv, d, d_pad = self.tq, self.tkv, self.d, self.d_pad
-        padded = d_pad != d
-        # The head's block scales: a block wider than the head is one
-        # truncated block.  ``d_blocks`` is DRAM's, ``d_blocks_pad`` the
-        # tile's.
-        d_blocks = math.ceil(d / bs) if mx else None
-        d_blocks_pad = math.ceil(d_pad / bs) if mx else None
-        blocks_padded = mx and d_blocks_pad != d_blocks
         out = voyager.alloc(self.out_shape, self.out_dtype)
 
-        # SRAM slots (2 slots each) + per-slot DMA semaphores; under MX each
-        # operand's block scales stream beside it through slots of their
-        # own.  The output slot is single-slotted (written once per Q tile).
-        def stream(src, tile):
-            slots = voyager.alloc([*unit, *tile], src.dtype, _SRAM, 2)
-            return slots, voyager.zeros([], torch.int64, num_slots=2)
-
-        q_slots, q_sem = stream(q, (tq, d_pad))
-        k_slots, k_sem = stream(k, (d_pad, tkv))
-        v_slots, v_sem = stream(v, (tkv, d_pad))
-        if mx:
-            q_scale_slots, q_scale_sem = stream(q_scale, (tq, d_blocks_pad))
-            k_scale_slots, k_scale_sem = stream(k_scale, (d_blocks_pad, tkv))
-            v_scale_slots, v_scale_sem = stream(v_scale, (tkv // bs, d_pad))
+        # SRAM slots (2 slots each) + per-slot DMA semaphores; the output
+        # slot is single-slotted (written once per Q tile).
+        q_slots = voyager.alloc([*unit, self.tq, self.d], q.dtype, _SRAM, 2)
+        q_sem = voyager.zeros([], torch.int64, num_slots=2)
+        k_slots = voyager.alloc([*unit, self.d, self.tkv], k.dtype, _SRAM, 2)
+        k_sem = voyager.zeros([], torch.int64, num_slots=2)
+        v_slots = voyager.alloc([*unit, self.tkv, self.d], v.dtype, _SRAM, 2)
+        v_sem = voyager.zeros([], torch.int64, num_slots=2)
         if self.has_mask:
             munit = (1,) * (mask.ndim - 2)
-            m_slots = voyager.alloc([*munit, tq, tkv], mask.dtype, _SRAM, 2)
+            m_slots = voyager.alloc(
+                [*munit, self.tq, self.tkv], mask.dtype, _SRAM, 2
+            )
             m_sem = voyager.zeros([], torch.int64, num_slots=2)
-        out_slots = voyager.alloc([*unit, tq, d], out.dtype, _SRAM, 1)
+        out_slots = voyager.alloc([*unit, self.tq, self.d], out.dtype, _SRAM, 1)
         out_sem = voyager.zeros([], torch.int64, num_slots=1)
 
-        # Running softmax state -- the sum per sweep parity, the rest
-        # single-buffered (see module docstring) -- and the
-        # parity-double-buffered scores/probabilities tile.
+        # Running softmax state (single-buffered — see module docstring)
+        # and the parity-double-buffered scores/probabilities tile.
         acc = self.acc_dtype
-        m = voyager.alloc([*unit, tq, 1], acc, _SRAM)
-        l = voyager.alloc([*unit, tq, 1], acc, _SRAM, 2)
-        o = voyager.alloc([*unit, tq, d], acc, _SRAM)
-        s_buf = voyager.alloc([*unit, tq, tkv], acc, _SRAM, 2)
-        # P: under MX its codes and block scales (see the module docstring);
-        # else S exponentiated in place, unless the softmax runs at a dtype
-        # the matrix unit cannot take as an operand.
-        p_scale = None
-        if mx:
-            p_buf = voyager.alloc([*unit, tq, tkv], q.dtype, _SRAM, 2)
-            p_scale = voyager.alloc(
-                [*unit, tq, tkv // bs], q_scale.dtype, _SRAM, 2
-            )
-        elif acc != v.dtype:
-            p_buf = voyager.alloc([*unit, tq, tkv], v.dtype, _SRAM, 2)
-        else:
-            p_buf = s_buf
-        pv_buf = voyager.alloc([*unit, tq, d_pad], acc, _SRAM)
-        row_tmp = voyager.alloc([*unit, tq, 1], acc, _SRAM)
-        alpha = voyager.alloc([*unit, tq, 1], acc, _SRAM)
+        m = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
+        l = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
+        o = voyager.alloc([*unit, self.tq, self.d], acc, _SRAM)
+        s_buf = voyager.alloc([*unit, self.tq, self.tkv], acc, _SRAM, 2)
+        pv_buf = voyager.alloc([*unit, self.tq, self.d], acc, _SRAM)
+        row_tmp = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
+        alpha = voyager.alloc([*unit, self.tq, 1], acc, _SRAM)
         sem_scores = voyager.zeros([1], torch.int64)
         sem_pv = voyager.zeros([1], torch.int64)
-        res = self._residual_setup(operands, acc, q)
 
-        # The three DMA streams, each with its scales under MX.  K's DRAM
-        # block (and its scales') is transposed by the DMA into the Kᵀ tile
-        # the product reads; the mask block rides with K.
-        def load_q(slot, coords):
-            self._load_sweep(
-                q, q_slots, slot, q_sem, coords, (tq, d_pad), pad=padded
-            )
-            if mx:
-                self._load_sweep(
-                    q_scale,
-                    q_scale_slots,
-                    slot,
-                    q_scale_sem,
-                    coords,
-                    (tq, d_blocks_pad),
-                    pad=blocks_padded,
-                )
-
-        def load_k(slot, coords):
-            self._load_step(
-                k,
-                k_slots,
-                slot,
-                k_sem,
-                coords,
-                (tkv, d),
-                True,
-                rows=d if padded else None,
-            )
-            if mx:
-                self._load_step(
-                    k_scale,
-                    k_scale_slots,
-                    slot,
-                    k_scale_sem,
-                    coords,
-                    (tkv, d_blocks),
-                    True,
-                    rows=d_blocks if blocks_padded else None,
-                )
-            if self.has_mask:
-                self._load_mask(mask, m_slots, slot, m_sem, coords)
-
-        def load_v(slot, coords):
-            self._load_step(
-                v, v_slots, slot, v_sem, coords, (tkv, d_pad), False, pad=padded
-            )
-            if mx:
-                self._load_step(
-                    v_scale,
-                    v_scale_slots,
-                    slot,
-                    v_scale_sem,
-                    coords,
-                    (tkv // bs, d_pad),
-                    False,
-                    pad=padded,
-                )
-
-        # The tiles each product reads at the given slots, and the load
-        # semaphores it waits on.
-        def qk_operands(q_slot, k_slot):
-            q_tile = get_slot(q_slots, q_slot)
-            k_tile = get_slot(k_slots, k_slot)
-            deps = [get_slot(k_sem, k_slot), get_slot(q_sem, q_slot)]
-            if mx:
-                tiles = [
-                    q_tile,
-                    get_slot(q_scale_slots, q_slot),
-                    k_tile,
-                    get_slot(k_scale_slots, k_slot),
-                    *codes,
-                ]
-                deps += [
-                    get_slot(k_scale_sem, k_slot),
-                    get_slot(q_scale_sem, q_slot),
-                ]
-            else:
-                tiles = [q_tile, k_tile]
-            if self.has_mask:
-                tiles.append(get_slot(m_slots, k_slot))
-                deps.append(get_slot(m_sem, k_slot))
-            if self.mask_scaled:
-                tiles.append(self.mask_scale)
-            return tiles, deps
-
-        def pv_operands(p_slot, v_slot):
-            p_tile = get_slot(p_buf, p_slot)
-            v_tile = get_slot(v_slots, v_slot)
-            deps = [get_slot(v_sem, v_slot)]
-            if mx:
-                tiles = [
-                    p_tile,
-                    get_slot(p_scale, p_slot),
-                    v_tile,
-                    get_slot(v_scale_slots, v_slot),
-                    *codes,
-                ]
-                deps.append(get_slot(v_scale_sem, v_slot))
-            else:
-                tiles = [p_tile, v_tile]
-            return tiles, deps
-
-        def pv_real():
-            """What the accumulate reads of ``pv_buf``: its real columns.
-            Taken where it is read -- a view captured beside its buffer
-            would alias a ``while_loop`` input."""
-            return self._cols(pv_buf, d) if padded else pv_buf
-
-        def softmax(slot, sweep_slot):
-            self._softmax(
-                get_slot(s_buf, slot),
-                get_slot(p_buf, slot),
-                m,
-                get_slot(l, sweep_slot),
-                row_tmp,
-                alpha,
-                sem_scores,
-                get_slot(p_scale, slot) if mx else None,
-                probs if mx else None,
-            )
-
-        # ---- prologue: prime the DMA and run step 0's [A] + [D] --------
-        # The walk's first two steps: the second is sweep 0's next block,
-        # or sweep 1's first when sweep 0 has a single block.
-        sweeps, basis = self.sweeps, grid[:-1]
+        # ---- prologue: prime the DMA and run step 0's [A] + [C] --------
         c0 = _unravel(0, grid)
-        sweep1 = int(self._kv_last(0) == 0)
-        c1 = (*_unravel(sweep1, basis), 1 - sweep1)
-        # The row-padded Kᵀ tiles' pad rows, zeroed once before any load
-        # lands in the slots (module docstring).
-        row_padded = [k_slots] if padded else []
-        if blocks_padded:
-            row_padded.append(k_scale_slots)
-        if padded and res is not None:
-            row_padded.append(res.k_slots)
-        for slots in row_padded:
-            for slot in range(2):
-                tile = get_slot(slots, slot)
-                voyager.insert(torch.zeros_like(tile), tile)
-        load_q(0, c0)
-        load_k(0, c0)
+        self._load_q(q, q_slots, 0, q_sem, c0)
+        self._load_k(k, k_slots, 0, k_sem, c0)
+        if self.has_mask:
+            self._load_mask(mask, m_slots, 0, m_sem, c0)
         if num_steps > 1:
-            load_k(1, c1)
-            if sweep1:
+            c1 = _unravel(1, grid)
+            self._load_k(k, k_slots, 1, k_sem, c1)
+            if self.has_mask:
+                self._load_mask(mask, m_slots, 1, m_sem, c1)
+            if N == 1:
                 # Step 0 is also its sweep's LAST step, so the uniform
                 # pattern's end-of-sweep Q prefetch belongs here too.
-                load_q(1, c1)
-        if sweep1 and res is not None:
-            self._residual_prefetch(res, 0, c0)
+                self._load_q(q, q_slots, 1, q_sem, c1)
         # V's stream runs one step behind K's: block 0 lands in the slot
         # step 1 reads (slot 1); nothing is fetched for step 0, which
         # consumes no V.
-        load_v(1 % 2, c0)
+        self._load_v(v, v_slots, 1 % 2, v_sem, c0)
 
-        self._reset(m, get_slot(l, 0))
-        voyager.insert(torch.zeros_like(o), o)
-        tiles, deps = qk_operands(0, 0)
-        self._matmul_qk(tiles, get_slot(s_buf, 0), sem_scores, deps)
-        softmax(0, 0)
+        self._reset(m, l, o)
+        deps = [get_slot(k_sem, 0), get_slot(q_sem, 0)]
+        if self.has_mask:
+            deps.append(get_slot(m_sem, 0))
+        self._matmul_qk(
+            get_slot(q_slots, 0),
+            get_slot(k_slots, 0),
+            get_slot(m_slots, 0) if self.has_mask else None,
+            get_slot(s_buf, 0),
+            sem_scores,
+            deps,
+        )
+        self._softmax(get_slot(s_buf, 0), m, l, row_tmp, alpha, sem_scores)
 
         # ---- the uniform loop: t = 1 .. num_steps - 1 -------------------
-        # Carried beside the step: the (sweep, kv) pair it runs, which the
-        # walk advances (no step count maps back to its pair).
-        def cond_fn(step, sweep, kv):
+        def cond_fn(step):
             return step < num_steps
 
-        def body_fn(step, sweep, kv):
-            cur = (*voyager.delinearize_index(sweep, basis), kv)
-            last = self._kv_last(cur[self.gq])
-            nxt_sweep = sweep + (kv + 1) // (last + 1)
-            nxt_kv = (kv + 1) % (last + 1)
-            nxt = (*voyager.delinearize_index(nxt_sweep, basis), nxt_kv)
-            # The sweep that just ended, whose output a boundary stores;
-            # wrapped so the index stays in range on sweep 0, whose own
-            # boundary was the prologue's.
-            prev = voyager.delinearize_index(
-                (sweep + sweeps - 1) % sweeps, basis
-            )
+        def body_fn(step):
+            cur = voyager.delinearize_index(step, grid)
+            prev = voyager.delinearize_index(step - 1, grid)
+            nxt = voyager.delinearize_index(step + 1, grid)
+            kv = cur[self.gkv]
             cur_slot = step % 2
             nxt_slot = (step + 1) % 2
             torch._check(cur_slot < 2)
@@ -955,137 +372,111 @@ class _FA3Pipeline(torch.nn.Module):
             # step's block into the slot the next step reads (the lag);
             # Q prefetches the next sweep's tile at each sweep's end.
             def k_fetch():
-                load_k(nxt_slot, nxt)
+                self._load_k(k, k_slots, nxt_slot, k_sem, nxt)
+                if self.has_mask:
+                    self._load_mask(mask, m_slots, nxt_slot, m_sem, nxt)
                 return 1
 
             torch.cond(step + 1 < num_steps, k_fetch, lambda: 0)
-            load_v(nxt_slot, cur)
+            self._load_v(v, v_slots, nxt_slot, v_sem, cur)
 
-            next_sweep_slot = nxt_sweep % 2
-            torch._check(next_sweep_slot < 2)
+            q_next_slot = ((step + 1) // N) % 2
+            torch._check(q_next_slot < 2)
 
             def q_fetch():
-                load_q(next_sweep_slot, nxt)
+                self._load_q(q, q_slots, q_next_slot, q_sem, nxt)
                 return 1
 
             torch.cond(
-                (kv == last) & (step + 1 < num_steps), q_fetch, lambda: 0
+                (kv == N - 1) & (step + 1 < num_steps), q_fetch, lambda: 0
             )
-
-            sweep_slot = sweep % 2
-            torch._check(sweep_slot < 2)
-            if res is not None:
-                # The sweep's residual, consumed at the next boundary.
-                def res_fetch():
-                    self._residual_prefetch(res, sweep_slot, cur)
-                    return 1
-
-                torch.cond(kv == last, res_fetch, lambda: 0)
 
             # [A] current block's scores on the matrix unit: its K (and mask)
             # load semaphores are per-step commit dependencies; Q's is too, but
-            # Q is loaded once per sweep, so its load posts once per live step
-            # (see _load_sweep) to balance the per-step consume.  V is not a
-            # dependency here — it feeds [B], so [A] issues while V's DMA is
-            # in flight.  The sweep's parity picks its Q slot and its ``l``.
-            tiles, deps = qk_operands(sweep_slot, cur_slot)
-            self._matmul_qk(tiles, get_slot(s_buf, cur_slot), sem_scores, deps)
+            # Q is loaded once per sweep, so its load posts N times (see
+            # _load_q) to balance the per-step consume.  V is not a dependency
+            # here — it feeds [B], so [A] issues while V's DMA is in flight.
+            q_slot = (step // N) % 2
+            torch._check(q_slot < 2)
+            deps = [get_slot(k_sem, cur_slot), get_slot(q_sem, q_slot)]
+            if self.has_mask:
+                deps.append(get_slot(m_sem, cur_slot))
+            self._matmul_qk(
+                get_slot(q_slots, q_slot),
+                get_slot(k_slots, cur_slot),
+                get_slot(m_slots, cur_slot) if self.has_mask else None,
+                get_slot(s_buf, cur_slot),
+                sem_scores,
+                deps,
+            )
 
             # [B] the lagged P@V on the matrix unit: previous step's
             # probabilities × its V block (in this step's V read slot) into
             # pv_buf; the V load semaphore is the commit dependency.
             prev_slot = (step - 1) % 2
             torch._check(prev_slot < 2)
-            tiles, deps = pv_operands(prev_slot, cur_slot)
-            self._matmul_pv(tiles, pv_buf, sem_pv, deps)
+            self._matmul_pv(
+                get_slot(s_buf, prev_slot),
+                get_slot(v_slots, cur_slot),
+                pv_buf,
+                sem_pv,
+                [get_slot(v_sem, cur_slot)],
+            )
 
-            # [C] Q-tile boundary, first half: fresh m and l for the new
-            # tile.  The tile that just ended keeps its sum in the other l
-            # slot for the finalize, which waits until after [D].
-            def reset():
-                if res is not None:
-                    self._residual_snapshot(res, m)
-                self._reset(m, get_slot(l, sweep_slot))
-                return 1
-
-            torch.cond(kv == 0, reset, lambda: 0)
-
-            # [D] softmax of the current block on the vector unit — runs
-            # (synchronously) while the matrix [B] matmul is still in flight.
-            softmax(cur_slot, sweep_slot)
-
-            # [E] Q-tile boundary, second half: land the previous tile's last
-            # P@V into o, finalize (o / its l) to ITS rows, zero o for the
-            # new tile.  After [D] so the vector unit is not held on sem_pv
-            # before the softmax.
-            prev_sweep_slot = (sweep + 1) % 2
-            torch._check(prev_sweep_slot < 2)
-
-            def finalize():
+            # [D] Q-tile boundary: land the previous tile's last P@V into o,
+            # finalize (o / l) to ITS rows, reset for the new tile.  Runs
+            # before [C] so the new tile's softmax sees fresh m/l.
+            def boundary():
                 voyager.async_wait(sem_pv)
-                voyager.insert(o + pv_real(), o)
-                if res is not None:
-                    self._residual_step(
-                        res,
-                        prev_sweep_slot,
-                        get_slot(l, prev_sweep_slot),
-                        o,
-                        row_tmp,
-                        alpha,
-                    )
+                voyager.insert(o + pv_buf, o)
                 # Drain the previous boundary's store before overwriting
                 # the slot (no prior store exists at the first boundary).
-                _guarded_wait(get_slot(out_sem, 0), sweep >= 2)
+                _guarded_wait(get_slot(out_sem, 0), step >= 2 * N)
                 voyager.insert(
-                    (o / get_slot(l, prev_sweep_slot)).to(self.out_dtype),
-                    get_slot(out_slots, 0),
+                    (o / l).to(self.out_dtype), get_slot(out_slots, 0)
                 )
                 self._store_out(get_slot(out_slots, 0), out, out_sem, prev)
-                voyager.insert(torch.zeros_like(o), o)
+                self._reset(m, l, o)
                 return 1
 
-            torch.cond(kv == 0, finalize, lambda: 0)
+            torch.cond(kv == 0, boundary, lambda: 0)
 
-            # [F] deferred rescale fused with the P@V accumulate: o = alpha·(o
+            # [C] softmax of the current block on the vector unit — runs
+            # (synchronously) while the matrix [B] matmul is still in flight.
+            self._softmax(
+                get_slot(s_buf, cur_slot), m, l, row_tmp, alpha, sem_scores
+            )
+
+            # [E] deferred rescale fused with the P@V accumulate: o = alpha·(o
             # + pv).  Runs after softmax (kv >= 1 only) so the vector unit
             # isn't blocked on sem_pv before the softmax.
             def rescale():
                 voyager.async_wait(sem_pv)
-                voyager.insert(alpha * (o + pv_real()), o)
+                voyager.insert(alpha * (o + pv_buf), o)
                 return 1
 
             torch.cond(kv > 0, rescale, lambda: 0)
-            return (step + 1, nxt_sweep, nxt_kv)
+            return (step + 1,)
 
-        while_loop(cond_fn, body_fn, (1, sweep1, 1 - sweep1))
+        while_loop(cond_fn, body_fn, (1,))
 
         # ---- epilogue: the final tile's leftover P@V + finalize --------
-        c_last = _unravel(sweeps - 1, basis)
-        c_last = (*c_last, self._kv_last(c_last[self.gq]))
+        c_last = _unravel(num_steps - 1, grid)
         v_slot = num_steps % 2
         # [B] the final block's P@V on the matrix unit.
-        tiles, deps = pv_operands((num_steps - 1) % 2, v_slot)
-        self._matmul_pv(tiles, pv_buf, sem_pv, deps)
+        self._matmul_pv(
+            get_slot(s_buf, (num_steps - 1) % 2),
+            get_slot(v_slots, v_slot),
+            pv_buf,
+            sem_pv,
+            [get_slot(v_sem, v_slot)],
+        )
         # land it into o on the vector unit, then finalize.
         voyager.async_wait(sem_pv)
-        voyager.insert(o + pv_real(), o)
-        last_sweep_slot = (sweeps - 1) % 2
-        if res is not None:
-            self._residual_snapshot(res, m)
-            self._residual_step(
-                res,
-                last_sweep_slot,
-                get_slot(l, last_sweep_slot),
-                o,
-                row_tmp,
-                alpha,
-            )
-        if sweeps > 1:  # a prior boundary store exists (static)
+        voyager.insert(o + pv_buf, o)
+        if num_steps > N:  # a prior boundary store exists (static)
             voyager.async_wait(get_slot(out_sem, 0))
-        voyager.insert(
-            (o / get_slot(l, last_sweep_slot)).to(self.out_dtype),
-            get_slot(out_slots, 0),
-        )
+        voyager.insert((o / l).to(self.out_dtype), get_slot(out_slots, 0))
         self._store_out(get_slot(out_slots, 0), out, out_sem, c_last)
         voyager.async_wait(get_slot(out_sem, 0))  # drain
         if self.g_head > 1:
@@ -1093,106 +484,29 @@ class _FA3Pipeline(torch.nn.Module):
         return out
 
 
-def _operand_index(node):
-    """Position of each named operand -- query, key, value, attn_mask and
-    the MX kwargs -- among ``node.all_input_nodes``, the order
-    ``_FA3Pipeline.forward`` receives them."""
-    operands = {
-        "query": node.args[0],
-        "key": node.args[1],
-        "value": node.args[2],
-    }
-    for position, name in _OPTIONAL_OPERANDS.items():
-        operand = get_arg_value(node, position, name, None)
-        if isinstance(operand, torch.fx.Node):
-            operands[name] = operand
-    operands.update(
-        (name, n)
-        for name, n in node.kwargs.items()
-        if isinstance(n, torch.fx.Node)
-    )
-    inputs = list(node.all_input_nodes)
-    return {name: inputs.index(n) for name, n in operands.items()}
-
-
-def _stamp_probs_dtypes(gm, dtypes):
-    """Stamp ``dtypes`` -- P's ``(scale, codes)`` logical dtypes, the
-    query's -- on every ``quantize_mx`` in ``gm`` and its nested graphs:
-    no node of the original graph carries them for the bufferizer's
-    propagation to read."""
-    for n in gm.graph.nodes:
-        if n.op == "call_function" and n.target is _QUANTIZE_MX:
-            n.meta["dtype"] = dtypes
-        elif n.op in ("get_attr", "call_module"):
-            sub = getattr(gm, str(n.target), None)
-            if isinstance(sub, torch.fx.GraphModule):
-                _stamp_probs_dtypes(sub, dtypes)
-
-
-def _stamp_product_tilings(gm, products, keys):
-    """Copy the products' mapping metadata (``attention_op_tiling``) onto
-    every kernel of ``gm`` that runs one -- the bare product op or the
-    fused ``call_module`` around it, at every nesting level -- the way the
-    GEMM builder stamps its nest, so the emitter and the reporting model
-    see the mapping the kernel runs.  ``keys`` names each product by
-    ``(under MX, contraction, output width)``, which tells the scores from
-    the context and the main products from a residual's."""
-    named = dict(gm.named_modules())
-    for n in gm.graph.nodes:
-        sub = named.get(str(n.target)) if n.op != "call_function" else None
-        if n.op == "get_attr" and isinstance(sub, torch.fx.GraphModule):
-            _stamp_product_tilings(sub, products, keys)
-            continue
-        if n.op == "call_function" and n.target in _PRODUCT_OPS:
-            anchor = n
-        elif isinstance(sub, torch.fx.GraphModule):
-            anchor = next(
-                (x for x in sub.graph.nodes if x.target in _PRODUCT_OPS), None
-            )
-        else:
-            anchor = None
-        if anchor is None:
-            continue
-        which = keys[
-            (
-                anchor.target is _PRODUCT_OPS[1],
-                anchor.args[0].value.shape[-1],
-                anchor.value.shape[-1],
-            )
-        ]
-        n.meta.update(products[which])
-
-
 def build_attention_fa3(
     node,
     *,
-    accumulate_fp32: bool = False,
+    accumulate_fp32: bool = True,
     tiler=None,
-    bool_mask: bool = True,
 ):
     """FA3-style pipeline builder for an
-    ``aten.scaled_dot_product_attention`` node, or its ``sdpa_mx`` twin
-    whose operands are MX codes with block scales.
+    ``aten.scaled_dot_product_attention`` node.
 
     Returns the bufferized ``GraphModule`` (prologue + rolled
     ``while_loop`` + epilogue over ``voyager.*`` primitives, see the
-    module docstring), or ``None`` when uncovered (unsupported rank, an
-    unfoldable GQA layout, no tiling and no ``tiler`` to choose one).  GQA
-    is supported by folding the head group into the query rows (below);
-    ``dropout_p`` is ignored (identity at inference).  ``accumulate_fp32``
-    runs the softmax and the output accumulator in fp32 instead of the
-    output dtype, at the cost of a separate probabilities buffer at V's
-    dtype when the two differ.  The block counts
-    ``(num_q_blocks, num_kv_blocks)`` come from ``node.meta['l2_tiling']``
-    when set, else ``attention_op_tiling`` chooses them under
-    ``tiler.config``, which also sets the head the tiles are padded to
-    (``attention_head_pad``); a node tiled by a padding tiler is built
-    with that tiler, so the kernel's products match the ones it mapped.
-    The kernel adds its mask: an explicit ``attn_mask`` must be additive,
-    and under ``is_causal`` the kernel's own table is int1 codes plus a
-    scale (``bool_mask``) or the additive fill at the accumulation dtype.
+    module docstring), or ``None`` when uncovered (missing tiling,
+    unsupported rank).  GQA is supported by folding the head group into
+    the query rows (below); ``dropout_p`` is ignored (identity at
+    inference).  ``tiler`` is accepted for signature parity but unused —
+    attention tiling comes from ``node.meta['l2_tiling']``
+    (``(num_q_blocks, num_kv_blocks)``).
     """
-    if node.op != "call_function" or node.target not in _ATTENTION_OPS:
+    if (
+        node.op != "call_function"
+        or node.target
+        is not torch.ops.aten.scaled_dot_product_attention.default
+    ):
         return None
 
     q_node, k_node, v_node = node.args[0], node.args[1], node.args[2]
@@ -1207,10 +521,16 @@ def build_attention_fa3(
             node.name,
             dropout_p,
         )
-    if is_causal and isinstance(mask_node, torch.fx.Node):
-        raise ValueError(f"{node.name}: is_causal with an explicit attn_mask")
+    if is_causal:
+        raise NotImplementedError(
+            "is_causal attention is not supported yet; pass an explicit "
+            "additive attn_mask instead"
+        )
 
-    block_size = node.kwargs.get("block_size")  # None: unquantized
+    tiling = node.meta.get("l2_tiling")
+    if tiling is None:
+        return None
+    num_q_blocks, num_kv_blocks = tiling
 
     q = q_node.value.clone()
     k = k_node.value.clone()
@@ -1222,61 +542,29 @@ def build_attention_fa3(
     nb = q.ndim - 2
     Sq, d = q.shape[-2], q.shape[-1]
     Skv = k.shape[-2]
-    if is_causal and Skv < Sq:
-        raise ValueError(
-            f"{node.name}: is_causal over fewer keys ({Skv}) than queries "
-            f"({Sq})"
-        )
     if scale is None:
         scale = 1.0 / math.sqrt(d)
-    acc_dtype = torch.float32 if accumulate_fp32 else out.dtype
-    head_pad = attention_head_pad(d, tiler.config) if tiler is not None else d
 
     # GQA folds the head group into the query rows so K/V load once per KV head
     # and reuse across the group (see ``plan_gqa_fold``); ``forward`` applies
-    # the q / mask / output reshapes.  The fold only needs the query block
-    # count to check divisibility, and a count the tiler picks divides by
-    # construction, so an unset tiling plans at one block.
+    # the q / mask / output reshapes.
     mask_val = mask_node.value if isinstance(mask_node, torch.fx.Node) else None
-    tiling = node.meta.get("l2_tiling")
-    plan = plan_gqa_fold(
-        q, k, v, mask_val, out.shape, tiling[0] if tiling else 1
-    )
+    plan = plan_gqa_fold(q, k, v, mask_val, out.shape, num_q_blocks)
     if plan is None:
         return None
     kbatch, g_head = plan.kbatch, plan.g_head
-    if tiling is None:
-        if tiler is None:
-            return None
-        tiling = attention_op_tiling(
-            node,
-            tiler,
-            sq_eff=plan.sq_eff,
-            kv_batch=kbatch,
-            acc_dtype=acc_dtype,
-            bool_mask=bool_mask,
-        )
-    num_q_blocks, num_kv_blocks = tiling
     tq, tkv = plan.sq_eff // num_q_blocks, Skv // num_kv_blocks
-    if is_causal and Sq % tq:
-        raise ValueError(
-            f"{node.name}: a {tq}-row query tile straddles a head of {Sq} "
-            "rows under is_causal"
-        )
     grid = kbatch + (num_q_blocks, num_kv_blocks)
     gq, gkv = nb, nb + 1
 
     # Mask [*mbatch, Sq, Skv]: dynamic dims are the >1-block batch dims (a
     # size-1 batch dim broadcasts, pinned to block 0) plus the q / kv dims when
     # tiled.  Under the fold the mask's batch dims are the folded ones.
+    mask_is_bool = False
     mask_dyn = []
     if isinstance(mask_node, torch.fx.Node):
         mask = mask_node.value
-        if mask.dtype == torch.bool:
-            raise ValueError(
-                f"{node.name}: a bool attn_mask is not lowered; the kernel "
-                "adds its mask, so pass an additive one"
-            )
+        mask_is_bool = mask.dtype == torch.bool
         mb = tuple(mask.shape[:-2])
         if g_head > 1:
             mb = plan.mask_fold_shape[:-2]
@@ -1298,12 +586,10 @@ def build_attention_fa3(
         tq=tq,
         tkv=tkv,
         head_dim=d,
-        head_pad=head_pad,
         scale=float(scale),
-        has_mask=mask_node is not None or is_causal,
+        has_mask=mask_node is not None,
+        mask_is_bool=mask_is_bool,
         mask_dyn=mask_dyn,
-        is_causal=is_causal,
-        bool_mask=bool_mask,
         g_head=g_head,
         sq_orig=Sq,
         q_fold_shape=plan.q_fold_shape,
@@ -1312,17 +598,11 @@ def build_attention_fa3(
         mask_fold_shape=plan.mask_fold_shape,
         out_shape=plan.out_fold_shape,
         out_dtype=out.dtype,
-        acc_dtype=acc_dtype,
-        operand_index=_operand_index(node),
-        block_size=block_size,
-        probs_quant_max=node.kwargs.get("probs_quant_max"),
-        force_scale_power_of_two=node.kwargs.get(
-            "force_scale_power_of_two", False
-        ),
+        acc_dtype=torch.float32 if accumulate_fp32 else out.dtype,
     )
 
-    # ``all_input_nodes`` is the order ``forward`` takes its operands
-    # (``_operand_index``).
+    # ``all_input_nodes`` is the SDPA operands in fixed arg order (query,
+    # key, value, then optional attn_mask) — the order ``forward`` takes.
     inputs = tuple(n.value.clone() for n in node.all_input_nodes)
     with _lenient_verifier():
         gm = export_model(pattern, inputs)
@@ -1331,31 +611,4 @@ def build_attention_fa3(
     with oracle_disabled():
         ShapeProp(gm, recurse=True).propagate(*inputs)
     _fuse_passes(gm)
-    if block_size is not None:
-        _stamp_probs_dtypes(
-            gm,
-            (
-                node.kwargs["query_scale"].meta.get("dtype"),
-                q_node.meta.get("dtype"),
-            ),
-        )
-    if is_causal and bool_mask:
-        # The table's int1 codes ride a float buffer; its tiles are sized
-        # and emitted as int1 (the bufferizer carries the dtype to the slot).
-        for n in gm.graph.nodes:
-            if n.op == "get_attr" and str(n.target).endswith("causal_mask"):
-                n.meta["dtype"] = "int1"
-    products = node.meta.get("product_tilings")
-    if products is not None:
-        mx = block_size is not None
-        keys = {
-            (mx, head_pad, tkv): "scores",
-            (mx, tkv, head_pad): "context",
-        }
-        residual = get_arg_value(node, 7, "key_residual", None)
-        if residual is not None:
-            length = residual.value.shape[-2]
-            keys.setdefault((False, head_pad, length), "residual_scores")
-            keys.setdefault((False, length, head_pad), "residual_context")
-        _stamp_product_tilings(gm, products, keys)
     return gm

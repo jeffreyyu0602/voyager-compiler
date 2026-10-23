@@ -33,27 +33,27 @@ def quantize_to_nf(
     input: torch.Tensor,
     k: int = 4,
     use_extra_value=True,
-    grid=None,
+    int_bits=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a tensor to NormalFloat's levels.
+    """
+    Quantizes input tensor to normal distribution values.
 
     Args:
-        input: The tensor to quantize.
-        k: Bit width; there are ``2**k`` levels.
-        use_extra_value: Use the asymmetric map, which has one more positive
-            level than negative ones.
-        grid: Ascending values a level may take.  The levels are scaled to
-            its largest value and each moved to the nearest one, which can
-            merge two of them.  None keeps them in [-1, 1].
+        input: The input tensor to quantize
+        k: Bit-width for quantization (2^k values)
+        use_extra_value: Whether to use asymmetric quantization with an extra value
+        int_bits: If specified, scales values to integers with this many bits
 
     Returns:
-        The index of the level each element rounds to, and the levels.
+        tuple containing:
+            - indices: Tensor of quantized indices
+            - values: The corresponding quantization values/levels
     """
     values = create_normal_map(k=k, use_extra_value=use_extra_value)
 
-    if grid is not None:
-        values = values.to(grid) * grid.max()
-        values = grid[torch.abs(values[:, None] - grid).argmin(-1)]
+    if int_bits is not None:
+        scale_factor = 2**(int_bits - 1) - 1
+        values = torch.round(values * scale_factor)
 
     values = values.to(device=input.device, dtype=input.dtype)
     input = torch.clamp(input, min=values.amin(), max=values.amax())

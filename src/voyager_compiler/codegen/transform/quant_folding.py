@@ -1,41 +1,32 @@
 """Fold quantize / dequantize nodes into the ops around them.
 
-Three passes.  ``split_kv_cache`` runs on the exported decode graph before
-quantization: it splits each KV cache into the completed, block-aligned
-chunks (which the quantizer then sees as one tensor) and a small
-full-precision residual holding the chunk being filled.  The other two run
-over an already-quantized graph and move a quantize or dequantize rather
-than compute it:
+Two passes over an already-quantized graph, both of which move a quantize or
+dequantize rather than compute it:
 
   * ``fuse_quantize_dequantize_with_producer`` runs inside ``transform()``.
     It hoists a quantize into its producer (so a value is stored already
-    narrow), replays it above a relayout, and folds one (a ``quantize_mx``
-    or a group-wise ``quantize_affine``) into a KV cache write.
+    narrow), replays it above a relayout, folds one into a KV cache write, and
+    splits a quantized cache feeding a GEMV.
   * ``fuse_dequantize_quantize`` collapses a ``get_attr -> dequantize -> layout
     ops -> quantize`` chain into a single ``dequantize`` with pre-multiplied
     scales, storing a grouped-query parameter once rather than once per head.
 
-All three work purely on the ``quantized_ops`` schema and FX, not on the
-quantizer that produced the graph.
+Both work purely on the ``quantized_ops`` schema and FX, not on the quantizer
+that produced the graph.
 """
 
 import copy
 import logging
 import math
 import operator
-import re
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx import Graph, GraphModule, Node
-from torch.fx.node import map_arg
 
 from voyager_compiler.codegen.aten_classifier import is_compute_op
 from voyager_compiler.codegen.node_info import (
     _BROADCAST_OPS,
-    QUANTIZE_FAMILY_OPS,
     get_arg_value,
     is_gemm_op,
     is_mha_qkv_permute,
@@ -43,23 +34,22 @@ from voyager_compiler.codegen.node_info import (
     is_reshape_op,
     reshape_preserves_full_blocks,
 )
-from voyager_compiler.codegen.subgraph import get_new_node_name_with_prefix
-from voyager_compiler.export_utils import create_getattr_from_value
-from voyager_compiler.ops.quantized import expand
-from voyager_compiler.shape_prop import (
-    constant_value,
-    fetch_attr,
-    propagate_shape,
-    set_node_value,
+from voyager_compiler.codegen.subgraph import (
+    create_and_insert_subgraph,
+    replace_node_with_graph_module,
 )
+from voyager_compiler.export_utils import (
+    create_getattr_from_value,
+    get_aten_graph_module,
+)
+from voyager_compiler.ops.quantized import expand
+from voyager_compiler.shape_prop import fetch_attr, propagate_shape
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "fuse_dequantize_quantize",
     "fuse_quantize_dequantize_with_producer",
-    "sink_cache_folds",
-    "split_kv_cache",
 ]
 
 
@@ -87,25 +77,16 @@ _FORK_OPS = (
     torch.ops.aten.cat.default,
 )
 
-_DEQUANTIZE = torch.ops.quantized_ops.dequantize.default
 _QUANTIZE_MX = torch.ops.quantized_ops.quantize_mx.default
-_QUANTIZE_AFFINE = torch.ops.quantized_ops.quantize_affine.default
-_QUANTIZE_MX_OUTLIER = torch.ops.quantized_ops.quantize_mx_outlier.default
+_QUANTIZE_OPS = (
+    torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.dequantize.default,
+    _QUANTIZE_MX,
+)
 
-# A dynamic quantize returns its qparams beside the value, the value last:
-# ``quantize_mx`` gives ``(scale, value)``, ``quantize_affine`` ``(scale,
-# zero_point, value)``.  The value inherits the relayout ops the quantize was
-# lifted over; each qparam gets a replayed copy of them.  A cache baked through
-# one becomes a buffer per output, named ``<cache>_<suffix>``.
-_OUTPUT_NAMES = {
-    _QUANTIZE_MX: ("scale", "full"),
-    _QUANTIZE_AFFINE: ("scale", "zero_point", "full"),
-}
+# ``quantize_mx`` returns ``(scale, value)``.  The value inherits the relayout
+# ops the quantize was lifted over; the scale gets a replayed copy of them.
 _MX_VALUE = 1
-
-
-def _value_index(op) -> int:
-    return len(_OUTPUT_NAMES[op]) - 1
 
 
 def _is_relayout(node) -> bool:
@@ -351,552 +332,251 @@ def _replay(target_fn, value, ops):
     return value
 
 
-_MATMUL = torch.ops.aten.matmul.default
-_COND = torch.ops.higher_order.cond
-_SDPA = torch.ops.aten.scaled_dot_product_attention.default
-_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
-_ATTENTION_OPS = (_SDPA, _SDPA_MX)
-_REPEAT_OPS = (
-    torch.ops.aten.unsqueeze.default,
-    torch.ops.aten.expand.default,
-    *_REGROUP_OPS,
-)
-
-# The KV-cache buffers of a Hugging Face static-cache decode export, and the
-# residual buffers ``split_kv_cache`` puts beside them.
-_KV_CACHE = re.compile(r"^(key|value)_cache_(\d+)$")
+_MATMUL_MX = torch.ops.quantized_ops.matmul_mx.default
 
 
-def _shape_of(node: Node):
-    """``node``'s tensor shape, from ``ShapeProp``'s value or, on a graph
-    fresh from export, the fake value export stamped."""
-    value = getattr(node, "value", None)
-    if not isinstance(value, torch.Tensor):
-        value = node.meta["val"]
-    return tuple(value.shape)
+def _cone_to_matmul(idx: Node, node: Node):
+    """``(nodes, matmul)`` -- the cone from cache write ``idx`` through quantize
+    ``node`` and the relayout ops under it (``repeat_kv``, once for the value
+    and once for the scale), down to the one ``matmul_mx`` reading it.  Both
+    ``(None, None)`` if it is not that shape.
 
-
-def _axis_through(node: Node, axis: int):
-    """Where input dim ``axis`` of relayout ``node`` lands in its output, or
-    ``None`` when the op moves, merges or cuts it.  A quantize, dequantize,
-    ``getitem`` or ``expand`` keeps every dim in place."""
-    target = node.target
-    if target is operator.getitem or target in QUANTIZE_FAMILY_OPS:
-        return axis
-    rank = len(_shape_of(node.args[0]))
-    if target is torch.ops.aten.unsqueeze.default:
-        dim = node.args[1] % (rank + 1)
-        return axis + 1 if axis >= dim else axis
-    if target is torch.ops.aten.transpose.int:
-        a0, a1 = (d % rank for d in node.args[1:3])
-        return a1 if axis == a0 else a0 if axis == a1 else axis
-    if target is torch.ops.aten.permute.default:
-        return [d % rank for d in node.args[1]].index(axis)
-    if target in _REGROUP_OPS:
-        mapped = validate_and_map_group_axes_for_reshape(
-            _shape_of(node.args[0]), _shape_of(node), [axis]
-        )
-        return mapped[0] if mapped else None
-    if target is torch.ops.aten.slice.Tensor and node.args[1] % rank == axis:
-        return None
-    return axis
-
-
-def _attention_cone(idx: Node):
-    """``(relayouts, consumer)``: the relayout ops from cache write ``idx``
-    down to the one op that reads the cache -- an ``aten.matmul`` as its
-    right operand, or an attention node as its key or value -- in graph
-    order; ``(None, None)`` if the write reaches anything else."""
-    relayouts, frontier, consumers, seen = [], [idx], [], {idx}
+    Dead code has to be gone first: the hoist leaves the quantize it lifted
+    behind, still reading this cone, and the walk would stop on it.
+    """
+    cone, frontier, matmuls = {idx: None, node: None}, [node], set()
     while frontier:
         for user in frontier.pop().users:
-            if user in seen:
+            if user in cone:
                 continue
-            seen.add(user)
-            if user.target is _MATMUL or user.target in _ATTENTION_OPS:
-                consumers.append(user)
-            elif _is_relayout(user):
-                relayouts.append(user)
+            cone[user] = None
+            if user.target is _MATMUL_MX:
+                matmuls.add(user)
+            elif _is_relayout(user) or user.target is operator.getitem:
                 frontier.append(user)
             else:
                 return None, None
-    if len(consumers) != 1:
+    if len(matmuls) != 1:
         return None, None
-    consumer = consumers[0]
-    operands = consumer.args[1:3] if consumer.target is not _MATMUL else ()
-    operands = operands or (consumer.args[1],)
-    if not any(a in seen for a in operands):
-        return None, None
-    order = {n: i for i, n in enumerate(idx.graph.nodes)}
-    return sorted(relayouts, key=order.__getitem__), consumer
+    return list(cone), next(iter(matmuls))
 
 
-def _stamp_fake(node: Node, fake_mode) -> None:
-    """Give a node built after export the ``meta["val"]`` export would have
-    stamped: the op run on its operands' fake values, under the graph's own
-    fake mode.  The quantizer's annotation and observer insertion read it."""
-    if node.op == "get_attr":
-        value = fetch_attr(node.graph.owning_module, node.target)
-        node.meta["val"] = fake_mode.from_tensor(value, static_shapes=True)
-        return
-
-    def load(a):
-        return map_arg(a, lambda n: n.meta["val"])
-
-    with fake_mode:
-        node.meta["val"] = node.target(*load(node.args), **load(node.kwargs))
-
-
-def _copy_scope(node: Node, like: Node) -> None:
-    """Stamp ``node`` with the module scope ``like`` was traced from, so the
-    quantizer's scope- and order-based filters see it beside ``like``."""
-    for key in ("nn_module_stack", "source_fn_stack"):
-        if key in like.meta:
-            node.meta[key] = like.meta[key]
-
-
-def _split_one_cache(
+def _split_quantized_cache(
     model: GraphModule,
+    node: Node,
     idx: Node,
-    residual_length: int,
     context_len: int,
-    fake_mode,
-) -> None:
-    """Split the cache written by ``idx`` (see ``split_kv_cache``)."""
-    graph = model.graph
-    cache, dim, index, token = idx.args
-    length = residual_length
-    relayouts, matmul = _attention_cone(idx)
-    if matmul is None:
-        raise ValueError(
-            f"{cache.target}: the cache write does not reach a single "
-            "attention matmul or attention node through relayout ops"
-        )
-    dim = dim % len(_shape_of(idx))
-    attention = matmul.target in _ATTENTION_OPS
+    max_new_tokens: int,
+) -> bool:
+    """Split a cache the quantize blocks along the written axis in two, and
+    read each half with its own GEMV.
 
-    # Follow the written axis down to the matmul's right operand: reaching
-    # its last dim makes the residual's scores replace a window of the main
-    # scores; reaching the reduction dim makes them add.  An attention node
-    # takes the residual as operands and joins it itself.
-    join = None
-    if not attention:
-        axis_of = {idx: dim}
-        for n in relayouts:
-            src = next(a for a in n.all_input_nodes if a in axis_of)
-            axis_of[n] = _axis_through(n, axis_of[src])
-            if axis_of[n] is None:
-                raise ValueError(
-                    f"{cache.target}: {n} loses the cache's position axis"
-                )
-        weight = matmul.args[1]
-        weight_rank = len(_shape_of(weight))
-        if axis_of[weight] == weight_rank - 1:
-            join = "scores"
-        elif axis_of[weight] == weight_rank - 2:
-            join = "sum"
-        else:
-            raise ValueError(
-                f"{cache.target}: position axis {axis_of[weight]} of the "
-                "attention matmul's operand is neither its output nor its "
-                "reduction axis"
-            )
+    ``_fold_quantize_into_cache`` cannot bake such a cache: the token lands
+    mid-block, whose scale depends on tokens not written yet.  But every block
+    below the write is final, so the prefix under ``context_len`` is baked once
+    now, and only the residual -- the write's block and the generation slots
+    after it -- is re-quantized each step, at a cost that no longer grows with
+    the context.
 
-    # Split the contents: completed chunks stay, zeros above them; the tail
-    # moves into the residual buffer.
+    The halves are never rejoined -- that concat is the traffic being removed.
+    The GEMV reads them as two partial sums instead: the split axis is the one
+    it reduces over, so summing the two halves' results reconstructs the dot
+    product.
+
+    Args:
+        model: The graph module being lowered; edited in place.
+        node: The ``quantize_mx`` hoisted onto the cache write, blocking
+            along the axis the write indexes.
+        idx: The ``index_copy_`` cache write feeding ``node``.
+        context_len: Positions already written in the exported cache -- the
+            prefix that can be baked quantized.
+        max_new_tokens: Generation slots that follow, sizing the residual
+            window.
+
+    Returns:
+        ``True`` if the cache was split; ``False`` if the cone below ``node``
+        is not a single cache -> GEMV, or the prefix is under one block so
+        there is nothing to bake.
+
+    Raises:
+        RuntimeError: The cache's exported length along the written axis does
+            not match ``context_len + max_new_tokens`` rounded up to
+            ``block_size`` -- the compiler was told a shape the graph was not
+            exported with.
+    """
+
+    cone, matmul = _cone_to_matmul(idx, node)
+    if cone is None:
+        logger.debug(f"Skip splitting {node}: not a cache -> GEMV cone.")
+        return False
+    cache = idx.args[0]
+    rank = len(node.args[0].value.shape)
+    dim = idx.args[1] % rank
+    block_size = node.args[3]
+
     contents = fetch_attr(model, cache.target)
     cache_len = contents.shape[dim]
-    if cache_len % length:
-        raise ValueError(
-            f"{cache.target}: {cache_len} positions is not a multiple of "
-            f"the residual length {length}"
+    expect = -(-(context_len + max_new_tokens) // block_size) * block_size
+    if cache_len != expect:
+        raise RuntimeError(
+            f"KV split: {cache.target} holds {cache_len} positions along dim "
+            f"{dim}, but context_len={context_len} + "
+            f"max_new_tokens={max_new_tokens} rounded "
+            f"up to the {block_size} block is {expect} -- the compiler was "
+            f"told a different shape than the graph was exported with"
         )
-    done = context_len // length * length
-    residual = torch.zeros_like(contents.narrow(dim, 0, length))
-    if context_len > done:
-        residual.narrow(dim, 0, context_len - done).copy_(
-            contents.narrow(dim, done, context_len - done)
-        )
-    contents.narrow(dim, done, cache_len - done).zero_()
 
-    # The write lands in the residual at ``p mod R``; the attention's main
-    # half reads the cache buffer directly.  The residual keeps the cache's
-    # name as its prefix, which is what a traffic report files it under.
-    # A step writing several positions (a speculative-decoding verification)
-    # fills consecutive slots from its first position's and completes the
-    # chunk when its last position lands on slot ``R - 1``; it must not
-    # cross a chunk boundary.
-    tokens = _shape_of(index)[0]
-    if tokens > length:
-        raise ValueError(
-            f"{cache.target}: a step writes {tokens} positions, more than "
-            f"the {length}-slot residual holds"
-        )
-    with graph.inserting_before(idx):
-        residual_attr = create_getattr_from_value(
-            model, graph, f"{cache.target}_residual", residual
-        )
-        _stamp_fake(residual_attr, fake_mode)
-        new_nodes = []
-        first = index
-        if tokens > 1:
-            first = graph.call_function(
-                torch.ops.aten.select.int, (index, 0, 0)
-            )
-            new_nodes.append(first)
-        slot = graph.call_function(
-            torch.ops.aten.remainder.Scalar, (first, length)
-        )
-        chunk = graph.call_function(
-            torch.ops.aten.floor_divide.default, (first, length)
-        )
-        base = graph.call_function(torch.ops.aten.mul.Tensor, (chunk, length))
-        arange = graph.call_function(
-            torch.ops.aten.arange.default,
-            (length,),
-            {"dtype": torch.int64, "device": _shape_device(index)},
-        )
-        offsets = graph.call_function(torch.ops.aten.add.Tensor, (base, arange))
-        new_nodes += [slot, chunk, base, arange, offsets]
-        slots = last = slot
-        if tokens > 1:
-            steps = graph.call_function(
-                torch.ops.aten.arange.default,
-                (tokens,),
-                {"dtype": torch.int64, "device": _shape_device(index)},
-            )
-            slots = graph.call_function(
-                torch.ops.aten.add.Tensor, (slot, steps)
-            )
-            last = graph.call_function(
-                torch.ops.aten.add.Tensor, (slot, tokens - 1)
-            )
-            new_nodes += [steps, slots, last]
-        pred = graph.call_function(torch.ops.aten.eq.Scalar, (last, length - 1))
-        new_nodes.append(pred)
-        for n in new_nodes:
-            _copy_scope(n, idx)
-            _stamp_fake(n, fake_mode)
-    idx.replace_all_uses_with(cache)
-    idx.update_arg(0, residual_attr)
-    idx.update_arg(2, slots)
-    _stamp_fake(idx, fake_mode)
+    # Round *down*: a position at or past ``context_len`` is unwritten, so a
+    # block straddling it is not final and belongs to the residual.
+    split = context_len // block_size * block_size
+    if split == 0:
+        return False
 
-    if attention:
-        joined = _split_attention_operand(
-            model, matmul, cache, idx, relayouts, offsets, fake_mode
-        )
-        _fold_chunk(model, cache, dim, idx, offsets, pred, joined, fake_mode)
-        logger.info(
-            f"Split {cache.target}: {done} positions in completed chunks, "
-            f"{context_len - done} in the {length}-slot residual; the "
-            "attention takes the residual as an operand"
-        )
-        return
-
-    # The residual half: the same relayouts and matmul, over the residual's
-    # ``R`` positions, right after the main matmul so the quantizer counts
-    # them main, residual, main, residual within the layer.  The main half
-    # now reads the cache where it read the write.  A matmul that read the
-    # write directly (no relayout: multi-head attention's values) keeps it.
-    remap = {cache: idx, idx: idx}
-    with graph.inserting_before(matmul.next):
-        for n in relayouts:
-            new = graph.node_copy(n, lambda a: remap[a])
-            if n.target in _REGROUP_OPS:
-                shape = list(_shape_of(n))
-                shape[axis_of[n]] = length
-                new.args = (new.args[0], shape)
-            elif n.target is torch.ops.aten.expand.default:
-                in_shape = _shape_of(n.args[0])
-                new.args = (
-                    new.args[0],
-                    [
-                        o if o != i else -1
-                        for o, i in zip(_shape_of(n), in_shape)
-                    ],
-                )
-            _stamp_fake(new, fake_mode)
-            remap[n] = new
-        if join == "scores":
-            lhs = matmul.args[0]
-        else:
-            lhs = graph.call_function(
-                torch.ops.aten.index_select.default,
-                (matmul.args[0], -1, offsets),
-            )
-            _copy_scope(lhs, matmul)
-            _stamp_fake(lhs, fake_mode)
-        residual_matmul = graph.node_copy(matmul, lambda a: remap.get(a, a))
-        residual_matmul.args = (lhs, remap[weight])
-        _stamp_fake(residual_matmul, fake_mode)
-        if join == "scores":
-            joined = graph.call_function(
-                torch.ops.aten.index_copy.default,
-                (matmul, -1, offsets, residual_matmul),
-            )
-        else:
-            joined = graph.call_function(
-                torch.ops.aten.add.Tensor, (matmul, residual_matmul)
-            )
-        _copy_scope(joined, matmul)
-        _stamp_fake(joined, fake_mode)
-    matmul.replace_all_uses_with(
-        joined, delete_user_cb=lambda u: u is not joined
+    q_args = node.args[1:]
+    consts = [
+        fetch_attr(model, a.target) if isinstance(a, Node) else a
+        for a in q_args
+    ]
+    main_scale, main_value = torch.ops.quantized_ops.quantize_mx(
+        contents.narrow(dim, 0, split), *consts
     )
-    _fold_chunk(model, cache, dim, idx, offsets, pred, joined, fake_mode)
-    logger.info(
-        f"Split {cache.target}: {done} positions in completed chunks, "
-        f"{context_len - done} in the {length}-slot residual; residual "
-        f"{'replaces a window of' if join == 'scores' else 'adds to'} the "
-        "main attention"
-    )
+    residual = contents.narrow(dim, split, cache_len - split).clone()
 
+    # The quantize's tensor arguments arrive as placeholders, in the order
+    # ``all_input_nodes`` lists them; the rest are constants, baked at export.
+    template = [None if isinstance(a, Node) else a for a in q_args]
+    slots = [i for i, a in enumerate(q_args) if isinstance(a, Node)]
 
-def _fold_chunk(model, cache, dim, idx, offsets, pred, after, fake_mode):
-    """The fold, after the attention has read the main cache: on the step
-    that completes a chunk, copy the residual into it.  Spelled without a
-    branch -- chunk ``c`` is rewritten every step, with the residual on
-    the completing step and with what it already holds otherwise -- so
-    the graph stays plain tensor ops (a CUDA graph can replay it) and the
-    lowering turns the pattern into a real conditional.  The cache is
-    reached through its own ``get_attr`` so that an observer on the read
-    never sits between the fold and the buffer.
+    # One KV head feeds ``groups`` query heads; the scale carries one element
+    # per block where the value carries one per position.
+    groups = matmul.args[1].value.shape[1] // contents.shape[1]
+    blocks = split // block_size
 
-    Args:
-        model: The graph module.
-        cache: The main cache's ``get_attr``.
-        dim: The cache's position axis.
-        idx: The residual write, whose value is the residual buffer.
-        offsets: The chunk's positions in the cache.
-        pred: Whether this step completes the chunk.
-        after: The node that reads the main cache; the fold follows it.
-        fake_mode: The graph's fake mode, for ``_stamp_fake``.
-    """
-    graph = model.graph
-    with graph.inserting_before(after.next):
-        handle = graph.get_attr(cache.target)
-        _stamp_fake(handle, fake_mode)
-        window = graph.call_function(
-            torch.ops.aten.index_select.default, (handle, dim, offsets)
+    # The GEMV's kwargs, rebuilt in the order it had them: each half brings its
+    # own two scales, a code table is handed through untouched (both halves are
+    # the same dtype, so they read the same table), the rest are constants.
+    mm_order = list(matmul.kwargs)
+    mm_consts = {
+        k: v for k, v in matmul.kwargs.items() if not isinstance(v, Node)
+    }
+    code_names = [
+        k
+        for k, v in matmul.kwargs.items()
+        if isinstance(v, Node) and k not in ("input_scale", "weight_scale")
+    ]
+
+    def mx_kwargs(input_scale, weight_scale, codes):
+        named = {
+            "input_scale": input_scale,
+            "weight_scale": weight_scale,
+            **mm_consts,
+            **dict(zip(code_names, codes)),
+        }
+        return {k: named[k] for k in mm_order}
+
+    def repeat(x):
+        b, h, s, d = x.shape
+        return (
+            x.unsqueeze(2)
+            .expand(b, h, groups, s, d)
+            .reshape(b, h * groups, s, d)
         )
-        folded = graph.call_function(
-            torch.ops.aten.where.self, (pred, idx, window)
-        )
-        fold = graph.call_function(_INDEX_COPY, (handle, dim, offsets, folded))
-        for n in (window, folded, fold):
-            _copy_scope(n, idx)
-            _stamp_fake(n, fake_mode)
 
+    base = cache.target.replace(".", "_")
+    dtypes = node.meta.get("dtype", (None, None))
+    parts = {
+        base + "_scale": (main_scale, dtypes[0]),
+        base + "_full": (main_value, dtypes[_MX_VALUE]),
+        base + "_residual": (residual, None),
+    }
+    scale_name, value_name, residual_name = parts
 
-def _additive_mask(graph, mask, dtype, fake_mode):
-    """A bool mask as the additive one the attention kernel adds to its
-    scores: zero where the mask keeps, the dtype's minimum elsewhere."""
-    zeros = graph.call_function(
-        torch.ops.aten.zeros_like.default, (mask,), {"dtype": dtype}
-    )
-    dropped = graph.call_function(torch.ops.aten.logical_not.default, (mask,))
-    filled = graph.call_function(
-        torch.ops.aten.masked_fill.Scalar,
-        (zeros, dropped, torch.finfo(dtype).min),
-    )
-    for n in (zeros, dropped, filled):
-        _stamp_fake(n, fake_mode)
-    return filled
+    class SplitCache(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name, (tensor, _) in parts.items():
+                self.register_buffer(name, tensor)
 
+        def forward(self, cache, index, token, *rest):
+            n = len(slots)
+            tensors, probs, probs_scale = rest[:n], rest[n], rest[n + 1]
+            codes = rest[n + 2 :]
+            args = list(template)
+            for slot, tensor in zip(slots, tensors):
+                args[slot] = tensor
 
-def _split_attention_operand(
-    model, node, cache, idx, relayouts, offsets, fake_mode
-):
-    """Hand attention ``node`` the residual of the cache it reads as its key
-    or value: the operand becomes a view of the cache buffer -- a GQA
-    repeat between the two is dropped for ``enable_gqa``, so the kernel
-    folds the head group; a view rather than the buffer itself, so the
-    quantizer's convert sees an activation and emits the dynamic quantize
-    the fold pass bakes into the cache, not a parameter it would quantize
-    once -- and the residual write ``idx`` goes onto its ``sdpa_mx`` twin
-    as ``key_residual`` / ``value_residual``.  The first cache split
-    retargets the node and gives it the query as ``query_residual`` (read
-    unquantized) and its masks: the main mask with the chunk's window
-    dropped, and ``residual_mask``, the window's own slice.  Both are
-    additive (``_additive_mask``).  The residual operands are positional,
-    as the quantizer requires.
-
-    Returns:
-        The attention node, retargeted.
-
-    Raises:
-        ValueError: Relayouts other than a GQA repeat sit between the cache
-            and the attention.
-    """
-    graph = model.graph
-    position = next(
-        i for i in (1, 2) if node.args[i] is cache or node.args[i] in relayouts
-    )
-    operand = node.args[position]
-    residual_position = position + 6  # query_residual leads at 6
-    kwargs = dict(node.kwargs)
-    if operand is not cache:
-        # ``repeat_kv``: unsqueeze -> expand -> reshape, multiplying the
-        # head dim and nothing else, head ``h`` reading KV head ``h // g``.
-        b, hkv, *rest = _shape_of(cache)
-        b_out, heads, *rest_out = _shape_of(operand)
-        if (
-            any(n.target not in _REPEAT_OPS for n in relayouts)
-            or (b_out, rest_out) != (b, rest)
-            or heads % hkv
-        ):
-            raise ValueError(
-                f"{cache.target}: {operand} between the cache and {node} is "
-                "not a GQA repeat"
+            written = getattr(self, residual_name).index_copy_(
+                dim, index - split, token
             )
-        kwargs["enable_gqa"] = True
-    args = list(node.args)
-    with graph.inserting_before(node):
-        args[position] = graph.call_function(
-            torch.ops.aten.view.default, (cache, list(_shape_of(cache)))
-        )
-        _copy_scope(args[position], node)
-        _stamp_fake(args[position], fake_mode)
-    if node.target is _SDPA_MX:
-        args[residual_position] = idx
-        node.args = tuple(args)
-        node.kwargs = kwargs
-        _stamp_fake(node, fake_mode)
-        return node
-
-    query = args[0]
-    dtype = query.meta["val"].dtype
-    mask = get_arg_value(node, 3, "attn_mask", None)
-    with graph.inserting_before(node):
-        # The residual reads the query unquantized: a view of its own, so
-        # the observer the quantizer puts on the query does not cover it.
-        residual_query = graph.call_function(
-            torch.ops.aten.view.default, (query, list(_shape_of(query)))
-        )
-        _copy_scope(residual_query, node)
-        _stamp_fake(residual_query, fake_mode)
-        if mask is None:
-            rows, keys = _shape_of(query)[-2], _shape_of(cache)[-2]
-            mask = graph.call_function(
-                torch.ops.aten.ones.default,
-                ((1, 1, rows, keys),),
-                {"dtype": torch.bool, "device": _shape_device(query)},
+            res_scale, res_value = torch.ops.quantized_ops.quantize_mx(
+                written, *args
             )
-            _stamp_fake(mask, fake_mode)
-        main = graph.call_function(
-            torch.ops.aten.index_fill.int_Scalar, (mask, -1, offsets, False)
-        )
-        window = graph.call_function(
-            torch.ops.aten.index_select.default, (mask, -1, offsets)
-        )
-        _stamp_fake(main, fake_mode)
-        _stamp_fake(window, fake_mode)
-        main = _additive_mask(graph, main, dtype, fake_mode)
-        window = _additive_mask(graph, window, dtype, fake_mode)
-        # (query, key, value, attn_mask, dropout_p, is_causal, then the
-        # residual's query, key, value and mask)
-        dropout_p = get_arg_value(node, 4, "dropout_p", 0.0)
-        is_causal = get_arg_value(node, 5, "is_causal", False)
-        args = args[:3] + [main, dropout_p, is_causal, residual_query]
-        args += [None, None]
-        args.append(window)
-        args[residual_position] = idx
-        kwargs.pop("dropout_p", None)
-        kwargs.pop("is_causal", None)
-        new = graph.call_function(_SDPA_MX, tuple(args), kwargs)
-        _copy_scope(new, node)
-        _stamp_fake(new, fake_mode)
-    node.replace_all_uses_with(new)
-    graph.erase_node(node)
-    return new
+            main = torch.ops.quantized_ops.matmul_mx(
+                probs[..., :split],
+                repeat(getattr(self, value_name)),
+                **mx_kwargs(
+                    probs_scale[..., :blocks],
+                    repeat(getattr(self, scale_name)),
+                    codes,
+                ),
+            )
+            residue = torch.ops.quantized_ops.matmul_mx(
+                probs[..., split:],
+                repeat(res_value),
+                **mx_kwargs(
+                    probs_scale[..., blocks:], repeat(res_scale), codes
+                ),
+            )
+            return main + residue
 
+    new_node = create_and_insert_subgraph(cone, model)
+    example = tuple(n.value.clone() for n in new_node.all_input_nodes)
+    gm = get_aten_graph_module(SplitCache(), example)
+    value_remap = {}
+    outs = replace_node_with_graph_module(model, new_node, gm, value_remap)
 
-def _shape_device(node: Node):
-    value = getattr(node, "value", None)
-    if not isinstance(value, torch.Tensor):
-        value = node.meta["val"]
-    return value.device
-
-
-def split_kv_cache(
-    model: GraphModule, residual_length: int, context_len: int
-) -> int:
-    """Split each KV cache of an exported decode graph into its completed
-    chunks and a full-precision residual.
-
-    The main cache buffer keeps only whole chunks of ``residual_length``
-    positions, zeros above them; a residual buffer of ``residual_length``
-    slots, in the cache's dtype, holds the chunk being filled, the token at
-    position ``p`` in slot ``p mod residual_length``.  The attention reads
-    both: the residual's scores replace the main scores at the chunk's
-    positions (``q @ K^T``) and its values add to the main ones (``P @ V``,
-    over the same window of ``P``).  After the attention has read the
-    cache, chunk ``p // residual_length`` of the main cache is rewritten:
-    with the residual on the step that fills its last slot, with what it
-    already holds otherwise.  A quantizer then annotates the main cache's
-    read and leaves the residual alone; the lowering turns the rewrite
-    into a conditional store of the quantized chunk.
-
-    A step may write several consecutive positions -- a speculative-decoding
-    verification step -- at most ``residual_length`` of them and never
-    across a chunk boundary: they take consecutive residual slots and the
-    chunk completes when the last one lands on its last slot.
-
-    Args:
-        model: The decode graph from ``convert_and_export_with_cache``, its
-            cache buffers loaded with ``context_len`` positions; rewritten
-            in place.
-        residual_length: Positions per chunk, a multiple of the quantizer's
-            block size along the sequence.
-        context_len: Positions already written in each cache.
-
-    Returns:
-        The number of caches split.
-
-    Raises:
-        ValueError: A cache is not a multiple of ``residual_length`` long,
-            its write does not reach a single attention matmul, or a step
-            writes more positions than the residual holds.
-    """
-    graph = model.graph
-    fake_mode = next(
-        n.meta["val"].fake_mode
-        for n in graph.nodes
-        if isinstance(n.meta.get("val"), FakeTensor)
-    )
-    count = 0
-    for idx in list(graph.nodes):
-        if (
-            idx.target is not _INDEX_COPY
-            or not isinstance(idx.args[0], Node)
-            or idx.args[0].op != "get_attr"
-            or _KV_CACHE.match(str(idx.args[0].target)) is None
-        ):
+    for out in outs:
+        out.meta["dtype"] = matmul.meta.get("dtype")
+    for n in gm.graph.nodes:
+        new = value_remap.get(n)
+        if new is None or n.op == "placeholder":
             continue
-        _split_one_cache(model, idx, residual_length, context_len, fake_mode)
-        count += 1
-    graph.eliminate_dead_code()
-    graph.lint()
-    model.recompile()
-    return count
+        if n.op == "get_attr" and n.target in parts:
+            new.meta["dtype"] = parts[n.target][1]
+        elif n.target is _QUANTIZE_MX:
+            new.meta["dtype"] = dtypes
+        elif n.target is operator.getitem:
+            new.meta["dtype"] = dtypes[n.args[1]]
+        elif n.target is _MATMUL_MX:
+            new.meta["dtype"] = matmul.meta.get("dtype")
+        elif _is_relayout(new):
+            new.meta["dtype"] = new.args[0].meta.get("dtype")
+
+    model.graph.erase_node(new_node)
+    delattr(model, new_node.target)
+    logger.info(
+        f"Split {cache.target} at {split}: {split} positions baked quantized, "
+        f"{cache_len - split} re-quantized per step; one GEMV each"
+    )
+    return True
 
 
-def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
-    """Fold a dynamic quantize over a KV cache write into the cache itself.
+def _fold_quantize_into_cache(
+    model: GraphModule, node: Node, context_len: int, max_new_tokens: int
+) -> bool:
+    """Fold a ``quantize_mx`` over a KV cache into the cache itself.
 
     The write puts one token in; the quantize then sweeps all of it, every
     step.  Since each token's blocks are its own, quantizing at write time is
     the same arithmetic -- so the buffer is baked already quantized and the
-    quantize moves onto the token the write carries.  The quantize returns its
-    qparams beside the value, so the one cache buffer becomes one per output
-    (``_OUTPUT_NAMES``), each with its own write.  A ``pad`` above the write
-    folds in the same way: the buffer is baked wide, and only the token still
-    pays for it.
+    quantize moves onto the token the write carries.  ``quantize_mx`` returns a
+    pair, so the one cache buffer becomes two (values and scales), each with
+    its own write.  A ``pad`` above the write folds in the same way: the buffer
+    is baked wide, and only the token still pays for it.
 
     Only when the blocked axis is not the one the write indexes.  Otherwise a
-    token lands mid-block and its block's qparams depend on tokens not yet
-    written -- that is what ``split_kv_cache``'s residual is for.
+    token lands mid-block and its block's scale depends on tokens not yet
+    written -- that needs a KIVI-style residual window, not this.
     """
 
     graph = model.graph
@@ -913,10 +593,14 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
     rank = len(node.args[0].value.shape)
     dim = idx.args[1] % rank
     if any(a % rank == dim for a in node.args[2]):
-        # Blocked along the written axis a token lands mid-block, so the
-        # cache cannot be baked whole.
-        logger.debug(f"Skip folding {node}: blocked along the written axis.")
-        return False
+        # A token lands mid-block, so the cache cannot be baked whole -- but
+        # the blocks below the write can be.  Split it instead.
+        if prelude or context_len is None or max_new_tokens is None:
+            logger.debug(f"Skip folding {node}: blocked along written axis.")
+            return False
+        return _split_quantized_cache(
+            model, node, idx, context_len, max_new_tokens
+        )
 
     cache = idx.args[0]
     q_args = node.args[1:]
@@ -931,14 +615,16 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
         fetch_attr(model, a.target) if isinstance(a, Node) else a
         for a in q_args
     ]
-    baked_outputs = node.target(baked, *consts)
+    scale, value = torch.ops.quantized_ops.quantize_mx(baked, *consts)
 
     with graph.inserting_before(node):
         buffers = {
-            i: create_getattr_from_value(
-                model, graph, f"{cache.target}_{name}", baked_outputs[i]
-            )
-            for i, name in enumerate(_OUTPUT_NAMES[node.target])
+            0: create_getattr_from_value(
+                model, graph, cache.target + "_scale", scale
+            ),
+            _MX_VALUE: create_getattr_from_value(
+                model, graph, cache.target + "_full", value
+            ),
         }
         for buffer in buffers.values():
             propagate_shape(buffer, model)
@@ -983,547 +669,6 @@ def _fold_quantize_into_cache(model: GraphModule, node: Node) -> bool:
     return True
 
 
-_QUANTIZE = torch.ops.quantized_ops.quantize.default
-
-
-class _FoldBranch:
-    """The branches of a split cache's fold, lowered to a ``torch.cond``.
-
-    On a chunk-completing step the ``true`` branch quantizes the residual
-    and stores the outputs into the baked cache buffers at the chunk's own
-    entries; the ``false`` branch is empty.  Both take the same operands,
-    positionally: a top-level node the ``true`` branch reads gets a
-    placeholder in each (``placeholder``).  Nodes are built in the ``true``
-    graph ahead of its output and shape-propagated as they are made, on
-    copies of the operands' values, so a store executed during propagation
-    never reaches the module's buffers.
-    """
-
-    def __init__(self, model: GraphModule, cache: str, chunk_index: Node):
-        self.model = model
-        self.cache = cache
-        self.chunk_index = chunk_index
-        self.operands = []
-        self.placeholders = {}
-        self.offsets = {}
-        self.cond = None
-        self.true = GraphModule(torch.nn.Module(), Graph())
-        self.false = GraphModule(torch.nn.Module(), Graph())
-        self.outputs = [g.graph.output((0,)) for g in (self.true, self.false)]
-        self.last_placeholder = [None, None]
-        self.handles = []
-        for prefix, branch in (
-            ("true_graph", self.true),
-            ("false_graph", self.false),
-        ):
-            name = get_new_node_name_with_prefix(prefix)(model)
-            setattr(model, name, branch)
-            self.handles.append(name)
-
-    @property
-    def graph(self) -> Graph:
-        return self.true.graph
-
-    def placeholder(self, node: Node) -> Node:
-        """``node``, a top-level node, as the ``true`` branch reads it."""
-        if node not in self.placeholders:
-            self.operands.append(node)
-            made = []
-            for k, branch in enumerate((self.true, self.false)):
-                anchor = self.last_placeholder[k]
-                with (
-                    branch.graph.inserting_after(anchor)
-                    if anchor is not None
-                    else branch.graph.inserting_before(self.outputs[k])
-                ):
-                    made.append(branch.graph.placeholder(node.name))
-                made[k].meta["dtype"] = node.meta.get("dtype")
-                set_node_value(made[k], node.value)
-                self.last_placeholder[k] = made[k]
-            self.placeholders[node] = made
-        return self.placeholders[node][0]
-
-    def arguments(self, args) -> tuple:
-        """``args`` as the branch takes them: a top-level node becomes its
-        placeholder, anything else passes as is."""
-        return tuple(
-            self.placeholder(a) if isinstance(a, Node) else a for a in args
-        )
-
-    def call(self, target, args, dtype=None, kwargs=None) -> Node:
-        """A node computed in the ``true`` branch, stamped with its value."""
-        with self.graph.inserting_before(self.outputs[0]):
-            node = self.graph.call_function(target, args, kwargs)
-        return self.stamp(node, dtype)
-
-    def copy(self, template: Node, source: Node) -> Node:
-        """``template``, a top-level relayout, copied into the ``true``
-        branch onto ``source``.  The caller restates its arguments for
-        ``source``'s extents and then stamps it."""
-        with self.graph.inserting_before(self.outputs[0]):
-            node = self.graph.node_copy(
-                template, lambda a: source if a is template.args[0] else a
-            )
-        node.meta = {}
-        return node
-
-    def stamp(self, node: Node, dtype) -> Node:
-        node.meta["dtype"] = dtype
-        propagate_shape(node, self.true)
-        return node
-
-    def store(self, source: Node, buffer: Node, axis: int) -> Node:
-        """Store ``source``, a chunk-sized branch value, into ``buffer``, a
-        baked cache buffer, at the chunk's own entries along ``axis``:
-        ``index_copy_`` at the ``span`` entries from ``chunk_index * span``,
-        ``span`` being the entries a chunk covers there."""
-        span = source.value.shape[axis]
-        if span not in self.offsets:
-            start = self.call(
-                operator.mul, (self.placeholder(self.chunk_index), span)
-            )
-            end = self.call(operator.add, (start, span))
-            self.offsets[span] = self.call(
-                torch.ops.aten.arange.start_step,
-                (start, end, 1),
-                dtype=None,
-                kwargs={
-                    "dtype": torch.int64,
-                    # The buffer itself: ShapeProp's value may be a copy
-                    # elsewhere.
-                    "device": fetch_attr(self.model, buffer.target).device,
-                },
-            )
-        return self.call(
-            _INDEX_COPY,
-            (self.placeholder(buffer), axis, self.offsets[span], source),
-            dtype=buffer.meta.get("dtype"),
-        )
-
-    def unstore(self, write: Node) -> None:
-        """Remove a store, and its offsets once nothing else reads them."""
-        self.graph.erase_node(write)
-        for span, offsets in list(self.offsets.items()):
-            if offsets.users:
-                continue
-            start, end = offsets.args[:2]
-            for n in (offsets, end, start):
-                self.graph.erase_node(n)
-            del self.offsets[span]
-
-    def place(self, predicate, before: Node) -> None:
-        """Put the ``cond`` running the branches on ``predicate`` into the
-        top-level graph, before ``before``."""
-        graph = self.model.graph
-        with graph.inserting_before(before):
-            handles = [graph.get_attr(name) for name in self.handles]
-            for handle in handles:
-                propagate_shape(handle, self.model)
-            self.cond = graph.call_function(_COND, (predicate, *handles, ()))
-        # Scoped like a bufferized nest, so its branch nodes get model-wide
-        # unique names and it lands in the layer table as the cache's fold.
-        self.cond.meta["scope"] = (f"{self.cache}_fold", None)
-        set_node_value(self.cond, (0,))
-        self.bind()
-
-    def bind(self) -> None:
-        """Hand the ``cond`` the operands the branches take now, dropping
-        a placeholder nothing reads any more."""
-        for node, made in list(self.placeholders.items()):
-            if made[0].users:
-                continue
-            for k, branch in enumerate((self.true, self.false)):
-                if self.last_placeholder[k] is made[k]:
-                    self.last_placeholder[k] = made[k].prev
-                    if self.last_placeholder[k].op != "placeholder":
-                        self.last_placeholder[k] = None
-                branch.graph.erase_node(made[k])
-            del self.placeholders[node]
-            self.operands.remove(node)
-        self.cond.args = (*self.cond.args[:3], tuple(self.operands))
-
-
-@dataclass
-class _Fold:
-    """A split KV cache's fold, as the lowering rebuilds it.
-
-    ``split_kv_cache`` spells the fold as a masked write-back of chunk
-    ``p // R`` of the residual into the main cache.  The lowering keeps
-    the main cache baked in its quantized form and turns the write-back
-    into ``branch``, a ``torch.cond`` on the completing-step predicate
-    whose ``true`` branch quantizes the residual and stores the outputs
-    into the baked buffers.  ``parts`` are the branch-side outputs of that
-    quantize, by output index; ``stores`` the branch's ``index_copy_`` of
-    each into its baked buffer, by output index, until a re-encode replaces
-    it; ``scale_qmap`` the table that quantize rounds its scale through (a
-    top-level ``get_attr``), or ``None`` when the qparams keep the cache's
-    dtype.
-    """
-
-    cache: str
-    dim: int
-    branch: _FoldBranch
-    parts: dict
-    stores: dict
-    scale_qmap: Optional[Node]
-
-
-def _fold_write(graph: Graph, target: str) -> Optional[Node]:
-    """The masked write-back ``split_kv_cache`` left on cache ``target``:
-    ``index_copy_(cache, dim, offsets, where(pred, residual, window))``."""
-    for n in graph.nodes:
-        if (
-            n.target is _INDEX_COPY
-            and isinstance(n.args[0], Node)
-            and n.args[0].op == "get_attr"
-            and n.args[0].target == target
-            and isinstance(n.args[3], Node)
-            and n.args[3].target is torch.ops.aten.where.self
-        ):
-            return n
-    return None
-
-
-def _is_split_cache(graph: Graph, node) -> bool:
-    """Whether ``node`` reads a main KV cache ``split_kv_cache`` left a fold
-    on -- the buffer a dynamic quantize on the read folds into."""
-    return (
-        isinstance(node, Node)
-        and node.op == "get_attr"
-        and _fold_write(graph, node.target) is not None
-    )
-
-
-def _fold_quantize_into_split_cache(
-    model: GraphModule, node: Node, folds: dict
-) -> bool:
-    """Fold a dynamic quantize (``quantize_affine`` or ``quantize_mx``) over
-    a split KV cache into the cache.
-
-    The quantize sweeps the whole main cache every step, though only whole,
-    block-aligned chunks are ever written into it.  So the buffer is baked
-    quantized once, into one buffer per quantize output
-    (``<cache>_scale`` [/ ``_zero_point``] / ``_full``), the read path takes
-    those, and the fold's ``cond`` quantizes the residual instead -- ``R``
-    positions, on the completing step only -- storing its outputs into the
-    baked buffers at the chunk's entries.  The chunk's blocks are its own
-    because ``R`` is a multiple of the block size, so this is the arithmetic
-    the sweep did, on the chunk alone.
-
-    Returns:
-        ``True`` if ``node`` read a split cache and was folded.
-
-    Raises:
-        ValueError: The residual is not a whole number of blocks long.
-        RuntimeError: The main cache already holds data where this step's
-            fold lands, i.e. the graph was run past a fold before
-            ``transform``.
-    """
-    graph = model.graph
-    cache = node.args[0]
-    if not isinstance(cache, Node) or cache.op != "get_attr":
-        return False
-    write = _fold_write(graph, cache.target)
-    if write is None:
-        return False
-    outs = {}
-    for user in node.users:
-        if user.target is not operator.getitem:
-            return False
-        outs[user.args[1]] = user
-
-    _, dim, offsets, folded = write.args
-    residual = folded.args[1]
-    dim %= cache.value.ndim
-    length = residual.value.shape[dim]
-    block_size = node.args[3]
-    if length % block_size:
-        raise ValueError(
-            f"{cache.target}: a {length}-position residual is not a whole "
-            f"number of {block_size}-wide blocks"
-        )
-    # The offsets are real only when folded from a constant; in a fake
-    # propagation nothing has run the graph past a fold, so there is
-    # nothing to check.
-    contents = fetch_attr(model, cache.target)
-    chunk = (
-        constant_value(model, offsets)
-        if isinstance(offsets, Node) and offsets.op == "get_attr"
-        else offsets.value
-    )
-    if not isinstance(chunk, FakeTensor):
-        chunk = chunk.to(contents.device)
-        if contents.index_select(dim, chunk).abs().sum() != 0:
-            raise RuntimeError(
-                f"{cache.target} already holds data at the chunk this step "
-                "folds: the graph was run past a fold before transform"
-            )
-
-    consts = [
-        fetch_attr(model, a.target) if isinstance(a, Node) else a
-        for a in node.args[1:]
-    ]
-    baked = node.target(contents, *consts)
-    with graph.inserting_before(node):
-        buffers = {
-            i: create_getattr_from_value(
-                model, graph, f"{cache.target}_{name}", baked[i]
-            )
-            for i, name in enumerate(_OUTPUT_NAMES[node.target])
-        }
-    for i, old in outs.items():
-        buffers[i].meta["dtype"] = old.meta.get("dtype")
-        propagate_shape(buffers[i], model)
-        old.replace_all_uses_with(buffers[i])
-
-    # The chunk index and the completing-step predicate as control-
-    # processor scalars.  ``scalarize_index_arithmetic`` has usually
-    # already made the offsets an ``arange`` from ``c * R`` and the
-    # predicate a host-written ``full``; otherwise they are read out.
-    with graph.inserting_before(write):
-        if offsets.target is torch.ops.aten.arange.start_step:
-            chunk_index = graph.call_function(
-                operator.floordiv, (offsets.args[0], length)
-            )
-            new_nodes = (chunk_index,)
-        else:
-            first = graph.call_function(
-                torch.ops.aten.slice.Tensor, (offsets, 0, 0, 1)
-            )
-            chunk_tensor = graph.call_function(
-                torch.ops.aten.floor_divide.default, (first, length)
-            )
-            chunk_index = graph.call_function(
-                torch.ops.aten._local_scalar_dense.default, (chunk_tensor,)
-            )
-            new_nodes = (first, chunk_tensor, chunk_index)
-        flag = folded.args[0]
-        if flag.target is torch.ops.aten.full.default:
-            predicate = flag.args[1]
-        else:
-            predicate = graph.call_function(
-                torch.ops.aten._local_scalar_dense.default, (flag,)
-            )
-            new_nodes = (*new_nodes, predicate)
-        for n in new_nodes:
-            propagate_shape(n, model)
-
-    branch = _FoldBranch(model, cache.target, chunk_index)
-    chunk = branch.call(
-        node.target,
-        (branch.placeholder(residual), *branch.arguments(node.args[1:])),
-        dtype=node.meta.get("dtype"),
-    )
-    fold = _Fold(
-        cache=cache.target,
-        dim=dim,
-        branch=branch,
-        parts={
-            i: branch.call(
-                operator.getitem, (chunk, i), dtype=outs[i].meta.get("dtype")
-            )
-            for i in sorted(outs)
-        },
-        stores={},
-        scale_qmap=(
-            get_arg_value(node, 6, "scale_qmap")
-            if node.target is _QUANTIZE_AFFINE
-            else None
-        ),
-    )
-    for i, part in fold.parts.items():
-        fold.stores[i] = branch.store(part, buffers[i], dim)
-    branch.place(predicate, before=write)
-
-    # The masked write-back's own reads: the ``where``, the window it
-    # selects from the cache, and the handle on the cache.
-    reads = (folded, folded.args[2], write.args[0])
-    graph.erase_node(write)
-    for n in reads:
-        if not n.users:
-            graph.erase_node(n)
-    folds[buffers[_value_index(node.target)].target] = fold
-
-    for n in (*outs.values(), node):
-        if not n.users:
-            graph.erase_node(n)
-    logger.info(
-        f"Folded {cache.target}: baked quantized, {length}-position chunks "
-        "quantized on their fold"
-    )
-    return True
-
-
-def _repeat_in_branch(branch: _FoldBranch, node: Node, dim: int, factor: int):
-    """``node`` with every entry along ``dim`` repeated ``factor`` times in
-    place, spelled ``unsqueeze -> expand -> reshape`` -- the relayouts the
-    lowering already folds into addressing."""
-    shape = list(node.value.shape)
-    grown = [-1] * (len(shape) + 1)
-    grown[dim + 1] = factor
-    merged = list(shape)
-    merged[dim] *= factor
-    dtype = node.meta.get("dtype")
-    unsqueezed = branch.call(
-        torch.ops.aten.unsqueeze.default, (node, dim + 1), dtype=dtype
-    )
-    expanded = branch.call(
-        torch.ops.aten.expand.default, (unsqueezed, grown), dtype=dtype
-    )
-    return branch.call(
-        torch.ops.aten.reshape.default, (expanded, merged), dtype=dtype
-    )
-
-
-def _fold_reencode(
-    model: GraphModule,
-    fold: _Fold,
-    cache_axes,
-    block_axes,
-    block_size,
-    quantize_mx: Node,
-    bases: dict,
-    column_axis: int,
-    column_repeat: int,
-) -> None:
-    """Extend a split cache's fold with the qparams its GEMV reads through
-    the fused dequantize: the chunk's int6 block scale, and its fused scale
-    (affine scale over block scale) and zero point.  All are in cache
-    layout, as ``fuse_dequantize_quantize`` baked them, so each is stored
-    as the chunk's quantize returns it, in place of the chunk's affine
-    scale and zero point.
-
-    Args:
-        model: The graph module being lowered.
-        fold: The cache's fold.
-        cache_axes: Axes the affine groups lie along.
-        block_axes: Axes the re-encode blocks along.
-        block_size: The block size the groups and blocks share.
-        quantize_mx: The re-encode, whose arguments the chunk's copy takes.
-        bases: ``"scale"`` (the fused scale), ``"zero_point"`` and ``"mx"``
-            -> the baked buffer, as ``fuse_dequantize_quantize`` stored it.
-        column_axis: The axis of the GEMV's output columns.
-        column_repeat: Entries the block scale is repeated to per block
-            along it, as the baked one was.
-    """
-    branch = fold.branch
-    scale_c, zp_c, codes_c = (fold.parts[i] for i in range(3))
-    qparam_dtype = bases["scale"].meta.get("dtype")
-    for i in (0, 1):
-        branch.unstore(fold.stores.pop(i))
-
-    decoded = branch.call(
-        _DEQUANTIZE, (codes_c, scale_c, zp_c, cache_axes, block_size)
-    )
-    mx_args = list(branch.arguments(quantize_mx.args[1:]))
-    mx_args[1] = list(block_axes)
-    mx = branch.call(
-        quantize_mx.target,
-        (decoded, *mx_args),
-        dtype=quantize_mx.meta.get("dtype"),
-    )
-    mx_scale = branch.call(
-        operator.getitem, (mx, 0), dtype=bases["mx"].meta.get("dtype")
-    )
-
-    # The fused scale divides the affine scale by the block scale on the
-    # affine groups' grid: the block scale is repeated up to it.
-    divisor = mx_scale
-    for d, (have, want) in enumerate(
-        zip(mx_scale.value.shape, scale_c.value.shape)
-    ):
-        if have != want:
-            divisor = _repeat_in_branch(branch, divisor, d, want // have)
-    fused = branch.call(
-        torch.ops.aten.div.Tensor, (scale_c, divisor), dtype=qparam_dtype
-    )
-    if fold.scale_qmap is not None:
-        # Rounded through the affine scale's table, as the baked one was: a
-        # per-tensor quantize with a unit scale.
-        graph = model.graph
-        with graph.inserting_before(branch.cond):
-            # On the cache's device: propagated values live on the CPU.
-            unit = create_getattr_from_value(
-                model,
-                graph,
-                f"{fold.cache}_unit_scale",
-                fused.value.new_ones(
-                    1, device=fetch_attr(model, fold.cache).device
-                ),
-            )
-        propagate_shape(unit, model)
-        fused = branch.call(
-            _QUANTIZE,
-            (
-                fused,
-                *branch.arguments((unit, None, None, None, fold.scale_qmap)),
-            ),
-            dtype=qparam_dtype,
-        )
-
-    columns = mx_scale
-    if column_repeat > 1:
-        columns = _repeat_in_branch(
-            branch, mx_scale, column_axis, column_repeat
-        )
-
-    branch.store(fused, bases["scale"], fold.dim)
-    branch.store(zp_c, bases["zero_point"], fold.dim)
-    branch.store(columns, bases["mx"], fold.dim)
-    branch.bind()
-
-
-def sink_cache_folds(model: GraphModule) -> GraphModule:
-    """Move each split cache's fold below the last reader of the buffers it
-    writes.
-
-    The fold's ``cond`` stands where the eager graph wrote the chunk back:
-    after the attention read the cache.  Operator fusion can carry a read
-    past it, since a fused group lands at its last op and the GEMV reading
-    the cache may fuse with ops that follow the fold.  A read after the
-    fold would see the completing chunk in both the main cache and the
-    residual, so the ``cond`` and its branch handles go back after the
-    last reader of any buffer the ``true`` branch writes in place.
-
-    Runs at the end of ``fuse_operator``.
-
-    Args:
-        model: The graph module to reorder in place.
-
-    Returns:
-        ``model``, reordered in place.
-    """
-    graph = model.graph
-    for cond in list(graph.nodes):
-        if cond.target is not _COND:
-            continue
-        true_graph = getattr(model, cond.args[1].target).graph
-        placeholders = [n for n in true_graph.nodes if n.op == "placeholder"]
-        written = {
-            cond.args[3][placeholders.index(n.args[0])].target
-            for n in true_graph.nodes
-            if n.target is _INDEX_COPY
-        }
-        order = {n: i for i, n in enumerate(graph.nodes)}
-        last = cond
-        for n in graph.nodes:
-            if n.op != "get_attr" or n.target not in written:
-                continue
-            for user in n.users:
-                if order[user] > order[last]:
-                    last = user
-        if last is cond:
-            continue
-        reader = last
-        for moved in (*cond.args[1:3], cond):
-            last.append(moved)
-            last = moved
-        logger.info(f"Sunk {cond} below {reader}")
-    graph.lint()
-    model.recompile()
-    return model
-
-
 def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     """Lift a ``quantize_mx`` over the relayout ops feeding it, so it quantizes
     the tensor they re-address rather than the one they hand on.
@@ -1536,9 +681,8 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     wants to stop -- the GEMM below stores straight through that permute, and
     the quantize fuses onto the end of it (``fuse_reshape_with_output``).
 
-    The op returns its qparams beside the value (``_OUTPUT_NAMES``): the
-    value keeps the relayout ops it was lifted over and each qparam gets a
-    replayed copy of them.  It is never forked: a
+    The op has two outputs, so the value keeps the relayout ops it was lifted
+    over and the scale gets a replayed copy of them.  It is never forked: a
     concat can move the axis it blocks along, and head splitting -- the only
     thing that forks -- never runs where microscaling is used.
     """
@@ -1550,7 +694,6 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
             return False
         outs[user.args[1]] = user
 
-    value_index = _value_index(node.target)
     block_size = node.args[3]
     src, path, axes_at, src_axes = _relayout_path(
         node.args[0], node.args[2], block_size, keep_head_permute=True
@@ -1565,7 +708,6 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
         not is_compute_op(src)
         and not is_mha_qkv_permute(src)
         and not any(n.target in _BROADCAST_OPS for n in path)
-        and not _is_split_cache(graph, src)
     ):
         logger.debug(f"Skip moving {node} because there is no fusable anchor.")
         return False
@@ -1583,16 +725,16 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
 
     # The value keeps the relayout ops it was lifted over: rewire them onto it.
     with graph.inserting_before(path[-1]):
-        value = unpack(value_index)
+        value = unpack(_MX_VALUE)
     path[-1].replace_input_with(src, value)
     for n in reversed(path):
         propagate_shape(n, model)
-    _annotate(path, outs[value_index])
-    outs[value_index].replace_all_uses_with(path[0])
+    _annotate(path, outs[_MX_VALUE])
+    outs[_MX_VALUE].replace_all_uses_with(path[0])
 
-    # A qparam is one element per block, so it needs its own copy of them.
+    # The scale is one element per block, so it needs its own copy of them.
     for i, old in outs.items():
-        if i == value_index:
+        if i == _MX_VALUE:
             continue
         with graph.inserting_before(node):
             cur = unpack(i)
@@ -1607,52 +749,39 @@ def _hoist_microscaling(model: GraphModule, node: Node) -> bool:
     return True
 
 
-def fuse_quantize_dequantize_with_producer(model: GraphModule):
+def fuse_quantize_dequantize_with_producer(
+    model: GraphModule,
+    context_len: Optional[int] = None,
+    max_new_tokens: Optional[int] = None,
+):
     """Move each quantize / dequantize up the graph to sit directly after the
     op that computed its input, so the two can fuse into one kernel.
 
     Everything it is lifted over only relayouts data -- a reshape, a transpose,
     the ``stack`` MHA splitting leaves behind, the ``expand`` of GQA's
     ``repeat_kv`` -- so quantizing above them is the same arithmetic on less
-    data.  A dynamic quantize (``quantize_mx``, ``quantize_affine``) also
-    blocks along an axis and returns its qparams beside its value, so it takes
-    the ``_hoist_microscaling`` route; the rest share the walk but fork over a
-    concat.
-
-    A ``quantize_affine`` on a KV cache is folded into the cache first: a
-    split cache (``split_kv_cache``) is baked quantized and its chunks are
-    quantized on their fold, a cache written token by token is baked and
-    quantized on the write.  The baked cache then reads ``get_attr ->
-    dequantize -> relayouts -> quantize_mx``, which ``fuse_dequantize_quantize``
-    collapses into one dequantize -- extending a split cache's fold with the
-    qparams that dequantize reads -- before the ``quantize_mx`` hoist would
-    lift the re-encode above the relayouts.  The ``quantize_mx`` hoist and
-    cache fold come last.
+    data.  A microscaling ``quantize_mx`` also blocks along an axis and returns
+    a scale beside its value, so it takes the ``_hoist_microscaling`` route;
+    the rest share the walk but fork over a concat.
 
     Args:
         model: The graph module to rewrite in place.
+        context_len: Positions already written in the decode cache the graph
+            was exported with.  ``None`` outside decode.
+        max_new_tokens: Generation slots that follow those positions.  ``None``
+            outside decode.  With ``context_len`` it lets a quantize that
+            blocks along the written axis split the cache rather than sweep it
+            (``_split_quantized_cache``).
 
     Returns:
         ``model``, rewritten in place.
     """
     graph = model.graph
 
-    folds = {}
     for node in list(graph.nodes):
-        if node.target is _QUANTIZE_AFFINE:
-            if not _fold_quantize_into_split_cache(model, node, folds):
-                _fold_quantize_into_cache(model, node)
-    graph.eliminate_dead_code()
-    fuse_dequantize_quantize(model, folds)
-
-    for node in list(graph.nodes):
-        if node.target not in QUANTIZE_FAMILY_OPS:
+        if node.target not in _QUANTIZE_OPS:
             continue
-        if node.target is _QUANTIZE_MX_OUTLIER:
-            # The sparse quantize's CSR outputs have no relayout replay; it
-            # stays where the quantizer put it.
-            continue
-        if node.target in _OUTPUT_NAMES:
+        if node.target is _QUANTIZE_MX:
             _hoist_microscaling(model, node)
             continue
         # A blocked plain quantize would need the same axis bookkeeping as
@@ -1665,8 +794,7 @@ def fuse_quantize_dequantize_with_producer(model: GraphModule):
     graph.eliminate_dead_code()
     for node in list(graph.nodes):
         if node.target is _QUANTIZE_MX:
-            if not _fold_quantize_into_split_cache(model, node, folds):
-                _fold_quantize_into_cache(model, node)
+            _fold_quantize_into_cache(model, node, context_len, max_new_tokens)
 
     graph.lint()
     graph.eliminate_dead_code()
@@ -1762,9 +890,8 @@ def propagate_group_axes_through_op(node, input, axes, block_size):
         args = (dim, start, end, step)
         output = tgt(input, *args)
     elif tgt == torch.ops.aten.expand.default:
-        # ``-1`` keeps the dim, so it is not a size to divide.
         size = [
-            math.ceil(s / block_size) if d in axes and s != -1 else s
+            math.ceil(s / block_size) if d in axes else s
             for d, s in enumerate(node.args[1])
         ]
         output = tgt(input, size)
@@ -1781,19 +908,14 @@ def propagate_group_axes_through_op(node, input, axes, block_size):
             s * block_size if i in axes else s
             for i, s in enumerate(input.shape)
         ]
-        # The node's own output resolves a ``-1`` in the requested shape.
-        target_shape = list(getattr(node, "value", node.args[1]).shape)
         axes = validate_and_map_group_axes_for_reshape(
-            orig_shape, target_shape, axes
+            orig_shape, node.args[1], axes
         )
         if axes is None:
-            raise RuntimeError(
-                f"{node}: reshape {orig_shape} -> {target_shape} cuts a "
-                "quantization block"
-            )
+            raise RuntimeError("Invalid reshape")
         new_shape = [
             math.ceil(s / block_size) if d in axes else s
-            for d, s in enumerate(target_shape)
+            for d, s in enumerate(node.args[1])
         ]
         output = tgt(input, new_shape)
     else:
@@ -1829,11 +951,11 @@ def store_qparam_unrepeated(
     after all.
     """
     # The broadcast grows one dim, which the reshape under it then folds into
-    # the dim above -- the head dim.  A ``-1`` size keeps its dim.
+    # the dim above -- the head dim.
     grown = [
         d
         for d, s in enumerate(expand_node.args[1])
-        if s != -1 and s != expand_node.args[0].shape[d]
+        if s != expand_node.args[0].shape[d]
     ]
     if len(grown) != 1:
         return None
@@ -1867,11 +989,6 @@ def store_qparam_unrepeated(
 
 
 def run_qparam_through_nodes(model, input, nodes, axes, block_size):
-    axes = tuple(a + input.ndim if a < 0 else a for a in axes)
-    if not nodes:
-        # Nothing between the dequantize and the quantize (multi-head
-        # attention's values): the qparams reach it as stored.
-        return input, axes
     env = {nodes[0].args[0]: input}
 
     def map_node(n):
@@ -1881,6 +998,8 @@ def run_qparam_through_nodes(model, input, nodes, axes, block_size):
 
     def load_arg(a):
         return torch.fx.graph.map_arg(a, map_node)
+
+    axes = tuple(a + input.ndim if a < 0 else a for a in axes)
 
     for n in nodes:
         if n.target in LAYOUT_OPS:
@@ -1892,7 +1011,7 @@ def run_qparam_through_nodes(model, input, nodes, axes, block_size):
     return env[nodes[-1]], axes
 
 
-def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
+def fuse_dequantize_quantize(model: torch.fx.GraphModule):
     """
     Fuses consecutive dequantize -> quantize operations in a quantized model
     for optimization.
@@ -1902,29 +1021,13 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
     buffer for a longer graph, which pays off because the GEMM folds the repeat
     into its tile addressing instead of copying.
 
-    A chain reading a split KV cache's baked codes (``folds``, keyed by the
-    codes buffer's target) gets the same fused dequantize, with three
-    differences.  Its qparams are kept in cache layout, like the codes --
-    the block scale taken on the cache's own blocks, the group scale and
-    zero point as the cache holds them -- with the relayouts to the GEMM
-    put back into the graph on the qparams, so the fold can store a chunk's
-    qparams as its quantize returns them.  Its fused scale and zero point
-    take the affine qparams' dtype, the fused scale rounded through the
-    affine scale's table when there is one, since the fold stores a run-time
-    quotient into that buffer.  And the cache's fold is extended to store
-    the chunk's block scale, fused scale and zero point beside its codes
-    (``_fold_reencode``).
-
     Args:
         model (GraphModule): The FX-traced model to optimize.
-        folds: ``codes target -> _Fold`` for the split caches
-            ``_fold_quantize_into_split_cache`` baked, or ``None``.
 
     Returns:
         GraphModule: The optimized model with fused operations.
     """
     graph = model.graph
-    folds = folds or {}
     for node in list(graph.nodes):
         if node.target not in (
             torch.ops.quantized_ops.quantize.default,
@@ -1978,21 +1081,23 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
 
         # Pre-compute the transformed scales and zero points
         dq_input = fetch_attr(model, dq_node.args[0].target)
-        fold = (
-            folds.get(dq_node.args[0].target)
-            if node.target == torch.ops.quantized_ops.quantize_mx.default
-            else None
-        )
-        cache_axes = get_arg_value(dq_node, 3, "axes")
+        if node.target == torch.ops.quantized_ops.quantize_mx.default:
+            q_scale = run_through_ops(model, dq_input, nodes_on_path)[0]
+        else:
+            q_scale = fetch_attr(model, scale_node.target)
+
+        dq_axes = get_arg_value(dq_node, 3, "axes")
         dq_scale = fetch_attr(model, dq_node.args[1].target)
-        zero_point = (
-            fetch_attr(model, dq_node.args[2].target)
-            if len(dq_node.args) > 2
-            else None
+        dq_scale, new_dq_axes = run_qparam_through_nodes(
+            model, dq_scale, nodes_on_path[1:-1], dq_axes, block_size
         )
-        relaid_scale, new_dq_axes = run_qparam_through_nodes(
-            model, dq_scale, nodes_on_path[1:-1], cache_axes, block_size
-        )
+
+        if len(dq_node.args) > 2:
+            zero_point = fetch_attr(model, dq_node.args[2].target)
+            zero_point, _ = run_qparam_through_nodes(
+                model, zero_point, nodes_on_path[1:-1], dq_axes, block_size
+            )
+
         output = run_through_ops(model, dq_input, nodes_on_path[:-1])
         rank = output.ndim
         dq_axes = tuple((a + rank) % rank for a in new_dq_axes)
@@ -2006,53 +1111,6 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
         q_axes = tuple((a + rank) % rank for a in q_axes)
         new_axes = tuple(set(q_axes) & set(dq_axes))
 
-        if fold is not None:
-            # A split cache's qparams stay in cache layout, like its codes:
-            # the block scale is taken on the cache's own blocks, the group
-            # scale and zero point as the cache holds them, and the
-            # relayouts to the GEMM go back into the graph on the qparams
-            # (``relaid``), so the fold stores a chunk's qparams as its
-            # quantize returns them.
-            src, path, _, block_axes = _relayout_path(
-                node.args[0], node.args[2], block_size
-            )
-            # The GEMM's output columns: the last axis below the relayouts.
-            src_c, _, _, (column_axis,) = _relayout_path(
-                node.args[0], (-1,), None
-            )
-            if src is not dq_node or src_c is not dq_node:
-                raise RuntimeError(
-                    f"{dq_node.args[0].target}: the read path's relayouts "
-                    "cut the re-encode's blocks"
-                )
-            decoded = run_through_ops(model, dq_input, [dq_node])
-            mx_args = [
-                fetch_attr(model, a.target) if isinstance(a, Node) else a
-                for a in node.args[1:]
-            ]
-            mx_args[1] = list(block_axes)
-            q_scale = node.target(decoded, *mx_args)[0]
-            column_axis %= decoded.ndim
-            columns = decoded.shape[column_axis]
-            block_axes = sorted(a % decoded.ndim for a in block_axes)
-            mx_blocked = [a for a in block_axes if a != column_axis]
-        else:
-            if node.target == torch.ops.quantized_ops.quantize_mx.default:
-                q_scale = run_through_ops(model, dq_input, nodes_on_path)[0]
-            else:
-                q_scale = fetch_attr(model, scale_node.target)
-            dq_scale = relaid_scale
-            if zero_point is not None:
-                zero_point, _ = run_qparam_through_nodes(
-                    model,
-                    zero_point,
-                    nodes_on_path[1:-1],
-                    cache_axes,
-                    block_size,
-                )
-            path, mx_blocked = (), ()
-            column_axis, columns = -1, output.shape[-1]
-
         # Broadcast scales to the same shape
         nd = max(dq_scale.ndim, q_scale.ndim)
         while dq_scale.ndim < nd:
@@ -2064,17 +1122,6 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
         q_scale_expanded = expand(q_scale, shape, block_size)
         dq_scale_expanded = expand(dq_scale, shape, block_size)
         fused_scale = dq_scale_expanded / q_scale_expanded
-        fold = (
-            folds.get(dq_node.args[0].target)
-            if node.target == torch.ops.quantized_ops.quantize_mx.default
-            else None
-        )
-        if fold is not None and fold.scale_qmap is not None:
-            fused_scale = torch.ops.quantized_ops.quantize(
-                fused_scale,
-                fused_scale.new_ones(1),
-                qmap=fetch_attr(model, fold.scale_qmap.target),
-            )
 
         # The qparams were run through the path, so a broadcast on it (GQA's
         # ``repeat_kv``) is baked into them: they hold each value once per query
@@ -2090,62 +1137,25 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
             None,
         )
 
-        # The fused scale and zero point keep the dtype of the qparams they
-        # derive from; the block scale keeps its own.
-        qparam_dtype = dq_node.args[1].meta.get("dtype")
-        mx_dtype = scale_node.meta.get("dtype")
-        # A split cache's baked qparam buffers, by role, for its fold.
-        bases = {}
+        qparam_dtype = scale_node.meta.get("dtype")
 
-        def relaid(attr, blocked, dtype):
-            """``attr``, a cache-layout qparam with one entry per block along
-            ``blocked``, read through the path's relayouts."""
-            cur, axes = attr, [a % attr.value.ndim for a in blocked]
-            with graph.inserting_before(node):
-                for op in reversed(path):
-                    axes = [_axis_through(op, a) for a in axes]
-                    cur = _replay_relayout(graph, op, cur, axes, block_size)
-                    cur.meta["dtype"] = dtype
-                    propagate_shape(cur, model)
-            return cur
-
-        def create_qparam(value, name, role, blocked, dtype):
-            if fold is not None:
-                with graph.inserting_before(node):
-                    attr = create_getattr_from_value(model, graph, name, value)
-                attr.meta["dtype"] = dtype
-                propagate_shape(attr, model)
-                bases[role] = attr
-                return relaid(attr, blocked, dtype)
+        def create_qparam(value, name):
             if expand_node is not None:
-                stored = store_qparam_unrepeated(
-                    model, value, expand_node, name, node, dtype
+                repeated = store_qparam_unrepeated(
+                    model, value, expand_node, name, node, qparam_dtype
                 )
-                if stored is not None:
-                    return stored
+                if repeated is not None:
+                    return repeated
             with graph.inserting_before(node):
                 attr = create_getattr_from_value(model, graph, name, value)
-            attr.meta["dtype"] = dtype
-            propagate_shape(attr, model)
+            attr.meta["dtype"] = qparam_dtype
             return attr
 
         input_node = dq_node.args[0]
-        new_scale = create_qparam(
-            fused_scale,
-            input_node.name + "_scale",
-            "scale",
-            cache_axes,
-            qparam_dtype,
-        )
+        new_scale = create_qparam(fused_scale, input_node.name + "_scale")
         new_zero_point = (
-            create_qparam(
-                zero_point,
-                input_node.name + "_zero_point",
-                "zero_point",
-                cache_axes,
-                qparam_dtype,
-            )
-            if zero_point is not None
+            create_qparam(zero_point, input_node.name + "_zero_point")
+            if len(dq_node.args) > 2
             else None
         )
         with graph.inserting_before(node):
@@ -2155,7 +1165,6 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
                 output_qmap = graph.node_copy(node.args[1])
             else:
                 output_qmap = graph.node_copy(node.args[5])
-            propagate_shape(output_qmap, model)
             new_dq = graph.call_function(
                 torch.ops.quantized_ops.dequantize.default,
                 (
@@ -2169,20 +1178,18 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
                 ),
             )
 
-        column_repeat = 1
         if scale_node.op != "get_attr":
             if (
                 any(is_gemm_op(n) for n in scale_node.users)
-                and q_scale.shape[column_axis] != columns
+                and q_scale.shape[-1] != output.shape[-1]
             ):
-                column_repeat = columns // q_scale.shape[column_axis]
                 q_scale = torch.repeat_interleave(
-                    q_scale, repeats=column_repeat, dim=column_axis
+                    q_scale,
+                    repeats=output.shape[-1] // q_scale.shape[-1],
+                    dim=-1,
                 )
 
-            mx_scale = create_qparam(
-                q_scale, input_node.name + "_scale", "mx", mx_blocked, mx_dtype
-            )
+            mx_scale = create_qparam(q_scale, input_node.name + "_scale")
             scale_node.replace_all_uses_with(mx_scale)
 
         if node.target == torch.ops.quantized_ops.quantize_mx.default:
@@ -2200,23 +1207,9 @@ def fuse_dequantize_quantize(model: torch.fx.GraphModule, folds=None):
 
         dq_node.replace_all_uses_with(input_node)
         graph.erase_node(dq_node)
-        propagate_shape(new_dq, model)
 
         for n in nodes_on_path[1:-1]:
             n.meta["dtype"] = input_node.meta.get("dtype")
-
-        if fold is not None:
-            _fold_reencode(
-                model,
-                fold,
-                cache_axes,
-                block_axes,
-                block_size,
-                node,
-                bases,
-                column_axis,
-                column_repeat,
-            )
 
     graph.lint()
     graph.eliminate_dead_code()

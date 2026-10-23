@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Operator fusion: group a compute op with the relayout / dequantize ops
 around it into one fused ``call_module``, so the accelerator reads and
 writes the tensor once instead of once per op.
@@ -12,8 +15,6 @@ import torch
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
-    LAYER_NORM_OPS,
-    SOFTMAX_OPS,
     dtype_byte_size,
     get_arg_value,
     is_elementwise_op,
@@ -22,12 +23,10 @@ from voyager_compiler.codegen.node_info import (
     is_nop,
     is_prunable_op,
     is_reshape_op,
-    is_spmm,
     repeat_of,
     swaps_last_two_dims,
 )
 from voyager_compiler.codegen.subgraph import create_and_insert_subgraph
-from voyager_compiler.codegen.transform.quant_folding import sink_cache_folds
 from voyager_compiler.shape_prop import propagate_shape
 
 logger = logging.getLogger(__name__)
@@ -373,7 +372,6 @@ def _fuse_reshape_with_input_impl(
         and is_gemm_op(current_node)
         and fused_nodes[-2]
         in (
-            current_node.args[0],
             current_node.args[1],
             current_node.kwargs.get("weight_scale"),
             current_node.kwargs.get("other_scale"),
@@ -476,23 +474,6 @@ def fuse_reshape_with_output(
     candidates: List[List[Node]],
     reshape_node: Node,
 ) -> bool:
-    """Fuse an MHA head permute into the GEMM group whose tile it stores.
-
-    The walk up from the permute crosses single-user nops and stops at a
-    GEMM or an elementwise op.  The permute joins the group only when a
-    GEMM is in it -- the op it stopped at, or the group that op's tail
-    belongs to.  Above any other producer the permute stays standalone: a
-    group anchored on an elementwise op has no tail to store the tile
-    through the permute, and its tiling does not see the permute.
-
-    Args:
-        graph: The graph the permute is in.
-        candidates: The fusion groups found so far, extended in place.
-        reshape_node: The node to try to fuse.
-
-    Returns:
-        Whether the permute joined a group.
-    """
     if not is_mha_qkv_permute(reshape_node):
         return False
 
@@ -514,13 +495,6 @@ def fuse_reshape_with_output(
     if len(curr_node.users) > 1:
         return False
 
-    group = search_group(curr_node, candidates)
-    if not is_gemm_op(curr_node) and (
-        group is None or not any(is_gemm_op(n) for n in group)
-    ):
-        logger.debug(f"Cannot fuse {reshape_node} with {curr_node}: no GEMM")
-        return False
-
     if not _tile_holds_whole_heads(curr_node, reshape_node):
         logger.debug(
             f"Cannot fuse {reshape_node} with {curr_node}: "
@@ -539,6 +513,8 @@ def fuse_reshape_with_output(
         and search_group(users[0], candidates) is None
     ):
         fused_nodes.append(users[0])
+
+    group = search_group(curr_node, candidates)
 
     if group is not None:
         group.extend(n for n in fused_nodes if n not in group)
@@ -600,8 +576,12 @@ def _fuse_dequantize_recursive(graph, candidates, current_node, fused_nodes):
     if (
         is_gemm_op(current_node)
         or is_elementwise_op(current_node)
-        or current_node.target in LAYER_NORM_OPS
-        or current_node.target in SOFTMAX_OPS
+        or current_node.target
+        in [
+            torch.ops.aten.layer_norm.default,
+            torch.ops.aten.softmax.int,
+            torch.ops.quantized_ops.layer_norm.default,
+        ]
     ):
         fused_nodes = duplicate_shared_nodes(graph, fused_nodes)
         fused_nodes = move_dq_after_select(graph, fused_nodes)
@@ -694,48 +674,117 @@ def move_dq_after_select(graph: torch.fx.Graph, nodes: List[Node]):
     return nodes
 
 
-def _tail_fits(
-    anchor: Node, tail: List[Node], patterns: List[List[Any]], adds: int
+def _accumulate_fusible(
+    anchor: Node, group: List[Node], patterns: List[List[Any]]
 ) -> bool:
-    """Whether one pass of the vector pipeline holds ``adds`` accumulator
-    adds and then ``tail``, in that order, after ``anchor``.
+    """Whether the vector pipeline can absorb a cross-tile reduction's
+    accumulator add into ``anchor``'s fused chain.
 
-    The pipeline runs a fused chain in one pass only if every op gets a
-    stage of its own, in chain order.  The check embeds the adds and then
-    the tail's ops into each pattern's post-anchor stages, each stage
-    claimed at most once.  The adds are virtual (no FX node) and match a
-    stage by target alone: an SpMM's sparse correction takes one, and a
-    ``num_k > 1`` reduction's accumulate another, both ahead of the tail.
+    A ``num_k > 1`` reduction's last step runs ``anchor -> add(accumulator) ->
+    tail`` as one pass only if the add gets a pipeline stage of its own,
+    between the anchor and the stages the tail occupies.  The check embeds
+    ``[add, *tail]`` into each pattern's post-anchor stages in order, each
+    stage claimed at most once.  The tail is the group's post-anchor ops minus
+    relayout / nop members, which consume no stage; the add is virtual (no FX
+    node) and matches a stage by target alone.
 
     Args:
         anchor: The group's GEMM / conv node.
-        tail: The group's post-anchor ops minus relayout / nop members,
-            which consume no stage.
+        group: The fused group's nodes, in graph order.
         patterns: The pipeline patterns handed to :func:`fuse_operator`.
-        adds: Add stages to claim ahead of the tail.
 
     Returns:
-        True if some pattern admits the chain.
+        True if some pattern admits the chain with the add inserted.
     """
-    if tail and tail[0].target == torch.ops.quantized_ops.dequantize.default:
-            tail = tail[1:]
+    tail = [
+        n
+        for n in group[group.index(anchor) + 1 :]
+        if not (is_nop(n) or is_reshape_op(n))
+    ]
     add = torch.ops.aten.add.Tensor
     for pattern in patterns:
         if not pattern[0].matches(anchor):
             continue
         stages = iter(pattern[1:])
-        claimed = all(
-            any(add in m.targets for m in stages) for _ in range(adds)
-        )
-        if claimed and all(any(m.matches(n) for m in stages) for n in tail):
+        if any(add in m.targets for m in stages) and all(
+            any(m.matches(n) for m in stages) for n in tail
+        ):
             return True
     return False
+
+
+def fuse_execution_instructions(model: GraphModule, patterns) -> int:
+    """Group each declared target instruction into one node.
+
+    Separate from :func:`fuse_operator`, and not a variant of it, because the
+    two answer different questions. ``fuse_operator`` asks whether running
+    several operations as one is *faster*; a group it declines is a missed
+    optimization and the graph still means the same thing. This asks whether
+    the machine issues them as one *instruction*, and a group declined here is
+    a record that does not exist -- the emitted layer count simply drops.
+
+    Two consequences follow from that difference, and they are why this cannot
+    just call ``fuse_operator`` with a longer pattern list:
+
+    *It runs whether or not operator fusion was asked for.* A lane that passes
+    ``skip_op_fusion`` is turning off an optimization, not asking for its
+    target's instructions to come apart.
+
+    *It does not normalize the group's iteration space.* That check exists to
+    refuse a group the *bufferizer* could not lower into one loop nest, and a
+    target with its own terminal codegen never builds one -- so for such a
+    target the check can only reject, never contribute. Leaving it on would
+    discard the instruction and report the loss as a warning.
+
+    That reason is about *this* caller and does not generalize. Normalization
+    is **not** free to skip elsewhere: it is not atomic, and a group it
+    rejects has already been partly rewritten -- ``normalize`` raises inside
+    ``_rewrite_parent_inputs`` after inserting relayouts for earlier plans,
+    and again mid-loop in ``_rewrite_child``. Turning it off on the shared
+    path would not merely keep more groups, it would keep half-rewritten
+    ones.
+
+    Args:
+        model: The graph, after the target's own rewrites have built the
+            operations these patterns name.
+        patterns: Sequences of :class:`OpMatcher` stages, from the target.
+
+    Returns:
+        How many instructions were grouped.
+    """
+    if not patterns:
+        return 0
+
+    grouped = 0
+    order = {node: i for i, node in enumerate(model.graph.nodes)}
+    for nodes in find_sequential_nodes(model, list(patterns)):
+        members = sorted(nodes, key=lambda n: order[n])
+        if len(members) < 2:
+            continue
+        node = create_and_insert_subgraph(
+            members, model, normalize_iteration_space=False
+        )
+        if node is None:
+            # ``create_and_insert_subgraph`` only returns ``None`` when
+            # normalization rejects the group, which is off here. Anything
+            # else is a defect rather than a decision, so say so.
+            raise RuntimeError(
+                f"declared target instruction "
+                f"{[n.name for n in members]} could not be grouped"
+            )
+        propagate_shape(node, model)
+        grouped += 1
+
+    model.graph.lint()
+    model.recompile()
+    return grouped
 
 
 def fuse_operator(
     model: GraphModule,
     operations: List[List[Callable]] = None,
     fuse_reshape: bool = True,
+    group_is_issuable: Callable[[List[Node]], bool] = None,
 ):
     """
     Fuse reshape, slicing, and dequantize operations with their immediate users.
@@ -784,24 +833,21 @@ def fuse_operator(
     fused_nodes_list.sort(key=lambda g: nodes_order[g[-1]])
 
     for fused_nodes in fused_nodes_list:
+        # Fusing states that the datapath runs these as one instruction. A
+        # target that says it cannot issue such a call gets no such node: the
+        # members stay separate, which is what they are on the host.
+        if group_is_issuable is not None and not group_is_issuable(fused_nodes):
+            logger.info(
+                "[fuse] not fusing %s: no unit issues this call",
+                [n.name for n in fused_nodes],
+            )
+            continue
         anchor = next((n for n in fused_nodes if is_gemm_op(n)), None)
-        single_k_tail_fusible = split_k_tail_fusible = False
-        if anchor is not None and operations is not None:
-            tail = [
-                n
-                for n in fused_nodes[fused_nodes.index(anchor) + 1 :]
-                if not (is_nop(n) or is_reshape_op(n))
-            ]
-            # The sparse correction takes an add stage ahead of the tail;
-            # a split reduction's accumulate takes one more.  A tail that
-            # does not fit runs as a pass of its own after the GEMM's.
-            reserved = 1 if is_spmm(anchor) else 0
-            single_k_tail_fusible = _tail_fits(
-                anchor, tail, operations, reserved
-            )
-            split_k_tail_fusible = _tail_fits(
-                anchor, tail, operations, reserved + 1
-            )
+        fusible = (
+            anchor is not None
+            and operations is not None
+            and _accumulate_fusible(anchor, fused_nodes, operations)
+        )
         node = create_and_insert_subgraph(
             fused_nodes, model, normalize_iteration_space=True
         )
@@ -809,12 +855,8 @@ def fuse_operator(
             continue
         propagate_shape(node, model)
         if anchor is not None:
-            node.meta["single_k_tail_fusible"] = single_k_tail_fusible
-            node.meta["split_k_tail_fusible"] = split_k_tail_fusible
+            node.meta["accumulate_fusible"] = fusible
 
-    # A fused group lands at its last op, which can carry a KV cache read
-    # below the cache's fold: put every fold back after its last reader.
-    sink_cache_folds(model)
     graph.lint()
     graph.eliminate_dead_code()
     model.recompile()

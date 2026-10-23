@@ -1,23 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import copy
 import logging
+import math
 import operator
-import os
-import types
+import re
 from collections import OrderedDict
 from dataclasses import asdict, replace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch.ao.quantization.fx.utils import assert_and_get_unique_device
-from torch.fx import Graph, GraphModule, Node, map_arg
+from torch.fx import GraphModule, Node
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
-from torchao.quantization.pt2e.qat_utils import _fuse_conv_bn_qat
 from torchao.quantization.pt2e.quantizer import (
     EdgeOrNode,
     QuantizationSpecBase,
 )
-from torchao.utils import _assert_and_get_unique_device
 
 from voyager_compiler.codegen.node_info import (
     get_arg_value,
@@ -28,14 +29,23 @@ from voyager_compiler.export_utils import (
     create_getattr_from_value,
     export_model,
 )
+from voyager_compiler.quantization.contracts import (
+    QUANTIZATION_DOMAIN_ALIAS,
+    QUANTIZATION_DOMAIN_DTYPE,
+    QUANTIZATION_DOMAIN_ENTRY,
+    QUANTIZATION_REGION,
+    VSQ_JOIN_ALIAS,
+    VSQ_JOIN_ENTRY,
+    VSQ_SCALE_ENDPOINTS,
+)
+from voyager_compiler.quantization.regions import (
+    _VSQ_JOIN_PASSTHROUGH_TARGETS,
+    _VSQ_JOIN_TARGETS,
+    _vsq_join_data_inputs,
+)
 from voyager_compiler.quantization.fake_quantize import (
-    DirectCastFakeQuantize,
-    GroupWiseAffineFakeQuantize,
-    MXFakeQuantize,
-    RandomHadamardTransform,
+    FusedAmaxObsFakeQuantize,
     _DerivedObserverOrFakeQuantize,
-    _FreezableFlags,
-    calculate_global_scale,
     get_quantization_map,
 )
 from voyager_compiler.quantization.quantizer.quantizer import (
@@ -48,7 +58,6 @@ from voyager_compiler.quantization.quantizer.xnnpack_quantizer import (
 )
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     QuantizationConfig,
-    _set_ch_axis,
 )
 from voyager_compiler.shape_prop import fetch_attr
 
@@ -59,11 +68,9 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
     """Create observer or fake quantize objects based on quantization spec
 
     Args:
-       quantization_spec: used to store parameters to create the observer or
-           fake quantizer
-       obs_or_fq_map: this is a map from edge/output to the corresponding
-           observer/fake_quant instance, it may be reused for different
-           edge/output depending on configuration
+       quantization_spec: used to store parameters to create the observer or fake quantizer
+       obs_or_fq_map: this is a map from edge/output to the corresponding observer/fake_quant
+       instance, it may be reused for different edge/output depending on configuration
     """
     if quantization_spec is None:
         return None
@@ -85,42 +92,22 @@ def _create_obs_or_fq_from_qspec(quantization_spec, obs_or_fq_map, is_qat):
     return observer_or_fake_quant_ctr.with_args(**kwargs)()
 
 
-# Spec fields torchao's implicit sharing does not compare, but that the
-# readers of one tensor must agree on to share a fake-quant.
-_SHARED_FIELDS = (
-    "amax_history_len",
-    "block_size",
-    "power_2_scale",
-    "scale_dtype",
-    "outlier_threshold",
-    "outlier_pct",
-    "rht_axis",
-    "stochastic_rounding",
-    "global_scale",
-)
-
-
 def _get_obs_or_fq_map(
     edge_or_node_to_group_id: Dict[EdgeOrNode, int],
     edge_or_node_to_qspec: Dict[EdgeOrNode, QuantizationSpecBase],
     is_qat: bool,
 ) -> Dict[EdgeOrNode, ObserverOrFakeQuantize]:
     """Generates the EdgeOrNode to observer/fake_quant instances
-    Makes sure that for EdgeOrNode that has the same group_id should have the
-    same observer or fake quant instances
+    Makes sure that for EdgeOrNode that has the same group_id should have the same observer or fake quant
+    instances
     """
     obs_or_fq_map: Dict[EdgeOrNode, ObserverOrFakeQuantize] = {}
-    group_id_to_obs_or_fq: Dict[Tuple, ObserverOrFakeQuantize] = {}
+    group_id_to_obs_or_fq: Dict[int, ObserverOrFakeQuantize] = {}
     for edge_or_node, qspec in edge_or_node_to_qspec.items():
-        # torchao's union-find groups readers by its own spec attributes
-        # only; split each group by the fields it does not compare.
-        group_id = (edge_or_node_to_group_id[edge_or_node],) + tuple(
-            getattr(qspec, field, None) for field in _SHARED_FIELDS
-        )
+        group_id = edge_or_node_to_group_id[edge_or_node]
         if group_id not in group_id_to_obs_or_fq:
-            # TODO: maybe edge_or_node_to_qspec should be
-            # edge_or_node_to_root_qspec, this will simplify the implementation
-            # for _create_obs_or_fq_from_qspec
+            # TODO: maybe edge_or_node_to_qspec should be edge_or_node_to_root_qspec, this will simplify
+            # the implementation for _create_obs_or_fq_from_qspec
             group_id_to_obs_or_fq[group_id] = _create_obs_or_fq_from_qspec(
                 qspec, obs_or_fq_map, is_qat
             )
@@ -128,21 +115,14 @@ def _get_obs_or_fq_map(
     return obs_or_fq_map
 
 
-_SDPA = torch.ops.aten.scaled_dot_product_attention.default
-# Dropouts, each taking ``(input, p, train)``.
-_DROPOUTS = (
-    torch.ops.aten.dropout.default,
-    torch.ops.aten.dropout_.default,
-    torch.ops.aten.feature_dropout.default,
-    torch.ops.aten.feature_dropout_.default,
-)
+def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
+    if qspec is None:
+        return None
+    return replace(qspec, ch_axis=ch_axis)
 
 
 def get_microscaling_quantizer(
-    activation: Optional[QuantizationSpec],
-    weight: Optional[QuantizationSpec],
-    error: Optional[QuantizationSpec] = None,
-    random_hadamard_transform: Tuple[str, ...] = (),
+    activation: Optional[QuantizationSpec], weight: Optional[QuantizationSpec]
 ):
     # Microscaling performs quantization along the reduction dimension
     act_qspec = _set_ch_axis(activation, 1)
@@ -151,25 +131,65 @@ def get_microscaling_quantizer(
 
     act_qspec = _set_ch_axis(activation, -1)
     weight_qspec = _set_ch_axis(weight, -1)
-    qconfig_linear = QuantizationConfig(
-        act_qspec,
-        None,
-        weight_qspec,
-        None,
-        error=error,
-        random_hadamard_transform=random_hadamard_transform,
-    )
+    qconfig_linear = QuantizationConfig(act_qspec, None, weight_qspec, None)
 
     act0_qspec = _set_ch_axis(activation, -1)
     act1_qspec = _set_ch_axis(activation, -2)
-    # With an error spec, training GEMMs pick specs by operand type.
+    qconfig_matmul = QuantizationConfig(act0_qspec, None, act1_qspec, None)
+
+    return (
+        XNNPACKQuantizer()
+        .set_object_type(torch.ops.aten.conv2d.default, qconfig_conv2d)
+        .set_object_type(torch.ops.aten.linear.default, qconfig_linear)
+        .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
+    )
+
+
+def get_vsq_quantizer(
+    activation: Optional[QuantizationSpec],
+    output_activation: Optional[QuantizationSpec],
+    weight: Optional[QuantizationSpec],
+):
+    """Configure VSQ along each GEMM reduction dimension.
+
+    A VSQ spec names no ``ch_axis`` of its own: the fine blocks must run along
+    whichever axis the operation reduces over, which is a property of the
+    operation rather than of the datatype. Conv2d reduces over axis 1, linear
+    over the last axis, and matmul over the last axis of one operand and the
+    second-to-last of the other.
+
+    A per-channel coarse level is separate: it is always the weight's output
+    channel, axis 0.
+    """
+
+    def _weight_for(ch_axis):
+        qspec = _set_ch_axis(weight, ch_axis)
+        if (
+            qspec is not None
+            and qspec.coarse is not None
+            and qspec.coarse.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
+        ):
+            qspec = replace(qspec, coarse=replace(qspec.coarse, ch_axis=0))
+        return qspec
+
+    # Bias stays unquantized: VSQ keeps the accumulation in the coarse domain.
+    qconfig_conv2d = QuantizationConfig(
+        _set_ch_axis(activation, 1),
+        _set_ch_axis(output_activation, 1),
+        _weight_for(1),
+        None,
+    )
+    qconfig_linear = QuantizationConfig(
+        _set_ch_axis(activation, -1),
+        _set_ch_axis(output_activation, -1),
+        _weight_for(-1),
+        None,
+    )
     qconfig_matmul = QuantizationConfig(
-        act0_qspec,
+        _set_ch_axis(activation, -1),
+        _set_ch_axis(output_activation, -1),
+        _set_ch_axis(activation, -2),
         None,
-        act1_qspec if error is None else weight,
-        None,
-        error=error,
-        random_hadamard_transform=random_hadamard_transform,
     )
 
     return (
@@ -177,8 +197,6 @@ def get_microscaling_quantizer(
         .set_object_type(torch.ops.aten.conv2d.default, qconfig_conv2d)
         .set_object_type(torch.ops.aten.linear.default, qconfig_linear)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
-        .set_object_type(_SDPA, qconfig_matmul)
-        .set_object_type(MX_OP_MAPPING[_SDPA], qconfig_matmul)
     )
 
 
@@ -217,9 +235,10 @@ def get_per_channel_act_quantizer(
 def derive_bias_qparams_fn(
     obs_or_fqs: List[ObserverOrFakeQuantize],
 ) -> Tuple[Tensor, Tensor]:
-    assert len(obs_or_fqs) == 2, (
-        "Expecting two obs/fqs, one for activation and one for weight, "
-        "got: {}".format(len(obs_or_fqs))
+    assert (
+        len(obs_or_fqs) == 2
+    ), "Expecting two obs/fqs, one for activation and one for weight, got: {}".format(
+        len(obs_or_fqs)
     )
     act_obs_or_fq = obs_or_fqs[0]
     weight_obs_or_fq = obs_or_fqs[1]
@@ -229,59 +248,57 @@ def derive_bias_qparams_fn(
 
 
 def get_default_quantizer(
-    input_activation: Optional[str] = None,
-    output_activation: Optional[str] = None,
-    weight: Optional[str] = None,
-    bias: Optional[str] = None,
-    error: Optional[str] = None,
-    random_hadamard_transform: Tuple[str, ...] = (),
+    input_activation: Optional[QuantizationSpec] = None,
+    output_activation: Optional[QuantizationSpec] = None,
+    weight: Optional[QuantizationSpec] = None,
+    bias: Optional[QuantizationSpec] = None,
+    record_histogram: bool = False,
+    force_scale_power_of_two: bool = False,
     **kwargs: Any,
 ) -> XNNPACKQuantizer:
-    """Build a quantizer for conv2d, linear and matmul from spec strings.
+    """
+    Create a quantizer for the given activation and weight quantization specifications.
 
-    Args:
-        input_activation: Spec for GEMM inputs, or None.
-        output_activation: Spec for GEMM outputs, or None.
-        weight: Spec for weights, or None.
-        bias: Dtype the bias is quantized to, with the product of its GEMM's
-            input and weight scales; required with non-microscaling input
-            and weight specs.
-        error: Spec for gradients, or None.  Setting it builds the quantizer
-            of ``prepare_training``, whose GEMM configs give each operand
-            the spec of its type.
-        random_hadamard_transform: GEMM kinds -- ``"fprop"``, ``"dgrad"``,
-            ``"wgrad"`` -- whose operands are rotated before quantizing;
-            microscaling specs only.
-        **kwargs: Ignored.
+    Parameters:
+    - activation: The quantization spec for activations.
+    - weight: The quantization spec for weights.
+    - record_histogram: Whether to record histogram of input.
+    - force_scale_power_of_two: Whether to force the scaling factor to be a power of two.
 
     Returns:
-        The configured quantizer.
-
-    Raises:
-        ValueError: ``random_hadamard_transform`` is set with specs that are
-            not microscaling.
+    - A configured XNNPACKQuantizer.
     """
+
+    observer_or_fake_quant_ctr = FusedAmaxObsFakeQuantize.with_args(
+        record_histogram=record_histogram,
+        force_scale_power_of_two=force_scale_power_of_two,
+    )
+
     qschemes = []
     if input_activation is not None:
         input_activation = QuantizationSpec.from_str(input_activation)
+        input_activation.observer_or_fake_quant_ctr = observer_or_fake_quant_ctr
         qschemes.append(input_activation.qscheme)
 
     if output_activation is not None:
         output_activation = QuantizationSpec.from_str(output_activation)
+        output_activation.observer_or_fake_quant_ctr = (
+            observer_or_fake_quant_ctr
+        )
 
     if weight is not None:
         weight = QuantizationSpec.from_str(weight)
+        weight.observer_or_fake_quant_ctr = observer_or_fake_quant_ctr
         qschemes.append(weight.qscheme)
 
-    if error is not None:
-        error = QuantizationSpec.from_str(error)
-
     qschemes = [qs for qs in qschemes if qs is not None]
-    if len(qschemes) > 0 and QScheme.MICROSCALING not in qschemes:
-        assert bias is not None, (
-            "Bias quantization is required when quantizing activations and "
-            "weights."
-        )
+    # Block-scaled schemes carry their own scales, so they need no bias
+    # quantization to imply an accumulation dtype.
+    _BLOCK_SCALED = {QScheme.MICROSCALING, QScheme.VSQ}
+    if qschemes and not _BLOCK_SCALED.intersection(qschemes):
+        assert (
+            bias is not None
+        ), "Bias quantization is required when quantizing activations and weights."
 
     # We will specify derived_from later in the quantizer.
     # We use bias data type to imply the accumulation data type for the output.
@@ -292,15 +309,18 @@ def get_default_quantizer(
             dtype=bias,
         )
 
-    if QScheme.MICROSCALING in qschemes:
-        return get_microscaling_quantizer(
-            input_activation, weight, error, random_hadamard_transform
-        )
+    if QScheme.VSQ in qschemes:
+        if len(set(qschemes)) != 1:
+            raise ValueError("VSQ cannot be mixed with another qscheme.")
+        if bias is not None:
+            raise ValueError("VSQ keeps bias unquantized; bias must be None.")
+        return get_vsq_quantizer(input_activation, output_activation, weight)
 
-    if random_hadamard_transform:
-        raise ValueError(
-            "The random Hadamard transform supports microscaling specs only"
-        )
+    if QScheme.MICROSCALING in qschemes:
+        assert (
+            len(set(qschemes)) == 1
+        ), f"Quantization scheme {qschemes[0]} does not work with {qschemes[1]}"
+        return get_microscaling_quantizer(input_activation, weight)
 
     if weight is not None and weight.qscheme == QScheme.PER_CHANNEL_SYMMETRIC:
         assert weight.ch_axis == 0, (
@@ -317,25 +337,48 @@ def get_default_quantizer(
         )
 
     qconfig = QuantizationConfig(
-        input_activation, output_activation, weight, bias, error=error
+        input_activation, output_activation, weight, bias
     )
-    # With an error spec, training GEMMs pick specs by operand type.
     qconfig_matmul = QuantizationConfig(
-        input_activation,
-        output_activation,
-        input_activation if error is None else weight,
-        None,
-        error=error,
+        input_activation, output_activation, input_activation, None
     )
     return (
         XNNPACKQuantizer()
         .set_object_type(torch.ops.aten.conv2d.default, qconfig)
         .set_object_type(torch.ops.aten.linear.default, qconfig)
         .set_object_type(torch.ops.aten.matmul.default, qconfig_matmul)
+        .set_object_type(torch.ops.aten.add.Tensor, qconfig)
+        .set_object_type(torch.ops.aten.add_.Tensor, qconfig)
     )
 
 
-def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
+def prepare_pt2e(
+    model,
+    quantizer,
+    args=None,
+    kwargs=None,
+    dynamic_shapes=None,
+    *,
+    region_qspec=None,
+    domain_rules=None,
+    target=None,
+):
+    """Insert observers, then form the graph's quantization regions.
+
+    Regions are formed *here*, immediately after observer insertion, because
+    forming one inserts observers of its own: a value entering a region has
+    to carry the region's domain, and the only place to say so is where
+    observers live. Doing it later would mean rewriting a calibrated graph.
+
+    Args:
+        region_qspec: The domain data-movement regions take. ``None`` derives
+            each region's domain from its own members and forms only the ones
+            that already agree -- which is every lane that has no target
+            saying otherwise.
+        domain_rules: The declared relations, from
+            ``codegen.targets.prepared_domain_rules``. ``None`` uses the
+            compiler's own.
+    """
     from torchao.quantization.pt2e import prepare
     from torchao.quantization.pt2e.quantize_pt2e import prepare_pt2e
 
@@ -346,123 +389,40 @@ def prepare_pt2e(model, quantizer, args=None, kwargs=None, dynamic_shapes=None):
         model = export_model(model, args, kwargs, dynamic_shapes=dynamic_shapes)
 
     model = prepare_pt2e(model, quantizer)
-    # Both device lookups are memoized on the module they are given; the
-    # intermediate graph prepare passes in would keep every parameter alive.
-    assert_and_get_unique_device.cache_clear()
-    _assert_and_get_unique_device.cache_clear()
+
+    # Local to avoid making the PT2E module and target packages import each
+    # other while their operator namespaces are being registered.
+    from voyager_compiler.codegen.targets import prepare_quantization
+
+    return prepare_quantization(
+        model,
+        target,
+        region_qspec=region_qspec,
+        domain_rules=domain_rules,
+    )
+
+
+def finalize_pt2e_calibration(model: GraphModule, *, target=None):
+    """Freeze the last observed sample and target-owned shared domains.
+
+    Observer forwards intentionally update their live scale from the history
+    *before* the current sample. Finalization therefore recomputes each
+    distinct observer after the target has joined any physical domains.
+    """
+    from voyager_compiler.codegen.targets import (
+        finalize_quantization_calibration,
+    )
+
+    finalize_quantization_calibration(model, target)
+    finalized = set()
+    for module in model.modules():
+        if not isinstance(module, FusedAmaxObsFakeQuantize):
+            continue
+        if id(module) in finalized:
+            continue
+        module.calculate_qparams()
+        finalized.add(id(module))
     return model
-
-
-def prepare_qat_pt2e(model: GraphModule, quantizer) -> GraphModule:
-    """Prepare a graph for QAT with each conv-BN fold simulated.
-
-    Every batch norm must follow a conv2d that feeds nothing else; torchao
-    rewrites each pair into the simulated fold: the weight is scaled by the
-    BN factor ``s = gamma / sqrt(running_var + eps)`` before its fake-quant,
-    the conv output is divided by ``s``, and the batch norm keeps
-    normalizing with batch statistics.  A conv without a bias first gets a
-    zero buffer as one, so the quantizer annotates the bias the fold will
-    produce.
-
-    Args:
-        model: Graph exported in training mode.
-        quantizer: Annotates the rewritten graph.
-
-    Returns:
-        The prepared graph, whose ``train()`` and ``eval()`` do nothing:
-        ``set_training`` sets its mode.
-
-    Raises:
-        ValueError: A batch norm does not follow a conv2d alone, or its
-            momentum or eps is not 0.1 or 1e-5, the values torchao's
-            rewrite writes into the graph.
-    """
-    graph = model.graph
-    for bn in list(graph.nodes):
-        if bn.target != torch.ops.aten.batch_norm.default:
-            continue
-        conv = bn.args[0]
-        if conv.target != torch.ops.aten.conv2d.default or len(conv.users) > 1:
-            raise ValueError(f"{bn} does not follow a conv2d alone")
-        momentum, eps = bn.args[6], bn.args[7]
-        if (momentum, eps) != (0.1, 1e-5):
-            raise ValueError(
-                f"{bn} has momentum {momentum} and eps {eps}; the QAT fold "
-                "supports only 0.1 and 1e-5"
-            )
-        if get_arg_value(conv, 2, "bias") is not None:
-            continue
-        weight = conv.args[1]
-        value = fetch_attr(model, weight.target)
-        with graph.inserting_before(conv):
-            bias = create_getattr_from_value(
-                model,
-                graph,
-                weight.target + "_bias",
-                value.new_zeros(value.shape[0]),
-            )
-        conv.args = conv.args[:2] + (bias,) + conv.args[3:]
-    model.recompile()
-
-    # torchao traces its patterns on random inputs; the caller's random
-    # stream stays as it was.
-    with torch.random.fork_rng():
-        _fuse_conv_bn_qat(model)
-    # The rewrite builds each conv's zero bias in the dtype it was traced in.
-    for conv in graph.nodes:
-        if conv.target != torch.ops.aten.conv2d.default:
-            continue
-        bias = get_arg_value(conv, 2, "bias")
-        if bias is None or bias.target != torch.ops.aten.zeros_like.default:
-            continue
-        bias.update_kwarg("dtype", None)
-    model = prepare_pt2e(model, quantizer)
-
-    def _eval(self, mode: bool = True):
-        return self
-
-    model.eval = types.MethodType(_eval, model)
-    model.train = types.MethodType(_eval, model)
-    return model
-
-
-def set_batch_norm_training(model: GraphModule, training: bool) -> None:
-    """Set whether ``model``'s batch norms normalize with batch statistics.
-
-    ``train()`` and ``eval()`` do not reach the ops of an exported graph, so
-    this sets each batch norm's ``training`` argument.  Out of training a
-    batch norm normalizes with its running statistics and leaves them
-    unchanged.
-
-    Args:
-        model: Exported graph, rewritten in place.
-        training: Whether the batch norms use batch statistics.
-    """
-    for node in model.graph.nodes:
-        if node.target == torch.ops.aten.batch_norm.default:
-            node.update_arg(5, training)
-    model.recompile()
-
-
-def set_training(model: GraphModule, training: bool) -> None:
-    """Switch ``model``'s dropouts and batch norms between training and eval.
-
-    Out of training a dropout passes its input through.  Attention's dropout
-    probability is fixed when the graph is exported; it is kept in the
-    node's meta and restored for training.  Batch norms switch as
-    ``set_batch_norm_training`` switches them.
-
-    Args:
-        model: Exported graph, rewritten in place.
-        training: Whether the ops behave as in training.
-    """
-    for node in model.graph.nodes:
-        if node.target in _DROPOUTS:
-            node.update_arg(2, training)
-        elif node.target == _SDPA and len(node.args) > 4:
-            dropout_p = node.meta.setdefault("dropout_p", node.args[4])
-            node.update_arg(4, dropout_p if training else 0.0)
-    set_batch_norm_training(model, training)
 
 
 def _get_module(
@@ -475,6 +435,149 @@ def _get_module(
         return named_modules[str(node.target)]
     else:
         return None
+
+
+def _insert_or_update_gemm_dequantize(
+    model: GraphModule,
+    user: Node,
+    scale: Tensor,
+    output_dtype: Optional[str],
+    device: torch.device,
+) -> None:
+    """Materialize the existing post-GEMM dequantization boundary."""
+    graph = model.graph
+    user.meta["dtype"] = output_dtype
+    node_order = {node: index for index, node in enumerate(graph.nodes)}
+    all_users = sorted(
+        user.users,
+        key=lambda node: node_order.get(node, float("inf")),
+    )
+    if not all_users:
+        return
+    maybe_dequantize = all_users[0]
+
+    if (
+        maybe_dequantize.op == "call_function"
+        and maybe_dequantize.target
+        is torch.ops.quantized_ops.dequantize.default
+    ):
+        qparam_node = maybe_dequantize.args[1]
+        buffer = model.get_buffer(qparam_node.target)
+        model.register_buffer(qparam_node.target, scale * buffer)
+        return
+
+    quant_map = get_quantization_map(output_dtype, device)
+    with graph.inserting_before(maybe_dequantize):
+        qparam_node = create_getattr_from_value(
+            model, graph, user.name + "_scale", scale
+        )
+        get_attr_node = create_getattr_from_value(
+            model, graph, "qmap", quant_map
+        )
+        dequantized = graph.call_function(
+            torch.ops.quantized_ops.dequantize.default,
+            (
+                user,
+                qparam_node,
+                None,
+                None,
+                None,
+                get_attr_node,
+            ),
+        )
+
+    for original_user in list(user.users):
+        if original_user is not dequantized:
+            original_user.replace_input_with(user, dequantized)
+
+
+def _insert_dequantize_before_user(
+    model: GraphModule,
+    source: Node,
+    user: Node,
+    scale: Tensor,
+    *,
+    adjacent_to_source: bool = False,
+) -> None:
+    graph = model.graph
+    insertion_point = (
+        source.next
+        if adjacent_to_source and source.op != "get_attr"
+        else user
+    )
+    with graph.inserting_before(insertion_point):
+        qparam_node = create_getattr_from_value(
+            model, graph, user.name + "_scale", scale
+        )
+        dequantized = graph.call_function(
+            torch.ops.quantized_ops.dequantize.default,
+            (source, qparam_node),
+        )
+    user.replace_input_with(source, dequantized)
+
+
+def _materialize_domain_users(
+    model: GraphModule,
+    observer: Node,
+    source: Node,
+    users: list[Node],
+    scale: Tensor,
+    dtype: str,
+    output_dtype: Optional[str],
+    device: torch.device,
+) -> None:
+    """Keep region-internal edges encoded and decode only at its exits."""
+    region = observer.meta.get(QUANTIZATION_REGION)
+    for user in users:
+        if region is not None and user.meta.get(QUANTIZATION_REGION) == region:
+            user.meta["dtype"] = dtype
+        elif is_gemm_op(user):
+            _insert_or_update_gemm_dequantize(
+                model,
+                user,
+                scale,
+                output_dtype,
+                device,
+            )
+        else:
+            _insert_dequantize_before_user(
+                model,
+                source,
+                user,
+                scale,
+                # Preserve the pre-region graph order for every ordinary
+                # lane.  Only an explicit region needs an edge-local exit.
+                adjacent_to_source=region is None,
+            )
+
+
+def _replace_domain_alias(
+    model: GraphModule,
+    node: Node,
+    modules: Dict[str, torch.nn.Module],
+    output_dtype: Optional[str],
+) -> None:
+    """Remove a prepared region-exit observer without requantizing codes."""
+    assert isinstance(node.target, str)
+    activation_post_process = modules[node.target]
+    device = assert_and_get_unique_device(activation_post_process)
+    dtype = next(iter(model.parameters())).dtype
+    scale = activation_post_process.calculate_qparams().to(dtype)
+    users = list(node.users)
+    source = node.args[0]
+    node.replace_all_uses_with(source)
+    model.graph.erase_node(node)
+    source.meta["dtype"] = activation_post_process.dtype
+    _materialize_domain_users(
+        model,
+        node,
+        source,
+        users,
+        scale,
+        activation_post_process.dtype,
+        output_dtype,
+        device,
+    )
 
 
 def _replace_observer_with_quantize_dequantize_node_decomposed(
@@ -528,100 +631,464 @@ def _replace_observer_with_quantize_dequantize_node_decomposed(
 
         # Annotate input dtype
         quantized_node.meta["dtype"] = activation_post_process.dtype
+        for key in (
+            QUANTIZATION_REGION,
+            QUANTIZATION_DOMAIN_ENTRY,
+            QUANTIZATION_DOMAIN_DTYPE,
+        ):
+            if key in node.meta:
+                quantized_node.meta[key] = node.meta[key]
 
         node.replace_all_uses_with(quantized_node)
     graph.erase_node(node)
 
-    # A bias, and a cast with no scale, get no dequantize node.
-    if isinstance(
-        activation_post_process,
-        (_DerivedObserverOrFakeQuantize, DirectCastFakeQuantize),
+    # We don't need to insert dequantize node for bias
+    if (
+        isinstance(activation_post_process, _DerivedObserverOrFakeQuantize)
+        or activation_post_process.qscheme is None
     ):
         return
 
-    for user_node in orig_fq_users:
-        if is_gemm_op(user_node):
-            user_node.meta["dtype"] = output_dtype
-
-            # Insert dequantize node before the node that appear the earlist in
-            # the graph
-            node_index_map = {n: i for i, n in enumerate(graph.nodes)}
-            all_user_nodes = sorted(
-                user_node.users.keys(),
-                key=lambda n: node_index_map.get(n, float("inf")),
-            )
-            maybe_dq_node = all_user_nodes[0]
-
-            if (
-                maybe_dq_node.op != "call_function"
-                or maybe_dq_node.target
-                != torch.ops.quantized_ops.dequantize.default
-            ):
-                # Insert a dequantize node after the gemm operation
-                quant_map = get_quantization_map(output_dtype, device)
-                with graph.inserting_before(maybe_dq_node):
-                    qparam_node = create_getattr_from_value(
-                        model, graph, user_node.name + "_scale", scale
-                    )
-                    get_attr_node = create_getattr_from_value(
-                        model, graph, "qmap", quant_map
-                    )
-                    dequantized_node = graph.call_function(
-                        torch.ops.quantized_ops.dequantize.default,
-                        (
-                            user_node,
-                            qparam_node,
-                            None,
-                            None,
-                            None,
-                            get_attr_node,
-                        ),
-                    )
-
-                # We need to save orig users before updating users because
-                # the list of users will change as we update users
-                orig_users = list(user_node.users.keys())
-                for user in orig_users:
-                    if id(user) == id(dequantized_node):
-                        continue
-                    user.replace_input_with(user_node, dequantized_node)
-            else:
-                # Update the scale if a dequantize node already exists
-                qparam_node = maybe_dq_node.args[1]
-                buffer = model.get_buffer(qparam_node.target)
-                model.register_buffer(qparam_node.target, scale * buffer)
-        else:
-            # Insert a dequantize node after the quantize node
-            with graph.inserting_before(quantized_node.next):
-                qparam_node = create_getattr_from_value(
-                    model, graph, user_node.name + "_scale", scale
-                )
-                dequantized_node = graph.call_function(
-                    torch.ops.quantized_ops.dequantize.default,
-                    (quantized_node, qparam_node),
-                )
-
-            user_node.replace_input_with(quantized_node, dequantized_node)
+    _materialize_domain_users(
+        model,
+        node,
+        input_node if input_node.op == "get_attr" else quantized_node,
+        orig_fq_users,
+        scale,
+        activation_post_process.dtype,
+        output_dtype,
+        device,
+    )
 
 
 MX_OP_MAPPING = {
     torch.ops.aten.conv2d.default: torch.ops.quantized_ops.conv2d_mx.default,
     torch.ops.aten.linear.default: torch.ops.quantized_ops.linear_mx.default,
     torch.ops.aten.matmul.default: torch.ops.quantized_ops.matmul_mx.default,
-    _SDPA: torch.ops.quantized_ops.sdpa_mx.default,
 }
 
-# An attention operand's scale kwarg, by its position among the operands.
-_ATTENTION_SCALES = ("query_scale", "key_scale", "value_scale")
 
-# The GEMMs whose operands may carry a global scale: they apply it to their
-# product, as ``alpha``.
-_GEMMS = (
-    torch.ops.aten.linear.default,
-    torch.ops.aten.matmul.default,
-    torch.ops.quantized_ops.linear_mx.default,
-    torch.ops.quantized_ops.matmul_mx.default,
-)
+def _trace_converted_vsq_join(source: Node):
+    """Recover the prepared component-wise join underneath ``source``."""
+    path = []
+    current = source
+    while current.target in _VSQ_JOIN_PASSTHROUGH_TARGETS:
+        inputs = _vsq_join_data_inputs(current)
+        if len(inputs) != 1:
+            return None
+        path.append(current)
+        current = inputs[0]
+    if current.target not in _VSQ_JOIN_TARGETS:
+        return None
+    return current, tuple(reversed(path))
+
+
+def _converted_vsq_components(node: Node):
+    """Payload, scales and geometry reconstructed by one VSQ dequantizer."""
+    if node.target is not torch.ops.quantized_ops.dequantize_vsq.default:
+        return None
+    return (
+        get_arg_value(node, 0, "input"),
+        get_arg_value(node, 1, "fine_scale"),
+        get_arg_value(node, 2, "coarse_scale"),
+        get_arg_value(node, 3, "axes"),
+        get_arg_value(node, 4, "block_size"),
+        get_arg_value(node, 5, "code"),
+    )
+
+
+def _clone_vsq_join_component(
+    graph,
+    join: Node,
+    path: tuple[Node, ...],
+    inputs: tuple[Node, ...],
+) -> tuple[Node, tuple[Node, ...]]:
+    """Replay one prepared join path over one VSQ component."""
+    args = list(join.args)
+    args[0] = inputs
+    with graph.inserting_before(join):
+        output = graph.call_function(join.target, tuple(args), dict(join.kwargs))
+    output.meta = copy.copy(join.meta)
+    created = [output]
+
+    previous = join
+    for path_node in path:
+        args = list(path_node.args)
+        if not args or args[0] is not previous:
+            raise RuntimeError(
+                f"{path_node.name}: malformed VSQ join transfer path"
+            )
+        args[0] = output
+        with graph.inserting_before(path_node):
+            next_output = graph.call_function(
+                path_node.target, tuple(args), dict(path_node.kwargs)
+            )
+        next_output.meta = copy.copy(path_node.meta)
+        output = next_output
+        created.append(output)
+        previous = path_node
+    return output, tuple(created)
+
+
+def _replace_vsq_join_alias(
+    model: GraphModule,
+    node: Node,
+    modules: Dict[str, torch.nn.Module],
+) -> None:
+    """Convert one calibrated VSQ fan-in into payload and scale joins."""
+    graph = model.graph
+    observer = modules[str(node.target)]
+    source = node.args[0]
+    match = _trace_converted_vsq_join(source)
+    if match is None:
+        raise RuntimeError(f"{node.name}: cannot recover its VSQ join")
+    join, path = match
+
+    dequantizers = _vsq_join_data_inputs(join)
+    components = tuple(
+        _converted_vsq_components(input_node) for input_node in dequantizers
+    )
+    if not components or any(component is None for component in components):
+        raise RuntimeError(
+            f"{node.name}: VSQ join inputs are not encoded boundaries"
+        )
+
+    payloads = tuple(component[0] for component in components)
+    fine_scales = tuple(component[1] for component in components)
+    coarse_scales = tuple(component[2] for component in components)
+    axes = tuple(component[3] for component in components)
+    block_sizes = tuple(component[4] for component in components)
+    codes = tuple(component[5] for component in components)
+    if len(set(map(str, axes))) != 1 or len(set(block_sizes)) != 1:
+        raise RuntimeError(f"{node.name}: incompatible VSQ join geometry")
+    if len(set(map(str, codes))) != 1:
+        raise RuntimeError(f"{node.name}: incompatible VSQ join codebooks")
+
+    payload, payload_nodes = _clone_vsq_join_component(
+        graph, join, path, payloads
+    )
+    fine_scale, fine_scale_nodes = _clone_vsq_join_component(
+        graph, join, path, fine_scales
+    )
+    scale_dtype = (
+        "fp8_e8m0"
+        if observer.force_scale_power_of_two
+        else observer.scale_dtype
+    )
+    payload.meta["dtype"] = observer.dtype
+    for payload_node in payload_nodes:
+        payload_node.meta[QUANTIZATION_REGION] = node.meta[QUANTIZATION_REGION]
+    for fine_scale_node in fine_scale_nodes:
+        fine_scale_node.meta["dtype"] = scale_dtype
+        fine_scale_node.meta.pop(QUANTIZATION_DOMAIN_DTYPE, None)
+
+    original_users = list(node.users)
+    node.replace_all_uses_with(payload)
+    graph.erase_node(node)
+
+    for user in original_users:
+        if (
+            user.target not in MX_OP_MAPPING
+            and user.target not in MX_OP_MAPPING.values()
+        ):
+            raise RuntimeError(
+                f"{payload.name}: unsupported VSQ join user {user.target}"
+            )
+        target = MX_OP_MAPPING.get(user.target, user.target)
+        _requires_coarse_scale_support(target, user.name)
+        kwargs = OrderedDict(user.kwargs)
+        kwargs["input_scale"] = fine_scale
+        kwargs["input_coarse_scale"] = coarse_scales[0]
+        kwargs["block_size"] = block_sizes[0]
+        if codes[0] is not None:
+            kwargs["input_code"] = codes[0]
+        order = (
+            "input_scale",
+            "input_coarse_scale",
+            "weight_scale",
+            "weight_coarse_scale",
+            "block_size",
+            "input_code",
+            "weight_code",
+        )
+        kwargs = OrderedDict(
+            (key, kwargs[key]) for key in order if key in kwargs
+        )
+        if user.target in MX_OP_MAPPING:
+            with graph.inserting_before(user):
+                mx_node = graph.call_function(
+                    target, user.args, kwargs
+                )
+            mx_node.meta = user.meta
+            user.replace_all_uses_with(mx_node)
+            graph.erase_node(user)
+        else:
+            user.kwargs = kwargs
+
+    for dead in (*reversed(path), join, *dequantizers):
+        if not dead.users:
+            graph.erase_node(dead)
+
+
+def _requires_coarse_scale_support(target, node_name: str) -> None:
+    """Refuse a matrix operator whose schema cannot carry a coarse scale.
+
+    A VSQ operand is three values, and an operator that accepts only the
+    payload and the fine scale would take two of them and silently drop the
+    third -- a graph that runs, converts, and computes the wrong number. So
+    the check is on the *schema*, not on a list of operators: an operator that
+    later grows the fields simply starts working.
+    """
+    schema = getattr(target, "_schema", None)
+    names = {argument.name for argument in getattr(schema, "arguments", ())}
+    missing = {"input_coarse_scale", "weight_coarse_scale"} - names
+    if missing:
+        raise RuntimeError(
+            f"{node_name}: {target} cannot carry a vector-scaled operand -- "
+            f"its schema has no {sorted(missing)}. A VSQ value is a payload, "
+            "a per-block fine scale and a coarse scale; an operator that "
+            "takes only the first two computes something else."
+        )
+
+
+def _replace_observer_with_quantize_vsq_node_decomposed(
+    model: GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
+):
+    """Replace one VSQ fake quantizer with the three values VSQ produces.
+
+    A vector-scaled value is not one tensor. It is a narrow payload, a
+    per-block *fine* scale, and a *coarse* scale applied once -- and the split
+    is the datapath's rather than a representation choice: the array
+    multiplies the fine scale into the reduction while the coarse one is
+    applied at the epilogue, so folding them together describes a machine that
+    does not exist.
+
+    Without this branch a VSQ observer fell through to the plain
+    quantize/dequantize replacement. That keeps the payload's *width* -- the
+    graph still says int4 -- and discards the level that makes it accurate,
+    which is the worst of the three possible outcomes: no error, the right
+    dtype, the wrong number.
+
+    Two shapes come out, chosen by what reads the value:
+
+    * every reader is a matrix operation -> the payload replaces the observer
+      and the two scales ride on that operation as keyword operands, which is
+      what a machine with a vector-scaled datapath actually issues;
+    * anything else reads it -> a ``dequantize_vsq`` reconstructs the value,
+      because an operation with no vector-scaled form has to be handed a
+      number rather than three.
+    """
+    graph = model.graph
+    assert isinstance(node.target, str)
+    observer = modules[node.target]
+    input_node = node.args[0]
+
+    axes = observer.ch_axis
+    if isinstance(axes, int):
+        axes = (axes,)
+    if observer.is_codebook_quantization:
+        # Fail closed rather than fall through: the codebook path rewrites the
+        # observer's own dtype and qmap on the way past, and a VSQ value has
+        # two maps to rewrite. Nothing asks for the combination today.
+        raise NotImplementedError(
+            f"{node.target}: codebook levels under VSQ are not supported"
+        )
+
+    storage_dtype = observer.dtype
+    scale_dtype = (
+        "fp8_e8m0"
+        if observer.force_scale_power_of_two
+        else observer.scale_dtype
+    )
+
+    if input_node.op == "get_attr":
+        # A parameter is known now, so the three values are computed here and
+        # stored, rather than recomputed on every forward.
+        parameter = fetch_attr(model, input_node.target)
+        coarse, fine, payload = observer.quantize_vsq_components(
+            parameter.data
+        )
+        with graph.inserting_before(node):
+            coarse_scale_output = create_getattr_from_value(
+                model, graph, input_node.name + "_coarse_scale", coarse
+            )
+            fine_scale_output = create_getattr_from_value(
+                model, graph, input_node.name + "_scale", fine
+            )
+            quantized_node = create_getattr_from_value(
+                model, graph, input_node.name + "_" + storage_dtype, payload
+            )
+        # No quantizer node exists for a parameter, so nothing else in the
+        # converted graph records the split these components were made under.
+        # A target re-derives the mantissa/coarse rebalance from exactly this
+        # pair; without it the only recourse is a declared default, which is
+        # right for the pairing that matches it and silent for one that does
+        # not.
+        coarse_scale_output.meta[VSQ_SCALE_ENDPOINTS] = (
+            float(observer.scale_quant_max),
+            float(observer.coarse_scale_quant_max),
+        )
+        vsq_node = None
+    else:
+        with graph.inserting_before(node):
+            coarse_scale_node = create_getattr_from_value(
+                model,
+                graph,
+                input_node.name + "_coarse_scale",
+                observer.calculate_qparams(),
+            )
+            coarse_qmap_node = create_getattr_from_value(
+                model, graph, "coarse_qmap", observer.coarse_qmap
+            )
+            fine_qmap_node = create_getattr_from_value(
+                model, graph, "qmap", observer.qmap
+            )
+            fine_scale_qmap_node = None
+            if observer.scale_qmap is not None:
+                fine_scale_qmap_node = create_getattr_from_value(
+                    model, graph, "scale_qmap", observer.scale_qmap
+                )
+            vsq_node = graph.call_function(
+                torch.ops.quantized_ops.quantize_vsq.default,
+                (
+                    input_node,
+                    coarse_scale_node,
+                    coarse_qmap_node,
+                    fine_qmap_node,
+                    axes,
+                    observer.block_size,
+                    observer.scale_quant_max,
+                    observer.force_scale_power_of_two,
+                    fine_scale_qmap_node,
+                    None,
+                    observer.coarse_scale_quant_max,
+                ),
+            )
+            coarse_scale_output = graph.call_function(
+                operator.getitem, (vsq_node, 0)
+            )
+            fine_scale_output = graph.call_function(
+                operator.getitem, (vsq_node, 1)
+            )
+            quantized_node = graph.call_function(
+                operator.getitem, (vsq_node, 2)
+            )
+        # One tracked dtype per output, in the order the operator returns
+        # them. The coarse scale keeps the dtype it was traced with.
+        vsq_node.meta["dtype"] = (None, scale_dtype, storage_dtype)
+        for key in (
+            QUANTIZATION_REGION,
+            QUANTIZATION_DOMAIN_DTYPE,
+            VSQ_JOIN_ENTRY,
+            VSQ_JOIN_ALIAS,
+        ):
+            if key in node.meta:
+                vsq_node.meta[key] = node.meta[key]
+
+    quantized_node.meta["dtype"] = storage_dtype
+    for key in (QUANTIZATION_REGION, VSQ_JOIN_ENTRY):
+        if key in node.meta:
+            quantized_node.meta[key] = node.meta[key]
+    if scale_dtype is not None:
+        fine_scale_output.meta["dtype"] = scale_dtype
+
+    original_users = list(node.users.keys())
+
+    def _reads_it_as_a_matrix_operand(user):
+        if user.target is torch.Tensor.to and len(user.users) == 1:
+            user = next(iter(user.users))
+        return (
+            user.target in MX_OP_MAPPING
+            or user.target in MX_OP_MAPPING.values()
+        )
+
+    is_matrix_operand = input_node.op == "get_attr" or (
+        bool(original_users)
+        and all(_reads_it_as_a_matrix_operand(u) for u in original_users)
+    )
+
+    if not is_matrix_operand:
+        with graph.inserting_before(node):
+            dequantized_node = graph.call_function(
+                torch.ops.quantized_ops.dequantize_vsq.default,
+                (
+                    quantized_node,
+                    fine_scale_output,
+                    coarse_scale_output,
+                    axes,
+                    observer.block_size,
+                    None,
+                ),
+            )
+        dequantized_node.meta = copy.copy(node.meta)
+        node.replace_all_uses_with(dequantized_node)
+        graph.erase_node(node)
+        return
+
+    node.replace_all_uses_with(quantized_node)
+    graph.erase_node(node)
+    if len(input_node.users) == 0:
+        graph.erase_node(input_node)
+
+    for user in original_users:
+        coarse_for_user, fine_for_user = coarse_scale_output, fine_scale_output
+
+        # Skip a device alignment node, moving the scales to the same device.
+        if user.target is torch.Tensor.to:
+            user_device = user.args[1]
+            with graph.inserting_before(user):
+                coarse_for_user = graph.call_function(
+                    torch.Tensor.to, (coarse_for_user, user_device)
+                )
+                fine_for_user = graph.call_function(
+                    torch.Tensor.to, (fine_for_user, user_device)
+                )
+            user = next(iter(user.users))
+
+        target = MX_OP_MAPPING.get(user.target, user.target)
+        _requires_coarse_scale_support(target, user.name)
+
+        kwargs = OrderedDict(user.kwargs)
+        kwargs.setdefault("block_size", observer.block_size)
+        is_weight = input_node.op == "get_attr" or id(quantized_node) == id(
+            user.args[1]
+        )
+        if is_weight:
+            kwargs.setdefault("weight_scale", fine_for_user)
+            kwargs.setdefault("weight_coarse_scale", coarse_for_user)
+        else:
+            kwargs.setdefault("input_scale", fine_for_user)
+            kwargs.setdefault("input_coarse_scale", coarse_for_user)
+
+        # Sorted so they can be read sequentially, the same order the
+        # microscaling replacement above uses.
+        order = [
+            "input_scale",
+            "input_coarse_scale",
+            "weight_scale",
+            "weight_coarse_scale",
+            "block_size",
+            "input_code",
+            "weight_code",
+        ]
+        kwargs = OrderedDict(
+            (key, kwargs[key]) for key in order if key in kwargs
+        )
+
+        if user.target in MX_OP_MAPPING:
+            with graph.inserting_before(user):
+                mx_op_node = graph.call_function(target, user.args, kwargs)
+            user.replace_all_uses_with(mx_op_node)
+            graph.erase_node(user)
+            mx_op_node.meta = user.meta
+        elif user.target in MX_OP_MAPPING.values():
+            user.kwargs = kwargs
+        else:
+            raise RuntimeError(
+                f"Unsupported VSQ user {user.target}; a vector-scaled value "
+                f"is a matrix operand, expected one of "
+                f"{list(MX_OP_MAPPING.keys())}"
+            )
 
 
 def _replace_observer_with_quantize_mx_node_decomposed(
@@ -641,18 +1108,12 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         activation_post_process.ch_axis = (activation_post_process.ch_axis,)
 
     if activation_post_process.outlier_threshold is not None:
-        # The stream takes the observed maximum plus one percentage point,
-        # rounded to the nearest whole percent: headroom for the blocks
-        # above the mean.
-        observed = activation_post_process.max_outlier_pct
-        stream_pct = round((observed + 0.01) * 100) / 100
-        # ``CSR_STREAM_PCT`` declares the stream at that rate instead (never
-        # below what was observed).
-        if os.environ.get("CSR_STREAM_PCT"):
-            stream_pct = max(observed, float(os.environ["CSR_STREAM_PCT"]))
+        max_outlier_pct = (
+            math.ceil(activation_post_process.max_outlier_pct * 100) / 100.0
+        )
+        activation_post_process.max_outlier_pct = max(max_outlier_pct, 0.05)
         logger.info(
-            f"{node.target}: {observed:.4%} outliers observed, stream "
-            f"declared at {stream_pct:.4%}"
+            f"{node.target} has maximum outlier percentage {max_outlier_pct:.2%}"
         )
 
     dequant_code, quant_code = None, None
@@ -663,8 +1124,9 @@ def _replace_observer_with_quantize_mx_node_decomposed(
         per_head = table.dim() > 1
         values = table if per_head else torch.unique(table)
 
+        level_bits = re.fullmatch(r".*_(\d+)", activation_post_process.dtype)
         activation_post_process.dtype = (
-            f"int{activation_post_process.index_bits}"
+            f"int{math.ceil(math.log2(values.shape[-1]))}"
         )
         # A lookup table answers with the index directly, since it is
         # indexed by the value itself.  A codebook stays the levels, and
@@ -676,17 +1138,10 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             if per_head
             else torch.searchsorted(values, table).to(torch.int64)
         )
-        # Entries without a dtype of their own are stored in the model's, and
-        # a graph with no parameters keeps the table's.  The midpoints are
-        # taken from the levels as fitted.
-        entries = values
-        parameter = next(iter(model.parameters()), None)
-        if activation_post_process.code_dtype is None and parameter is not None:
-            entries = values.to(parameter.dtype)
 
         with graph.inserting_before(node):
             dequant_code = create_getattr_from_value(
-                model, graph, "code", entries
+                model, graph, "code", values
             )
             if input_node.op != "get_attr":
                 midpoints = (values[..., :-1] + values[..., 1:]) / 2
@@ -694,40 +1149,28 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     model, graph, "code", midpoints
                 )
 
-        if activation_post_process.code_dtype is not None:
-            dequant_code.meta["dtype"] = activation_post_process.code_dtype
+        if level_bits is not None:
+            dequant_code.meta["dtype"] = f"int{level_bits.group(1)}"
 
-    uses_global_scale = activation_post_process.global_scale
-    filters_outliers = activation_post_process.outlier_threshold is not None
-    if uses_global_scale and filters_outliers:
-        raise NotImplementedError(
-            "A global scale with outlier filtering has no lowering yet"
-        )
-
-    get_attr_node = scale_qmap = global_scale_node = None
     if input_node.op == "get_attr":
         # quantize model parameter and remove the fq module
         param = fetch_attr(model, input_node.target)
 
-        global_scale = (
-            calculate_global_scale(
-                param.data,
-                activation_post_process.quant_max,
-                activation_post_process.scale_max,
-            )
-            if uses_global_scale
-            else None
-        )
-
-        scale, weight = torch.ops.quantized_ops.quantize_mx(
+        scale = torch.ops.quantized_ops.calculate_mx_qparam(
             param.data,
-            activation_post_process.qmap,
             activation_post_process.ch_axis,
             activation_post_process.block_size,
             activation_post_process.quant_max,
-            activation_post_process.power_2_scale,
+            activation_post_process.force_scale_power_of_two,
             activation_post_process.scale_qmap,
-            global_scale=global_scale,
+        )
+
+        weight = torch.ops.quantized_ops.quantize(
+            param.data,
+            scale,
+            axes=activation_post_process.ch_axis,
+            block_size=activation_post_process.block_size,
+            qmap=activation_post_process.qmap,
         )
 
         with graph.inserting_before(node):
@@ -737,13 +1180,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             scale_node = create_getattr_from_value(
                 model, graph, input_node.name + "_scale", scale
             )
-            if global_scale is not None:
-                global_scale_node = create_getattr_from_value(
-                    model,
-                    graph,
-                    input_node.name + "_global_scale",
-                    global_scale,
-                )
     else:
         with graph.inserting_before(node):
             get_attr_node = create_getattr_from_value(
@@ -763,41 +1199,17 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 activation_post_process.ch_axis,
                 activation_post_process.block_size,
                 activation_post_process.quant_max,
-                activation_post_process.power_2_scale,
+                activation_post_process.force_scale_power_of_two,
                 scale_qmap,
                 quant_code,
             ]
-
-            if uses_global_scale:
-                # ``calculate_global_scale`` as graph nodes: the amax over
-                # the whole tensor, then scalar arithmetic.
-                magnitude = graph.call_function(
-                    torch.ops.aten.abs.default, (node_to_quantize,)
-                )
-                amax = graph.call_function(
-                    torch.ops.aten.amax.default, (magnitude,)
-                )
-                ratio = graph.call_function(
-                    torch.ops.aten.div.Scalar,
-                    (
-                        amax,
-                        activation_post_process.quant_max
-                        * activation_post_process.scale_max,
-                    ),
-                )
-                global_scale_node = graph.call_function(
-                    torch.ops.aten.clamp_min.default,
-                    (ratio, torch.finfo(torch.float32).tiny),
-                )
-                # No seed: a converted graph rounds to nearest.
-                args += [None, global_scale_node]
 
             if activation_post_process.outlier_threshold is not None:
                 target = torch.ops.quantized_ops.quantize_mx_outlier.default
                 args.extend(
                     [
                         float(activation_post_process.outlier_threshold),
-                        stream_pct,
+                        activation_post_process.max_outlier_pct,
                     ]
                 )
                 num_outputs = 5
@@ -813,7 +1225,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
         scale_dtype = (
             "fp8_e8m0"
-            if activation_post_process.power_2_scale
+            if activation_post_process.force_scale_power_of_two
             else activation_post_process.scale_dtype
         )
 
@@ -830,7 +1242,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 scale_dtype,
                 activation_post_process.dtype,
             )
-            quantize_mx_node.meta["outlier_rate"] = observed
         else:
             scale_node, quantized_node = output_nodes
             dtype_tuple = (scale_dtype, activation_post_process.dtype)
@@ -839,7 +1250,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
 
     quantized_node.meta["dtype"] = activation_post_process.dtype
 
-    if activation_post_process.power_2_scale:
+    if activation_post_process.force_scale_power_of_two:
         scale_node.meta["dtype"] = "fp8_e8m0"
     elif activation_post_process.scale_dtype is not None:
         scale_node.meta["dtype"] = activation_post_process.scale_dtype
@@ -855,8 +1266,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
     for user in orig_fq_users:
         # Keep the original nodes for other users
         kwarg1, kwarg2 = dequant_code, scale_node
-        global_scale_arg = global_scale_node
-        operand = quantized_node
 
         # Skip device alignment node
         if user.target == torch.Tensor.to:
@@ -869,37 +1278,11 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 kwarg2 = graph.call_function(
                     torch.Tensor.to, (scale_node, user_device)
                 )
-                if global_scale_arg is not None:
-                    global_scale_arg = graph.call_function(
-                        torch.Tensor.to, (global_scale_node, user_device)
-                    )
-            operand = user
             user = next(iter(user.users))
 
         kwargs = OrderedDict(user.kwargs)
         kwargs.setdefault("block_size", activation_post_process.block_size)
-        if user.target in (_SDPA, MX_OP_MAPPING[_SDPA]):
-            # The query, key and value each carry their own scale; the
-            # query and the probabilities share a codebook, the key and the
-            # value the other.  The probabilities are quantized inside the
-            # attention kernel with the query's parameters.
-            position = user.args.index(operand)
-            kwargs.setdefault(_ATTENTION_SCALES[position], kwarg2)
-            if position == 0:
-                kwargs.setdefault("input_code", kwarg1)
-                kwargs.setdefault("probs_qmap", get_attr_node)
-                kwargs.setdefault(
-                    "probs_quant_max", activation_post_process.quant_max
-                )
-                kwargs.setdefault("probs_scale_qmap", scale_qmap)
-                kwargs.setdefault("probs_code", quant_code)
-                kwargs.setdefault(
-                    "force_scale_power_of_two",
-                    activation_post_process.power_2_scale,
-                )
-            else:
-                kwargs.setdefault("weight_code", kwarg1)
-        elif input_node.op == "get_attr" or id(quantized_node) == id(
+        if input_node.op == "get_attr" or id(quantized_node) == id(
             user.args[1]
         ):
             kwargs.setdefault("weight_code", kwarg1)
@@ -908,43 +1291,19 @@ def _replace_observer_with_quantize_mx_node_decomposed(
             kwargs.setdefault("input_code", kwarg1)
             kwargs.setdefault("input_scale", kwarg2)
 
-        if global_scale_arg is not None:
-            if user.target not in _GEMMS:
-                raise NotImplementedError(
-                    f"A global scale on {user.target} has no lowering yet"
-                )
-            # ``alpha`` collects the operands' global scales, one multiply
-            # per operand after the first.
-            alpha = kwargs.get("alpha")
-            if alpha is not None:
-                with graph.inserting_before(user):
-                    global_scale_arg = graph.call_function(
-                        torch.ops.aten.mul.Tensor, (alpha, global_scale_arg)
-                    )
-            kwargs["alpha"] = global_scale_arg
-
+        # Sort kwargs so that they can be accessed sequentially during MHA splitting
         order = [
             "input_scale",
             "weight_scale",
-            "query_scale",
-            "key_scale",
-            "value_scale",
             "block_size",
             "input_code",
             "weight_code",
-            "alpha",
-            "probs_qmap",
-            "probs_quant_max",
-            "probs_scale_qmap",
-            "probs_code",
-            "force_scale_power_of_two",
             "A_data",
             "A_indices",
             "A_indptr",
         ]
         kwargs = OrderedDict(
-            [(key, kwargs[key]) for key in order if key in kwargs]
-            + [(key, val) for key, val in kwargs.items() if key not in order]
+            (key, kwargs[key]) for key in order if key in kwargs
         )
 
         # Replace the node with its MX counterpart
@@ -987,10 +1346,7 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 torch.ops.aten.matmul.default,
                 torch.ops.quantized_ops.linear_mx.default,
                 torch.ops.quantized_ops.matmul_mx.default,
-            ], (
-                "Only GEMM is supported for outlier suppresion, got "
-                f"{user.target}"
-            )
+            ], f"Only GEMM is supported for outlier suppresion, got {user.target}"
 
             weight_node = mx_op_node.args[1]
 
@@ -1004,7 +1360,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                     "A_indices": csr_indices_node,
                     "A_indptr": csr_indptr_node,
                 }
-                mx_op_node.meta["outlier_rate"] = observed
             else:
                 with graph.inserting_before(mx_op_node):
                     spmm_node = graph.call_function(
@@ -1031,24 +1386,6 @@ def _replace_observer_with_quantize_mx_node_decomposed(
                 add_node.replace_input_with(add_node, mx_op_node)
 
 
-def _is_written_buffer(model: GraphModule, node: Node) -> bool:
-    """Whether the buffer ``get_attr`` ``node`` names is written in the
-    graph -- the destination of an in-place op (a KV cache and its fold).
-    Such a buffer changes at run time, so it is quantized dynamically, in
-    the graph, not baked once from the observer's statistics."""
-    written = (
-        torch.ops.aten.index_copy_.default,
-        torch.ops.aten.copy_.default,
-    )
-    for n in model.graph.nodes:
-        if n.op != "call_function" or n.target not in written:
-            continue
-        for operand in n.all_input_nodes:
-            if operand.op == "get_attr" and operand.target == node.target:
-                return True
-    return False
-
-
 def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
     model: torch.fx.GraphModule, node: Node, modules: Dict[str, torch.nn.Module]
 ):
@@ -1063,9 +1400,7 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
 
     input_node = node.args[0]
 
-    if input_node.op == "get_attr" and not _is_written_buffer(
-        model, input_node
-    ):
+    if input_node.op == "get_attr":
         param = fetch_attr(model, input_node.target)
         activation_post_process(param.data)
         scale, zero_point = activation_post_process.calculate_qparams()
@@ -1095,38 +1430,7 @@ def _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
                 model, graph, input_node.name + "_zero_point", zero_point
             )
     else:
-        # An activation's blocks change every step, so the qparams are
-        # computed in the graph and come out of the quantize beside the value.
-        with graph.inserting_before(node):
-            qmap_node = create_getattr_from_value(
-                model, graph, "qmap", activation_post_process.qmap
-            )
-            scale_qmap_node = None
-            if activation_post_process.scale_qmap is not None:
-                scale_qmap_node = create_getattr_from_value(
-                    model, graph, "qmap", activation_post_process.scale_qmap
-                )
-            quantize_node = graph.call_function(
-                torch.ops.quantized_ops.quantize_affine.default,
-                (
-                    input_node,
-                    qmap_node,
-                    activation_post_process.ch_axis,
-                    activation_post_process.block_size,
-                    float(activation_post_process.quant_min),
-                    float(activation_post_process.quant_max),
-                    scale_qmap_node,
-                ),
-            )
-            scale_node, zero_point_node, quantized_node = [
-                graph.call_function(operator.getitem, (quantize_node, i))
-                for i in range(3)
-            ]
-        quantize_node.meta["dtype"] = (
-            activation_post_process.scale_dtype,
-            activation_post_process.scale_dtype,
-            activation_post_process.dtype,
-        )
+        raise NotImplementedError
 
     quantized_node.meta["dtype"] = activation_post_process.dtype
 
@@ -1160,9 +1464,8 @@ def _eliminate_dequantize_with_no_effect(model: GraphModule):
             continue
 
         scale_node = node.args[1]
-        if scale_node.op != "get_attr":
-            continue
-        if torch.any(model.get_buffer(scale_node.target) != 1):
+        scale = model.get_buffer(scale_node.target)
+        if scale_node.op != "get_attr" or torch.any(scale != 1):
             continue
 
         # During integer quantization, the dequantize node also perform a
@@ -1236,197 +1539,6 @@ def sink_obs_or_fq(model: GraphModule) -> GraphModule:
     return model
 
 
-def _is_mutating(node: Node) -> bool:
-    """Whether ``node`` writes to one of its operands."""
-    return (
-        isinstance(node.target, torch._ops.OpOverload)
-        and node.target._schema.is_mutable
-    )
-
-
-def _finish_freezing(model: GraphModule) -> None:
-    """Mark ``model`` frozen, fix its fake-quants' enable flags, and drop
-    what the freezing left unused."""
-    for module in model.modules():
-        if isinstance(module, _FreezableFlags):
-            module.freeze_flags()
-    model.meta["frozen_weights"] = True
-    model.graph.lint()
-    model.recompile()
-    model.delete_all_unused_submodules()
-
-
-@torch.no_grad()
-def freeze_weights(*models: GraphModule) -> None:
-    """Bake each weight's fake-quantization into the weight.
-
-    Every fake-quant reading a parameter runs once and is removed; its users
-    read the fake-quantized value instead.  A buffer, such as a KV cache,
-    changes between calls and is left alone.  The graphs may share parameters
-    -- graphs exported from one model do -- and a shared one is quantized
-    once for all of them: when every fake-quant reading it gives the same
-    value and nothing else reads it, the value is written into the
-    parameter itself, so every holder of the tensor (the source model, the
-    other graphs) sees it too; otherwise each fake-quant's value gets a
-    buffer of its own and the other readers keep the raw weight.  The
-    graphs compute the same values without re-quantizing their weights on
-    every forward.  Call it once every weight scale is final, i.e. after
-    calibration.  A frozen graph is for evaluation only: its remaining
-    fake-quants keep the enable flags they have now, and ``convert_pt2e``
-    rejects it, since quantizing the weights needs the raw ones.
-
-    Args:
-        *models: Prepared graph modules, rewritten in place.
-    """
-    # Each tensor's fake-quants and other readers across the graphs, keyed
-    # by its memory: graphs exported from one model hold the same tensors.
-    readers = {}
-    for model in models:
-        modules = dict(model.named_modules())
-        params = dict(model.named_parameters(remove_duplicate=False))
-        for node in model.graph.nodes:
-            if node.op != "get_attr" or node.target not in params:
-                continue
-            param = params[node.target]
-            key = (param.data_ptr(), tuple(param.shape))
-            _, fake_quants, others = readers.setdefault(key, (param, [], []))
-            for user in node.users:
-                module = _get_module(user, modules)
-                if isinstance(module, FakeQuantizeBase):
-                    fake_quants.append((model, user, module))
-                else:
-                    others.append(user)
-
-    for param, fake_quants, others in readers.values():
-        if not fake_quants:
-            continue
-        values = [module(param) for _, _, module in fake_quants]
-        if not others and all(torch.equal(values[0], v) for v in values):
-            param.copy_(values[0])
-            for _, node, _ in fake_quants:
-                node.replace_all_uses_with(node.args[0])
-                node.graph.erase_node(node)
-            continue
-        for (model, node, _), value in zip(fake_quants, values):
-            with model.graph.inserting_before(node):
-                frozen = create_getattr_from_value(
-                    model, model.graph, node.args[0].target + "_frozen", value
-                )
-            node.replace_all_uses_with(frozen)
-            model.graph.erase_node(node)
-
-    for model in models:
-        _finish_freezing(model)
-
-
-@torch.no_grad()
-def freeze_cache_reads(
-    model: GraphModule, caches: List[str]
-) -> Callable[[], None]:
-    """Precompute what ``model`` computes from caches its caller writes.
-
-    A cache here is a buffer that changes only between calls, and seldom:
-    the main half of a split KV cache (``split_kv_cache``) takes a chunk
-    only when the residual fills.  The graph's own writes to ``caches`` are
-    removed, so the caller must make them.  Everything the graph then
-    computes from the caches and from buffers it never writes -- their
-    fake-quants included -- is the same on every call until the caches
-    change: it moves into a module of its own, and the graph reads the
-    results from buffers.  Freeze the weights first, so their fake-quants
-    are not mistaken for such reads.
-
-    Args:
-        model: Prepared graph module, rewritten in place.
-        caches: Names of the buffers the caller writes.
-
-    Returns:
-        A function recomputing the results from the caches' current
-        contents; call it after writing them.
-
-    Raises:
-        ValueError: The graph reads the value of one of its cache writes.
-    """
-    graph = model.graph
-    caches = set(caches)
-    for node in list(graph.nodes):
-        if (
-            _is_mutating(node)
-            and isinstance(node.args[0], Node)
-            and node.args[0].op == "get_attr"
-            and node.args[0].target in caches
-        ):
-            if node.users:
-                raise ValueError(f"{node} writes a cache and is read")
-            graph.erase_node(node)
-    written = {
-        node.args[0].target
-        for node in graph.nodes
-        if _is_mutating(node)
-        and isinstance(node.args[0], Node)
-        and node.args[0].op == "get_attr"
-    }
-    modules = dict(model.named_modules())
-
-    # Nodes computed only from buffers the graph never writes, mapped to
-    # whether they read a cache.
-    static = {}
-    for node in graph.nodes:
-        inputs = node.all_input_nodes
-        if node.op == "get_attr":
-            if node.target not in written:
-                static[node] = node.target in caches
-        elif all(n in static for n in inputs) and (
-            (node.op == "call_function" and not _is_mutating(node))
-            or isinstance(_get_module(node, modules), FakeQuantizeBase)
-        ):
-            static[node] = any(static[n] for n in inputs)
-
-    results = [
-        node
-        for node, reads_cache in static.items()
-        if reads_cache
-        and node.op != "get_attr"
-        and any(user not in static for user in node.users)
-    ]
-    needed = set()
-    pending = list(results)
-    while pending:
-        node = pending.pop()
-        if node not in needed:
-            needed.add(node)
-            pending.extend(node.all_input_nodes)
-    compute = Graph()
-    copies = {}
-    for node in graph.nodes:
-        if node in needed:
-            copies[node] = compute.node_copy(node, lambda n: copies[n])
-    compute.output(tuple(copies[n] for n in results))
-    computed = GraphModule(model, compute)
-
-    buffers = []
-    for node, value in zip(results, computed()):
-        with graph.inserting_before(node):
-            frozen = create_getattr_from_value(
-                model, graph, node.name + "_frozen", value
-            )
-        buffers.append(fetch_attr(model, frozen.target))
-        node.replace_all_uses_with(
-            frozen, delete_user_cb=lambda user: user not in static
-        )
-    graph.eliminate_dead_code(
-        is_impure_node=lambda n: n.op in {"placeholder", "output"}
-        or _is_mutating(n)
-    )
-    _finish_freezing(model)
-
-    @torch.no_grad()
-    def refresh():
-        for buffer, value in zip(buffers, computed()):
-            buffer.copy_(value)
-
-    return refresh
-
-
 def swap_matmul_inputs(model: GraphModule):
     graph = model.graph
     modules = dict(model.named_modules(remove_duplicate=False))
@@ -1462,15 +1574,11 @@ def swap_matmul_inputs(model: GraphModule):
         input_fq = get_fake_quant_mod(input_node)
         other_fq = get_fake_quant_mod(other_node)
 
-        if (
-            not isinstance(other_fq, MXFakeQuantize)
-            or other_fq.outlier_threshold is None
-        ):
+        if other_fq is None or other_fq.outlier_threshold is None:
             continue
 
         assert (
-            not isinstance(input_fq, MXFakeQuantize)
-            or input_fq.outlier_threshold is None
+            input_fq is None or input_fq.outlier_threshold is None
         ), "Only one input of matmul can have outlier filter"
 
         node.args = (other_node, input_node)
@@ -1493,130 +1601,87 @@ def swap_matmul_inputs(model: GraphModule):
     model.recompile()
 
 
-@torch.no_grad()
-def fold_conv_bn_qat(model: GraphModule) -> None:
-    """Fold each batch norm of a QAT graph into the conv before it.
-
-    ``prepare_qat_pt2e`` leaves every conv-BN pair as the simulated fold,
-    ``conv(x, fq(W * s), fq(zeros)) / s + b`` into the batch norm, with
-    ``s = gamma / sqrt(running_var + eps)``.  With the running statistics
-    taken as final this is ``conv(x, fq(W'), fq(b'))``, where
-    ``W' = W * s`` and ``b' = (b - running_mean) * s + beta``: the fold
-    writes ``W'`` and ``b'`` into the conv's parameters, points the
-    fake-quants at them and removes the rest of the chain.  ``W'`` is
-    computed by the graph's own nodes, so the weight fake-quant sees the
-    values it was trained on.  Any other batch norm is left alone.
-
-    Args:
-        model: Graph prepared by ``prepare_qat_pt2e``, rewritten in place.
-    """
-    graph = model.graph
-    modules = dict(model.named_modules())
-
-    def fake_quant_input(node):
-        """The node ``node`` fake-quantizes, or ``node`` itself."""
-        if isinstance(_get_module(node, modules), FakeQuantizeBase):
-            return node.args[0]
-        return node
-
-    def value(node):
-        """``node``'s value, computed from the parameters it reads."""
-        if node.op == "get_attr":
-            return fetch_attr(model, node.target)
-        args = map_arg(node.args, value)
-        return node.target(*args, **map_arg(node.kwargs, value))
-
-    for bn in list(graph.nodes):
-        if bn.target != torch.ops.aten.batch_norm.default:
-            continue
-        add_bias = bn.args[0]
-        if (
-            add_bias.target != torch.ops.aten.add.Tensor
-            or add_bias.args[0].target != torch.ops.aten.div.Tensor
-        ):
-            continue
-        divide = add_bias.args[0]
-        conv = fake_quant_input(divide.args[0])
-        if conv.target != torch.ops.aten.conv2d.default:
-            continue
-        scaled_weight = fake_quant_input(conv.args[1])
-        zeros = fake_quant_input(conv.args[2])
-        weight, bias = scaled_weight.args[0], zeros.args[0]
-
-        scale = value(divide.args[1]).flatten()
-        mean, beta = value(bn.args[3]), value(bn.args[2])
-        value(weight).copy_(value(scaled_weight))
-        bias_value = value(bias)
-        bias_value.copy_((bias_value - mean) * scale + beta)
-
-        scaled_weight.replace_all_uses_with(weight)
-        zeros.replace_all_uses_with(bias)
-        # Any fake-quant on the conv output now quantizes the folded output.
-        bn.replace_all_uses_with(divide.args[0])
-        graph.erase_node(bn)
-
-    graph.eliminate_dead_code()
-    model.recompile()
-
-
 def convert_pt2e(
     model: GraphModule,
     output_dtype: str = None,
     eliminate_no_effect: bool = True,
+    *,
+    target=None,
 ):
-    if model.meta.get("frozen_weights"):
-        raise ValueError(
-            "convert_pt2e needs the raw weights that freeze_weights "
-            "replaced; convert a graph that was not frozen"
-        )
+    # Preparation-only target modules must leave before the shared observer
+    # replacement walks every call_module node.
+    from voyager_compiler.codegen.targets import (
+        cleanup_quantization_preparation,
+    )
 
-    fold_conv_bn_qat(model)
-
+    cleanup_quantization_preparation(model, target)
     modules = dict(model.named_modules(remove_duplicate=False))
 
     swap_matmul_inputs(model)
 
     for node in list(model.graph.nodes):
-        if node.op != "call_module":
+        if node.op == "call_module":
+            mod = _get_module(node, modules)
+            assert mod is not None
+            if isinstance(mod, FakeQuantizeBase):
+                if node.meta.get(QUANTIZATION_DOMAIN_ALIAS):
+                    _replace_domain_alias(model, node, modules, output_dtype)
+                elif node.meta.get(VSQ_JOIN_ALIAS):
+                    if mod.qscheme != QScheme.VSQ:
+                        raise RuntimeError(
+                            f"{node.name}: VSQ join alias uses {mod.qscheme}"
+                        )
+                    _replace_vsq_join_alias(model, node, modules)
+                elif mod.qscheme == QScheme.VSQ:
+                    _replace_observer_with_quantize_vsq_node_decomposed(
+                        model, node, modules
+                    )
+                elif mod.qscheme == QScheme.MICROSCALING:
+                    _replace_observer_with_quantize_mx_node_decomposed(
+                        model, node, modules
+                    )
+                elif mod.qscheme == QScheme.GROUP_WISE_AFFINE:
+                    _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
+                        model, node, modules
+                    )
+                else:
+                    _replace_observer_with_quantize_dequantize_node_decomposed(
+                        model, node, modules, output_dtype
+                    )
+
+    # Shape propagation still describes the prepared graph's logical float
+    # values.  Region membership is the explicit physical decision, so make
+    # that decision authoritative after observers have been materialized.
+    for node in model.graph.nodes:
+        domain_dtype = node.meta.get(QUANTIZATION_DOMAIN_DTYPE)
+        if domain_dtype is None:
             continue
-        mod = _get_module(node, modules)
-        assert mod is not None
-        if not isinstance(mod, FakeQuantizeBase):
+        declared_dtype = node.meta.get("dtype")
+        if isinstance(declared_dtype, (tuple, list)):
+            # A tuple-valued encoder already declares one physical dtype per
+            # component.  Its surrounding scalar domain describes the
+            # payload, not every companion: quantize_vsq/PVS is
+            # (float coarse scale, uint8 fine scale, int4 payload).  The fork
+            # could broadcast here because a separate physical-contract
+            # object remained authoritative; this path represents that
+            # contract directly in ``meta['dtype']``, so overwriting it would
+            # turn every component into the payload dtype.
             continue
-        if (
-            isinstance(mod, RandomHadamardTransform)
-            and mod.rht_axis is not None
-        ):
-            raise NotImplementedError(
-                "The random Hadamard transform has no lowering yet"
-            )
-        if isinstance(mod, MXFakeQuantize) and mod.stochastic_rounding:
-            raise NotImplementedError("Stochastic rounding has no lowering yet")
-        if isinstance(mod, MXFakeQuantize):
-            _replace_observer_with_quantize_mx_node_decomposed(
-                model, node, modules
-            )
-        elif isinstance(mod, GroupWiseAffineFakeQuantize):
-            _replace_observer_with_groupwise_affine_q_dq_node_decomposed(
-                model, node, modules
-            )
-        else:
-            _replace_observer_with_quantize_dequantize_node_decomposed(
-                model, node, modules, output_dtype
-            )
+        value = getattr(node, "value", None)
+        if value is None:
+            value = node.meta.get("val")
+        node.meta["dtype"] = (
+            tuple(domain_dtype for _ in value)
+            if isinstance(value, (tuple, list))
+            else domain_dtype
+        )
 
     if eliminate_no_effect:
         _eliminate_dequantize_with_no_effect(model)
 
     model.graph.lint()
-    # A KV-cache fold writes a buffer in place and yields nothing; it is the
-    # one side effect kept.
     model.graph.eliminate_dead_code(
         is_impure_node=lambda n: n.op in {"placeholder", "output"}
-        or (
-            n.target is torch.ops.aten.index_copy_.default
-            and n.args[0].op == "get_attr"
-        )
     )
     model.recompile()
     model.delete_all_unused_submodules()

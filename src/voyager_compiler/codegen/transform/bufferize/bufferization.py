@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """
 Bufferization pass: rewrite tiled FX nodes into an explicit bufferized FX graph.
 
@@ -11,7 +14,6 @@ post-op tail in the kernel.
 Runs after operator fusion and before memory allocation.
 """
 
-import hashlib
 import itertools
 import logging
 import math
@@ -24,20 +26,13 @@ import torch.fx as fx
 from torch.fx import GraphModule, Node
 
 from voyager_compiler.codegen.node_info import (
-    DYNAMIC_QUANTIZE_OPS,
-    LAYER_NORM_OPS,
-    SOFTMAX_OPS,
     bound_operands,
-    csr_quantize_node,
-    gemm_produces_csr,
     get_anchor_node,
     is_aliasing_op,
     is_compute_op,
     is_conv2d,
     is_elementwise_op,
     is_gemm_op,
-    is_axis_reduction,
-    is_full_reduction,
     is_nop,
     is_pooling,
     quant_param_arg_nodes,
@@ -56,25 +51,24 @@ from voyager_compiler.codegen.transform.bufferize.ops import (
     oracle_disabled,
 )
 from voyager_compiler.codegen.transform.bufferize.pipeline import (
-    _single_pass_kernel,
+    _map_kernel,
     build_conv2d,
     build_gemm,
     build_pipelined_buffers,
     build_pointwise,
     build_pool,
 )
-from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
-    build_sparse_gemm,
-)
 from voyager_compiler.codegen.transform.bufferize.quantize_mx_outlier import (
     BASE_TABLE_TAG,
     GEOMETRY_META,
     PRODUCER_META,
+    _quantize_node,
     build_quantize_mx_outlier,
     merge_base_tables,
 )
-from voyager_compiler.codegen.transform.bufferize.view_lowering import (
-    lower_views,
+from voyager_compiler.codegen.transform.bufferize.sparse_gemm import (
+    build_sparse_gemm,
+    gemm_produces_csr,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
@@ -84,8 +78,14 @@ from voyager_compiler.codegen.transform.bufferize.utils import (
     _ScratchSpec,
     _subgraph,
 )
-from voyager_compiler.codegen.transform.tiling.sparse import plan_csr_slices
+from voyager_compiler.codegen.transform.bufferize.view_lowering import (
+    lower_views,
+)
 from voyager_compiler.codegen.transform.tiling.tiler import prefetch_tilings
+from voyager_compiler.codegen.unsupported import (
+    declare_unsupported_operation,
+    is_declared_unsupported_operation,
+)
 from voyager_compiler.shape_prop import set_node_value
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,6 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 _COND = torch.ops.higher_order.cond
 _COMMIT = torch.ops.higher_order.commit
 _SDPA = torch.ops.aten.scaled_dot_product_attention.default
-_SDPA_MX = torch.ops.quantized_ops.sdpa_mx.default
 
 
 def _produces_tensor(node: Node) -> bool:
@@ -169,6 +168,23 @@ def _is_compute(node: Node) -> bool:
     if not _produces_tensor(node):
         return False
     return node.op == "call_module" or is_compute_op(node)
+
+
+def _is_accelerator_compute(node: Node) -> bool:
+    """A compute op the *datapath* runs, so one to build a nest for and hold to
+    the Scratchpad rule.
+
+    A call a target declared a boundary is excluded.  It is left where it is:
+    ``_annotate_and_validate`` then reaches its ``_produces_tensor`` arm and
+    gives it ``space="DRAM"``, the planner gives that buffer an address, and it
+    serializes as a host-materialized tensor the accelerator does not compute —
+    the same treatment a host-side ``pad`` already gets.
+
+    It stays ``_is_compute`` for every other purpose: it is still a layer of the
+    model, still worth a scope and a row in the layer table, still a tensor
+    worth dumping.  It is simply not work the array does.
+    """
+    return _is_compute(node) and not is_declared_unsupported_operation(node)
 
 
 def _result_handles(node: Node, gm: GraphModule, parent_hop: Node) -> list:
@@ -266,7 +282,9 @@ def _viewed_buffer(node: Node) -> Optional[Node]:
 
 def _validate_compute(node: Node, codebooks: set, ctx: tuple) -> None:
     """The array only reaches Scratchpad, so every tile a compute op reads must
-    be there, and its result must be stored back there (via ``insert``)."""
+    be there, and its result must be stored back there (via ``insert``).
+
+    """
     for inp in node.all_input_nodes:
         if not _produces_tensor(inp) or _passed_whole(inp, codebooks):
             continue
@@ -339,7 +357,7 @@ def _annotate_and_validate(
             _walk_region(
                 gm, node, list(node.args[1:]), (node.args[0],), codebooks, ctx
             )
-        elif _is_compute(node):
+        elif _is_accelerator_compute(node):
             _validate_compute(node, codebooks, ctx)
         elif node.target is _VOYAGER_INSERT:
             src, dst = node.args[0], node.args[1]
@@ -501,9 +519,7 @@ def propagate_logical_dtypes(
             )
         elif t is _COND:
             operands = list(node.args[3]) if len(node.args) > 3 else []
-            _thread_hop(
-                gm, node, operands, (node.args[1], node.args[2]), rules
-            )
+            _thread_hop(gm, node, operands, (node.args[1], node.args[2]), rules)
         elif t is _COMMIT:
             _thread_hop(gm, node, list(node.args[1:]), (node.args[0],), rules)
         elif rules.get(t) is not None:
@@ -640,28 +656,8 @@ def _nest_output_values(sub_gm) -> list:
     if not isinstance(outs, (tuple, list)):
         outs = [outs]
     return [
-        getattr(n, "value", None) if isinstance(n, Node) else None
-        for n in outs
+        getattr(n, "value", None) if isinstance(n, Node) else None for n in outs
     ]
-
-
-def _key_digest(key) -> Optional[str]:
-    """A stable short digest of a ``_bufferize_key``, or ``None`` when the
-    key cannot be serialised deterministically.
-
-    ``build_group`` is a per-run counter, so it cannot carry a measurement
-    from one compile to another; this digest can, because the key is content
-    addressed -- two nodes that build the same nest produce the same key in
-    any compile.  ``repr`` is used rather than ``hash``, whose string salt
-    differs per process.  A literal whose repr embeds its address would not
-    be stable, so such a key gets no digest at all.
-    """
-    if key is None:
-        return None
-    text = repr(key)
-    if " at 0x" in text or " object at " in text:
-        return None
-    return hashlib.sha1(text.encode()).hexdigest()[:12]
 
 
 def _bufferize_key(node):
@@ -677,34 +673,10 @@ def _bufferize_key(node):
             return None
         else:
             key = ("bare", _node_to_hashable(node))
-            # A nest built for an op reading one tensor twice, such as
-            # ``x * x``, has one operand, so it cannot serve ``x * y``.
-            uses = []
-            fx.node.map_arg((node.args, node.kwargs), uses.append)
-            if len(set(uses)) < len(uses):
-                key += (tuple(node.all_input_nodes.index(u) for u in uses),)
         hash(key)  # surface any unhashable literal as uncacheable
         return key
     except TypeError:
         return None
-
-
-def _stamp_unbuilt_keys(model: GraphModule) -> None:
-    """Give a ``build_key`` to the nodes bufferization never built.
-
-    A DMA-only node is spliced from no nest, so the splice loop never stamps
-    it and reporting can group it only by byte counts, which collide between
-    unrelated operations.  ``_bufferize_key`` signs it structurally instead;
-    it raises on some non-build-candidates, and those simply get no key.
-    """
-    for node in model.graph.nodes:
-        if node.op == "placeholder" or node.meta.get("build_key") is not None:
-            continue
-        try:
-            key = _bufferize_key(node)
-        except (AttributeError, TypeError, ValueError):
-            key = None
-        node.meta["build_key"] = _key_digest(key)
 
 
 def _producer_names(node):
@@ -726,6 +698,12 @@ def _producer_names(node):
 # ---------------------------------------------------------------------------
 
 _FUSED_SUFFIX = "_fused"
+
+
+def _base_name(name: str) -> str:
+    """A node name without the per-graph counter FX appended (``select_11`` ->
+    ``select``), so the model-wide numbering can start it afresh."""
+    return re.sub(r"_\d+$", "", name)
 
 
 def _keeps_scope(gm: GraphModule) -> set:
@@ -761,16 +739,11 @@ def rename_nest_nodes(model: GraphModule) -> None:
     used = {n.name for n in model.graph.nodes}
 
     def rename(node: Node, candidate: str) -> None:
-        """Name ``node`` ``candidate``, or the first numbered variant of it
-        that is unused model-wide.  A graph's namespace may hand back a
-        different name than asked (a suffix it counts up past names of
-        erased nodes), so it is the name assigned, not the one requested,
-        that has to be unique."""
         base, i = candidate, 1
-        node._rename(candidate)  # registers the name in the graph's namespace
-        while node.name in used:
-            node._rename(f"{base}_{i}")
+        while candidate in used:
+            candidate = f"{base}_{i}"
             i += 1
+        node._rename(candidate)  # registers the name in the graph's namespace
         used.add(node.name)
 
     def rename_node(
@@ -794,9 +767,7 @@ def rename_nest_nodes(model: GraphModule) -> None:
         elif n in keep:
             candidate = f"{scope}_{n.name}"
         else:
-            # Drop FX's per-graph counter (``select_11`` -> ``select``) so the
-            # model-wide numbering can start it afresh.
-            candidate = re.sub(r"_\d+$", "", n.name)
+            candidate = _base_name(n.name)
         rename(n, candidate)
 
         if sub is not None:
@@ -845,31 +816,13 @@ def rename_nest_nodes(model: GraphModule) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _sites(model: GraphModule):
-    """Every node the bufferizer visits, as ``(graph module, node, scope)``:
-    the top-level nodes, scoped by their own name, and, for a ``cond``
-    among them, both branches' nodes ahead of it, scoped under the cond's
-    scope so a nest in a branch never shares a name with one outside.  A
-    split KV cache's fold quantizes the completing chunk in its ``true``
-    branch, so the nests for that live in the branch and take its
-    placeholders -- the cache buffers -- as their operands."""
-    for node in list(model.graph.nodes):
-        if node.op == "call_function" and node.target is _COND:
-            prefix = node.meta["scope"][0]
-            for handle in node.args[1:3]:
-                branch = getattr(model, handle.target)
-                for inner in list(branch.graph.nodes):
-                    yield branch, inner, f"{prefix}_{inner.name}"
-        yield model, node, node.name
-
-
 def bufferize_graph(
     model: GraphModule,
     pipelined: bool = False,
     tiler=None,
     single_buffer_tail: bool = False,
     flash_attention_v3: bool = True,
-    bool_mask: bool = True,
+    unsupported_policy=None,
 ) -> GraphModule:
     """Rewrite tiled GEMM / pointwise nodes into bufferized while_loop nests.
 
@@ -887,27 +840,19 @@ def bufferize_graph(
         flash_attention_v3: Lower a ``scaled_dot_product_attention`` node with
           the cross-sweep FA3 pipeline (``build_attention_fa3``); off => the
           baseline flash-attention builder (``build_attention``).
-        bool_mask: Store an ``is_causal`` attention's mask table as int1 codes
-          plus a scale, the way the eager path quantizes its mask; off => the
-          additive fill at the accumulation dtype.
     """
     graph = model.graph
     num_slots = 2 if pipelined else 1
-    accumulate_fp32 = tiler is not None and tiler.accumulate_fp32
     build_cache = {}
     group_ids = itertools.count()
 
-    plan_csr_slices(list(graph.nodes), tiler)
     if tiler is not None:
         prefetch_tilings(
             [n for n in graph.nodes if is_gemm_op(get_anchor_node(n))],
             tiler,
         )
 
-    modules = {model}
-    for gm, node, scope in _sites(model):
-        modules.add(gm)
-        graph = gm.graph
+    for node in list(graph.nodes):
         if node.op not in ("call_module", "call_function"):
             continue
 
@@ -919,7 +864,7 @@ def bufferize_graph(
             graph.erase_node(node)
             continue
 
-        if not _is_compute(node):
+        if not _is_accelerator_compute(node):
             continue
 
         anchor = get_anchor_node(node)
@@ -935,101 +880,122 @@ def bufferize_graph(
         if cached is not None:
             sub_gm, n_out, group, tag_sources = cached
         else:
-            if is_conv2d(anchor):
-                sub_gm = build_conv2d(
-                    node,
-                    num_slots=num_slots,
-                    single_buffer_tail=single_buffer_tail,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif anchor.kwargs.get(
-                "A_indptr"
-            ) is not None or gemm_produces_csr(node):
-                # A GEMM whose activation carries an outlier CSR: same dense
-                # nest, plus the per-step gather of the row tile's blocks.
-                sub_gm = build_sparse_gemm(
-                    node,
-                    num_slots=num_slots,
-                    accumulate_fp32=accumulate_fp32,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif is_gemm_op(anchor):
-                sub_gm = build_gemm(
-                    node,
-                    num_slots=num_slots,
-                    accumulate_fp32=accumulate_fp32,
-                    single_buffer_tail=single_buffer_tail,
-                    async_pipeline=pipelined,
-                    tiler=tiler,
-                )
-            elif is_pooling(anchor):
-                sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
-            elif anchor.target in (_SDPA, _SDPA_MX):
-                sub_gm = (
-                    build_attention_fa3(node, tiler=tiler, bool_mask=bool_mask)
-                    if flash_attention_v3
-                    else build_attention(
+            try:
+                if is_conv2d(anchor):
+                    sub_gm = build_conv2d(
+                        node,
+                        num_slots=num_slots,
+                        single_buffer_tail=single_buffer_tail,
+                        async_pipeline=pipelined,
+                        tiler=tiler,
+                    )
+                elif anchor.kwargs.get(
+                    "A_indptr"
+                ) is not None or gemm_produces_csr(node):
+                    # A GEMM whose activation carries an outlier CSR: same dense
+                    # nest, plus the per-step gather of the row tile's blocks.
+                    sub_gm = build_sparse_gemm(
+                        node,
+                        num_slots=num_slots,
+                        async_pipeline=pipelined,
+                        tiler=tiler,
+                    )
+                elif is_gemm_op(anchor):
+                    sub_gm = build_gemm(
+                        node,
+                        num_slots=num_slots,
+                        single_buffer_tail=single_buffer_tail,
+                        async_pipeline=pipelined,
+                        tiler=tiler,
+                    )
+                elif is_pooling(anchor):
+                    sub_gm = build_pool(node, num_slots=num_slots, tiler=tiler)
+                elif anchor.target is _SDPA:
+                    sub_gm = (
+                        build_attention_fa3(node, tiler=tiler)
+                        if flash_attention_v3
+                        else build_attention(
+                            node, num_slots=num_slots, tiler=tiler
+                        )
+                    )
+                elif _quantize_node(node) is not None:
+                    # A row-swept producer: the quantize needs a per-K-slice tiling
+                    # its anchor cannot give it, so it gets its own two-loop nest
+                    # rather than build_pointwise's single grid.  A GEMM-anchored
+                    # epilogue never reaches this arm — the sparse arm above
+                    # takes it.
+                    sub_gm = build_quantize_mx_outlier(
+                        node, tiler=tiler, num_slots=num_slots
+                    )
+                    if sub_gm is None:
+                        # No fallback: build_pointwise would hand the quantize a
+                        # full-K tile, whose column indices span all of K and which
+                        # the SpMM engine cannot consume.
+                        raise ValueError(
+                            f"{node.name}: produces an outlier CSR but no "
+                            f"row-swept nest could be built for it"
+                        )
+                elif (
+                    is_elementwise_op(anchor)
+                    or anchor.target in _REDUCTION_POINTWISE_OPS
+                    or anchor.target in _RELAYOUT_POINTWISE_OPS
+                ):
+                    sub_gm = build_pointwise(
                         node, num_slots=num_slots, tiler=tiler
                     )
-                )
-            elif csr_quantize_node(node) is not None:
-                # A row-swept producer: the quantize needs a per-K-slice tiling
-                # its anchor cannot give it, so it gets its own two-loop nest
-                # rather than build_pointwise's single grid.  A GEMM-anchored
-                # epilogue never reaches this arm — the sparse arm above
-                # takes it.
-                sub_gm = build_quantize_mx_outlier(
-                    node, tiler=tiler, num_slots=num_slots
-                )
-                if sub_gm is None:
-                    # No fallback: build_pointwise would hand the quantize a
-                    # full-K tile, whose column indices span all of K and which
-                    # the SpMM engine cannot consume.
-                    raise ValueError(
-                        f"{node.name}: produces an outlier CSR but no "
-                        f"row-swept nest could be built for it"
+                else:
+                    sub_gm = None
+
+                if sub_gm is not None:
+                    val = node.value
+                    n_out = len(val) if isinstance(val, (list, tuple)) else 1
+                elif not (
+                    (tiling := node.meta.get("l2_tiling")) is not None
+                    and math.prod(tiling) > 1
+                ):
+                    # Untiled / interstellar-skipped op (FC batch-1, depthwise conv,
+                    # a shape-changing reshape/slice): bufferize whole (trip-1).
+                    built = _build_for_untiled(node, tiler)
+                    if built is None:
+                        continue  # getitem / non-tensor: nothing to load/store
+                    sub_gm, n_out = built
+                else:
+                    raise Exception(
+                        f"bufferization: no builder for tiled node {node.op} "
+                        f"'{node.name}' ({node.target})"
                     )
-            elif (
-                is_elementwise_op(anchor)
-                or is_axis_reduction(anchor)
-                or is_full_reduction(anchor)
-                or anchor.target in _REDUCTION_POINTWISE_OPS
-                or anchor.target in _RELAYOUT_POINTWISE_OPS
-            ):
-                sub_gm = build_pointwise(
-                    node, num_slots=num_slots, tiler=tiler
+
+                # A nest built afresh starts an equivalence group; an uncacheable
+                # key never reaches the cache, so its group stays a singleton.
+                group = next(group_ids)
+                tag_sources = _producer_names(node)
+                if key is not None:
+                    build_cache[key] = (sub_gm, n_out, group, tag_sources)
+
+            except (RuntimeError, ValueError) as error:
+                # A target may declare it cannot run this call.
+                # Without such a declaration the failure stands: the
+                # accelerator was asked for a plan it cannot execute.
+                reason = (
+                    unsupported_policy(node, error)
+                    if unsupported_policy is not None
+                    else None
                 )
-            else:
-                sub_gm = None
-
-            if sub_gm is not None:
-                val = node.value
-                n_out = len(val) if isinstance(val, (list, tuple)) else 1
-            elif not (
-                (tiling := node.meta.get("l2_tiling")) is not None
-                and math.prod(tiling) > 1
-            ):
-                # Untiled / interstellar-skipped op (FC batch-1, depthwise conv,
-                # a shape-changing reshape/slice): bufferize whole (trip-1).
-                built = _build_for_untiled(node, tiler)
-                if built is None:
-                    continue  # getitem / non-tensor: nothing to load/store
-                sub_gm, n_out = built
-            else:
-                raise Exception(
-                    f"bufferization: no builder for tiled node {node.op} "
-                    f"'{node.name}' ({node.target})"
+                if reason is None:
+                    raise
+                declare_unsupported_operation(
+                    node,
+                    reason_code=reason,
+                    detail=str(error),
+                    stage="bufferize",
+                    facts={"anchor": str(anchor.target)},
                 )
-
-            # A nest built afresh starts an equivalence group; an uncacheable
-            # key never reaches the cache, so its group stays a singleton.
-            group = next(group_ids)
-            tag_sources = _producer_names(node)
-            if key is not None:
-                build_cache[key] = (sub_gm, n_out, group, tag_sources)
-
+                logger.info(
+                    "[bufferize] %s declared unsupported (%s)",
+                    node.name,
+                    reason,
+                )
+                continue
         # Stamp logical (quantized) dtypes on the nest
         phs = [p for p in sub_gm.graph.nodes if p.op == "placeholder"]
         ph_seed = {
@@ -1050,13 +1016,14 @@ def bufferize_graph(
         value_remap = {}
         with oracle_disabled():
             results = replace_node_with_graph_module(
-                gm, node, sub_gm, propagate=False, value_remap=value_remap
+                model, node, sub_gm, propagate=False, value_remap=value_remap
             )
         logger.debug("[bufferize] %s spliced (n_out=%d)", node.name, n_out)
 
         # Scope the nest by the name of the op it replaces, and record which
         # build it came from — the scope says which layer a node belongs to,
         # the group says which other layers were built the same way.
+        scope = node.name
         # ``node_copy`` carries the cached build's base-table tags; retag
         # them to this splice's own producers so ``merge_base_tables``
         # groups every nest with its own layer's tables.
@@ -1065,16 +1032,10 @@ def bufferize_graph(
             for old, new in zip(tag_sources, _producer_names(node))
             if old is not None and new is not None and old != new
         }
-        digest = _key_digest(key)
         for src, new in value_remap.items():
             if src.op != "placeholder" and isinstance(new, Node):
                 new.meta["scope"] = (scope, anchor.target)
                 new.meta["build_group"] = group
-                # The group says which layers of THIS compile were built
-                # alike; the key says the same across compiles, which is what
-                # carries an RTL measurement from a two-layer compile to the
-                # full model.
-                new.meta["build_key"] = digest
                 tag = new.meta.get(BASE_TABLE_TAG)
                 if tag in retag:
                     new.meta[BASE_TABLE_TAG] = retag[tag]
@@ -1123,14 +1084,12 @@ def bufferize_graph(
         graph.erase_node(node)
 
     merge_base_tables(model)
-    for gm in modules:
-        gm.graph.lint()
-        gm.recompile()
+    graph.lint()
+    model.recompile()
     lower_views(model)
     _dedup_regions(model)
     annotate_tensor_spaces(model)
     rename_nest_nodes(model)
-    _stamp_unbuilt_keys(model)
     return model
 
 
@@ -1224,12 +1183,16 @@ def _dedup_regions(gm: GraphModule) -> None:
                 _dedup_regions(sub)
 
 
-_REDUCTION_POINTWISE_OPS = (
-    DYNAMIC_QUANTIZE_OPS
-    | LAYER_NORM_OPS
-    | SOFTMAX_OPS
-    | {torch.ops.quantized_ops.quantize.default}
-)
+_MULTI_OUTPUT_POINTWISE = {
+    torch.ops.quantized_ops.quantize_mx.default,
+    torch.ops.quantized_ops.quantize_mx_outlier.default,
+}
+_REDUCTION_POINTWISE_OPS = _MULTI_OUTPUT_POINTWISE | {
+    torch.ops.quantized_ops.quantize.default,
+    torch.ops.quantized_ops.layer_norm.default,
+    torch.ops.aten.layer_norm.default,
+    torch.ops.aten.softmax.int,
+}
 # A standalone transpose / permute relayout — build_pointwise stores each tile
 # identity and loads the input from the transposed source.  (Untiled ones fall
 # to ``_build_for_untiled``; build_pointwise returns ``None`` when untiled.)
@@ -1332,7 +1295,7 @@ def _build_for_untiled(node: Node, tiler):
         for o in outputs
     ]
     scratch_specs = [_ScratchSpec(shape, dtype) for _, shape, dtype in scratch]
-    kernel = _single_pass_kernel(compute, len(outputs), len(scratch_specs))
+    kernel = _map_kernel(compute, len(outputs), len(scratch_specs))
     gm = build_pipelined_buffers(
         kernel,
         grid,

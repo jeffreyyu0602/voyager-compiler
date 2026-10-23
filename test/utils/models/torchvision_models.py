@@ -1,3 +1,4 @@
+import re
 import torch
 from torchvision import models
 from tqdm import tqdm
@@ -15,9 +16,9 @@ from voyager_compiler import (
     derive_bias_qparams_fn,
     extract_input_preprocessor,
     fuse_operator,
+    issuable_group,
 )
-from voyager_compiler.quantization import parse_codebook_dtype
-from voyager_compiler.export_utils import get_conv_bn_layers
+from voyager_compiler.quantization.quantize import get_conv_bn_layers
 
 from .utils import get_transform_args, get_compile_args
 
@@ -49,7 +50,15 @@ def quantize_and_dump_model(
     transform_args = get_transform_args(args, vector_stages)
     compile_args = get_compile_args(args)
 
-    modules_to_fuse = get_conv_bn_layers(model)
+    # Folding is the default: it is what every existing lane emits, and the
+    # reference collateral for most targets records no BatchNorm at all. A
+    # pairing whose reference keeps it -- because the datapath normalizes
+    # itself rather than absorbing it into the convolution's weights -- opts
+    # out, and the op survives to be lowered on its own.
+    modules_to_fuse = (
+        [] if getattr(args, "retain_conv_bn", False)
+        else get_conv_bn_layers(model)
+    )
     if len(modules_to_fuse) > 0:
         model = torch.ao.quantization.fuse_modules(
             model, modules_to_fuse, inplace=True
@@ -98,21 +107,18 @@ def quantize_and_dump_model(
     # Use per-tensor instead of microscaling for conv1
     if args.activation is not None and "microscaling" in args.activation:
         dtype = args.activation.split(",")[0]
-        # A lookup table's layer takes its entry dtype, and stays unquantized
-        # when the entries keep the model's.
-        if (codebook := parse_codebook_dtype(dtype)) is not None:
-            dtype = codebook[1]
-        qconfig = None
-        if dtype is not None:
-            qspec = QuantizationSpec.from_str(
-                f"{dtype},qs=per_tensor_symmetric"
-            )
-            bias_qspec = DerivedQuantizationSpec(
-                derived_from=None,
-                derive_qparams_fn=derive_bias_qparams_fn,
-                dtype=None,
-            )
-            qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
+        match = re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype, re.IGNORECASE)
+        if match is not None and match.group(2) is not None:
+            dtype = f"int{match.group(2)}"
+        qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
+
+        bias_qspec = DerivedQuantizationSpec(
+            derived_from=None,
+            derive_qparams_fn=derive_bias_qparams_fn,
+            dtype=None,
+        )
+
+        qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
         quantizer.set_module_name("^conv1$", qconfig)
 
     example_args = (torch.randn(1, 3, 224, 224, dtype=torch_dtype),)
@@ -141,7 +147,13 @@ def quantize_and_dump_model(
     gm, preprocess_fn = extract_input_preprocessor(gm)
     example_args = (preprocess_fn(*example_args),)
 
-    fuse_operator(gm, vector_stages)
+    # The driver fuses here rather than inside transform(), so the
+    # machine's narrowing has to be handed over at this call too.
+    fuse_operator(
+        gm,
+        vector_stages,
+        group_is_issuable=issuable_group(transform_args.get("config")),
+    )
 
     gm.graph.print_tabular()
 

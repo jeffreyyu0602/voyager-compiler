@@ -18,17 +18,11 @@ from voyager_compiler.codegen.node_info import (
     dtype_byte_size,
     get_anchor_node,
     is_conv2d,
-    is_depthwise_conv,
     is_fully_connected,
     is_gemm_op,
-    is_pooling,
 )
 from voyager_compiler.codegen.reporting.model import OpInfo
-from voyager_compiler.codegen.transform.tiling.cost import (
-    gemv_lanes,
-    pool_taps,
-    vector_op_utilization,
-)
+from voyager_compiler.codegen.transform.tiling.cost import vector_op_utilization
 from voyager_compiler.hardware_config import AcceleratorConfig
 
 
@@ -70,12 +64,6 @@ def _dtype(node):
     return _val(node).dtype
 
 
-def _dtypes(out_node, *in_nodes) -> str:
-    """``in,...->out`` logical dtypes, for the op's calibration signature."""
-    ins = ",".join(str(_dtype(n)) for n in in_nodes if isinstance(n, Node))
-    return f"{ins}->{_dtype(out_node)}"
-
-
 # --------------------------------------------------------------------------
 # DRAM traffic
 # --------------------------------------------------------------------------
@@ -108,33 +96,24 @@ def op_utilization(
 ) -> float:
     """The utilization to charge ``node``.
 
-    A matrix op the interstellar tiler mapped carries its RuntimeCalculator,
-    mapping and bank partition (stamped on it by the builder); the calculator
-    prices one tiled execution, so its utilization is the ideal-to-actual
-    ratio.
+    A matrix op the interstellar tiler mapped carries the RuntimeCalculator's
+    per-tile compute cycles (stamped on it by the builder), which is what one of
+    its tiled executions really costs -- so its utilization is the ideal-to-
+    actual ratio.
 
     Everything else runs on the vector unit; ``vector_op_utilization`` (shared
     with the vector L2-tiling cost model) charges it, at
     ``cost.bytes_per_cycle`` SRAM bandwidth -- including the fully-connected
-    case, which it sizes by the streamed weight and its bank switches over
-    the anchor's shape, the tile once bufferized, and a pool, whose fetch it
-    walks for bank switches over the anchor's input tile.  ``ideal_cycles``
-    is one tile's, so it also folds in the per-launch overhead the tiling
-    model charges, and the two cannot disagree on what a tile costs.
+    case, which it sizes by the streamed weight.  ``ideal_cycles`` is one
+    tile's, so it also folds in the per-launch overhead the tiling model
+    charges, and the two cannot disagree on what a tile costs.
     """
-    tiling = node.meta.get("interstellar_tiling")
-    if "mma" in units and tiling is not None and ideal_cycles > 0:
-        per_tile = node.meta["runtime_calculator"].matrix_cycles(
-            tiling[0], node.meta.get("bank_groups")
-        )
+    per_tile = node.meta.get("per_tile_cycles")
+    if "mma" in units and per_tile and ideal_cycles > 0:
         return min(1.0, ideal_cycles / per_tile)
-    anchor = get_anchor_node(node) or node
-    tile = None
-    if is_fully_connected(anchor):
-        tile = (_shape(anchor)[-1], _shape(anchor.args[0])[-1])
-    elif is_pooling(anchor):
-        tile = _shape(anchor.args[0])
-    return vector_op_utilization(node, cost, ideal_cycles, tile)
+    return vector_op_utilization(
+        node, cost.vector_lanes, cost.bytes_per_cycle, ideal_cycles
+    )
 
 
 # --------------------------------------------------------------------------
@@ -164,12 +143,10 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     matrix_units = ("mma", "vector") if fused else ("mma",)
 
     if is_conv2d(anchor):
+        # MACs = prod(out) * C * kh * kw; the channel / kernel dims sit at
+        # different positions per layout (transposed => HWIO, else OIHW).
         w = _shape(anchor.args[1])
-        nhwc = (
-            anchor.target is torch.ops.quantized_ops.conv2d.default
-            or anchor.kwargs.get("layout") == "nhwc"
-        )
-        if nhwc and not is_depthwise_conv(anchor):  # HWIO = [kh, kw, C, K]
+        if anchor.meta.get("transposed", False):  # HWIO = [kh, kw, C, K]
             kh, kw, c = w[0], w[1], w[2]
         else:  # OIHW = [K, C, kh, kw]
             c, kh, kw = w[1], w[2], w[3]
@@ -184,7 +161,6 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "input": _shape(anchor.args[0]),
                 "weight": w,
                 "output": out,
-                "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
             },
             units=matrix_units,
             utilization=op_utilization(node, matrix_units, ideal, cost),
@@ -195,10 +171,10 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
         # (folds batch dims; works for linear / matmul / bmm).
         inp = _shape(anchor.args[0])
         macs = math.prod(out) * inp[-1]
-        # A fully-connected (matrix-vector) GEMM streams through the
-        # matrix-vector or the vector unit (``gemv_lanes``), not the array.
+        # A fully-connected (matrix-vector) GEMM runs on the vector unit, so
+        # its throughput is the vector lane count, not the systolic MAC count.
         fc = is_fully_connected(anchor)
-        divisor = gemv_lanes(anchor, cost) if fc else mma_macs
+        divisor = vec_lanes if fc else mma_macs
         ideal = math.ceil(macs / divisor)
         units = ("vector",) if fc else matrix_units
         return OpInfo(
@@ -210,7 +186,6 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
                 "input": inp,
                 "weight": _shape(anchor.args[1]),
                 "output": out,
-                "dtypes": _dtypes(anchor, anchor.args[0], anchor.args[1]),
             },
             units=units,
             utilization=op_utilization(node, units, ideal, cost),
@@ -223,20 +198,12 @@ def op_info(node: Node, cost: AcceleratorConfig) -> OpInfo:
     in_nodes = anchor.all_input_nodes
     in_shape = _shape(in_nodes[0]) if in_nodes else ()
     ops = max(math.prod(out), math.prod(in_shape))
-    if is_pooling(anchor):
-        # A pool's work is one fetched lane group per window tap and output.
-        ops = math.prod(out) * pool_taps(anchor)
     ideal = math.ceil(ops / vec_lanes)
     return OpInfo(
         node.name,
         "vector",
         ideal,
-        {
-            "ops": ops,
-            "input": in_shape,
-            "output": out,
-            "dtypes": _dtypes(anchor, *in_nodes[:1]),
-        },
+        {"ops": ops, "input": in_shape, "output": out},
         units=("vector",),
         utilization=op_utilization(node, ("vector",), ideal, cost),
     )

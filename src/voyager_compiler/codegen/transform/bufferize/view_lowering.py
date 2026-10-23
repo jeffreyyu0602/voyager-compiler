@@ -14,11 +14,6 @@ each element becomes its own window.  A select on an extent-1 dim and a
 whole-extent slice are already nops (``is_nop``); a non-contiguous one
 stays an op.
 
-``aten.split_with_sizes`` / ``aten.chunk`` (read side): each piece is a
-window of its size at the running offset along the split dim.  A subview
-windows every dim, so the pieces need no extent-1 dims ahead of the split
-one.
-
 ``aten.cat`` / ``aten.stack`` (write side): when every dim before the join
 dim has extent 1, each source occupies one contiguous window of the
 result -- ``stack`` joining along a dim its sources do not carry, so its
@@ -30,12 +25,6 @@ the join through a reshape keeps storing at its own shape, so it takes the
 window reshaped back to it; a source with no alloc to redirect (a
 parameter) is host-copied into its window with ``insert(clone(src),
 window)``, the sanctioned buffer-to-buffer move.
-
-``aten.copy_`` (write side): a training program ends by writing each
-result into a buffer that outlives it -- a gradient, a parameter, an
-optimizer moment.  That is a one-source join whose window is the whole
-destination: the producing nest's output alloc is redirected into it, so
-the nest stores straight into the destination and the copy goes.
 """
 
 import operator
@@ -50,15 +39,10 @@ from voyager_compiler.shape_prop import set_node_value
 _ALLOC = torch.ops.voyager.alloc.default
 _CAT = torch.ops.aten.cat.default
 _CLONE = torch.ops.aten.clone.default
-_COPY = torch.ops.aten.copy_.default
 _INSERT = torch.ops.voyager.insert.default
 _RESHAPE = torch.ops.aten.reshape.default
 _SELECT = torch.ops.aten.select.int
 _SLICE = torch.ops.aten.slice.Tensor
-_SPLITS = (
-    torch.ops.aten.split_with_sizes.default,
-    torch.ops.aten.chunk.default,
-)
 _STACK = torch.ops.aten.stack.default
 _SUBVIEW = torch.ops.voyager.subview.default
 _UNBIND = torch.ops.aten.unbind.int
@@ -66,10 +50,8 @@ _WHILE_LOOP = torch.ops.higher_order.while_loop
 
 
 def lower_views(model: GraphModule) -> GraphModule:
-    """Rewrite foldable ``select`` / ``slice`` / ``unbind`` / ``split`` /
-    ``cat`` / ``stack`` / ``copy_`` nodes into subview windows.  A window
-    carries the logical (quantized) dtype of the buffer it views, so its
-    bytes are sized like the buffer's."""
+    """Rewrite foldable ``select`` / ``slice`` / ``cat`` / ``stack`` nodes
+    into subview windows."""
     for node in list(model.graph.nodes):
         if node.op != "call_function":
             continue
@@ -79,12 +61,8 @@ def lower_views(model: GraphModule) -> GraphModule:
             _fold_slice(model, node)
         elif node.target is _UNBIND:
             _fold_unbind(model, node)
-        elif node.target in _SPLITS:
-            _fold_split(model, node)
         elif node.target in (_CAT, _STACK):
             _fold_join(model, node)
-        elif node.target is _COPY:
-            _fold_copy(model, node)
     model.graph.lint()
     model.recompile()
     return model
@@ -119,7 +97,6 @@ def _fold_select(model: GraphModule, node: Node) -> None:
             {"squeeze_dim": [dim]},
         )
     set_node_value(subview, node.value)
-    subview.meta["dtype"] = source.meta.get("dtype")
     node.replace_all_uses_with(subview)
     graph.erase_node(node)
 
@@ -161,45 +138,6 @@ def _fold_unbind(model: GraphModule, node: Node) -> None:
                 {"squeeze_dim": [dim]},
             )
         set_node_value(subview, user.value)
-        subview.meta["dtype"] = source.meta.get("dtype")
-        user.replace_all_uses_with(subview)
-        graph.erase_node(user)
-    graph.erase_node(node)
-
-
-def _fold_split(model: GraphModule, node: Node) -> None:
-    source = node.args[0]
-    dim = get_arg_value(node, 2, "dim", 0)
-    value = getattr(source, "value", None)
-    if not isinstance(value, torch.Tensor):
-        return
-    shape = list(value.shape)
-    dim = dim + len(shape) if dim < 0 else dim
-    # The pieces' own extents, so one rule serves explicit sizes and chunks.
-    split_sizes = [piece.shape[dim] for piece in node.value]
-    # The pieces are reached one at a time; a split consumed whole (a list
-    # handed to another op) names no single window.
-    users = list(node.users)
-    if any(
-        u.op != "call_function" or u.target is not operator.getitem
-        for u in users
-    ):
-        return
-
-    graph = model.graph
-    for user in users:
-        index = user.args[1]
-        index = index + len(split_sizes) if index < 0 else index
-        offsets = [0] * len(shape)
-        offsets[dim] = sum(split_sizes[:index])
-        sizes = list(shape)
-        sizes[dim] = split_sizes[index]
-        with graph.inserting_before(user):
-            subview = graph.call_function(
-                _SUBVIEW, (source, offsets, sizes, [1] * len(shape))
-            )
-        set_node_value(subview, user.value)
-        subview.meta["dtype"] = source.meta.get("dtype")
         user.replace_all_uses_with(subview)
         graph.erase_node(user)
     graph.erase_node(node)
@@ -240,7 +178,6 @@ def _fold_slice(model: GraphModule, node: Node) -> None:
             _SUBVIEW, (source, offsets, sizes, [1] * len(shape))
         )
     set_node_value(subview, node.value)
-    subview.meta["dtype"] = source.meta.get("dtype")
     node.replace_all_uses_with(subview)
     graph.erase_node(node)
 
@@ -248,17 +185,12 @@ def _fold_slice(model: GraphModule, node: Node) -> None:
 def _storage_of(node):
     """The builder-created output ``alloc`` whose bytes ``node`` names, walked
     through result handles and views; ``None`` when there is none to redirect
-    (a parameter, a window onto part of a buffer -- one an earlier join
-    already placed -- or a shape this walk does not cover)."""
+    (a parameter, or a shape this walk does not cover)."""
     while isinstance(node, Node):
         if node.op != "call_function":
             return None
         if node.target is _ALLOC:
             return node
-        if node.target is _SUBVIEW and (
-            node.value.numel() != node.args[0].value.numel()
-        ):
-            return None
         if node.target is operator.getitem:
             src, index = node.args
             if isinstance(src, Node) and src.target is _WHILE_LOOP:
@@ -296,10 +228,6 @@ def _fold_join(model: GraphModule, node: Node) -> None:
         for v in values
     ):
         return
-    dtypes = {s.meta.get("dtype") for s in sources}
-    if len(dtypes) != 1:
-        return
-    dtype = dtypes.pop()
     # A shared producer cannot land in two windows at once.
     targets = [_storage_of(s) for s in sources]
     redirected = [t for t in targets if t is not None]
@@ -319,7 +247,6 @@ def _fold_join(model: GraphModule, node: Node) -> None:
             _ALLOC, (out_shape, value.dtype, int(MemoryLevel.DRAM), 0)
         )
     set_node_value(buf, value)
-    buf.meta["dtype"] = dtype
     if (scope := first.meta.get("scope")) is not None:
         buf.meta["scope"] = scope
 
@@ -342,101 +269,23 @@ def _fold_join(model: GraphModule, node: Node) -> None:
                 _SUBVIEW, (buf, offsets, sizes, [1] * rank), squeeze
             )
         set_node_value(window, v)
-        window.meta["dtype"] = dtype
         last = window
         if t is not None:
-            last = _redirect(graph, t, window, before=last.next)
+            dest = window
+            if tuple(t.value.shape) != tuple(v.shape):
+                with graph.inserting_after(last):
+                    dest = graph.call_function(
+                        _RESHAPE, (window, list(t.value.shape))
+                    )
+                set_node_value(dest, t.value)
+                last = dest
+            t.replace_all_uses_with(dest)
+            graph.erase_node(t)
         else:
             with graph.inserting_before(node):
                 clone = graph.call_function(_CLONE, (s,))
                 graph.call_function(_INSERT, (clone, window))
             set_node_value(clone, v)
-            clone.meta["dtype"] = dtype
 
     node.replace_all_uses_with(buf)
     graph.erase_node(node)
-
-
-def _redirect(graph, storage: Node, window: Node, before: Node) -> Node:
-    """Point the output alloc ``storage`` at ``window``, so the nest that
-    stores into it stores into the window: reshaped back to the alloc's
-    shape, inserted before ``before``, when the two differ.  Returns the node
-    the nest now stores into."""
-    dest = window
-    if tuple(storage.value.shape) != tuple(window.value.shape):
-        with graph.inserting_before(before):
-            dest = graph.call_function(
-                _RESHAPE, (window, list(storage.value.shape))
-            )
-        set_node_value(dest, storage.value)
-        dest.meta["dtype"] = window.meta.get("dtype")
-    storage.replace_all_uses_with(dest)
-    graph.erase_node(storage)
-    return dest
-
-
-def _names_of(buffer: Node) -> list:
-    """``buffer`` and every view that names its bytes, transitively."""
-    names, frontier = [buffer], [buffer]
-    while frontier:
-        node = frontier.pop()
-        for user in node.users:
-            if (user.target is _SUBVIEW or is_nop(user)) and (
-                user.args[0] is node
-            ):
-                names.append(user)
-                frontier.append(user)
-    return names
-
-
-def _space(buffer: Node) -> int:
-    """The memory level a buffer root lives in: an ``alloc``'s level
-    argument; an input or a weight is in DRAM."""
-    if buffer.target is _ALLOC:
-        return get_arg_value(buffer, 2, "space", int(MemoryLevel.DRAM))
-    return int(MemoryLevel.DRAM)
-
-
-def _fold_copy(model: GraphModule, node: Node) -> None:
-    """Make ``copy_(dst, src)``'s producer store into ``dst``.
-
-    Folds when ``src`` is a nest's output of ``dst``'s shape and dtype, in
-    the memory ``dst`` lives in, and nothing reads the buffer ``dst`` views,
-    under any name, after that nest starts storing.  The nest may read
-    ``dst`` itself, as an update does: it reads each tile before storing
-    over it.
-    """
-    dst, src = node.args
-    storage = _storage_of(src)
-    value = getattr(src, "value", None)
-    dst_value = getattr(dst, "value", None)
-    root = dst
-    while root.target is _SUBVIEW or is_nop(root):
-        root = root.args[0]
-    if (
-        storage is None
-        or _space(storage) != _space(root)
-        or not isinstance(value, torch.Tensor)
-        or not isinstance(dst_value, torch.Tensor)
-        or value.shape != dst_value.shape
-        or value.dtype != dst_value.dtype
-    ):
-        return
-    graph = model.graph
-    order = {n: i for i, n in enumerate(graph.nodes)}
-    first_store = min(storage.users, key=order.__getitem__)
-    if any(
-        order[user] > order[first_store]
-        for name in _names_of(root)
-        for user in name.users
-        if user is not node
-    ):
-        return
-    _redirect(graph, storage, dst, before=first_store)
-    node.replace_all_uses_with(dst)
-    graph.erase_node(node)
-    # The views that named the result for the copy are unread now.
-    while src is not storage and is_nop(src) and not src.users:
-        source = src.args[0]
-        graph.erase_node(src)
-        src = source

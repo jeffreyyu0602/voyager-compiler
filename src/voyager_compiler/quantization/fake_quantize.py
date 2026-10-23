@@ -1,306 +1,194 @@
-import functools
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import logging
 import math
+import re
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 from torchao.quantization.pt2e import FakeQuantizeBase, ObserverOrFakeQuantize
 
-from voyager_compiler.ops import compiled_on_gpu, expand, quantize_mx, vmap
+from voyager_compiler.ops import expand, quantize_mx, vmap
 from voyager_compiler.quantization.dtypes import (
-    quantize_to_minifloat,
+    _quantize_elemwise_core,
+    quantize_to_fp8_e4m3,
+    quantize_to_fp8_e5m2,
     quantize_to_nf,
     quantize_to_posit,
 )
 from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
 from voyager_compiler.quantization.qspec import (
+    DEFAULT_QUANTIZATION_ROUNDING,
+    SUPPORTED_QUANTIZATION_ROUNDING,
     QScheme,
-    float_format,
-    int_range,
-    parse_codebook_dtype,
-    posit_format,
 )
 
 __all__ = [
-    "DirectCastFakeQuantize",
     "FusedAmaxObsFakeQuantize",
-    "GroupWiseAffineFakeQuantize",
-    "MXFakeQuantize",
-    "OutlierFilter",
-    "RandomHadamardTransform",
+    "get_vsq_scale_quantization_map",
     "_DerivedObserverOrFakeQuantize",
-    "calculate_global_scale",
-    "entry_levels",
-    "fake_quantize_class",
-    "hadamard_matrix",
 ]
 
 
 logger = logging.getLogger(__name__)
 
-# Elements a random Hadamard transform mixes together, as in NVFP4.
-HADAMARD_SIZE = 16
-# The random signs of the transform: Transformer Engine's fixed vector
-# (``get_wgrad_sign_vector``), shared by every operand.
-HADAMARD_SIGNS = (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
 
-
-def hadamard_matrix(device=None) -> torch.Tensor:
-    """The random Hadamard matrix ``diag(signs) @ H / 4``.
-
-    ``H`` is Sylvester's 16x16 Hadamard matrix and ``signs`` is
-    ``HADAMARD_SIGNS``; the matrix is orthogonal.
-
-    Args:
-        device: Where the matrix lives.
-
-    Returns:
-        A float32 ``HADAMARD_SIZE`` x ``HADAMARD_SIZE`` tensor.
-    """
-    matrix = torch.ones(1, 1)
-    while matrix.shape[0] < HADAMARD_SIZE:
-        matrix = torch.cat(
-            [torch.cat([matrix, matrix], 1), torch.cat([matrix, -matrix], 1)]
+def _validate_integer_bounds(
+    dtype,
+    quant_min,
+    quant_max,
+    storage_min,
+    storage_max,
+):
+    """Reject bounds the storage dtype could not hold."""
+    if any(
+        not math.isfinite(bound) or bound != round(bound)
+        for bound in (quant_min, quant_max)
+    ):
+        raise ValueError(f"{dtype} quantization bounds must be finite integers")
+    if quant_min > quant_max:
+        raise ValueError(f"{dtype} quant_min must not exceed quant_max")
+    if quant_min < storage_min or quant_max > storage_max:
+        raise ValueError(
+            f"{dtype} quantization bounds [{quant_min}, {quant_max}] "
+            f"exceed storage range [{storage_min}, {storage_max}]"
         )
-    signs = torch.tensor(HADAMARD_SIGNS, dtype=torch.float)
-    return (signs[:, None] * matrix / math.sqrt(HADAMARD_SIZE)).to(device)
 
 
-def _rotate(x: torch.Tensor, axis: int, matrix: torch.Tensor) -> torch.Tensor:
-    """``x`` with each whole run of ``HADAMARD_SIZE`` elements along ``axis``
-    multiplied by ``matrix``, computed in float32.
+def get_quantization_map(
+    dtype,
+    device=None,
+    quant_min=None,
+    quant_max=None,
+    rounding=DEFAULT_QUANTIZATION_ROUNDING,
+):
+    """Return a quantization map for the given dtype.
 
-    A shorter run left at the end stays as it is.  Both operands of a GEMM
-    have the same length along the axis they are rotated on, so they leave
-    the same tail and their product is unchanged.
+    ``quant_min`` / ``quant_max`` narrow an integer dtype below its storage
+    range, and ``rounding`` selects truncation for a datapath that floors
+    rather than rounds to nearest.
     """
-    moved = x.movedim(axis, -1)
-    whole = moved.shape[-1] // HADAMARD_SIZE * HADAMARD_SIZE
-    head, tail = moved[..., :whole], moved[..., whole:]
-    blocks = head.reshape(*head.shape[:-1], -1, HADAMARD_SIZE)
-    rotated = (blocks.float() @ matrix).reshape(head.shape).to(x.dtype)
-    return torch.cat([rotated, tail], -1).movedim(-1, axis)
-
-
-@functools.lru_cache(maxsize=None)
-def get_quantization_map(dtype, device=None):
-    """Return the lookup table that quantizes a bfloat16 value to ``dtype``.
-
-    Entry ``i`` is the value the bfloat16 whose bits read ``i`` rounds to,
-    so quantizing is one gather.  Floats saturate: a value past the largest
-    finite one, infinity included, takes it.  A lookup table's entries are
-    NormalFloat's levels, snapped to its entry dtype's grid.  Each table is
-    built once per dtype and device and shared by every caller, so it must
-    not be modified in place.
-
-    Args:
-        dtype: ``int<N>``, ``uint<N>``, ``fp<B>_e<X>m<Y>``, ``posit<N>_<es>``
-            or ``lut<I>[_to_<E>]``; None returns the identity.
-        device: Where the table lives.
-
-    Returns:
-        A ``2**16``-entry bfloat16 tensor.
-
-    Raises:
-        ValueError: ``dtype`` names none of these.
-    """
+    if rounding not in SUPPORTED_QUANTIZATION_ROUNDING:
+        raise ValueError(
+            f"rounding must be one of "
+            f"{sorted(SUPPORTED_QUANTIZATION_ROUNDING)}"
+        )
+    round_values = torch.floor if rounding == "floor" else torch.round
     values = torch.arange(2**16, dtype=torch.int16, device=device)
     values = values.view(torch.bfloat16)
     if dtype is None:
         return values
 
-    if (bounds := int_range(dtype)) is not None:
-        return torch.clamp(torch.round(values), *bounds)
+    # PyTorch native dtypes
+    if dtype in ["float32", "float16", "bfloat16"]:
+        torch_dtype = getattr(torch, dtype)
+        return values.to(torch_dtype).to(torch.bfloat16)
 
-    if (fmt := float_format(dtype)) is not None:
-        if not fmt.signed:
+    # Integer data types
+    if match := re.fullmatch(r"int(\d+)", dtype, re.IGNORECASE):
+        nbits = int(match.group(1))
+        storage_min, storage_max = -(2 ** (nbits - 1)), 2 ** (nbits - 1) - 1
+        quant_min = storage_min if quant_min is None else quant_min
+        quant_max = storage_max if quant_max is None else quant_max
+        _validate_integer_bounds(
+            dtype, quant_min, quant_max, storage_min, storage_max
+        )
+        return torch.clamp(round_values(values), quant_min, quant_max)
+
+    # Unsigned integer
+    if match := re.fullmatch(r"uint(\d+)", dtype, re.IGNORECASE):
+        nbits = int(match.group(1))
+        storage_min, storage_max = 0, 2**nbits - 1
+        quant_min = storage_min if quant_min is None else quant_min
+        quant_max = storage_max if quant_max is None else quant_max
+        _validate_integer_bounds(
+            dtype, quant_min, quant_max, storage_min, storage_max
+        )
+        return torch.clamp(round_values(values), quant_min, quant_max)
+
+    # Custom implementation for NVIDIA FP8 format
+    if match := re.fullmatch(r"(?:fp8\.)?(e4m3|e5m2)", dtype, re.IGNORECASE):
+        fp8_format = match.group(1).lower()
+        if fp8_format == "e4m3":
+            return quantize_to_fp8_e4m3(values)
+        else:
+            return quantize_to_fp8_e5m2(values)
+
+    # Floating point implementation adopted from microscaling code
+    if match := re.fullmatch(r"fp(\d+)_e(\d+)m(\d+)", dtype):
+        nbits, ebits, mbits = map(int, match.groups())
+        assert nbits == ebits + mbits + 1 or nbits == ebits + mbits
+
+        # Unsigned float for scaling factors
+        if nbits == ebits + mbits:
             values = torch.abs(values)
-        values = torch.clamp(values, -fmt.max_norm, fmt.max_norm)
-        # The rounding runs in float32: bfloat16 cannot hold the halfway
-        # sums it compares against.
-        return quantize_to_minifloat(
-            values.float(),
-            fmt.mbits + 2,
-            fmt.ebits,
-            fmt.max_norm,
-            round="even",
-            saturate_normals=True,
-        ).to(torch.bfloat16)
 
-    if (posit := posit_format(dtype)) is not None:
-        return quantize_to_posit(values, *posit, round_to_even=True)
+        mbits = mbits + 2
+        emax = 2 ** (ebits - 1) - 1 if ebits > 4 else 2 ** (ebits - 1)
+        if dtype != "fp8_e4m3":
+            max_norm = 2**emax * float(2 ** (mbits - 1) - 1) / 2 ** (mbits - 2)
+        else:
+            max_norm = 2**emax * 1.75  # FP8 has custom max_norm
 
-    if (codebook := parse_codebook_dtype(dtype)) is not None:
-        index_bits, entry = codebook
-        grid = None if entry is None else entry_levels(entry, device)
-        indices, levels = quantize_to_nf(values, index_bits, grid=grid)
-        return levels[indices]
+        return _quantize_elemwise_core(
+            values, mbits, ebits, max_norm, round="even", saturate_normals=True
+        )
+
+    # Posit data types invented by John Gustafson
+    # https://www.johndcook.com/blog/2018/04/11/anatomy-of-a-posit-number/
+    if match := re.fullmatch(r"posit(\d+)_(\d+)", dtype):
+        nbits, es = match.groups()
+        return quantize_to_posit(
+            values, int(nbits), int(es), round_to_even=True
+        )
+
+    # NormalFloat by Tim Dettmers and adopted from the bitsandbytes library
+    # This data type returns two tensors: a mapping to the NF index, and
+    # a value map
+    if match := re.fullmatch(r"nf(\d+)(?:_(\d+))?", dtype):
+        nbits = int(match.group(1))
+        int_bits = int(match.group(2)) if match.group(2) else None
+        return quantize_to_nf(values, nbits, int_bits=int_bits)
 
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-def entry_levels(dtype, device=None):
-    """Return every value a lookup-table entry of ``dtype`` can hold.
-
-    The grid is symmetric, so an integer's extra negative value is left out:
-    ``int6`` spans [-31, 31], the range its ``quant_max`` gives.
-
-    Args:
-        dtype: The entry dtype, ``int<N>`` or ``fp<B>_e<X>m<Y>``.
-        device: Where to build the grid.
-
-    Returns:
-        The distinct values in ascending order, as float32, with one zero.
-    """
-    table = get_quantization_map(dtype, device).float()
-    levels = torch.unique(table[torch.isfinite(table)])
-    # ``torch.unique`` can keep -0 as the zero; adding 0 turns it into +0.
-    return levels[levels >= -levels.max()] + 0.0
-
-
-def calculate_global_scale(
-    input: torch.Tensor, quant_max: float, scale_max: float
-) -> torch.Tensor:
-    """NVFP4's per-tensor scale: ``amax(|input|) / (quant_max * scale_max)``.
-
-    Dividing the block scales by it puts the tensor's largest one on the
-    scale dtype's largest value.  An all-zero tensor gets float32's smallest
-    normal value instead of zero, which its blocks then divide to nothing.
-
-    Args:
-        input: Tensor about to be quantized.
-        quant_max: Largest magnitude of the element dtype.
-        scale_max: Largest value of the block scales' dtype.
-
-    Returns:
-        A 0-d tensor in ``input``'s dtype.
-    """
-    ratio = torch.amax(torch.abs(input)) / (quant_max * scale_max)
-    return ratio.clamp_min(torch.finfo(torch.float32).tiny)
-
-
-# A fake-quant graph sees the same shapes window after window.
-_compiled_per_shape = compiled_on_gpu(dynamic=False)
-
-
-@_compiled_per_shape
-def _fake_quant(input, qmap, scale):
-    """Fake-quantize ``input`` against a per-tensor or per-channel scale.
-
-    Args:
-        input: Tensor to quantize.
-        qmap: Lookup table, one entry per bfloat16 bit pattern.
-        scale: Scale, broadcastable to ``input``.
-
-    Returns:
-        The fake-quantized tensor.
-    """
-    scale = scale.to(input.dtype)
-    return vmap(input / scale, qmap) * scale
-
-
-@_compiled_per_shape
-def _mx_fake_quant(
-    input,
-    qmap,
-    axes,
-    block_size,
-    quant_max,
-    power_of_two,
-    scale_qmap,
-    seed,
-    global_scale,
+def get_vsq_scale_quantization_map(
+    dtype,
+    device,
+    fine_quant_max,
+    coarse_scale_quant_max,
 ):
-    """Fake-quantize ``input`` in microscaling blocks.
+    """Return a normalized VSQ fine-scale quantization map.
 
-    Args:
-        input: Tensor to quantize.
-        qmap: Lookup table or codebook the elements are quantized into.
-        axes: Axis or axes the blocks run along.
-        block_size: Elements per block.
-        quant_max: Largest magnitude ``qmap`` represents.
-        power_of_two: Round each block scale to a power of two.
-        scale_qmap: Lookup table the scales are quantized into, or None.
-        seed: int64 scalar keying stochastic rounding, or None to round to
-            the nearest value.
-        global_scale: The tensor's global scale, a 0-d tensor, or None.
-
-    Returns:
-        ``(scale, output)``: the block scales, without the global scale,
-        and the fake-quantized tensor.
+    Integer fine-scale storage represents a *fraction* of the full logical
+    fine-scale range rather than an integer-valued scale, so an unsigned
+    storage dtype is remapped onto that fraction. Any other dtype has no such
+    reinterpretation and uses the ordinary map.
     """
-    scale, output = quantize_mx(
-        input,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        power_of_two,
-        scale_qmap=scale_qmap,
-        seed=seed,
-        global_scale=global_scale,
-    )
-    output = output * expand(scale, output.shape, block_size)
-    if global_scale is not None:
-        output = output * global_scale
-    return scale, output
+    if (
+        match := re.fullmatch(r"uint(\d+)", dtype or "", re.IGNORECASE)
+    ) is None:
+        return get_quantization_map(dtype, device)
 
+    nbits = int(match.group(1))
+    # A zero code would erase the block, so the smallest scale is one step.
+    quant_min, quant_max = 1, 2**nbits - 1
 
-@_compiled_per_shape
-def _group_wise_affine_fake_quant(
-    input, axes, block_size, quant_min, quant_max, scale_qmap
-):
-    """Fake-quantize ``input`` with a scale and zero point per block.
+    for bound, name in (
+        (fine_quant_max, "fine_quant_max"),
+        (coarse_scale_quant_max, "coarse_scale_quant_max"),
+    ):
+        if bound is None or not math.isfinite(bound) or bound <= 0:
+            raise ValueError(f"{name} must be finite and positive")
 
-    Each block maps its own ``[min, max]`` onto ``[quant_min, quant_max]``.
-
-    Args:
-        input: Tensor to quantize.
-        axes: Axis or axes the blocks run along.
-        block_size: Elements per block.
-        quant_min: Smallest code.
-        quant_max: Largest code.
-        scale_qmap: Lookup table the scale and zero point are quantized
-            into, or None.
-
-    Returns:
-        ``(scale, zero_point, output)``: the per-block parameters and the
-        fake-quantized tensor.
-    """
-    assert block_size > 0
-
-    # Make sure axes is a list of non-negative numbers
-    axes = [axes] if type(axes) == int else axes
-    axes = [x + input.ndim if x < 0 else x for x in axes]
-
-    # Perform tiling to the hardware vector size
-    reshaped_input, axes, orig_shape, padded_shape = _reshape_to_blocks(
-        input, axes, block_size
-    )
-
-    shared_exp_axes = [x + 1 for x in axes]
-
-    min = torch.amin(reshaped_input, dim=shared_exp_axes)
-    max = torch.amax(reshaped_input, dim=shared_exp_axes)
-
-    sf = (max - min) / (quant_max - quant_min)
-    sf = torch.where(sf > 0.0, sf, 1.0)
-    # Quantize the scale using the codebook; a scale below its range
-    # rounds to zero and the block is one level, as with no range.
-    if scale_qmap is not None:
-        sf = vmap(sf, scale_qmap)
-        sf = torch.where(sf > 0.0, sf, 1.0)
-    zp = -min / sf + quant_min
-    if scale_qmap is not None:
-        zp = vmap(zp, scale_qmap)
-
-    expanded_sf = expand(sf, input.shape, block_size)
-    expanded_zp = expand(zp, input.shape, block_size)
-
-    q = torch.round(input / expanded_sf + expanded_zp)
-    q = torch.clamp(q, quant_min, quant_max)
-    return sf, zp, (q - expanded_zp) * expanded_sf
+    step = coarse_scale_quant_max / (fine_quant_max * quant_max)
+    values = torch.arange(2**16, dtype=torch.int16, device=device)
+    values = values.view(torch.bfloat16)
+    codes = torch.floor(values.to(torch.float32) / step)
+    return torch.clamp(codes, quant_min, quant_max) * step
 
 
 class FakeQuantizeFunction(torch.autograd.Function):
@@ -310,13 +198,14 @@ class FakeQuantizeFunction(torch.autograd.Function):
     def forward(
         ctx,
         input: torch.Tensor,
-        enabled: bool,
+        fake_quant_enabled: torch.Tensor,
         qmap: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        if not enabled:
+        if fake_quant_enabled[0] == 0:
             return input
-        return _fake_quant(input, qmap, scale)
+        scale = scale.to(input.dtype)
+        return vmap(input / scale, qmap) * scale
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -333,7 +222,7 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
     def forward(
         ctx,
         input: torch.Tensor,
-        enabled: bool,
+        fake_quant_enabled: torch.Tensor,
         scale: torch.Tensor,
         qmap: torch.Tensor,
         axes: Union[int, List[int]],
@@ -341,35 +230,26 @@ class MXFakeQuantizeFunction(torch.autograd.Function):
         quant_max: float,
         force_scale_power_of_two=False,
         scale_qmap=None,
-        stochastic_rounding=False,
-        global_scale=None,
     ):
-        if not enabled:
+        if fake_quant_enabled[0] == 0:
             return input
-        # Each call rounds under a fresh seed from torch's generator.
-        seed = (
-            torch.randint(2**63 - 1, (), device=input.device)
-            if stochastic_rounding
-            else None
-        )
-        sf, output = _mx_fake_quant(
+        sf, input = quantize_mx(
             input,
             qmap,
             axes,
             block_size,
             quant_max,
             force_scale_power_of_two,
-            scale_qmap,
-            seed,
-            global_scale,
+            scale_qmap=scale_qmap,
         )
         scale.resize_(sf.shape).copy_(sf)
-        return output
+        input = input * expand(sf, input.shape, block_size)
+        return input
 
     @staticmethod
     def backward(ctx, grad_output):
         """Straight-through estimator: only ``input`` takes a gradient."""
-        return (grad_output,) + (None,) * 10
+        return (grad_output,) + (None,) * 8
 
 
 class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
@@ -377,7 +257,7 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
     def forward(
         ctx,
         input: torch.Tensor,
-        enabled: bool,
+        fake_quant_enabled: torch.Tensor,
         scale: torch.Tensor,
         zero_point: torch.Tensor,
         axes: Union[int, List[int]],
@@ -386,14 +266,42 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
         quant_max: float,
         scale_qmap=None,
     ):
-        if not enabled:
+        if fake_quant_enabled[0] == 0:
             return input
-        sf, zp, output = _group_wise_affine_fake_quant(
-            input, axes, block_size, quant_min, quant_max, scale_qmap
+
+        assert block_size > 0
+
+        # Make sure axes is a list of non-negative numbers
+        axes = [axes] if type(axes) == int else axes
+        axes = [x + input.ndim if x < 0 else x for x in axes]
+
+        # Perform tiling to the hardware vector size
+        reshaped_input, axes, orig_shape, padded_shape = _reshape_to_blocks(
+            input, axes, block_size
         )
+
+        shared_exp_axes = [x + 1 for x in axes]
+
+        min = torch.amin(reshaped_input, dim=shared_exp_axes)
+        max = torch.amax(reshaped_input, dim=shared_exp_axes)
+
+        sf = (max - min) / (quant_max - quant_min)
+        sf = torch.where(sf > 0.0, sf, 1.0)
+        zp = -min / sf + quant_min
+
+        # Quantize the scale using the codebook
+        if scale_qmap is not None:
+            sf = vmap(sf, scale_qmap)
+            zp = vmap(zp, scale_qmap)
+
         scale.resize_(sf.shape).copy_(sf)
         zero_point.resize_(zp.shape).copy_(zp)
-        return output
+
+        sf = expand(sf, input.shape, block_size)
+        zp = expand(zp, input.shape, block_size)
+
+        q = torch.clamp(torch.round(input / sf + zp), quant_min, quant_max)
+        return (q - zp) * sf
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -401,83 +309,420 @@ class GroupWiseAffineFakeQuantFunction(torch.autograd.Function):
         return (grad_output,) + (None,) * 8
 
 
-class _FreezableFlags(FakeQuantizeBase):
-    """``FakeQuantizeBase`` whose enable flags freezing can fix.
+class FusedAmaxObsFakeQuantize(FakeQuantizeBase):
+    r"""Simulate the quantize and dequantize operations in training time.
 
-    The flags are device tensors, so reading one on every call waits for
-    the device, and a CUDA graph cannot capture the read.  Once
-    ``freeze_flags`` has read them, the module goes by those values.
-    """
+    Observer module for computing the quantization parameters based on the
+    historical amax values.
 
-    _frozen_flags: Optional[Tuple[bool, bool]] = None
-
-    def freeze_flags(self) -> None:
-        """Fix the enable flags at their current values."""
-        self._frozen_flags = (
-            bool(self.fake_quant_enabled[0]),
-            bool(self.observer_enabled[0]),
-        )
-
-    def fake_quant_on(self) -> bool:
-        """Whether ``forward`` fake-quantizes."""
-        if self._frozen_flags is not None:
-            return self._frozen_flags[0]
-        return bool(self.fake_quant_enabled[0])
-
-    def observer_on(self) -> bool:
-        """Whether ``forward`` updates the statistics."""
-        if self._frozen_flags is not None:
-            return self._frozen_flags[1]
-        return bool(self.observer_enabled[0])
-
-
-class _FakeQuantize(_FreezableFlags):
-    """The parts every fake-quant scheme shares.
-
-    The dtype's lookup table and the ``scale`` every scheme reports.  A
-    spec is passed whole to the class that implements its scheme, so each
-    class takes the fields it uses and the rest fall through to
-    ``**unused``.  A subclass fake-quantizes in ``forward`` and reports
-    its parameters from ``calculate_qparams``.
-
-    Args:
-        dtype: Element dtype, as a spec string names it.
-        device: Where the buffers live.
-        **unused: The spec's fields this scheme does not use.
+    This observer uses the tensor amax statistics to compute the quantization
+    parameters. The module records the maximums of absolute values of output
+    tensors, and uses this statistic to compute the quantization parameters.
     """
 
     qmap: torch.Tensor
+    scale_qmap: Optional[torch.Tensor]
+    amax_history: torch.Tensor
     scale: torch.Tensor
-
-    #: Buffers that take their shape from the first input; a loaded one is
-    #: resized to the saved shape before its values are copied in.
-    _lazily_sized = ("scale",)
+    zero_point: torch.Tensor
 
     def __init__(
         self,
         dtype: str,
+        qscheme: Optional[str] = None,
+        quant_min: Optional[float] = None,
+        quant_max: Optional[float] = None,
+        rounding: str = DEFAULT_QUANTIZATION_ROUNDING,
+        amax_history_len: int = None,
+        ch_axis: Optional[int] = None,
+        block_size: Optional[int] = None,
+        scale_dtype: Optional[str] = None,
+        scale_quant_max: Optional[float] = None,
+        coarse: Optional[dict] = None,
+        force_scale_power_of_two: bool = False,
+        record_histogram: bool = False,
+        outlier_threshold: Optional[float] = None,
+        outlier_pct: Optional[float] = None,
         device: Optional[torch.device] = None,
-        **unused,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.dtype = dtype
+        self.qscheme = qscheme
+        self.quant_min = quant_min
+        self.quant_max = quant_max
+        if rounding not in SUPPORTED_QUANTIZATION_ROUNDING:
+            raise ValueError(
+                "rounding must be one of "
+                f"{sorted(SUPPORTED_QUANTIZATION_ROUNDING)}"
+            )
+        self.rounding = rounding
+        self.amax_history_len = amax_history_len
+        self.ch_axis = ch_axis
+        self.block_size = block_size
+        self.scale_dtype = scale_dtype
+        # A scale's own range defaults to the range of the data it scales.
+        self.scale_quant_max = (
+            quant_max if scale_quant_max is None else scale_quant_max
+        )
+        self.force_scale_power_of_two = force_scale_power_of_two
+        self.record_histogram = record_histogram
+        self.outlier_pct = outlier_pct
+        assert (
+            outlier_pct is None or outlier_threshold is None
+        ), "Only one of outlier_pct and outlier_threshold can be set."
+        self.max_outlier_pct = 0.0
+
         factory_kwargs = {"device": device, "dtype": torch.float}
 
-        codebook = parse_codebook_dtype(dtype)
-        self.is_codebook_quantization = codebook is not None
-        if self.is_codebook_quantization:
-            self.index_bits, self.code_dtype = codebook
-        self.register_buffer(
-            "qmap", get_quantization_map(dtype, device), persistent=False
+        # Generate quantization map buffers
+        quant_map = get_quantization_map(
+            dtype,
+            device,
+            quant_min,
+            quant_max,
+            rounding,
         )
-        self.register_buffer("scale", torch.tensor([1.0], **factory_kwargs))
+        self.is_codebook_quantization = isinstance(quant_map, tuple)
+        if self.is_codebook_quantization:
+            indices, values = quant_map
+            quant_map = values[indices]
+        self.register_buffer("qmap", quant_map, persistent=False)
 
+        # VSQ nests a coarse quantization around this one.  Its fields
+        # arrive as a plain dict because the spec is splatted with asdict().
+        self.is_vsq = self.qscheme == QScheme.VSQ
+        coarse = coarse or {}
+        self.coarse = dict(coarse)
+        self.coarse_quant_min = coarse.get("quant_min")
+        self.coarse_quant_max = coarse.get("quant_max")
+        self.coarse_scale_quant_max = coarse.get("scale_quant_max")
+        if self.coarse_scale_quant_max is None:
+            self.coarse_scale_quant_max = self.coarse_quant_max
+        self.coarse_ch_axis = coarse.get("ch_axis")
+        self.coarse_is_per_channel = (
+            coarse.get("qscheme") == QScheme.PER_CHANNEL_SYMMETRIC
+        )
+        coarse_map = (
+            get_quantization_map(
+                coarse["dtype"],
+                device,
+                coarse.get("quant_min"),
+                coarse.get("quant_max"),
+                coarse.get("rounding", DEFAULT_QUANTIZATION_ROUNDING),
+            )
+            if coarse.get("dtype") is not None
+            else None
+        )
+        if isinstance(coarse_map, tuple):
+            indices, values = coarse_map
+            coarse_map = values[indices]
+        self.register_buffer("coarse_qmap", coarse_map, persistent=False)
+
+        if self.scale_dtype is None:
+            scale_map = None
+        elif self.is_vsq:
+            # The fine scale is stored as a fraction of the coarse range.
+            scale_map = get_vsq_scale_quantization_map(
+                self.scale_dtype,
+                device,
+                self.scale_quant_max,
+                self.coarse_scale_quant_max,
+            )
+        else:
+            scale_map = get_quantization_map(self.scale_dtype, device)
+        self.register_buffer("scale_qmap", scale_map, persistent=False)
+
+        # Create amax history and scale buffers
+        self.register_buffer("amax_history", torch.tensor([], **factory_kwargs))
+        self.register_buffer("scale", torch.tensor([1.0], **factory_kwargs))
+        self.register_buffer(
+            "fine_scale",
+            torch.tensor([1.0], **factory_kwargs) if self.is_vsq else None,
+        )
+        self.register_buffer(
+            "zero_point", torch.tensor([1.0], **factory_kwargs)
+        )
+
+        # Create histogram buffer
+        if self.record_histogram:
+            self.register_buffer(
+                "histogram",
+                torch.zeros(254, **factory_kwargs),
+                persistent=False,
+            )
+
+        self.observer_enabled[0] = self.qscheme is not None
+        self.is_per_channel = self.qscheme == QScheme.PER_CHANNEL_SYMMETRIC
+
+        if outlier_pct is not None:
+            self.outlier_ema_decay = kwargs.get("outlier_ema_decay", 0.9)
+            self.register_buffer(
+                "outlier_threshold", torch.tensor([], **factory_kwargs)
+            )
+        else:
+            self.outlier_threshold = outlier_threshold
+
+    @torch.no_grad()
+    def _update_amax_scale(
+        self,
+        x: torch.Tensor,
+        *,
+        is_per_channel: Optional[bool] = None,
+        ch_axis: Optional[int] = None,
+        quant_max: Optional[float] = None,
+    ) -> None:
+        """Fold ``x``'s amax into the history and recompute ``scale``.
+
+        The absolute maximum is taken over every axis, or over every axis
+        but ``ch_axis`` when the observer is per-channel. The history and
+        the scale are lazily sized on the first call, since the observed
+        shape is only known once a tensor arrives.
+
+        Args:
+            x: The tensor being observed.
+        """
+        # VSQ observes on its *coarse* level, so the geometry is a
+        # parameter rather than always this observer's own.
+        if is_per_channel is None:
+            is_per_channel = self.is_per_channel
+        if ch_axis is None:
+            ch_axis = self.ch_axis
+        if quant_max is None:
+            quant_max = self.scale_quant_max
+
+        if is_per_channel:
+            axis = ch_axis % x.ndim
+            dim = tuple(i for i in range(x.ndim) if i != axis)
+            amax_cur = torch.amax(torch.abs(x), dim=dim, keepdim=True)
+        else:
+            amax_cur = torch.amax(torch.abs(x))
+
+        if self.amax_history.numel() == 0:
+            size = (self.amax_history_len,) + amax_cur.shape
+            self.amax_history.resize_(size).fill_(0.0)
+            self.scale.resize_(amax_cur.shape).fill_(1.0)
+
+        amax = torch.amax(self.amax_history, dim=0)
+        self.amax_history.copy_(torch.roll(self.amax_history, -1, 0))
+        self.amax_history[0] = amax_cur
+
+        # Deliberately the pre-roll amax: the scale reflects the history as
+        # it stood before this sample, which is the behaviour every existing
+        # lane's collateral was produced with.
+        self._apply_amax(amax, quant_max)
+
+    @torch.no_grad()
+    def _apply_amax(self, amax, quant_max=None) -> None:
+        """Set ``scale`` from one observed absolute maximum.
+
+        Extracted so that the calibrated range and the scale it implies have
+        one relation, wherever the range came from: a forward pass, or a
+        quantization region joining several observers' ranges into one. Two
+        copies of this arithmetic is how a region ends up nominally joined
+        and numerically not.
+
+        A zero or non-finite amax leaves the scale alone, which is what keeps
+        an observer that has seen nothing from collapsing its scale to zero.
+        """
+        if quant_max is None:
+            quant_max = (
+                self.coarse_scale_quant_max
+                if self.is_vsq
+                else self.scale_quant_max
+            )
+        sf = amax / quant_max
+        sf = torch.where(amax > 0.0, sf, self.scale)
+        sf = torch.where(torch.isfinite(amax), sf, self.scale)
+        if self.force_scale_power_of_two:
+            sf = torch.pow(2, torch.ceil(torch.log2(sf)))
+        self.scale.copy_(sf)
+
+    @torch.no_grad()
+    def join_amax(self, amax) -> None:
+        """Adopt ``amax`` as this observer's whole calibrated range.
+
+        Used by quantization-region formation, where several observers have
+        to end up with one scale. The history is replaced rather than folded
+        into, because the joined range *is* the region's range: leaving the
+        observer's own samples in it would let a later read of the history
+        disagree with the scale.
+        """
+        if self.amax_history.numel() == 0:
+            self.amax_history.resize_(
+                (self.amax_history_len,) + tuple(amax.shape)
+            ).fill_(0.0)
+            self.scale.resize_(tuple(amax.shape)).fill_(1.0)
+        self.amax_history.copy_(amax.expand_as(self.amax_history))
+        self._apply_amax(amax)
+
+    def quantize_vsq_components(
+        self,
+        values: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Quantize ``values`` into ``(coarse_scale, fine_scale, payload)``.
+
+        This is what the converter stamps onto the graph: the calibrated
+        coarse scale, the per-block fine scale, and the narrow payload.
+        """
+        if not self.is_vsq:
+            raise ValueError("VSQ components require a VSQ observer")
+        axes = self.ch_axis
+        axes = (axes,) if isinstance(axes, int) else tuple(axes)
+        return torch.ops.quantized_ops.quantize_vsq.default(
+            values,
+            self.calculate_qparams().to(
+                device=values.device, dtype=values.dtype
+            ),
+            self.coarse_qmap.to(values.device),
+            self.qmap.to(values.device),
+            axes,
+            self.block_size,
+            self.scale_quant_max,
+            self.force_scale_power_of_two,
+            (
+                self.scale_qmap.to(values.device)
+                if self.scale_qmap is not None
+                else None
+            ),
+            None,
+            self.coarse_scale_quant_max,
+        )
+
+    @torch.jit.export
+    def calculate_qparams(self):
+        # Forward intentionally derives its live scale from the history as it
+        # stood before the current sample was rolled in.  At a calibration
+        # boundary the last sample is already in ``amax_history`` and must be
+        # incorporated before the qparam is frozen.
+        if self.amax_history.numel() > 0:
+            quant_max = (
+                self.coarse_scale_quant_max
+                if self.is_vsq
+                else self.scale_quant_max
+            )
+            self._apply_amax(torch.amax(self.amax_history, dim=0), quant_max)
+        if self.qscheme == QScheme.GROUP_WISE_AFFINE:
+            return self.scale, self.zero_point
+        return self.scale
+
+    def reset_observer_statistics(self) -> None:
+        """Clear collected ranges while preserving observer enablement."""
+        self.amax_history.resize_(0)
+        self.scale.resize_(1).fill_(1.0)
+
+    @torch.jit.export
     def extra_repr(self):
         return (
-            f"fake_quant_enabled={self.fake_quant_enabled}, "
-            f"observer_enabled={self.observer_enabled}, dtype={self.dtype}, "
-            f"scale={self.scale}"
+            "fake_quant_enabled={}, observer_enabled={}, dtype={}, amax_history_len={}, "
+            "quant_max={}, qscheme={}, ch_axis={}, block_size={}, force_scale_power_of_two={}, "
+            "scale={}".format(
+                self.fake_quant_enabled,
+                self.observer_enabled,
+                self.dtype,
+                self.amax_history_len,
+                self.quant_max,
+                self.qscheme,
+                self.ch_axis,
+                self.block_size,
+                self.force_scale_power_of_two,
+                self.scale,
+            )
         )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.record_histogram:
+            exp = torch.floor(torch.log2(torch.abs(x.detach().float())))
+            self.histogram += torch.histc(exp, 254, min=-126, max=127)
+
+        if self.outlier_pct is not None and self.observer_enabled[0] == 1:
+            flat = x.abs().flatten()
+            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
+
+            vals = torch.topk(flat, k, largest=True, sorted=False).values
+            threshold = vals.min()
+
+            if self.outlier_threshold.numel() == 0:
+                self.outlier_threshold.resize_as_(threshold)
+                self.outlier_threshold.copy_(threshold)
+            else:
+                self.outlier_threshold.mul_(self.outlier_ema_decay).add_(
+                    threshold * (1.0 - self.outlier_ema_decay)
+                )
+
+        # Remove outliers from x before quantization
+        skip = None
+        if self.outlier_threshold is not None:
+            skip = x.abs() >= self.outlier_threshold
+            orig_x = x.clone()
+            x = x.masked_fill(skip, 0.0)
+            outlier_pct = skip.sum().item() / x.numel()
+            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
+
+        if self.is_vsq:
+            # Two nested levels: a coarse scale observed over the whole
+            # tensor, then a fine per-block scale on what remains once the
+            # coarse scale is divided out.  They stay separate because the
+            # datapath applies them at different granularities.
+            if self.observer_enabled[0] == 1:
+                self._update_amax_scale(
+                    x,
+                    is_per_channel=self.coarse_is_per_channel,
+                    ch_axis=self.coarse_ch_axis,
+                    quant_max=self.coarse_quant_max,
+                )
+            coarse_dequantized = FakeQuantizeFunction.apply(
+                x, self.fake_quant_enabled, self.coarse_qmap, self.scale
+            )
+            coarse_data = coarse_dequantized / self.scale.to(x.dtype)
+            fine_dequantized = MXFakeQuantizeFunction.apply(
+                coarse_data,
+                self.fake_quant_enabled,
+                self.fine_scale,
+                self.qmap,
+                self.ch_axis,
+                self.block_size,
+                self.scale_quant_max,
+                self.force_scale_power_of_two,
+                self.scale_qmap,
+            )
+            x = fine_dequantized * self.scale.to(x.dtype)
+        elif self.qscheme == QScheme.MICROSCALING:
+            x = MXFakeQuantizeFunction.apply(
+                x,
+                self.fake_quant_enabled,
+                self.scale,
+                self.qmap,
+                self.ch_axis,
+                self.block_size,
+                self.quant_max,
+                self.force_scale_power_of_two,
+                self.scale_qmap,
+            )
+        elif self.qscheme == QScheme.GROUP_WISE_AFFINE:
+            x = GroupWiseAffineFakeQuantFunction.apply(
+                x,
+                self.fake_quant_enabled,
+                self.scale,
+                self.zero_point,
+                self.ch_axis,
+                self.block_size,
+                self.quant_min,
+                self.quant_max,
+                self.scale_qmap,
+            )
+        else:
+            if self.observer_enabled[0] == 1:
+                self._update_amax_scale(x)
+            x = FakeQuantizeFunction.apply(
+                x, self.fake_quant_enabled, self.qmap, self.scale
+            )
+
+        # Restore all outlier positions.
+        if skip is not None:
+            x = torch.where(skip, orig_x, x)
+
+        return x
 
     def _load_from_state_dict(
         self,
@@ -489,10 +734,30 @@ class _FakeQuantize(_FreezableFlags):
         unexpected_keys,
         error_msgs,
     ):
-        for name in self._lazily_sized:
+        # Removing this function throws an error that the size of the loaded tensor does not match the original size
+        # i.e., These buffers start out with numel 0 and become numel 1 once they have their first forward pass.
+        local_state = ["scale", "amax_history"]
+        for name in local_state:
             key = prefix + name
             if key in state_dict:
-                getattr(self, name).resize_(state_dict[key].shape)
+                val = state_dict[key]
+                # Custom handling to allow loading scale and amax_history
+                # of size N into uninitialized buffers of size 0. The
+                # buffers are resized here, and the values are copied in
+                # the default state_dict loading code of the parent.
+                if name == "scale":
+                    self.scale.resize_(val.shape)
+                else:
+                    assert name == "amax_history"
+                    self.amax_history.resize_(val.shape)
+                # For torchscript module we need to update the attributes here since we do not
+                # call the `_load_from_state_dict` function defined module.py
+                if torch.jit.is_scripting():
+                    if name == "scale":
+                        self.scale.copy_(val)
+                    else:
+                        assert name == "amax_history"
+                        self.amax_history.copy_(val)
             elif strict:
                 missing_keys.append(key)
         super()._load_from_state_dict(
@@ -506,471 +771,9 @@ class _FakeQuantize(_FreezableFlags):
         )
 
 
-class _QuantizeTransform:
-    """The end of the ``pre`` / ``post`` chain, which leaves its input as is.
-
-    A fake-quant's ``forward`` passes its input through ``pre`` before it
-    quantizes and through ``post`` after.  Each transform mixin acts when
-    its spec field is set and hands on to ``super()``: ``pre`` transforms
-    first, ``post`` last, so mixins listed before a scheme's base nest, the
-    first one outermost.
-    """
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-
-
-class RandomHadamardTransform(_QuantizeTransform):
-    """Rotate the input by ``hadamard_matrix`` before it is quantized and
-    rotate it back after, while fake-quantization is on.
-
-    Args:
-        rht_axis: Axis to rotate along, or None.
-        *args: Forwarded to the scheme's base.
-        **kwargs: Forwarded to the scheme's base.
-    """
-
-    rht_matrix: Optional[torch.Tensor]
-
-    def __init__(self, *args, rht_axis: Optional[int] = None, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.rht_axis = rht_axis
-        self.register_buffer(
-            "rht_matrix",
-            (
-                hadamard_matrix(self.scale.device)
-                if rht_axis is not None
-                else None
-            ),
-            persistent=False,
-        )
-
-    def extra_repr(self):
-        return f"{super().extra_repr()}, rht_axis={self.rht_axis}"
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.rht_axis is not None and self.fake_quant_on():
-            x = _rotate(x, self.rht_axis, self.rht_matrix)
-        return super().pre(x)
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().post(x)
-        if self.rht_axis is not None and self.fake_quant_on():
-            x = _rotate(x, self.rht_axis, self.rht_matrix.T)
-        return x
-
-
-class OutlierFilter(_QuantizeTransform):
-    """Keep outliers out of quantization: zeroed before it, restored after.
-
-    An outlier is an element whose magnitude reaches the threshold.  The
-    threshold is given, or calibrated while the observer is on as the
-    smallest of the largest ``outlier_pct`` of the elements, the largest
-    any call asked for.
-
-    Args:
-        outlier_threshold: Magnitude from which an element is an outlier.
-        outlier_pct: Fraction of elements to treat as outliers instead.
-        *args: Forwarded to the scheme's base.
-        **kwargs: Forwarded to the scheme's base.
-    """
-
-    def __init__(
-        self,
-        *args,
-        outlier_threshold: Optional[float] = None,
-        outlier_pct: Optional[float] = None,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        assert (
-            outlier_pct is None or outlier_threshold is None
-        ), "Only one of outlier_pct and outlier_threshold can be set."
-        self.outlier_pct = outlier_pct
-        self.max_outlier_pct = 0.0
-        if outlier_pct is not None:
-            self.register_buffer(
-                "outlier_threshold",
-                torch.tensor([], device=self.scale.device, dtype=torch.float),
-            )
-        else:
-            self.outlier_threshold = outlier_threshold
-        # The outlier mask and the input ``pre`` took it from, which
-        # ``post`` restores.
-        self._outliers = None
-
-    def pre(self, x: torch.Tensor) -> torch.Tensor:
-        if self.outlier_pct is not None and self.observer_on():
-            flat = x.abs().flatten()
-            k = max(1, math.ceil(self.outlier_pct * flat.numel()))
-
-            vals = torch.topk(flat, k, largest=True, sorted=False).values
-            threshold = vals.min()
-
-            # The largest threshold any calibration batch asked for, so
-            # the bound holds on every batch seen.
-            if self.outlier_threshold.numel() == 0:
-                self.outlier_threshold.resize_as_(threshold)
-                self.outlier_threshold.copy_(threshold)
-            else:
-                self.outlier_threshold.copy_(
-                    torch.maximum(self.outlier_threshold, threshold)
-                )
-
-        if self.outlier_threshold is not None:
-            skip = x.abs() >= self.outlier_threshold
-            self._outliers = (skip, x)
-            x = x.masked_fill(skip, 0.0)
-            outlier_pct = skip.sum().item() / x.numel()
-            self.max_outlier_pct = max(outlier_pct, self.max_outlier_pct)
-        return super().pre(x)
-
-    def post(self, x: torch.Tensor) -> torch.Tensor:
-        x = super().post(x)
-        if self._outliers is not None:
-            skip, original = self._outliers
-            self._outliers = None
-            x = torch.where(skip, original, x)
-        return x
-
-
-class DirectCastFakeQuantize(_FakeQuantize):
-    """Fake-quantize by rounding each value to the dtype, with no scale.
-
-    For a spec with no scheme, such as ``fp8_e4m3`` or ``posit8_1``: every
-    value rounds to the nearest one the dtype represents, ``scale`` stays 1
-    and nothing is observed.
-
-    Args:
-        *args: Forwarded to ``_FakeQuantize``.
-        **kwargs: Forwarded to ``_FakeQuantize``.
-    """
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.disable_observer()
-
-    def calculate_qparams(self):
-        return self.scale
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.scale
-        )
-
-
-class FusedAmaxObsFakeQuantize(_FakeQuantize):
-    """Fake-quantize against a scale observed from recent amaxes.
-
-    The per-tensor and per-channel schemes keep the absolute maxima of the
-    last ``amax_history_len`` inputs, one per tensor or one per channel
-    along ``ch_axis``, and scale by the largest.  An input is quantized
-    before its own amax joins the history, so the first call uses scale
-    1.0, as Transformer Engine's delayed scaling does (whose default
-    history is 1024 long).  The history and the scale are kept in the
-    dtype of the tensor quantized.
-
-    Args:
-        dtype: Element dtype, as a spec string names it.
-        qscheme: ``PER_TENSOR_SYMMETRIC`` or ``PER_CHANNEL_SYMMETRIC``.
-        quant_max: Largest magnitude the dtype represents.
-        amax_history_len: How many past amaxes the scale is taken over.
-        ch_axis: The channel axis of a per-channel scale.
-        power_2_scale: Round each scale up to a power of two.
-        **kwargs: Forwarded to ``_FakeQuantize``.
-
-    Raises:
-        ValueError: ``qscheme`` is not per-tensor or per-channel.
-    """
-
-    amax_history: torch.Tensor
-
-    _lazily_sized = ("scale", "amax_history")
-
-    def __init__(
-        self,
-        dtype: str,
-        qscheme: QScheme,
-        quant_max: float,
-        amax_history_len: int,
-        ch_axis: Optional[int] = None,
-        power_2_scale: bool = False,
-        **kwargs,
-    ) -> None:
-        if qscheme not in (
-            QScheme.PER_TENSOR_SYMMETRIC,
-            QScheme.PER_CHANNEL_SYMMETRIC,
-        ):
-            raise ValueError(
-                f"{qscheme} is fake-quantized by "
-                f"{fake_quantize_class(qscheme).__name__}"
-            )
-        super().__init__(dtype, **kwargs)
-        self.qscheme = qscheme
-        self.quant_max = quant_max
-        self.amax_history_len = amax_history_len
-        self.ch_axis = ch_axis
-        self.power_2_scale = power_2_scale
-        self.is_per_channel = qscheme == QScheme.PER_CHANNEL_SYMMETRIC
-        self.register_buffer(
-            "amax_history",
-            torch.tensor([], device=self.scale.device, dtype=torch.float),
-        )
-
-    def start_history(self, shape: Tuple[int, ...], dtype) -> None:
-        """Size the history and the scale as before any input.
-
-        Args:
-            shape: Shape of one amax: ``()`` per tensor, or the channel
-                shape per channel.
-            dtype: Dtype of the tensor quantized.
-        """
-        device = self.scale.device
-        self.amax_history = torch.zeros(
-            (self.amax_history_len, *shape), dtype=dtype, device=device
-        )
-        self.scale = torch.ones(shape, dtype=dtype, device=device)
-
-    @torch.no_grad()
-    def _update_amax_scale(self, x: torch.Tensor) -> None:
-        """Fold ``x``'s amax into the history and recompute ``scale``.
-
-        The absolute maximum is taken over every axis, or over every axis
-        but ``ch_axis`` when the observer is per-channel. The history and
-        the scale are started on the first call, since the observed shape
-        and dtype are only known once a tensor arrives.
-
-        Args:
-            x: The tensor being observed.
-        """
-        if self.is_per_channel:
-            ch_axis = self.ch_axis % x.ndim
-            dim = tuple(i for i in range(x.ndim) if i != ch_axis)
-            amax_cur = torch.amax(torch.abs(x), dim=dim, keepdim=True)
-        else:
-            amax_cur = torch.amax(torch.abs(x))
-
-        if self.amax_history.numel() == 0:
-            self.start_history(amax_cur.shape, x.dtype)
-
-        amax = torch.amax(self.amax_history, dim=0)
-        self.amax_history.copy_(torch.roll(self.amax_history, -1, 0))
-        self.amax_history[0] = amax_cur
-
-        sf = amax / self.quant_max
-        sf = torch.where(amax > 0.0, sf, self.scale)
-        sf = torch.where(torch.isfinite(amax), sf, self.scale)
-        if self.power_2_scale:
-            sf = torch.pow(2, torch.ceil(torch.log2(sf)))
-        self.scale.copy_(sf)
-
-    def calculate_qparams(self):
-        return self.scale
-
-    def extra_repr(self):
-        return (
-            f"{super().extra_repr()}, qscheme={self.qscheme}, "
-            f"quant_max={self.quant_max}, ch_axis={self.ch_axis}, "
-            f"amax_history_len={self.amax_history_len}, "
-            f"power_2_scale={self.power_2_scale}"
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.observer_on():
-            self._update_amax_scale(x)
-        return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.scale
-        )
-
-
-class _BlockFakeQuantize(_FakeQuantize):
-    """The parts the block schemes share.
-
-    Blocks of ``block_size`` elements along ``ch_axis`` each take their
-    parameters from their own values on every call, so nothing is observed;
-    each block scale may itself be quantized to ``scale_dtype``.
-
-    Args:
-        dtype: Element dtype, as a spec string names it.
-        quant_max: Largest code the blocks map onto.
-        ch_axis: Axis or axes the blocks run along.
-        block_size: Elements per block.
-        scale_dtype: Dtype the block parameters are quantized to, or None.
-        **kwargs: Forwarded to ``_FakeQuantize``.
-    """
-
-    scale_qmap: Optional[torch.Tensor]
-
-    def __init__(
-        self,
-        dtype: str,
-        quant_max: float,
-        ch_axis: Union[int, List[int]],
-        block_size: int,
-        scale_dtype: Optional[str] = None,
-        **kwargs,
-    ) -> None:
-        super().__init__(dtype, **kwargs)
-        self.quant_max = quant_max
-        self.ch_axis = ch_axis
-        self.block_size = block_size
-        self.scale_dtype = scale_dtype
-        scale_qmap = (
-            get_quantization_map(scale_dtype, self.scale.device)
-            if scale_dtype is not None
-            else None
-        )
-        self.register_buffer("scale_qmap", scale_qmap, persistent=False)
-
-    def extra_repr(self):
-        return (
-            f"{super().extra_repr()}, quant_max={self.quant_max}, "
-            f"ch_axis={self.ch_axis}, block_size={self.block_size}, "
-            f"scale_dtype={self.scale_dtype}"
-        )
-
-
-class MXFakeQuantize(
-    RandomHadamardTransform, OutlierFilter, _BlockFakeQuantize
-):
-    """Fake-quantize in microscaling blocks.
-
-    Each block's scale is its absolute maximum over ``quant_max``; ``scale``
-    holds the last call's block scales, without the global scale.  Outliers
-    skip quantization (``OutlierFilter``).
-
-    Args:
-        power_2_scale: Round each block scale to a power of two.
-        stochastic_rounding: Round each element to one of the two values
-            around it at random, unbiased, rather than to the nearest.
-        global_scale: Divide the block scales by the tensor's global scale
-            (``calculate_global_scale``) before quantizing them to
-            ``scale_dtype``, as NVFP4 does.
-        *args: Forwarded to ``_BlockFakeQuantize``.
-        **kwargs: Forwarded to ``_BlockFakeQuantize``.
-    """
-
-    def __init__(
-        self,
-        *args,
-        power_2_scale: bool = False,
-        stochastic_rounding: bool = False,
-        global_scale: bool = False,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.power_2_scale = power_2_scale
-        self.stochastic_rounding = stochastic_rounding
-        self.global_scale = global_scale
-        # The largest block scale, which the global scale maps the tensor's
-        # largest block onto.
-        self.scale_max = (
-            entry_levels(self.scale_dtype).max().item()
-            if global_scale
-            else None
-        )
-
-    def calculate_qparams(self):
-        return self.scale
-
-    def extra_repr(self):
-        return (
-            f"{super().extra_repr()}, power_2_scale={self.power_2_scale}, "
-            f"stochastic_rounding={self.stochastic_rounding}, "
-            f"global_scale={self.global_scale}"
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pre(x)
-        global_scale = (
-            calculate_global_scale(x, self.quant_max, self.scale_max)
-            if self.global_scale
-            else None
-        )
-        x = MXFakeQuantizeFunction.apply(
-            x,
-            self.fake_quant_on(),
-            self.scale,
-            self.qmap,
-            self.ch_axis,
-            self.block_size,
-            self.quant_max,
-            self.power_2_scale,
-            self.scale_qmap,
-            self.stochastic_rounding,
-            global_scale,
-        )
-        return self.post(x)
-
-
-class GroupWiseAffineFakeQuantize(_BlockFakeQuantize):
-    """Fake-quantize with a scale and a zero point per block.
-
-    Each block maps its own ``[min, max]`` onto ``[quant_min, quant_max]``;
-    ``scale`` and ``zero_point`` hold the last call's.
-
-    Args:
-        quant_min: Smallest code the blocks map onto.
-        *args: Forwarded to ``_BlockFakeQuantize``.
-        **kwargs: Forwarded to ``_BlockFakeQuantize``.
-    """
-
-    zero_point: torch.Tensor
-
-    _lazily_sized = ("scale", "zero_point")
-
-    def __init__(self, *args, quant_min: float, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.quant_min = quant_min
-        self.register_buffer(
-            "zero_point",
-            torch.tensor([1.0], device=self.scale.device, dtype=torch.float),
-        )
-
-    def calculate_qparams(self):
-        return self.scale, self.zero_point
-
-    def extra_repr(self):
-        return f"{super().extra_repr()}, quant_min={self.quant_min}"
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return GroupWiseAffineFakeQuantFunction.apply(
-            x,
-            self.fake_quant_on(),
-            self.scale,
-            self.zero_point,
-            self.ch_axis,
-            self.block_size,
-            self.quant_min,
-            self.quant_max,
-            self.scale_qmap,
-        )
-
-
-def fake_quantize_class(qscheme):
-    """Return the fake-quant class that implements ``qscheme``.
-
-    Args:
-        qscheme: A ``QScheme``, or None for a cast with no scale.
-
-    Returns:
-        The class a spec with this scheme is built with.
-    """
-    if qscheme is None:
-        return DirectCastFakeQuantize
-    if qscheme == QScheme.MICROSCALING:
-        return MXFakeQuantize
-    if qscheme == QScheme.GROUP_WISE_AFFINE:
-        return GroupWiseAffineFakeQuantize
-    return FusedAmaxObsFakeQuantize
-
-
-class _DerivedObserverOrFakeQuantize(_FreezableFlags):
-    r"""This observer is used to describe an observer whose quantization
-    parameters are derived from other observers
+class _DerivedObserverOrFakeQuantize(FakeQuantizeBase):
+    r"""This observer is used to describe an observer whose quantization parameters
+    are derived from other observers
     """
 
     def __init__(
@@ -989,6 +792,7 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
         )
         self.observer_enabled[0] = 0
         self.dtype = dtype
+        self.qscheme = obs_or_fqs[1].qscheme
 
     def forward(self, x: Tensor) -> Tensor:
         devices = {p.device for p in self.buffers()}
@@ -996,7 +800,7 @@ class _DerivedObserverOrFakeQuantize(_FreezableFlags):
             self.to(x.device)
 
         return FakeQuantizeFunction.apply(
-            x, self.fake_quant_on(), self.qmap, self.calculate_qparams()
+            x, self.fake_quant_enabled, self.qmap, self.calculate_qparams()
         )
 
     def calculate_qparams(self):

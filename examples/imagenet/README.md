@@ -42,7 +42,7 @@ python examples/imagenet/main.py /data/datasets/ImageNet_Pytorch/ -a mobilenet_v
 To run inference on trained QAT model:
 
 ```bash
-python examples/imagenet/main.py /data/datasets/ImageNet_Pytorch/ -a mobilenet_v2 --pretrained -b 64 --evaluate --resume [path to qat checkpoint] --bn_folding --calibration_steps 10 --activation int8,qs=per_tensor_symmetric --weight int8,qs=per_tensor_symmetric --bias int24 --gpu 0
+python examples/imagenet/main.py /data/datasets/ImageNet_Pytorch/ -a mobilenet_v2 --pretrained -b 64 --evaluate --qat_model_id [path to qat model] --bn_folding --calibration_steps 10 --activation int8,qs=per_tensor_symmetric --weight int8,qs=per_tensor_symmetric --bias int24 --gpu 0
 ```
 
 ## Use Dummy Data

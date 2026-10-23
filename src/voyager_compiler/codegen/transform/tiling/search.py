@@ -1,4 +1,3 @@
-import itertools
 import logging
 import math
 from functools import partial
@@ -6,11 +5,7 @@ from typing import Generator, Optional, Tuple
 
 import torch
 
-import interstellar
 from voyager_compiler.codegen.node_info import (
-    DYNAMIC_QUANTIZE_OPS,
-    LAYER_NORM_OPS,
-    SOFTMAX_OPS,
     _pair,
     bound_operands,
     compute_output_tiled_shapes,
@@ -20,20 +15,15 @@ from voyager_compiler.codegen.node_info import (
     is_bmm,
     is_elementwise_op,
     is_fully_connected,
-    is_axis_reduction,
-    is_full_reduction,
     is_matmul,
     is_pooling,
     normalize_shape,
     quant_param_arg_nodes,
-    reduced_input_tiling,
     reduction_scratch,
     require_allocation,
-    stream_breaking_quantize,
     tensor_alloc_bytes,
     trailing_mha_perm,
     weight_is_ck,
-    weight_transforms,
 )
 from voyager_compiler.codegen.transform.tiling.cost import (
     gemv_tile_latency,
@@ -52,17 +42,8 @@ __all__ = [
 
 # How much longer than the best modeled runtime a tiling may take and still be
 # chosen; the least-traffic one among those wins.  0.0 = only the fastest.
-# Shared with the interstellar tiler, which takes the least energy (mostly DRAM
-# traffic) among those.
-DEFAULT_RUNTIME_TOLERANCE = 0.02
-
-# Which ``(X, C, K)`` tile a GEMV's search sizes each interstellar loop by:
-# the rows, the input features (the reduction) and the output features.
-_GEMV_LOOP_TILE = {
-    interstellar.le.OX: 0,
-    interstellar.le.IC: 1,
-    interstellar.le.OC: 2,
-}
+# Shared with the interstellar tiler, which selects the same way.
+DEFAULT_RUNTIME_TOLERANCE = 0.01
 
 
 def get_valid_tiling(
@@ -70,15 +51,12 @@ def get_valid_tiling(
     multiple_of: Optional[Tuple[int, ...]] = None,
     order: Optional[Tuple[int, ...]] = None,
     last_dim: Optional[int] = None,
-    pinned: Optional[dict] = None,
-    exhaustive: bool = False,
 ) -> Generator[Tuple[Tuple[int, ...], Tuple[int, ...]], None, None]:
     """Yield tile shapes from the full shape downwards.
 
     Reduces one dimension at a time to its next valid size, in ``order``,
-    leaving the dimensions already reduced at their smallest; ``exhaustive``
-    instead yields every combination of valid sizes.  A size is valid when it
-    divides the dimension and is a multiple of ``multiple_of``.
+    leaving the dimensions already reduced at their smallest.  A size is valid
+    when it divides the dimension and is a multiple of ``multiple_of``.
 
     Args:
         input_shape: The shape being tiled.
@@ -87,9 +65,6 @@ def get_valid_tiling(
         order: Dim indices to reduce, first reduced first; default is left to
             right.
         last_dim: Dims from here onwards stay at full size.
-        pinned: ``{dim: size}`` tiles held at one size while the other dims
-            reduce; nothing is yielded when a pinned size is not valid.
-        exhaustive: Yield the whole grid of valid sizes, ignoring ``order``.
 
     Yields:
         ``(tile_shape, tiling_factors)``, largest tile first.
@@ -125,16 +100,6 @@ def get_valid_tiling(
             )
             valid = [extent]
         sizes[dim] = valid
-    for dim, size in (pinned or {}).items():
-        dim = resolve(dim)
-        if input_shape[dim] % size or size % multiples[dim]:
-            return
-        sizes[dim] = [size]
-
-    if exhaustive:
-        for tile in itertools.product(*(sizes[dim] for dim in range(ndim))):
-            yield tile, tuple(e // t for e, t in zip(input_shape, tile))
-        return
 
     tile = [sizes[dim][0] for dim in range(ndim)]
 
@@ -236,64 +201,18 @@ def scratchpad_bytes(node, tiled_shapes, config, extra_sharing=0):
     )
 
 
-def _staged_scratch_bytes(node, tiled_shapes, config) -> int:
-    """Bytes of the accumulator a GEMV's fused tail reduces into.
-
-    Mirrors ``make_size_fn``'s charge on the interstellar side (``tiler.py``):
-    the builder allocates one ``_ScratchSpec`` for the whole kernel when the
-    reduction is split across K, and when a stream-breaking tail stages the
-    finished tile even for a single round (``_gemm_scratch_and_kernel``).
-    0 when it allocates none.
-
-    Sized off the shape-preserving output tile -- a ``quantize_mx`` tail
-    returns ``(scale, value)`` -- in the anchor's own dtype, the psum type
-    the accumulator holds.
-    """
-    anchor = get_anchor_node(node)
-    sub_gm = node.meta.get("submodule")
-    if anchor is None or sub_gm is None or not is_fully_connected(anchor):
-        return 0
-    # A submodule is not a tail: one holding only the anchor's prologue
-    # leaves the builder no tail to stage, and it allocates nothing.
-    ops = [n for n in sub_gm.graph.nodes if n.op == "call_function"]
-    if not ops or ops[-1] is anchor:
-        return 0
-    split_k = any(
-        role == "input"
-        and n in tiled_shapes
-        and tiled_shapes[n][-1] < anchor.args[0].shape[-1]
-        for n, (role, _) in operand_roles(node).items()
-    )
-    staged = stream_breaking_quantize(sub_gm) is not None or not node.meta.get(
-        "single_k_tail_fusible", True
-    )
-    if not (split_k or staged):
-        return 0
-    out_tile = tiled_shapes[node]
-    if isinstance(out_tile[0], (tuple, list)):
-        out_tile = out_tile[-1]
-    return tensor_alloc_bytes(
-        math.prod(out_tile),
-        anchor.value.dtype,
-        config.bank_width,
-        config.vector_lanes,
-    )
-
-
 def _bank_groups(node, tiled_shapes, config, extra_sharing):
     """The bank partition one candidate tile implies: ``(bytes, members)``
     pairs, one per bank, already merged smallest-first while the groups
     outnumber the banks (see ``scratchpad_bytes``, which prices exactly this
-    partition).  ``members`` are the operand FX nodes sharing the bank -- the
-    buffers the kernel loads, which the shape maps key their tiles by -- the
+    partition).  ``members`` are the operand FX nodes sharing the bank — the
     op node itself stands for the output, ``BANK_GROUP_RESERVED`` for the
-    ``reduction_scratch`` regions and the tail's accumulator
-    (``_staged_scratch_bytes``).  Unmerged (one group per operand) when
+    ``reduction_scratch`` regions.  Unmerged (one group per operand) when
     ``config.bank_size`` is unset."""
     # ``groups`` is the bank layout, one entry per bank: the groups that match,
     # then any operand they do not name on its own.  A ``where`` lays out as
     # ("input",) | ("other", ...) | ("output", ...) | ("condition",).
-    roles = {n: role for n, (role, _) in operand_roles(node).items()}
+    roles = operand_roles(node)
     groups = [
         [n for n in tiled_shapes if roles.get(n) in group]
         for group in GEMV_BANK_GROUPS
@@ -322,14 +241,6 @@ def _bank_groups(node, tiled_shapes, config, extra_sharing):
             node, tiled_shapes[node], config.vector_lanes
         )
     )
-    reserved += _staged_scratch_bytes(node, tiled_shapes, config)
-    # A reduction to one value keeps each tile's result beside the running
-    # one (``_running_max_kernel``).
-    anchor = get_anchor_node(node)
-    if anchor is not None and is_full_reduction(anchor):
-        reserved += tensor_alloc_bytes(
-            1, anchor.value.dtype, config.bank_width, config.vector_lanes
-        )
     if reserved:
         sized.append((reserved, [BANK_GROUP_RESERVED]))
 
@@ -357,31 +268,27 @@ def _search_tiling(
     multiple_of=None,
     cost_fn=None,
     tolerance=0.0,
-    pinned=None,
 ):
     """
     Generic driver over the valid tilings, scoring each by the scratchpad it
     needs (``scratchpad_bytes``: one bank per operand group, the two smallest
-    merged while they outnumber the banks).  ``pinned`` holds dims at one
-    tile size (``get_valid_tiling``).
+    merged while they outnumber the banks).
 
-    Without ``cost_fn`` the first tiling along ``order`` that fits one slot
-    wins (the largest fitting tile).  With ``cost_fn`` -- ``cost_fn(node,
-    tile_sizes, tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every
-    valid tiling is tried, ``order`` aside, since a larger tile is not always
-    a faster one; each that fits is scored and the one moving the fewest
-    bytes wins among those within ``(1 + tolerance)`` of the best latency.
-    Latency alone is not enough: a compute-bound op is equally fast however
-    its operands are diced, so the residue the model leaves behind would buy
-    any amount of traffic for a rounding error.  This is how the interstellar
-    tiler picks a mapping too (``mapping_point_generator``, with energy in
-    place of bytes).
+    ``get_valid_tiling`` yields candidates largest -> smallest.  Without
+    ``cost_fn`` the first tiling that fits one slot wins (the largest fitting
+    tile).  With ``cost_fn`` -- ``cost_fn(node, tile_sizes,
+    tiled_shapes, tiling) -> (latency, dram_bytes)`` -- every fitting candidate
+    is scored and the one moving the fewest bytes wins among those within
+    ``(1 + tolerance)`` of the best latency.  Latency alone is not enough: a
+    compute-bound op is equally fast however its operands are diced, so the
+    residue the model leaves behind would buy any amount of traffic for a
+    rounding error.  This is how the interstellar tiler picks a mapping too
+    (``mapping_point_generator``, with energy in place of bytes).
 
     Returns:
-        ``(tile_sizes, groups, runtime)`` -- the winning tile, its bank
-        partition (each ``_bank_groups`` member list) and its modeled
-        latency in cycles (0 without ``cost_fn``), or ``None`` when nothing
-        fits at any sharing level.
+        ``(tile_sizes, groups)`` -- the winning tile plus its bank partition
+        (each ``_bank_groups`` member list), or ``None`` when nothing fits at
+        any sharing level.
     """
 
     slot_size = config.usable_scratchpad_size // config.num_slots
@@ -397,8 +304,6 @@ def _search_tiling(
             multiple_of=multiple_of,
             order=order,
             last_dim=last_dim,
-            pinned=pinned,
-            exhaustive=cost_fn is not None,
         ):
             tiled_shapes = shape_builder_fn(node, tile_sizes, tiling)
 
@@ -428,7 +333,7 @@ def _search_tiling(
                     node, best[3], config, extra_sharing
                 )
             ]
-            return best[2], groups, best[0]
+            return best[2], groups
 
     logger.debug(f"Failed to tile {node} into a {slot_size}-byte slot.")
     return None
@@ -558,20 +463,6 @@ def _operand_placeholders(root):
     return leaves
 
 
-def _prologue_tile(tile, operand_shape, param_shape):
-    """Tile of a parameter read beside an operand: the operand's tile, shrunk
-    along every dim by the ratio of the two full shapes.  Ranks that do not
-    line up fall back to the whole parameter."""
-    if len(tile) != len(operand_shape) or len(operand_shape) != len(
-        param_shape
-    ):
-        return tuple(param_shape)
-    return tuple(
-        max(1, math.ceil(t * q / f))
-        for t, f, q in zip(tile, operand_shape, param_shape)
-    )
-
-
 def _build_gemv_shape_map(node, tile_sizes, tiling):
     """``_build_gemm_shape_map`` for the whole kernel a GEMV builds, keyed by
     the FX node each tile belongs to.
@@ -592,34 +483,19 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     divisor = tuple(max(1, s // t) for s, t in zip(anchor.shape, out_tile))
 
     if node is not anchor:
-        submod = node.meta["submodule"]
-        bound = bound_operands(node, submod)
-        # Key an anchor operand by the placeholder the kernel loads beneath
-        # its expand / transpose / dequantize (what the planner allocates).
-        # Whatever else that prologue reads (a dequantize's scale and zero
-        # point) has no role; it takes the operand's tile scaled by shape.
-        for n in list(shapes):
-            if n.graph is not submod.graph:
+        # An operand reaching the anchor through a GQA expand or a dequantize
+        # takes its role on that node, not on the placeholder the kernel loads,
+        # so trace the anchor's own back and skip them by position.
+        own = set(_operand_placeholders(anchor))
+        placeholders = [
+            p
+            for p in node.meta["submodule"].graph.nodes
+            if p.op == "placeholder"
+        ]
+        for n, p in zip(node.all_input_nodes, placeholders):
+            if p in own or n in shapes or not require_allocation(n):
                 continue
-            tile = shapes.pop(n)
-            source = weight_transforms(n)[0]
-            for p in _operand_placeholders(n):
-                outer = bound.get(p, p)
-                if outer in shapes or not require_allocation(outer):
-                    continue
-                shapes[outer] = (
-                    tile
-                    if p is source
-                    else _prologue_tile(
-                        tile, tuple(n.shape), tuple(outer.shape)
-                    )
-                )
-
-        # What the tail brought of its own -- a residual, a mask -- has no role
-        # and is diced by the output block, the way the builder dices it.
-        for n in node.all_input_nodes:
-            if n not in shapes and require_allocation(n):
-                shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
+            shapes[n] = compute_tiled_shape(tuple(n.shape), divisor)
 
     if tuple(_output_shape(node)) == tuple(anchor.shape):
         shapes[node] = compute_output_tiled_shapes(node, divisor)
@@ -637,7 +513,7 @@ def _build_gemv_shape_map(node, tile_sizes, tiling):
     return shapes
 
 
-def gemv_op_tiling(node, config, constraint=None):
+def gemv_op_tiling(node, config):
     """Per-dim tile counts for a matrix-vector GEMM, bare or fused.
 
     Called from ``get_tiling`` during bufferization, so it sees the layout the
@@ -649,14 +525,10 @@ def gemv_op_tiling(node, config, constraint=None):
         node: The op to tile -- a fully-connected GEMM, or a fused
             ``call_module`` around one.
         config (AcceleratorConfig): The hardware description.
-        constraint: A ``TileConstraint`` (``tiler.py``) on the rows
-            (``le.OX``), input-feature (``le.IC``) or output-feature
-            (``le.OC``) tile.
 
     On a banked config the winning tile's bank partition is stamped as
     ``node.meta["bank_groups"]`` (member lists per bank), which the builders
-    copy onto their SRAM allocs for the memory planner; the winner's modeled
-    latency is stamped as ``node.meta["tiling_runtime"]``.
+    copy onto their SRAM allocs for the memory planner.
 
     Returns:
         ``(n_m, n_n, n_k)`` -- the M, output and reduction tile counts -- or
@@ -689,21 +561,14 @@ def gemv_op_tiling(node, config, constraint=None):
     # A C tile short of a whole microscaling block leaves the scale tile
     # with no elements to expand against the input.
     block_size = anchor.kwargs.get("block_size") or 1
-    multiple = [1, block_size, math.lcm(config.vector_lanes, head_dim or 1)]
-    pinned = {}
-    if constraint is not None:
-        for loop, value in constraint.exact:
-            pinned[_GEMV_LOOP_TILE[loop]] = value
-        for loop, value in constraint.multiple:
-            dim = _GEMV_LOOP_TILE[loop]
-            multiple[dim] = math.lcm(multiple[dim], value)
 
     logger.info(f"Running L2 tiling for GEMV: {node}")
 
-    found = _search_tiling(
+    search = partial(
+        _search_tiling,
         node=node,
         full_shape=(X, C, K),
-        multiple_of=tuple(multiple),
+        multiple_of=(block_size, math.lcm(config.vector_lanes, head_dim or 1)),
         shape_builder_fn=_build_gemv_shape_map,
         config=config,
         cost_fn=(
@@ -712,26 +577,32 @@ def gemv_op_tiling(node, config, constraint=None):
             else None
         ),
         tolerance=DEFAULT_RUNTIME_TOLERANCE,
-        pinned=pinned,
     )
+
+    # C whole leaves the input vector loop-invariant, so its guarded load
+    # fetches it once however many output tiles there are: tile K alone if any
+    # such tile fits.  Failing that, split C as far as it takes to buy the
+    # largest K tile, since the input is then re-read once per output tile.
+    # ``get_valid_tiling`` reduces in ``order``, leaving what it already
+    # reduced at its smallest, so C whole is only ever reachable from the first
+    # pass -- the cost function ranks within one, it cannot cross them.
+    found = search(order=(2,)) or search(order=(1, 2))
     if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups, runtime = found
+    tile_sizes, groups = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
-    node.meta["tiling_runtime"] = runtime
 
     x_tiled, c_tiled, k_tiled = tile_sizes
     return X // x_tiled, K // k_tiled, C // c_tiled
 
 
 def _build_vector_op_shape_map(node, tile_sizes, divisor):
-    in_divisor = reduced_input_tiling(get_anchor_node(node), divisor)
     shapes_map = {
-        n: compute_tiled_shape(tuple(n.shape), in_divisor)
+        n: compute_tiled_shape(tuple(n.shape), divisor)
         for n in node.all_input_nodes
         if require_allocation(n)
     }
@@ -740,44 +611,49 @@ def _build_vector_op_shape_map(node, tile_sizes, divisor):
 
 
 def _vector_op_tiling_limits(node, vector_unit_width):
-    """``(last_dim, multiple_of)`` for a vector op's tile search.
+    """``(last_dim, multiple_of)`` for a vector op's tile search, or ``None``
+    when ``node`` is not an op this pass tiles.
 
     Args:
         node: The vector op whose dimensions are being constrained.
         vector_unit_width: Lanes the last dim has to fill.
     """
-    # A tile of the output reads each reduced dim whole; the kept dims tile
-    # freely, the last in whole lane groups.
-    if is_axis_reduction(node):
-        return None, (vector_unit_width if node.shape[-1] > 1 else 1,)
-    # A reduction to one value tiles its input the same way.
-    if is_full_reduction(node):
-        return None, (vector_unit_width if node.args[0].shape[-1] > 1 else 1,)
+    if not is_elementwise_op(node) and node.target not in [
+        torch.ops.aten.softmax.int,
+        torch.ops.aten.layer_norm.default,
+        torch.ops.aten.permute.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.quantized_ops.layer_norm.default,
+        torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.quantized_ops.quantize_mx_outlier.default,
+    ]:
+        return None
 
     # Certain dimensions cannot be tiled, e.g., transpose and reduction dims
     last_dim = -1
     multiple_of = (vector_unit_width,)
-    dequantize = node.target == torch.ops.quantized_ops.dequantize.default
-    if node.target in SOFTMAX_OPS:
+    if node.target == torch.ops.aten.softmax.int:
         last_dim = get_arg_value(node, 1, "dim", -1)
-    elif node.target in LAYER_NORM_OPS:
+    elif node.target in [
+        torch.ops.aten.layer_norm.default,
+        torch.ops.quantized_ops.layer_norm.default,
+    ]:
         normalized_shape = get_arg_value(node, 1, "normalized_shape", None)
         last_dim = (
             -len(normalized_shape) if normalized_shape is not None else -1
         )
-    elif node.target in DYNAMIC_QUANTIZE_OPS or (
-        dequantize and get_arg_value(node, 4, "block_size", None)
-    ):
-        axes_arg = 3 if dequantize else 2
-        axes = get_arg_value(node, axes_arg, "axes", None)
-        block_size = get_arg_value(node, axes_arg + 1, "block_size", None)
+    elif node.target in [
+        torch.ops.quantized_ops.quantize_mx.default,
+        torch.ops.quantized_ops.quantize_mx_outlier.default,
+    ]:
+        axes = get_arg_value(node, 2, "axes", None)
+        block_size = get_arg_value(node, 3, "block_size", None)
         ndim = len(node.args[0].shape)
 
         # A quantization block must not straddle a tile boundary, so a tile on a
         # quantization axis holds a whole number of blocks; the last dim also
-        # respects the hardware unroll.  A dequantize keeps its last dim whole,
-        # as any elementwise op does.
-        last_dim = -1 if dequantize else None
+        # respects the hardware unroll.
+        last_dim = None
         axes = set(a % ndim for a in (axes or ()))
         multiple_of = tuple(
             (
@@ -820,9 +696,8 @@ def vector_op_tiling(node, config):
     ``node.meta["bank_groups"]`` (see ``gemv_op_tiling``).
 
     Returns:
-        Tile counts over ``node``'s output -- over its input for a reduction
-        to one value (``is_full_reduction``) -- or ``None`` when it has no
-        anchor.
+        Tile counts over ``node``'s output, or ``None`` when the op is not one
+        this tiles.
 
     Raises:
         RuntimeError: when no tiling of the op's operands fits the scratchpad.
@@ -830,9 +705,10 @@ def vector_op_tiling(node, config):
     anchor = get_anchor_node(node)
     if anchor is None:
         return None
-    last_dim, multiple_of = _vector_op_tiling_limits(
-        anchor, config.vector_lanes
-    )
+    limits = _vector_op_tiling_limits(anchor, config.vector_lanes)
+    if limits is None:
+        return None
+    last_dim, multiple_of = limits
 
     logger.info(f"Running L2 tiling for vector op: {node}")
 
@@ -844,173 +720,25 @@ def vector_op_tiling(node, config):
         else None
     )
 
-    # A reduction to one value has no output to tile: every tile of its input
-    # folds into that one value.
-    shape = (
-        anchor.args[0].shape
-        if is_full_reduction(anchor)
-        else _output_shape(node)
-    )
-    search = partial(
-        _search_tiling,
+    output_shape = _output_shape(node)
+    found = _search_tiling(
         node=node,
-        full_shape=shape,
+        full_shape=output_shape,
         multiple_of=multiple_of,
+        last_dim=last_dim,
         shape_builder_fn=_build_vector_op_shape_map,
         config=config,
         cost_fn=cost_fn,
     )
-    found = search(last_dim=last_dim)
-    # An elementwise op whose whole rows do not fit splits its rows too, in
-    # whole lane groups.
-    if found is None and is_elementwise_op(anchor) and last_dim is not None:
-        found = search(last_dim=None)
     if found is None:
         raise RuntimeError(
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups, _ = found
+    tile_sizes, groups = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
-    return tuple(s // ts for s, ts in zip(shape, tile_sizes))
-
-
-def _divisors_descending(n):
-    return [d for d in range(n, 0, -1) if n % d == 0]
-
-
-def _attention_tiles(node, tq, tkv):
-    """Operand FX node -> its FA3 SRAM tile under query / key tile lengths
-    ``tq`` / ``tkv``: the query, the (transposed) key, the value, the
-    output, the mask when there is one, and under MX each operand's block
-    scales."""
-    query, key, value = node.args[0], node.args[1], node.args[2]
-    head_dim = query.value.shape[-1]
-    tiles = {
-        query: (tq, head_dim),
-        key: (head_dim, tkv),
-        value: (tkv, head_dim),
-        node: (tq, head_dim),
-    }
-    mask = get_arg_value(node, 3, "attn_mask", None)
-    if isinstance(mask, torch.fx.Node):
-        tiles[mask] = (tq, tkv)
-    block_size = node.kwargs.get("block_size")
-    if block_size is not None:
-        # A block wider than the head is one truncated block; along the
-        # keys the tile is a whole number of blocks.
-        head_blocks = math.ceil(head_dim / block_size)
-        tiles[node.kwargs["query_scale"]] = (tq, head_blocks)
-        tiles[node.kwargs["key_scale"]] = (head_blocks, tkv)
-        tiles[node.kwargs["value_scale"]] = (tkv // block_size, head_dim)
-    residual = get_arg_value(node, 7, "key_residual", None)
-    if residual is not None:
-        # The split cache's residual (``attention_v3``): its R
-        # positions whole, K transposed like the main key's.
-        length = residual.value.shape[-2]
-        tiles[get_arg_value(node, 6, "query_residual")] = (tq, head_dim)
-        tiles[residual] = (head_dim, length)
-        tiles[get_arg_value(node, 8, "value_residual")] = (length, head_dim)
-        tiles[get_arg_value(node, 9, "residual_mask")] = (tq, length)
-    return tiles
-
-
-def attention_head_pad(head_dim, config):
-    """The head dim the FA3 kernel holds its tiles at: ``head_dim`` rounded
-    up to a multiple of both PE-array dims, since the scores product
-    contracts over it and the context product emits it.  The pad is zeros
-    the kernel writes on chip; DRAM keeps the real head."""
-    unit = math.lcm(*config.pe_array_size)
-    return math.ceil(head_dim / unit) * unit
-
-
-def _attention_sram_bytes(node, tiles, acc_dtype, config, bool_mask):
-    """Bytes the FA3 kernel's SRAM allocations take under ``tiles``.
-
-    Mirrors the allocations ``_FA3Pipeline.forward`` makes: two slots of
-    every operand tile but the output's one, the running softmax state and
-    the score tile at ``acc_dtype``, and the probabilities -- under MX
-    their codes at the query's dtype plus their block scales, else a
-    buffer at V's dtype when the softmax runs at a dtype other than the
-    operands' -- each sized the way ``plan_memory`` will place it.  The
-    operand tiles and the P@V product hold the head at
-    ``attention_head_pad``: the query's, value's and their scales' last
-    dim, the transposed key's and its scales' first.  A split cache's
-    residual adds its own score tile, product, max snapshot and, at a
-    dtype the matrix unit cannot take, probabilities.
-
-    Args:
-        node: The attention node.
-        tiles: Operand FX node -> its DRAM tile shape
-            (``_attention_tiles``).
-        acc_dtype: The accumulation dtype of the softmax state.
-        config (AcceleratorConfig): The hardware description.
-        bool_mask: Whether the causal table's tiles are int1 codes rather
-            than the additive fill at ``acc_dtype``.
-    """
-    query, key, value = node.args[0], node.args[1], node.args[2]
-    tq, head_dim = tiles[query]
-    tkv = tiles[value][0]
-    head_pad = attention_head_pad(head_dim, config)
-    kw = node.kwargs
-    block_size = kw.get("block_size")
-    grown = {query: (-1, head_pad), key: (0, head_pad), value: (-1, head_pad)}
-    if block_size is not None:
-        head_blocks = math.ceil(head_pad / block_size)
-        grown[kw["query_scale"]] = (-1, head_blocks)
-        grown[kw["key_scale"]] = (0, head_blocks)
-        grown[kw["value_scale"]] = (-1, head_pad)
-    residual = get_arg_value(node, 7, "key_residual", None)
-    if residual is not None:
-        grown[get_arg_value(node, 6, "query_residual")] = (-1, head_pad)
-        grown[residual] = (0, head_pad)
-        grown[get_arg_value(node, 8, "value_residual")] = (-1, head_pad)
-    padded = dict(tiles)
-    for operand, (dim, size) in grown.items():
-        shape = list(tiles[operand])
-        shape[dim] = size
-        padded[operand] = tuple(shape)
-
-    total = sum(
-        (1 if operand is node else 2) * _tensor_bytes(operand, shape, config)
-        for operand, shape in padded.items()
-    )
-
-    def acc_bytes(shape):
-        return tensor_alloc_bytes(
-            math.prod(shape), acc_dtype, config.bank_width, config.vector_lanes
-        )
-
-    # m, row_tmp, alpha and the two slots of l; o, pv_buf; the
-    # double-buffered s_buf.
-    total += 5 * acc_bytes((tq, 1))
-    total += acc_bytes((tq, head_dim)) + acc_bytes((tq, head_pad))
-    total += 2 * acc_bytes((tq, tkv))
-    block_size = node.kwargs.get("block_size")
-    if block_size is not None:
-        total += 2 * _tensor_bytes(query, (tq, tkv), config)
-        total += 2 * _tensor_bytes(
-            node.kwargs["query_scale"], (tq, tkv // block_size), config
-        )
-    elif acc_dtype != value.value.dtype:
-        total += 2 * _tensor_bytes(value, (tq, tkv), config)
-    if get_arg_value(node, 5, "is_causal", False):
-        # The causal mask tiles stream through two slots like a mask's.
-        total += 2 * tensor_alloc_bytes(
-            tq * tkv,
-            torch.bool if bool_mask else acc_dtype,
-            config.bank_width,
-            config.vector_lanes,
-        )
-    if residual is not None:
-        length = tiles[residual][1]
-        total += acc_bytes((tq, length))
-        total += acc_bytes((tq, head_pad)) + acc_bytes((tq, 1))
-        value_residual = get_arg_value(node, 8, "value_residual")
-        if acc_dtype != value_residual.value.dtype:
-            total += _tensor_bytes(value_residual, (tq, length), config)
-    return total
+    return tuple(s // ts for s, ts in zip(output_shape, tile_sizes))
 
 
 def _pool_input_extent(tile, stride, dilation, kernel_size):
@@ -1172,7 +900,7 @@ def pool_op_tiling(node, config):
             f"{node}: no tiling of its operands fits the scratchpad "
             f"(anchor {anchor}, {len(node.all_input_nodes)} inputs)"
         )
-    tile_sizes, groups, _ = found
+    tile_sizes, groups = found
     if config.bank_size:
         node.meta["bank_groups"] = groups
     return tuple(s // ts for s, ts in zip(full_shape, tile_sizes))
