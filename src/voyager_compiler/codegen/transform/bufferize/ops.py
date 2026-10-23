@@ -302,7 +302,7 @@ def async_copy(
         payload = (
             tuple(slice(0, extent) for extent in count)
             if count is not None
-            else ...
+            else slice(None)
         )
         if transposed:
             dst.copy_(src[block].mT)

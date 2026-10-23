@@ -7,10 +7,7 @@ import torch
 from torch.fx import Node
 from torchao.quantization.pt2e.quantizer import Quantizer
 
-from voyager_compiler.export_utils import (
-    get_module_stack,
-    get_node_name_to_scope,
-)
+from voyager_compiler.export_utils import get_node_name_to_scope
 from voyager_compiler.quantization.quantizer.xnnpack_quantizer_utils import (
     OP_TO_ANNOTATOR,
     QuantizationConfig,
@@ -40,7 +37,8 @@ def _get_module_name_filter(module_name: str):
         #    'L__self___sub': ("L['self'].sub", <class '....Sub'>),
         #    'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
         # }
-        nn_module_stack = get_module_stack(n)
+        # get_attr nodes doesn't have nn_module_stack?
+        nn_module_stack = n.meta.get("nn_module_stack", {})
 
         def _normalize_path(n):
             prefix = 0
@@ -77,7 +75,7 @@ def _get_module_type_filter(tp: Callable):
         #     'L__self___sub': ("L['self'].sub", <class '....Sub'>),
         #     'L__self___sub_linear': ("L['self'].sub.linear", <class 'torch.nn.modules.linear.Linear'>)
         # }
-        nn_module_stack = get_module_stack(n)
+        nn_module_stack = n.meta.get("nn_module_stack", {})
         types = []
         for _, t in nn_module_stack.values():
             # export() returns str, but older APIs (e.g. capture_pre_autograd_graph)
@@ -143,26 +141,6 @@ def _get_module_name_object_type_order_filter(
     return module_name_object_type_order_filter
 
 
-def _get_module_name_object_type_filter(
-    module_name: str, object_type: Callable
-):
-    """Get the filter for nodes calling ``object_type`` directly in a module.
-
-    The module is the innermost one the node was traced in, so an op of a
-    submodule does not match; its name matches ``module_name`` exactly or as
-    a regex.
-    """
-
-    def module_name_object_type_filter(n: Node) -> bool:
-        nn_module_stack = get_module_stack(n)
-        if n.target != object_type or not nn_module_stack:
-            return False
-        name, _ = list(nn_module_stack.values())[-1]
-        return module_name == name or re.search(module_name, name) is not None
-
-    return module_name_object_type_filter
-
-
 def _get_not_module_type_or_name_filter(
     tp_list: List[Callable], module_name_list: List[str]
 ) -> Callable[[Node], bool]:
@@ -186,7 +164,6 @@ class XNNPACKQuantizer(Quantizer):
         "linear",
         "conv",
         "matmul",
-        "sdpa",
         "residual",
         "activation",
         "softmax",
@@ -205,9 +182,6 @@ class XNNPACKQuantizer(Quantizer):
         self.module_name_config: Dict[str, Optional[QuantizationConfig]] = {}
         self.module_name_object_type_order_config: OrderedDict[
             Tuple[str, Callable, int], Optional[QuantizationConfig]
-        ] = {}
-        self.module_name_object_type_config: Dict[
-            Tuple[str, Callable], Optional[QuantizationConfig]
         ] = {}
 
     def set_global(
@@ -261,21 +235,6 @@ class XNNPACKQuantizer(Quantizer):
         ] = quantization_config
         return self
 
-    def set_module_name_object_type(
-        self,
-        module_name: str,
-        object_type: Callable,
-        quantization_config: Optional[QuantizationConfig],
-    ):
-        """Set quantization_config for every ``object_type`` op called
-        directly in the module ``module_name``, an exact name or a regex; ops
-        of its submodules are not matched.
-        """
-        self.module_name_object_type_config[(module_name, object_type)] = (
-            quantization_config
-        )
-        return self
-
     def transform_for_annotation(
         self, model: torch.fx.GraphModule
     ) -> torch.fx.GraphModule:
@@ -294,16 +253,6 @@ class XNNPACKQuantizer(Quantizer):
                 _get_module_name_object_type_order_filter(
                     model, module_name, object_type, index
                 ),
-            )
-
-        for (
-            module_name,
-            object_type,
-        ), config in self.module_name_object_type_config.items():
-            self._annotate_all_static_patterns(
-                model,
-                config,
-                _get_module_name_object_type_filter(module_name, object_type),
             )
 
         module_name_list = list(self.module_name_config.keys())

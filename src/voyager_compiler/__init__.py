@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Lower a quantized PyTorch model onto a Voyager-generated accelerator.
 
 ``transform()`` runs the hardware-lowering passes over an exported FX graph;
@@ -6,6 +9,7 @@ operate in place and leave the graph executable, so every stage can be checked
 numerically against the original.
 """
 
+import logging
 import os
 from typing import Callable, Optional, Tuple
 
@@ -38,15 +42,49 @@ from voyager_compiler.codegen import (
     pad_matrix_op_dimensions,
     pad_vector_op_dimensions,
     pad_vit_embeddings_output,
-    remove_fp32_casts,
     remove_prunable_ops,
+    remove_softmax_dtype_cast,
     remove_zero_attention_mask,
+    bind_operand_sources,
     rename_nodes_with_param_names,
     replace_conv2d_with_im2col,
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
-    scalarize_index_arithmetic,
-    split_kv_cache,
+)
+from voyager_compiler.codegen.artifacts import dump_compile_artifacts
+from voyager_compiler.codegen.execution_order import (
+    DEFAULT_EXECUTION_MODES,
+    require_execution_mode,
+    validate_execution_order_mode,
+)
+from voyager_compiler.op_matcher import OpMatcher, get_op_overload
+from voyager_compiler.codegen.targets import (
+    apply_graph_rewrites as apply_target_graph_rewrites,
+)
+from voyager_compiler.codegen.targets import (
+    execution_fusion_patterns as target_execution_fusion_patterns,
+)
+from voyager_compiler.codegen.targets import (
+    execution_modes as target_execution_modes,
+)
+from voyager_compiler.codegen.targets import (
+    layer_table as target_layer_table,
+)
+from voyager_compiler.codegen.targets import (
+    scheduler_providers as target_scheduler_providers,
+)
+from voyager_compiler.codegen.targets import (
+    terminal_codegen as target_terminal_codegen,
+)
+from voyager_compiler.codegen.targets import (
+    unsupported_policy as target_unsupported_policy,
+)
+from voyager_compiler.codegen.transform.operator_fusion import (
+    fuse_execution_instructions,
+)
+from voyager_compiler.codegen.transform.unit_assignment import (
+    assign_compute_units,
+    issuable_group,
 )
 from voyager_compiler.codegen.transform.bufferize import (
     bufferize_graph,
@@ -55,16 +93,16 @@ from voyager_compiler.codegen.transform.bufferize import (
     plan_memory,
     print_bufferized_graph,
     print_layer_table,
-    shared_dram_layout,
 )
 from voyager_compiler.codegen.transform.tiling import (
     DEFAULT_RUNTIME_TOLERANCE,
     build_interstellar_tiler,
 )
 from voyager_compiler.export_utils import (
+    TorchExportableModuleWithStaticCache,
+    convert_and_export_with_split_cache,
     export_model,
     get_aten_graph_module,
-    get_conv_bn_layers,
     get_node_name_to_scope,
     print_node_scope_tabular,
 )
@@ -81,104 +119,89 @@ from voyager_compiler.ops.layout import (
 )
 from voyager_compiler.quantization import (
     DerivedQuantizationSpec,
-    DirectCastFakeQuantize,
     FusedAmaxObsFakeQuantize,
-    GroupWiseAffineFakeQuantize,
-    MXFakeQuantize,
+    QConfig,
     QScheme,
     QuantizationConfig,
     QuantizationSpec,
-    TrainingQuantizers,
-    capture_training,
+    convert,
     convert_pt2e,
     derive_bias_qparams_fn,
-    disable_observers,
-    fold_conv_bn_qat,
-    freeze_cache_reads,
-    freeze_weights,
+    finalize_pt2e_calibration,
     get_default_quantizer,
-    gradient_program,
-    prepare_from_args,
+    get_qconfig,
+    prepare,
     prepare_pt2e,
-    prepare_qat_pt2e,
-    prepare_training,
-    set_batch_norm_training,
-    set_training,
+    propagate_config,
+    quantize,
+    replace_softmax,
     sink_obs_or_fq,
-    update_program,
 )
 from voyager_compiler.quantization.dtypes import (
+    quantize_to_fp8_e4m3,
+    quantize_to_fp8_e5m2,
     quantize_to_nf,
     quantize_to_posit,
 )
-from voyager_compiler.shape_prop import (
-    ShapeProp,
-    fake_like,
-    fetch_attr,
-    propagate_shape,
-)
+from voyager_compiler.quantization.modules import swap_llama_attention
+from voyager_compiler.shape_prop import ShapeProp, fetch_attr, propagate_shape
 from voyager_compiler.utils import with_execution_context
 
 __all__ = [
     "AcceleratorConfig",
     "DerivedQuantizationSpec",
-    "DirectCastFakeQuantize",
     "FusedAmaxObsFakeQuantize",
-    "GroupWiseAffineFakeQuantize",
-    "MXFakeQuantize",
     "OpMatcher",
+    "get_op_overload",
+    "QConfig",
     "QScheme",
     "QuantizationConfig",
     "QuantizationSpec",
     "ShapeProp",
-    "TrainingQuantizers",
+    "TorchExportableModuleWithStaticCache",
     "add_compile_args",
     "add_experiment_args",
     "add_quantization_args",
-    "capture_training",
     "compile",
+    "convert",
+    "convert_and_export_with_split_cache",
     "convert_pt2e",
     "deduplicate_nodes",
     "derive_bias_qparams_fn",
-    "disable_observers",
+    "finalize_pt2e_calibration",
     "dispatch_model",
     "export_model",
     "extract_input_preprocessor",
     "fetch_attr",
-    "fold_conv_bn_qat",
-    "freeze_cache_reads",
-    "freeze_weights",
     "fuse_dequantize_quantize",
     "fuse_operator",
+    "issuable_group",
     "get_aten_graph_module",
-    "get_conv_bn_layers",
     "get_default_quantizer",
     "get_device_map",
     "get_node_name_to_scope",
-    "gradient_program",
+    "get_qconfig",
     "insert_align_device_nodes",
     "pad_vit_embeddings_output",
-    "prepare_from_args",
+    "prepare",
     "prepare_pt2e",
-    "prepare_qat_pt2e",
-    "prepare_training",
     "print_node_scope_tabular",
+    "propagate_config",
     "propagate_shape",
+    "quantize",
+    "quantize_to_fp8_e4m3",
+    "quantize_to_fp8_e5m2",
     "quantize_to_nf",
     "quantize_to_posit",
-    "remove_fp32_casts",
+    "remove_softmax_dtype_cast",
     "remove_zero_attention_mask",
     "replace_conv2d_with_im2col",
     "replace_interpolate",
     "replace_rmsnorm_with_layer_norm",
-    "scalarize_index_arithmetic",
-    "set_batch_norm_training",
-    "set_training",
-    "shared_dram_layout",
+    "replace_softmax",
     "sink_obs_or_fq",
-    "split_kv_cache",
+    "swap_llama_attention",
     "transform",
-    "update_program",
     "with_execution_context",
 ]
 
@@ -193,39 +216,10 @@ microscaling: qscheme = QScheme.MICROSCALING
 group_wise_affine: qscheme = QScheme.GROUP_WISE_AFFINE
 
 
-def _get_op_overload(op_name: str):
-    all_overloads = []
-    for lib in [torch.ops.aten, torch.ops.quantized_ops]:
-        # Also check inplace version of the op (e.g., "add_" for "add")
-        for name in [op_name, f"{op_name}_"]:
-            if (packet := getattr(lib, name, None)) is None:
-                continue
-            all_overloads.extend(
-                [getattr(packet, name) for name in packet.overloads()]
-            )
-    return all_overloads
-
-
-class OpMatcher:
-    targets: Tuple[torch._ops.OpOverload]
-    predicate: Optional[Callable[[Node], bool]] = None
-
-    def __init__(self, *ops, predicate=None):
-        self.predicate = predicate
-
-        # Resolve symbolic ops
-        targets = []
-        for op in ops:
-            targets.extend(_get_op_overload(op))
-
-        # Freeze resolved targets
-        self.targets = tuple(targets)
-
-    def matches(self, node: Node) -> bool:
-        if node.target not in self.targets:
-            return False
-
-        return self.predicate(node) if self.predicate else True
+#: Re-exported from the leaf module so a target package can import them
+#: without waiting on this one to finish initialising.  See
+#: :mod:`voyager_compiler.op_matcher`.
+_get_op_overload = get_op_overload
 
 
 def transform(
@@ -238,33 +232,11 @@ def transform(
     gemv_weight_layout=DEFAULT_GEMM_WEIGHT_LAYOUT,
     skip_op_fusion=False,
     fuse_reshape=True,
-    keep_fp32=True,
+    context_len=None,
+    max_new_tokens=None,
+    target=None,
+    rename_fused_operands=False,
 ):
-    """Lower ``model`` in place through the graph-level passes.
-
-    The passes run on fake copies of the example inputs and read only their
-    shapes (see ``shape_prop``).
-
-    Args:
-        model: The exported graph, rewritten in place.
-        example_args: Example positional inputs.
-        example_kwargs: Example keyword inputs; ``None`` for none.
-        patterns: The fusion patterns ``fuse_operator`` applies, each a list
-            of ``OpMatcher`` from anchor to tail.
-        config: The accelerator's ``AcceleratorConfig``; ``None`` models no
-            hardware and skips padding.
-        layout_policy: The data-layout policy: ``"systolic"`` puts conv2d in
-            NHWC, and the policy picks the matrix-matrix GEMM weight layout.
-        gemv_weight_layout: The weight layout of a matrix-vector GEMM.
-        skip_op_fusion: Skip operator fusion.
-        fuse_reshape: Let fusion fold a trailing reshape or permute into
-            its producer's output.
-        keep_fp32: ``False`` computes in 16-bit float where the model casts
-            up to float32 (``remove_fp32_casts``).
-
-    Returns:
-        ``model``.
-    """
     if example_kwargs is None:
         example_kwargs = {}
 
@@ -272,20 +244,16 @@ def transform(
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
 
-    if not keep_fp32:
-        remove_fp32_casts(model)
-
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*map(fake_like, flatten_args))
+    ShapeProp(model).propagate(*flatten_args)
 
     fold_constant_generators(model)
     inline_autocast_modules(model)
     remove_prunable_ops(model)
-    scalarize_index_arithmetic(model)
-    fuse_quantize_dequantize_with_producer(model)
+    fuse_quantize_dequantize_with_producer(model, context_len, max_new_tokens)
 
     if config.pe_array_size is not None:
-        pad_matrix_op_dimensions(model, config.pe_array_size)
+        pad_matrix_op_dimensions(model, *config.pe_array_size, config=config)
 
     if layout_policy == "systolic":
         normalize_conv2d_layout(model)
@@ -300,10 +268,43 @@ def transform(
         pad_vector_op_dimensions(model, config.vector_lanes)
 
     if not skip_op_fusion:
-        fuse_operator(model, patterns, fuse_reshape)
+        fuse_operator(
+            model,
+            patterns,
+            fuse_reshape,
+            group_is_issuable=issuable_group(config),
+        )
 
     rename_nodes_with_param_names(model)
+    # Always record which outer node each fused placeholder is: an edge in
+    # meta, invisible to the emitted IR. Rewriting the placeholder's *name* is
+    # the opt-in half, because a node name is what TensorBox.node serializes.
+    bound = bind_operand_sources(model, rename=rename_fused_operands)
+    logging.getLogger(__name__).info(
+        "bound %d fused-submodule placeholders (rename=%s)",
+        bound, rename_fused_operands,
+    )
     deduplicate_nodes(model)
+
+    # Last, with the graph settled: a target rewrites what it must, and
+    # declares any call its hardware cannot run.  A target with no backend
+    # hooks leaves the graph exactly as the untargeted compiler produced it.
+    apply_target_graph_rewrites(model, config, target)
+
+    # Then group what the machine issues as one instruction. After the
+    # rewrites, because these patterns name the operations the rewrites just
+    # built; and unconditionally, because a target's instruction is not an
+    # optimization -- ``skip_op_fusion`` turns off a performance pass, not the
+    # difference between a record existing and not. A target that declares no
+    # such sequence does nothing here, which is every target on the shared
+    # path.
+    instructions = fuse_execution_instructions(
+        model, target_execution_fusion_patterns(target)
+    )
+    if instructions:
+        logging.getLogger(__name__).info(
+            "grouped %d declared target instructions", instructions
+        )
 
     return model
 
@@ -317,45 +318,48 @@ def compile(
     output_file="compute_graph",
     dump_tensors=True,
     runtime_tolerance=None,
-    dram_layout=None,
-    accumulate_fp32=False,
+    target=None,
+    local_scheduler=None,
+    scratchpad_mapping=None,
+    execution_order=None,
 ):
-    """Bufferize ``model``, plan its memory and write its ``voyager`` IR.
-
-    Writes ``model.txt`` (the IR as text), ``layers.txt`` (a table of its
-    layers) and ``<output_file>.svg`` (the compute graph) to ``output_dir``.
-
-    Args:
-        model: A graph ``transform`` lowered, bufferized in place.
-        example_args: The inputs ``model`` runs on, so one it writes, such
-            as a gradient buffer, is overwritten.
-        example_kwargs: Keyword inputs; ``None`` for none.
-        config: The accelerator's ``AcceleratorConfig``; ``None`` models no
-            hardware.
-        output_dir: The directory the files are written to.
-        output_file: The compute-graph drawing's basename.
-        dump_tensors: Also write every tensor's values under
-            ``output_dir/tensor_files``.
-        runtime_tolerance: How much longer than the fastest modeled tiling
-            a tiling may run and still be chosen, as a fraction; ``None``
-            takes ``DEFAULT_RUNTIME_TOLERANCE``.
-        dram_layout: The DRAM ranges ``shared_dram_layout`` agreed for the
-            inputs ``model`` shares with other programs, such as a training
-            step's gradient and update programs; ``None`` places every
-            input freely.
-        accumulate_fp32: Accumulate a GEMM split along K in float32 rather
-            than its output dtype.
-
-    Returns:
-        The ``voyager`` IR ``Model`` written to ``model.txt``.
-    """
     if config is None:
         config = AcceleratorConfig(pe_array_size=None)
+
+    # Reject a combination nothing can honour, and then reject one the path
+    # about to run does not implement. The second question is asked of the
+    # *path*, not of the compiler: a whole-model residency is not what the
+    # bufferized planner does -- it packs lifetimes, which is the
+    # per-operation answer -- so accepting the flag and quietly doing that
+    # instead would report a placement the endpoint's addressing does not
+    # describe. A target with its own terminal codegen answers for itself,
+    # and answers with what it has implemented rather than with what its
+    # machine wants.
+    #
+    # Resolved here, before anything is created, so that an unhonourable
+    # request still fails before the compile leaves a directory behind.
+    execution_order, scratchpad_mapping = validate_execution_order_mode(
+        execution_order, scratchpad_mapping
+    )
+    emit_terminal = target_terminal_codegen(target)
+    require_execution_mode(
+        execution_order,
+        scratchpad_mapping,
+        target_execution_modes(target)
+        if emit_terminal is not None
+        else DEFAULT_EXECUTION_MODES,
+    )
 
     os.makedirs(output_dir, exist_ok=True)
 
     flatten_args, spec = tree_flatten((example_args, example_kwargs))
-    ShapeProp(model).propagate(*map(fake_like, flatten_args))
+    ShapeProp(model).propagate(*flatten_args)
+
+    # Refuse what no declared unit can issue, before anything is drawn or
+    # built. This is the last point at which the graph is still the one a
+    # reader recognizes -- fused, not yet bufferized -- so it is both where
+    # the question is answerable and where the answer is worth showing.
+    assign_compute_units(model, config)
 
     gen_compute_graph(model, os.path.join(output_dir, output_file))
 
@@ -364,22 +368,70 @@ def compile(
         if runtime_tolerance is None
         else runtime_tolerance
     )
-    tiler = build_interstellar_tiler(
-        config, runtime_tolerance=tolerance, accumulate_fp32=accumulate_fp32
-    )
-    bufferize_graph(model, pipelined=config.double_buffered_l2, tiler=tiler)
-    plan_memory(model, config, dram_layout)
-    print_bufferized_graph(model)
-
+    # The target chooses which scheduler plans its machine; one that names
+    # none gets the engine the compiler ships with.
+    # The target chooses the *set*; the command line chooses within it. A
+    # target carrying one engine is unaffected by naming it or not.
+    schedule = target_scheduler_providers(target)
     path = os.path.join(output_dir, "tensor_files")
-    params = gen_code_bufferized(
-        model, flatten_args, path if dump_tensors else None
-    )
+    if emit_terminal is not None:
+        # A target whose collateral is not the loop-nest IR ends here instead.
+        # It does not bufferize: its operators have no bufferized lowering, so
+        # the shared path would not produce worse output, it would produce
+        # none. See ``codegen.targets.terminal_codegen``.
+        #
+        # The provider *set* is handed over; the per-compile ``TilerContext``
+        # is not built here. That context is the shared engine's view of one
+        # machine, and it is an input to ``bufferize_graph`` and to nothing
+        # else -- so building it before the branch made every target pay for
+        # a per-compile GEMM engine, including one whose operations are
+        # claimed per operation and never tiled. Alpha declares exactly that:
+        # a live ``operation_provider`` and no entry in ``providers``, on
+        # which ``resolve`` raises. Constructing it eagerly therefore refused
+        # the terminal path for the absence of an object the terminal path
+        # does not use.
+        params = emit_terminal(
+            model,
+            flatten_args,
+            config=config,
+            schedule=schedule,
+            local_scheduler=local_scheduler,
+            scratchpad_mapping=scratchpad_mapping,
+            execution_order=execution_order,
+            runtime_tolerance=tolerance,
+            tensor_dir=path if dump_tensors else None,
+        )
+    else:
+        bufferize_graph(
+            model,
+            pipelined=config.double_buffered_l2,
+            tiler=schedule.resolve(local_scheduler)(
+                config, runtime_tolerance=tolerance
+            ),
+            unsupported_policy=target_unsupported_policy(target),
+        )
+        plan_memory(model, config)
+        print_bufferized_graph(model)
+
+        params = gen_code_bufferized(
+            model, flatten_args, path if dump_tensors else None
+        )
 
     with open(os.path.join(output_dir, "model.txt"), "w") as f:
         f.write(text_format.MessageToString(params))
+    # A target whose collateral is not the loop-nest IR writes its own layer
+    # list. The shared writer describes a bufferized nest and reads ``op.name``
+    # from each emitted operation -- a field the flat message does not have --
+    # so for such a target it raises rather than merely mis-describing.
+    write_layers = target_layer_table(target)
     with open(os.path.join(output_dir, "layers.txt"), "w") as f:
-        f.write(print_layer_table(model, params, to_string=True))
+        f.write(
+            write_layers(model, params)
+            if write_layers is not None
+            else print_layer_table(model, params, to_string=True)
+        )
+
+    dump_compile_artifacts(model, config, output_dir, target=target)
 
     flush_tensor_files()
     return params

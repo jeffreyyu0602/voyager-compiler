@@ -1,88 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import logging
 import math
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch._dynamo.repro.after_aot as after_aot
 import torch.nn.functional as F
 from torch.library import Library, impl
 
 logger = logging.getLogger(__name__)
-
-
-_cuda_system_info = after_aot._cuda_system_info_comment
-
-
-def _cuda_system_info_or_note():
-    """Return torch's CUDA-info comment, or a note when nvcc cannot run.
-
-    Every GPU compile writes this comment into its repro script by running
-    ``nvcc --version``.  torch catches only a missing nvcc; any other
-    ``OSError``, such as a PATH directory the user cannot open, gets the
-    same note instead of failing the compile.
-    """
-    try:
-        return _cuda_system_info()
-    except OSError:
-        return "# nvcc not runnable\n"
-
-
-after_aot._cuda_system_info_comment = _cuda_system_info_or_note
-
-
-def _compile(fn, dynamic):
-    """Return ``fn`` compiled with ``torch.compile`` to match eager.
-
-    The compile keeps eager's bfloat16 roundings and rounds every division
-    correctly, so it matches eager except where an intermediate is
-    denormal, which the GPU kernel flushes to zero.
-
-    Args:
-        fn: Function to compile.
-        dynamic: ``torch.compile``'s ``dynamic``.  False compiles a static
-            kernel per shape, the fastest when shapes repeat; None
-            recompiles an axis that changes size once as dynamic, for
-            shapes that vary, such as a prompt's length.
-    """
-    return torch.compile(
-        fn,
-        dynamic=dynamic,
-        recompile_limit=64,
-        options={
-            "eager_numerics.division_rounding": True,
-            "emulate_precision_casts": True,
-        },
-    )
-
-
-def compiled_on_gpu(dynamic):
-    """Decorate a function to run compiled on a GPU and as written on a CPU.
-
-    For a function called directly.  An op registers its compiled kernel
-    for the CUDA dispatch key instead, which fake and meta tensors never
-    reach.
-
-    Args:
-        dynamic: ``torch.compile``'s ``dynamic``, as ``_compile`` takes it.
-
-    Returns:
-        A decorator.  The function it returns takes the decorated one's
-        positional arguments, the first a tensor on the device to run on.
-    """
-
-    def decorate(fn):
-        compiled = _compile(fn, dynamic)
-
-        def run(input, *args):
-            return (compiled if input.is_cuda else fn)(input, *args)
-
-        return run
-
-    return decorate
-
-
-# The ops see prompts of every length.
-_OPS_DYNAMIC = None
 
 
 quantized_ops_lib = Library("quantized_ops", "DEF")
@@ -185,12 +112,6 @@ def vmap(
 
     indices = input.view(torch.int16)
 
-    # Chunking bounds the int32 index tensor eager materializes; a compiled
-    # kernel computes each index as it gathers, so it needs no chunks.
-    if torch.compiler.is_dynamo_compiling():
-        output = qmap[indices.to(torch.int32) & 0xFFFF].to(input.dtype)
-        return output.to(input_dtype)
-
     output = torch.empty_like(input, memory_format=torch.contiguous_format)
     indices_flat = indices.reshape(-1)
     output_flat = output.view(-1)
@@ -203,54 +124,105 @@ def vmap(
     return output.to(input_dtype)
 
 
+def vmap_exact(
+    input: torch.Tensor, qmap: torch.Tensor, chunk_size=1024 * 1024
+) -> torch.Tensor:
+    """``vmap``, but the codebook's own precision survives the lookup.
+
+    ``vmap`` allocates its output with ``empty_like`` on the *already
+    bfloat16-cast* index tensor, so every entry it reads is rounded to
+    bfloat16 on the way out. For a data codebook that is harmless -- the
+    values it returns are payloads that will live in the tensor's dtype
+    anyway. For a **scale** codebook whose entries are ``code * step`` it is
+    not: those are not bfloat16-representable, and the rounding is what
+    decides whether ``value / step`` is still the code the table chose.
+
+    Measured on the uint8 VSQ scale codebook, feeding each of the 255 codes
+    through ``vmap`` and dividing back out: only 132 of 255 survive for the
+    weight endpoints (7.0 / 127.0) and 96 of 255 for the activation ones
+    (8.0 / 126.0), with a worst error of 1.85 codes. An accelerator that
+    stores the code rather than the scale therefore cannot use ``vmap``.
+
+    The *index* is still bfloat16 -- that is the table's geometry and not a
+    precision choice. Only the output buffer differs.
+
+    Args:
+        input: Values to look up.
+        qmap: A bfloat16-indexed codebook, ``2 ** 16`` entries.
+        chunk_size: How many entries to gather at once.
+
+    Returns:
+        The looked-up values, in ``qmap``'s dtype.
+    """
+    indices = input.to(torch.bfloat16).view(torch.int16)
+    output = torch.empty(
+        input.shape, dtype=qmap.dtype, device=input.device
+    ).contiguous()
+    indices_flat = indices.reshape(-1)
+    output_flat = output.view(-1)
+    for start in range(0, indices_flat.numel(), chunk_size):
+        end = min(start + chunk_size, indices_flat.numel())
+        output_flat[start:end] = qmap[
+            indices_flat[start:end].to(torch.int32) & 0xFFFF
+        ]
+    return output
+
+
+def exact_block_scale(
+    input: torch.Tensor,
+    axes,
+    block_size: int,
+    quant_max: float,
+    scale_qmap: torch.Tensor,
+) -> torch.Tensor:
+    """One per-block scale, snapped to its codebook without losing it.
+
+    The same computation as ``calculate_mx_qparam``'s
+    non-power-of-two branch, with :func:`vmap_exact` in place of ``vmap``.
+    It is written out rather than delegated because the *order* is what
+    matters and cannot be recovered afterwards: the codebook is consulted
+    **before** an empty block's scale is replaced by one, so a block with no
+    value takes the codebook's lowest code rather than the code for
+    ``1.0``. Calling ``calculate_mx_qparam`` first and looking up afterwards
+    would apply the substitution to the wrong side of that step and give an
+    empty block a scale fourteen times too large.
+
+    A power-of-two scale needs none of this -- it is representable in every
+    float format the pipeline uses -- so that branch keeps the shared path.
+
+    Args:
+        input: The values being blocked.
+        axes: The axis (or axes) blocks are cut along.
+        block_size: Values per block.
+        quant_max: The payload's positive endpoint.
+        scale_qmap: The scale codebook.
+
+    Returns:
+        The per-block scale, in the codebook's dtype.
+    """
+    from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
+
+    assert block_size > 0
+    axes = [axes] if type(axes) == int else list(axes)
+    axes = [x + input.ndim if x < 0 else x for x in axes]
+    blocked, axes, _, _ = _reshape_to_blocks(input, axes, block_size)
+    amax = torch.amax(torch.abs(blocked), dim=[x + 1 for x in axes])
+    scale = vmap_exact(amax / quant_max, scale_qmap)
+    return torch.where(scale > 0.0, scale, 1.0)
+
+
 #: Entries in a bfloat16-indexed lookup table, one per bit pattern.  A
 #: quantization map that size is such a table; a smaller one is the
 #: codebook itself, and is searched rather than indexed.
 QMAP_SIZE = 2**16
 
-
-def _region_view(input: torch.Tensor, codebook: torch.Tensor):
-    """Reshape a tensor so its region grid leads, ready to gather.
-
-    Args:
-        input: Tensor the grid tiles, one codebook axis per input axis.
-        codebook: ``[*counts, k]``; ``counts[i]`` regions along axis ``i``,
-            1 leaving that axis whole.
-
-    Returns:
-        ``(moved, inverse)`` -- the tensor split into regions with the
-        region axes moved to the front, and the permutation putting them
-        back.
-
-    Raises:
-        ValueError: The grid's rank or its extents do not fit the tensor.
-    """
-    counts = tuple(codebook.shape[:-1])
-    if len(counts) != input.dim():
-        raise ValueError(
-            f"a {list(counts)} region codebook tiles {len(counts)} axes, "
-            f"but the tensor reaching it has {input.dim()}"
-        )
-    if any(extent % count for extent, count in zip(input.shape, counts)):
-        raise ValueError(
-            f"a {list(counts)} region codebook does not divide the "
-            f"{list(input.shape)} tensor reaching it"
-        )
-    split = []
-    for extent, count in zip(input.shape, counts):
-        split += [count, extent // count]
-    # Region axes land on the even positions, their tiles on the odd ones.
-    order = list(range(0, 2 * len(counts), 2))
-    order += list(range(1, 2 * len(counts), 2))
-    inverse = [0] * len(order)
-    for position, axis in enumerate(order):
-        inverse[axis] = position
-    return input.reshape(split).permute(order), inverse
+#: Axis an attention operand carries its heads on: Q, K, P and V all enter
+#: their matmul as ``[batch, head, ...]``.  A microscaling block never
+#: straddles two heads, so a head owns whole blocks and can carry its own
+#: codebook.
+HEAD_AXIS = 1
 
 
-# Inductor cannot lower ``searchsorted`` against boundaries computed in the
-# same graph, so under ``torch.compile`` this runs eagerly.
-@torch.compiler.disable
 def encode(
     input: torch.Tensor,
     codebook: torch.Tensor,
@@ -266,12 +238,9 @@ def encode(
 
     Args:
         input: Tensor to quantize, already divided by its block scale.
-        codebook: Entries in ascending order.  A 1-D codebook is one
-            table for the whole tensor.  Otherwise it carries one axis per
-            input axis plus the entries, ``[*counts, k]``: ``counts[i]``
-            splits axis ``i`` into that many regions, each decoding
-            through its own entries, and 1 leaves the axis whole.  One
-            table per attention head is ``[1, heads, 1, 1, k]``.
+        codebook: Entries in ascending order.  A 2-D codebook holds one
+            row per attention head and is indexed by ``input``'s
+            ``HEAD_AXIS``, which lets one tensor carry a table per head.
         bounds: The midpoints between entries, passed when the caller
             wants the index each element falls to rather than the entry
             itself -- what a compiled graph stores, to be decoded where
@@ -282,7 +251,8 @@ def encode(
         element rounded to or that entry's index.
 
     Raises:
-        ValueError: The codebook's grid does not fit the tensor.
+        ValueError: A per-head codebook has a different number of rows
+            than the tensor has heads.
     """
     edges = bounds
     if edges is None:
@@ -295,18 +265,19 @@ def encode(
         picked = index if bounds is not None else codebook[index]
         return picked.to(input.dtype)
 
-    # A region grid: an element's position picks its table, the way a
-    # consumer's tiles pick one.  ``searchsorted`` reaches the tables only
-    # when they lead, so the regions flatten to rows and the rest behind.
-    moved, inverse = _region_view(input, codebook)
-    regions = codebook.numel() // codebook.shape[-1]
-    flat = moved.reshape(regions, -1).bfloat16().float()
-    table = codebook.reshape(regions, -1)
-    edge = edges.reshape(regions, -1)
-    index = torch.searchsorted(edge.contiguous(), flat.contiguous())
-    picked = index if bounds is not None else table.gather(1, index)
-    picked = picked.view(moved.shape).permute(inverse)
-    return picked.reshape(input.shape).to(input.dtype)
+    # One row per head, which ``searchsorted`` reaches only when the head
+    # leads both operands: the rest of the tensor flattens behind it.
+    heads = codebook.shape[0]
+    if input.shape[HEAD_AXIS] != heads:
+        raise ValueError(
+            f"the codebook holds {heads} rows, but the tensor reaching it "
+            f"has {input.shape[HEAD_AXIS]} heads"
+        )
+    moved = input.movedim(HEAD_AXIS, 0)
+    flat = moved.reshape(heads, -1).bfloat16().float()
+    index = torch.searchsorted(edges.contiguous(), flat.contiguous())
+    picked = index if bounds is not None else codebook.gather(1, index)
+    return picked.view(moved.shape).movedim(0, HEAD_AXIS).to(input.dtype)
 
 
 def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
@@ -314,153 +285,35 @@ def decode(input: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
 
     Args:
         input: Tensor of indices, as ``encode`` emitted them.
-        codebook: The entries.  A 1-D codebook is one table for the whole
-            tensor; otherwise it carries one axis per input axis plus the
-            entries, ``[*counts, k]``, and ``counts[i]`` regions split
-            axis ``i``.
+        codebook: The entries.  A 2-D codebook holds one row per attention
+            head and is indexed by ``input``'s ``HEAD_AXIS``.
 
     Returns:
         Tensor shaped like ``input``, holding the entry each index names.
 
     Raises:
-        ValueError: The codebook's grid does not fit the tensor.
+        ValueError: A per-head codebook has a different number of rows
+            than the tensor has heads.
     """
     index = input.to(torch.long)
     if codebook.dim() == 1:
         return codebook[index].to(input.dtype)
 
-    moved, inverse = _region_view(index, codebook)
-    regions = codebook.numel() // codebook.shape[-1]
-    table = codebook.reshape(regions, -1)
-    picked = table.gather(1, moved.reshape(regions, -1))
-    picked = picked.view(moved.shape).permute(inverse)
-    return picked.reshape(index.shape).to(input.dtype)
-
-
-#: Philox4x32-10 (Salmon et al., 2011), the generator Transformer Engine's
-#: stochastic rounding draws from: its round multipliers, the increments
-#: that bump its key between rounds, and its round count.
-PHILOX_MULTIPLIERS = (0xD2511F53, 0xCD9E8D57)
-PHILOX_KEY_INCREMENTS = (0x9E3779B9, 0xBB67AE85)
-PHILOX_ROUNDS = 10
-_UINT32_MASK = 0xFFFFFFFF
-
-
-def _mulhilo32(a: torch.Tensor, b: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The high and low 32 bits of ``a * b``.
-
-    ``a`` holds uint32 values in int64 and ``b`` is a uint32.  The product
-    is taken over 16-bit halves of ``b``, so no partial product overflows.
-    """
-    low_half = a * (b & 0xFFFF)
-    high_half = a * (b >> 16)
-    low = low_half + ((high_half & 0xFFFF) << 16)
-    return (high_half >> 16) + (low >> 32), low & _UINT32_MASK
-
-
-def _philox(counter: torch.Tensor, seed: torch.Tensor) -> torch.Tensor:
-    """Philox4x32-10 of each counter under the key ``seed``.
-
-    Args:
-        counter: int64 counters, the low 64 bits of 128-bit counters whose
-            high 64 bits are zero.
-        seed: int64 scalar, the 64-bit key.
-
-    Returns:
-        int64 tensor ``[*counter.shape, 4]``: the four uint32 words each
-        counter draws.
-    """
-    c0, c1 = counter & _UINT32_MASK, (counter >> 32) & _UINT32_MASK
-    c2 = c3 = torch.zeros_like(counter)
-    k0, k1 = seed & _UINT32_MASK, (seed >> 32) & _UINT32_MASK
-    for _ in range(PHILOX_ROUNDS):
-        hi0, lo0 = _mulhilo32(c0, PHILOX_MULTIPLIERS[0])
-        hi1, lo1 = _mulhilo32(c2, PHILOX_MULTIPLIERS[1])
-        c0, c1, c2, c3 = hi1 ^ c1 ^ k0, lo1, hi0 ^ c3 ^ k1, lo0
-        k0 = (k0 + PHILOX_KEY_INCREMENTS[0]) & _UINT32_MASK
-        k1 = (k1 + PHILOX_KEY_INCREMENTS[1]) & _UINT32_MASK
-    return torch.stack([c0, c1, c2, c3], -1)
-
-
-def _random_bytes(seed: torch.Tensor, shape, device) -> torch.Tensor:
-    """Eight random bits for each element of a ``shape`` tensor.
-
-    Element ``i`` in flat order takes byte ``i % 4``, least significant
-    first, of word ``i % 16 // 4`` of the Philox draw with counter
-    ``i // 16``, so each 128-bit draw serves 16 elements.
-
-    Args:
-        seed: int64 scalar keying the draws.
-        shape: Shape of the tensor the bits are for.
-        device: Where the bits are drawn.
-
-    Returns:
-        int64 tensor of ``shape``, each value in [0, 255].
-    """
-    numel = math.prod(shape)
-    words = _philox(torch.arange(-(-numel // 16), device=device), seed)
-    shifts = torch.arange(0, 32, 8, device=device)
-    return ((words[..., None] >> shifts) & 0xFF).flatten()[:numel].view(shape)
-
-
-# Inductor cannot lower ``searchsorted`` against levels sorted in the same
-# graph, so under ``torch.compile`` this runs eagerly.
-@torch.compiler.disable
-def _neighbors(value: torch.Tensor, qmap: torch.Tensor):
-    """The levels of ``qmap`` on either side of each element.
-
-    Args:
-        value: float32 tensor, already divided by its scale.
-        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
-
-    Returns:
-        ``(value, low, high)``: each element saturated to the levels'
-        range, the largest level below it and the smallest at or above
-        it.  An element on a level is its own ``low`` and ``high``.
-    """
-    table = qmap.float()
-    # A table's NaN bit patterns take its first entry, zero's level.
-    levels = torch.sort(torch.where(torch.isfinite(table), table, table[0]))
-    levels = levels.values
-    value = value.clamp(levels[0], levels[-1])
-    upper = torch.searchsorted(levels, value).clamp(max=levels.numel() - 1)
-    high = levels[upper]
-    low = torch.where(high == value, high, levels[(upper - 1).clamp(min=0)])
-    return value, low, high
-
-
-def _stochastic_round(
-    input: torch.Tensor, qmap: torch.Tensor, seed: torch.Tensor
-) -> torch.Tensor:
-    """Round each element to one of the two levels of ``qmap`` around it.
-
-    Transformer Engine's rule: an element ``x`` between levels ``near``,
-    the one nearer zero, and ``far`` rounds to ``far`` when its eight
-    random bits ``r`` (``_random_bytes``) satisfy
-    ``|x| + r / 256 * |far - near| >= |far|``, and to ``near`` otherwise,
-    so the rounding is unbiased to 1/256 of the gap.  An element on a level
-    keeps it; one past the outermost levels saturates.
-
-    Args:
-        input: Tensor to round, already divided by its scale.
-        qmap: A value table of ``QMAP_SIZE`` entries, or a 1-D codebook.
-        seed: int64 scalar keying the random bits.
-
-    Returns:
-        The rounded tensor, in ``input``'s dtype.
-    """
-    value, low, high = _neighbors(input.float(), qmap)
-    noise = _random_bytes(seed, input.shape, input.device) / 256
-    near = torch.where(value < 0, high, low)
-    far = torch.where(value < 0, low, high)
-    rounds_away = value.abs() + noise * (high - low) >= far.abs()
-    return torch.where(rounds_away, far, near).to(input.dtype)
+    heads = codebook.shape[0]
+    if input.shape[HEAD_AXIS] != heads:
+        raise ValueError(
+            f"the codebook holds {heads} rows, but the tensor reaching it "
+            f"has {input.shape[HEAD_AXIS]} heads"
+        )
+    moved = index.movedim(HEAD_AXIS, 0)
+    picked = codebook.gather(1, moved.reshape(heads, -1)).view(moved.shape)
+    return picked.movedim(0, HEAD_AXIS).to(input.dtype)
 
 
 quantized_ops_lib.define(
     "quantize(Tensor input, Tensor scale, Tensor? zero_point=None, "
     "SymInt[]? axes=None, int? block_size=None, Tensor? qmap=None, "
-    "Tensor? output_code=None, Tensor? seed=None) -> Tensor"
+    "Tensor? output_code=None) -> Tensor"
 )
 
 
@@ -473,7 +326,6 @@ def quantize(
     block_size: Optional[int] = None,
     qmap: torch.Tensor = None,
     output_code: Optional[torch.Tensor] = None,
-    seed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Quantization for the Tensor using scales and zero points to map
     from floating point to quantized values
@@ -488,13 +340,9 @@ def quantize(
         qmap (torch.Tensor): quantization map for mapping from float to
             quantized values. A map of ``QMAP_SIZE`` entries is a lookup
             table indexed by the bfloat16 bit pattern; a smaller one is a
-            codebook, searched for the nearest entry. A 2-D codebook
-            carries one row per attention head (or head group), a 3-D one
-            a row per group of channels along the last axis.
+            codebook, searched for the nearest entry, and a 2-D codebook
+            carries one row per attention head.
         output_code (torch.Tensor): codebook for quantizing the output
-        seed (torch.Tensor): int64 scalar keying stochastic rounding
-            (``_stochastic_round``) against a ``qmap`` of values, or None
-            to round to the nearest value
 
     Returns:
         Tensor with requested dtype (e.g. int8), note the quantization
@@ -512,9 +360,6 @@ def quantize(
         input = input / scale
     else:
         input = input / scale + zero_point
-
-    if seed is not None:
-        return _stochastic_round(input, qmap, seed)
 
     # Both a value table and the index table ``convert_pt2e`` swaps in have
     # one entry per bit pattern, so size is what tells a table from a
@@ -579,30 +424,19 @@ def dequantize(
     return dequantized
 
 
-def _dequantize_mx(input, scale, code, block_size):
-    """``input``'s codes read back through ``code`` and scaled by their
-    block ``scale``; either may be absent."""
-    # With neither, the compile would trace no ops, and a compile that
-    # traces none stops compiling the function for every later call.
-    if code is None and scale is None:
-        return input
-    return _decode_and_scale(input, scale, code, block_size)
-
-
-@compiled_on_gpu(_OPS_DYNAMIC)
-def _decode_and_scale(input, scale, code, block_size):
-    """``_dequantize_mx`` given a code, a scale or both."""
-    if code is not None:
-        input = decode(input, code)
-    if scale is not None:
-        input = input * expand(scale, input.shape, block_size)
-    return input
-
-
+# The two coarse scales are what makes this operator able to carry a
+# vector-scaled operand. A VSQ value is three things -- a narrow payload, a
+# per-block fine scale, and a coarse scale applied once -- and the split is the
+# datapath's: the array multiplies the fine scale into the reduction while the
+# coarse one is applied at the epilogue. Both are keyword-only and default to
+# ``None``, so every existing microscaling caller passes exactly what it always
+# did and this stays one operator rather than two that drift.
 quantized_ops_lib.define(
     "conv2d_mx(Tensor input, Tensor weight, Tensor? bias=None, "
     "SymInt[2] stride=1, SymInt[2] padding=0, SymInt[2] dilation=1, "
-    "SymInt groups=1, *, Tensor? input_scale=None, Tensor? weight_scale=None, "
+    "SymInt groups=1, *, Tensor? input_scale=None, "
+    "Tensor? input_coarse_scale=None, Tensor? weight_scale=None, "
+    "Tensor? weight_coarse_scale=None, "
     "int? block_size=None, Tensor? input_code=None, "
     'Tensor? weight_code=None, str layout="nchw") -> Tensor'
 )
@@ -619,7 +453,9 @@ def conv2d_mx(
     groups: int = 1,
     *,
     input_scale: Optional[torch.Tensor] = None,
+    input_coarse_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
+    weight_coarse_scale: Optional[torch.Tensor] = None,
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
@@ -629,8 +465,23 @@ def conv2d_mx(
 
     assert layout in ("nchw", "nhwc"), layout
 
-    input = _dequantize_mx(input, input_scale, input_code, block_size)
-    weight = _dequantize_mx(weight, weight_scale, weight_code, block_size)
+    # For codebook quantization, decode input and weight into float values first
+    if input_code is not None:
+        input = decode(input, input_code)
+    if weight_code is not None:
+        weight = decode(weight, weight_code)
+
+    # Replicate scales to match input and weight shapes
+    if input_scale is not None:
+        input = input * expand(input_scale, input.shape, block_size)
+    # The coarse scale is per tensor or per output channel, never per block, so
+    # it broadcasts as it is rather than being expanded against the block size.
+    if input_coarse_scale is not None:
+        input = input * input_coarse_scale
+    if weight_scale is not None:
+        weight = weight * expand(weight_scale, weight.shape, block_size)
+    if weight_coarse_scale is not None:
+        weight = weight * weight_coarse_scale
 
     # The dispatcher fills omitted / default-valued args from this Python
     # signature's scalar defaults; the strict op calls below need pairs.
@@ -646,14 +497,12 @@ def conv2d_mx(
     )
 
 
-# ``alpha`` scales a GEMM's product, as in ``alpha * (A @ B) + bias``: the
-# operands' global scales, which factor out of the contraction.
 quantized_ops_lib.define(
     "linear_mx(Tensor input, Tensor weight, Tensor? bias=None, *, "
     "Tensor? input_scale=None, Tensor? weight_scale=None, "
     "int? block_size=None, Tensor? input_code=None, Tensor? weight_code=None, "
-    "Tensor? alpha=None, Tensor? A_data=None, Tensor? A_indices=None, "
-    'Tensor? A_indptr=None, str weight_layout="kc") -> Tensor'
+    "Tensor? A_data=None, Tensor? A_indices=None, Tensor? A_indptr=None, "
+    'str weight_layout="kc") -> Tensor'
 )
 
 
@@ -668,7 +517,6 @@ def linear_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
-    alpha: Optional[torch.Tensor] = None,
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
@@ -676,27 +524,27 @@ def linear_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    input = _dequantize_mx(input, input_scale, input_code, block_size)
-    decoded_weight = _dequantize_mx(
-        weight, weight_scale, weight_code, block_size
-    )
+    if input_code is not None:
+        input = decode(input, input_code)
 
-    # ``alpha`` scales the product alone, so the bias is added after it.
-    gemm_bias = bias if alpha is None else None
+    if input_scale is not None:
+        input = input * expand(input_scale, input.shape, block_size)
+
+    decoded_weight = weight
+    if weight_code is not None:
+        decoded_weight = decode(weight, weight_code)
+
+    if weight_scale is not None:
+        decoded_weight = decoded_weight * expand(
+            weight_scale, weight.shape, block_size
+        )
 
     # Call the operator matching the weight's storage layout: aten for
     # the KC-native layout, the layout twin for a CK-stored weight.
     if weight_layout == "kc":
-        dense_out = torch.ops.aten.linear(input, decoded_weight, gemm_bias)
+        dense_out = torch.ops.aten.linear(input, decoded_weight, bias)
     else:
-        dense_out = torch.ops.quantized_ops.linear(
-            input, decoded_weight, gemm_bias
-        )
-
-    if alpha is not None:
-        dense_out = dense_out * alpha
-        if bias is not None:
-            dense_out = dense_out + bias
+        dense_out = torch.ops.quantized_ops.linear(input, decoded_weight, bias)
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -729,9 +577,8 @@ def _(
 quantized_ops_lib.define(
     "matmul_mx(Tensor self, Tensor other, *, Tensor? input_scale=None, "
     "Tensor? weight_scale=None, int? block_size=None, Tensor? input_code=None, "
-    "Tensor? weight_code=None, Tensor? alpha=None, Tensor? A_data=None, "
-    "Tensor? A_indices=None, Tensor? A_indptr=None, "
-    'str weight_layout="ck") -> Tensor'
+    "Tensor? weight_code=None, Tensor? A_data=None, Tensor? A_indices=None, "
+    'Tensor? A_indptr=None, str weight_layout="ck") -> Tensor'
 )
 
 
@@ -745,7 +592,6 @@ def matmul_mx(
     block_size: Optional[int] = None,
     input_code: Optional[torch.Tensor] = None,
     weight_code: Optional[torch.Tensor] = None,
-    alpha: Optional[torch.Tensor] = None,
     A_data: Optional[torch.Tensor] = None,
     A_indices: Optional[torch.Tensor] = None,
     A_indptr: Optional[torch.Tensor] = None,
@@ -753,8 +599,18 @@ def matmul_mx(
 ) -> torch.Tensor:
     assert weight_layout in ("kc", "ck"), weight_layout
 
-    self = _dequantize_mx(self, input_scale, input_code, block_size)
-    decoded_other = _dequantize_mx(other, weight_scale, weight_code, block_size)
+    if input_code is not None:
+        self = decode(self, input_code)
+    if input_scale is not None:
+        self = self * expand(input_scale, self.shape, block_size)
+
+    decoded_other = other
+    if weight_code is not None:
+        decoded_other = decode(other, weight_code)
+    if weight_scale is not None:
+        decoded_other = decoded_other * expand(
+            weight_scale, other.shape, block_size
+        )
 
     # Call the operator matching the right operand's storage layout:
     # aten for the CK-native layout, the layout twin for KC storage.
@@ -762,9 +618,6 @@ def matmul_mx(
         dense_out = torch.ops.aten.matmul(self, decoded_other)
     else:
         dense_out = torch.ops.quantized_ops.matmul(self, decoded_other)
-
-    if alpha is not None:
-        dense_out = dense_out * alpha
 
     if A_data is not None:
         spmm_out = torch.ops.quantized_ops.spmm_csr(
@@ -794,145 +647,9 @@ def _(
 
 
 quantized_ops_lib.define(
-    "sdpa_mx(Tensor query, Tensor key, Tensor value, Tensor? attn_mask=None, "
-    "float dropout_p=0., bool is_causal=False, Tensor? query_residual=None, "
-    "Tensor? key_residual=None, Tensor? value_residual=None, "
-    "Tensor? residual_mask=None, *, float? scale=None, "
-    "bool enable_gqa=False, Tensor? query_scale=None, Tensor? key_scale=None, "
-    "Tensor? value_scale=None, int? block_size=None, Tensor? input_code=None, "
-    "Tensor? weight_code=None, Tensor? probs_qmap=None, "
-    "float? probs_quant_max=None, Tensor? probs_scale_qmap=None, "
-    "Tensor? probs_code=None, bool force_scale_power_of_two=False) -> Tensor"
-)
-
-
-@impl(quantized_ops_lib, "sdpa_mx", "CompositeExplicitAutograd")
-def sdpa_mx(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    query_residual: Optional[torch.Tensor] = None,
-    key_residual: Optional[torch.Tensor] = None,
-    value_residual: Optional[torch.Tensor] = None,
-    residual_mask: Optional[torch.Tensor] = None,
-    *,
-    scale: Optional[float] = None,
-    enable_gqa: bool = False,
-    query_scale: Optional[torch.Tensor] = None,
-    key_scale: Optional[torch.Tensor] = None,
-    value_scale: Optional[torch.Tensor] = None,
-    block_size: Optional[int] = None,
-    input_code: Optional[torch.Tensor] = None,
-    weight_code: Optional[torch.Tensor] = None,
-    probs_qmap: Optional[torch.Tensor] = None,
-    probs_quant_max: Optional[float] = None,
-    probs_scale_qmap: Optional[torch.Tensor] = None,
-    probs_code: Optional[torch.Tensor] = None,
-    force_scale_power_of_two: bool = False,
-) -> torch.Tensor:
-    """``scaled_dot_product_attention`` over microscaling operands.
-
-    The query, key and value are codes with block scales along their
-    contraction axes (``query_scale`` / ``key_scale`` / ``value_scale``) and
-    codebooks (``input_code`` for the query, ``weight_code`` for the key and
-    value).  The softmax's probabilities are quantized along the keys with
-    the query's parameters (``probs_qmap`` / ``probs_quant_max`` /
-    ``probs_scale_qmap`` / ``probs_code``, the arguments ``quantize_mx``
-    takes) before the value matmul, as the attention kernel does on chip.
-    ``dropout_p`` is ignored; ``is_causal`` masks every key past a query's
-    own position, as aten does, and excludes an explicit mask.
-
-    A split KV cache (``split_kv_cache``) adds a residual: ``key_residual``
-    / ``value_residual`` hold the chunk being filled in full precision and
-    are attended after the main keys, ``query_residual`` (the unquantized
-    query) against them under ``residual_mask``, in one softmax with the
-    main keys.  Their probabilities are not quantized.  They are positional
-    because the quantizer's observer insertion takes no tensor kwargs.
-
-    Returns:
-        The attention output, in the codebooks' dtype.
-    """
-    if is_causal and attn_mask is not None:
-        raise ValueError("is_causal excludes an explicit attn_mask")
-    query = _dequantize_mx(query, query_scale, input_code, block_size)
-    key = _dequantize_mx(key, key_scale, weight_code, block_size)
-    value = _dequantize_mx(value, value_scale, weight_code, block_size)
-    residual = key_residual is not None
-    if enable_gqa:
-        group = query.shape[-3] // key.shape[-3]
-        key = key.repeat_interleave(group, dim=-3)
-        value = value.repeat_interleave(group, dim=-3)
-        if residual:
-            key_residual = key_residual.repeat_interleave(group, dim=-3)
-            value_residual = value_residual.repeat_interleave(group, dim=-3)
-    if scale is None:
-        scale = 1.0 / math.sqrt(query.shape[-1])
-
-    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
-    if is_causal:
-        attn_mask = torch.ones(
-            scores.shape[-2:], dtype=torch.bool, device=scores.device
-        ).tril()
-    scores = _masked(scores, attn_mask)
-    keys = scores.shape[-1]
-    if residual:
-        residual_scores = query_residual @ key_residual.transpose(-1, -2)
-        residual_scores = _masked(residual_scores * scale, residual_mask)
-        scores = torch.cat([scores, residual_scores], dim=-1)
-    probs = torch.softmax(scores, dim=-1)
-    probs, residual_probs = probs[..., :keys], probs[..., keys:]
-    if probs_qmap is not None:
-        probs_scale, probs = torch.ops.quantized_ops.quantize_mx(
-            probs,
-            probs_qmap,
-            [-1],
-            block_size,
-            probs_quant_max,
-            force_scale_power_of_two,
-            probs_scale_qmap,
-            probs_code,
-        )
-        probs = _dequantize_mx(probs, probs_scale, input_code, block_size)
-    out = torch.matmul(probs, value)
-    if residual:
-        out = out + torch.matmul(residual_probs, value_residual)
-    return out
-
-
-def _masked(scores, mask):
-    """``scores`` under ``mask``: a bool mask keeps where true, a float one
-    adds; ``None`` masks nothing."""
-    if mask is None:
-        return scores
-    if mask.dtype == torch.bool:
-        return scores.masked_fill(~mask, float("-inf"))
-    return scores + mask
-
-
-@torch.library.register_fake("quantized_ops::sdpa_mx")
-def _(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attn_mask: Optional[torch.Tensor] = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    query_residual: Optional[torch.Tensor] = None,
-    key_residual: Optional[torch.Tensor] = None,
-    value_residual: Optional[torch.Tensor] = None,
-    residual_mask: Optional[torch.Tensor] = None,
-    **kwargs,
-):
-    return query.new_empty(*query.shape[:-1], value.shape[-1])
-
-
-quantized_ops_lib.define(
     "calculate_mx_qparam(Tensor self, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
-    "Tensor scale_qmap=None, Tensor? global_scale=None) -> Tensor"
+    "Tensor scale_qmap=None) -> Tensor"
 )
 
 
@@ -944,7 +661,6 @@ def calculate_mx_qparam(
     quant_max: float,
     force_scale_power_of_two: bool = False,
     scale_qmap: Optional[torch.Tensor] = None,
-    global_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Deferred to break a real cycle: ``quantization`` imports this module for
     # the ops, so it cannot be imported here at module scope.
@@ -976,10 +692,7 @@ def calculate_mx_qparam(
         )
 
         # Offset the max exponent by the largest representable exponent
-        # in the element data format.  This rounds the scale down, as the
-        # OCP MX spec suggests, so a block's largest elements can saturate.
-        # Transformer Engine, cuBLAS and Blackwell's ``cvt.rp`` round it up
-        # instead, 2**ceil(log2(amax / max)), which never saturates.
+        # in the element data format
         shared_exp = shared_exp - math.floor(math.log2(quant_max))
 
         for axis in reversed(axes):
@@ -992,11 +705,6 @@ def calculate_mx_qparam(
         amax = torch.amax(torch.abs(input), dim=shared_exp_axes)
         scale = amax / quant_max
 
-        # NVFP4's second level: the tensor's global scale divides out its
-        # own magnitude before the block scales are quantized.
-        if global_scale is not None:
-            scale = scale / global_scale
-
         # Quantize the scale using the codebook
         if scale_qmap is not None:
             scale = vmap(scale, scale_qmap)
@@ -1008,8 +716,7 @@ def calculate_mx_qparam(
 quantized_ops_lib.define(
     "quantize_mx(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
     "float quant_max, bool force_scale_power_of_two=False, "
-    "Tensor scale_qmap=None, Tensor output_code=None, Tensor? seed=None, "
-    "Tensor? global_scale=None) -> (Tensor, Tensor)"
+    "Tensor scale_qmap=None, Tensor output_code=None) -> (Tensor, Tensor)"
 )
 
 
@@ -1023,19 +730,7 @@ def quantize_mx(
     force_scale_power_of_two: bool = False,
     scale_qmap: Optional[torch.Tensor] = None,
     output_code: Optional[torch.Tensor] = None,
-    seed: Optional[torch.Tensor] = None,
-    global_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor]:
-    """Quantize ``input`` in microscaling blocks.
-
-    With a ``global_scale`` ``t``, each block scale is quantized as
-    ``scale_qmap(amax_block / quant_max / t)`` and the elements are divided
-    by it times ``t``.  The returned scales leave ``t`` out: whatever reads
-    the codes applies it once, as a GEMM's ``alpha``.
-
-    Returns:
-        ``(scale, codes)``.
-    """
     scale = calculate_mx_qparam(
         input,
         axes=axes,
@@ -1043,87 +738,100 @@ def quantize_mx(
         quant_max=quant_max,
         force_scale_power_of_two=force_scale_power_of_two,
         scale_qmap=scale_qmap,
-        global_scale=global_scale,
     )
-    element_scale = scale if global_scale is None else scale * global_scale
-    input = quantize(
-        input, element_scale, None, axes, block_size, qmap, output_code, seed
-    )
+    input = quantize(input, scale, None, axes, block_size, qmap, output_code)
     return scale, input
 
 
 quantized_ops_lib.define(
-    "quantize_affine(Tensor self, Tensor qmap, SymInt[] axes, int block_size, "
-    "float quant_min, float quant_max, Tensor scale_qmap=None) "
+    "quantize_vsq(Tensor self, Tensor coarse_scale, Tensor coarse_qmap, "
+    "Tensor fine_qmap, SymInt[] axes, int block_size, "
+    "float fine_quant_max, bool force_scale_power_of_two=False, "
+    "Tensor? fine_scale_qmap=None, Tensor? fine_output_code=None, "
+    "float? coarse_scale_quant_max=None) "
     "-> (Tensor, Tensor, Tensor)"
 )
 
 
-@impl(quantized_ops_lib, "quantize_affine", "CompositeExplicitAutograd")
-def quantize_affine(
+@impl(quantized_ops_lib, "quantize_vsq", "CompositeExplicitAutograd")
+def quantize_vsq(
     input: torch.Tensor,
-    qmap: torch.Tensor,
+    coarse_scale: torch.Tensor,
+    coarse_qmap: torch.Tensor,
+    fine_qmap: torch.Tensor,
     axes: Tuple[int],
     block_size: int,
-    quant_min: float,
-    quant_max: float,
-    scale_qmap: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor]:
-    """Group-wise affine quantization with the qparams computed on the fly.
+    fine_quant_max: float,
+    force_scale_power_of_two: bool = False,
+    fine_scale_qmap: Optional[torch.Tensor] = None,
+    fine_output_code: Optional[torch.Tensor] = None,
+    coarse_scale_quant_max: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize into one VSQ value with coarse and fine scale outputs.
 
-    Each block of ``block_size`` elements along the one axis in ``axes`` maps
-    its own ``[min, max]`` onto ``[quant_min, quant_max]``, so the result
-    carries a scale *and* a zero point per block.  The runtime twin of the
-    calibrated ``quantize``, the way ``quantize_mx`` is for microscaling.
-
-    Args:
-        input: The tensor to quantize.
-        qmap: Quantization map turning the scaled values into codes.
-        axes: The single axis the blocks lie along, as a one-element list
-            (the same argument shape as ``quantize_mx``).
-        block_size: Elements per block along the axis.
-        quant_min: Smallest code of the target dtype.
-        quant_max: Largest code of the target dtype.
-        scale_qmap: Quantization map for the scale and zero point, or
-            ``None`` to keep them in the input's dtype.
-
-    Returns:
-        ``(scale, zero_point, value)``.
+    Both scales are returned rather than folded together: the fine scale is a
+    per-block value the datapath applies inside a tile, while the coarse scale
+    is per-tensor (or per-channel) and applied once. Collapsing them would
+    lose the split the hardware relies on.
     """
-    # Deferred to break a real cycle: ``quantization`` imports this module for
-    # the ops, so it cannot be imported here at module scope.
-    from voyager_compiler.quantization.mx_utils import _reshape_to_blocks
+    if coarse_scale_quant_max is not None and (
+        not math.isfinite(coarse_scale_quant_max) or coarse_scale_quant_max <= 0
+    ):
+        raise ValueError("coarse_scale_quant_max must be finite and positive")
+    coarse_data = quantize(input, coarse_scale, qmap=coarse_qmap)
+    if fine_scale_qmap is not None and not force_scale_power_of_two:
+        # The fine scale is *stored as its code* by an accelerator that reads
+        # VSQ, so the codebook value has to survive the lookup intact --
+        # ``vmap`` would round it to bfloat16 and the code would no longer be
+        # recoverable. See ``exact_block_scale``. Only this branch differs;
+        # the payload quantization below is the shared one.
+        fine_scale = exact_block_scale(
+            coarse_data, axes, block_size, fine_quant_max, fine_scale_qmap
+        )
+        fine_data = quantize(
+            coarse_data,
+            fine_scale,
+            None,
+            axes,
+            block_size,
+            fine_qmap,
+            fine_output_code,
+        )
+    else:
+        fine_scale, fine_data = quantize_mx(
+            coarse_data,
+            fine_qmap,
+            axes,
+            block_size,
+            fine_quant_max,
+            force_scale_power_of_two,
+            fine_scale_qmap,
+            fine_output_code,
+        )
+    return coarse_scale, fine_scale, fine_data
 
-    assert block_size > 0
 
-    (axis,) = axes
-    axes = [axis % input.ndim]
-    blocked, block_axes, _, _ = _reshape_to_blocks(input, axes, block_size)
-    reduce_axes = [x + 1 for x in block_axes]
-
-    low = torch.amin(blocked, dim=reduce_axes)
-    high = torch.amax(blocked, dim=reduce_axes)
-    scale = (high - low) / (quant_max - quant_min)
-    scale = torch.where(scale > 0.0, scale, 1.0)
-    # A scale below the format's range rounds to zero: the block is one
-    # level, as with no range.  The zero point is taken against the scale
-    # as stored.
-    if scale_qmap is not None:
-        scale = vmap(scale, scale_qmap)
-        scale = torch.where(scale > 0.0, scale, 1.0)
-    zero_point = -low / scale + quant_min
-    if scale_qmap is not None:
-        zero_point = vmap(zero_point, scale_qmap)
-
-    value = quantize(input, scale, zero_point, axes, block_size, qmap)
-    return scale, zero_point, value
+quantized_ops_lib.define(
+    "dequantize_vsq(Tensor input, Tensor fine_scale, "
+    "Tensor coarse_scale, SymInt[] axes, int block_size, "
+    "Tensor? input_qmap=None) -> Tensor"
+)
 
 
-# On a GPU these ops run compiled: a few fused kernels instead of a pass
-# over the tensor per aten op.  The CUDA key alone takes the compiled
-# kernel, so fake and meta tensors keep the plain one.
-for _op in (quantize, dequantize, quantize_mx, quantize_affine):
-    quantized_ops_lib.impl(_op.__name__, _compile(_op, _OPS_DYNAMIC), "CUDA")
+@impl(quantized_ops_lib, "dequantize_vsq", "CompositeExplicitAutograd")
+def dequantize_vsq(
+    input: torch.Tensor,
+    fine_scale: torch.Tensor,
+    coarse_scale: torch.Tensor,
+    axes: Tuple[int],
+    block_size: int,
+    input_qmap: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Reconstruct a VSQ value without collapsing its two scale levels."""
+    if input_qmap is not None:
+        input = vmap(input, input_qmap)
+    fine_scale = expand(fine_scale, input.shape, block_size)
+    return input * fine_scale * coarse_scale
 
 
 quantized_ops_lib.define(
@@ -1151,8 +859,8 @@ def _pad_csr(
     # running both ``cond`` branches and one ``while_loop`` iteration from the
     # carried *initial* values, so a tiled quantize is propagated over an
     # accumulator no step has written yet and reads uninitialized memory as
-    # nearly all-outlier.  A block's capacity is its share of the declared
-    # stream, and a block holding more is truncated, as the hardware does.
+    # nearly all-outlier.  The capacity a tile really needs is checked against
+    # the live activation where the builder derives its geometry.
     logger.warning(
         f"Number of outliers {nse} exceeds capacity {max_nnz}; "
         f"{nse - max_nnz} dropped."
@@ -1286,15 +994,16 @@ def quantize_mx_outlier(
     if indptr_offset:
         indptr = indptr + indptr_offset
 
-    scale, inliers = torch.ops.quantized_ops.quantize_mx(
+    scale = calculate_mx_qparam(
         inliers,
-        qmap,
-        axes,
-        block_size,
-        quant_max,
-        force_scale_power_of_two,
-        scale_qmap,
-        output_code,
+        axes=axes,
+        block_size=block_size,
+        quant_max=quant_max,
+        force_scale_power_of_two=force_scale_power_of_two,
+        scale_qmap=scale_qmap,
+    )
+    inliers = quantize(
+        inliers, scale, None, axes, block_size, qmap, output_code
     )
 
     return data, indices, indptr, scale, inliers
@@ -1455,17 +1164,13 @@ def spmm_csr(
 
         # The row pointers may name a range lifted out of a longer array,
         # in which case they do not start at 0 and data/indices hold only
-        # the span they cover.  Rebase both onto that span's start, and
-        # keep the pointers and columns in range: shape propagation runs a
-        # nest over buffers no step has written (see ``_pad_csr``), and
-        # the sparse mm does not check its input.
-        crow = (indptr[i] - indptr[i][0]).clamp_(0, data.shape[-1])
-        crow = torch.cummax(crow, 0).values
-        end_index = int(crow[-1])
+        # the span they cover.  Rebase both onto that span's start.
+        base = indptr[i][0].item()
+        end_index = indptr[i][-1].item() - base
 
         csr = torch.sparse_csr_tensor(
-            crow,
-            indices[i, :end_index].clamp(0, B_batch.shape[0] - 1),
+            indptr[i] - base,
+            indices[i, :end_index],
             data[i, :end_index],
             dtype=torch.float32,
             size=input_size,

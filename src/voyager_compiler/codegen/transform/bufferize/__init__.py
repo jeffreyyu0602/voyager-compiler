@@ -32,7 +32,6 @@ from voyager_compiler.codegen.transform.bufferize.emit import (
 from voyager_compiler.codegen.transform.bufferize.memory_planning import (
     MemoryPlan,
     plan_memory,
-    shared_dram_layout,
 )
 
 # Mark the in-place / DMA primitives side-effecting so DCE never drops them.
@@ -52,5 +51,4 @@ __all__ = [
     "print_bufferized_graph",
     "plan_memory",
     "MemoryPlan",
-    "shared_dram_layout",
 ]

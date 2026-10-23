@@ -3,12 +3,12 @@ import torch
 __all__ = [
     "_shared_exponents",
     "_reshape_to_blocks",
+    "_undo_reshape_to_blocks",
 ]
 
 
 FP32_EXPONENT_BIAS = 127
 FP32_MIN_NORMAL = 2 ** (-FP32_EXPONENT_BIAS + 1)
-
 
 # -------------------------------------------------------------------------
 # Helper funcs
@@ -20,10 +20,9 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
       A      {PyTorch tensor} -- Input tensor
       method {str}            -- Exponent selection method.
                                  "max" uses the max absolute value
-                                 "none" uses an exponent for each value
-                                 (i.e., no sharing)
-      axes   {list(int)}      -- List of integers which specifies the axes
-                                 across which shared exponents are calculated.
+                                 "none" uses an exponent for each value (i.e., no sharing)
+      axes   {list(int)}      -- List of integers which specifies the axes across which
+                                 shared exponents are calculated.
     Returns:
       shared_exp {PyTorch tensor} -- Tensor of shared exponents
     """
@@ -34,28 +33,23 @@ def _shared_exponents(A, method="max", axes=None, ebits=0):
         else:
             shared_exp = A
             for axis in axes:
-                shared_exp, _ = torch.max(
-                    torch.abs(shared_exp), dim=axis, keepdim=True
-                )
+                shared_exp, _ = torch.max(torch.abs(shared_exp), dim=axis, keepdim=True)
     elif method == "none":
         shared_exp = torch.abs(A)
     else:
-        raise Exception(
-            "Unrecognized shared exponent selection method %s" % (method)
-        )
+        raise Exception("Unrecognized shared exponent selection method %s" % (method))
 
     # log2(shared_exp) and truncate to integer
     shared_exp = torch.floor(
         torch.log2(
-            shared_exp
-            + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
+            shared_exp + FP32_MIN_NORMAL * (shared_exp == 0).type(shared_exp.dtype)
         )
     )
 
     # Restrict to [-emax, emax] range
     if ebits > 0:
-        emax = 2 ** (ebits - 1) - 1
-        # shared_exp = torch.clamp(shared_exp, -emax, emax)
+        emax = 2**(ebits-1) - 1
+        #shared_exp = torch.clamp(shared_exp, -emax, emax)
         # Overflow to Inf
         shared_exp[shared_exp > emax] = float("NaN")
         # Underflows are set to -127 which causes them to be

@@ -1,7 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 import collections.abc
 import logging
 import math
-import operator
 import re
 from itertools import repeat
 from typing import Any, Optional
@@ -26,8 +28,27 @@ INT64_MAX = torch.iinfo(torch.int64).max
 
 # Arg names of the quantization lookup tables the quantized_ops
 # quantize / dequantize / quantize_mx family takes.
-QMAP_PARAMS = {"qmap", "scale_qmap", "input_qmap", "output_qmap"}
-CODEBOOK_PARAMS = {"code", "input_code", "weight_code", "output_code"}
+# VSQ names its two levels rather than sharing one ``qmap``, so the names are
+# listed here beside the others: a lookup table is a lookup table whatever the
+# operator calls it, and the whole point of matching on schema *names* is that
+# a new operator states its own. Without these the maps are counted as model
+# parameters and the collateral declares storage nothing occupies.
+QMAP_PARAMS = {
+    "qmap",
+    "scale_qmap",
+    "input_qmap",
+    "output_qmap",
+    "coarse_qmap",
+    "fine_qmap",
+    "fine_scale_qmap",
+}
+CODEBOOK_PARAMS = {
+    "code",
+    "input_code",
+    "weight_code",
+    "output_code",
+    "fine_output_code",
+}
 QUANT_PARAMS = QMAP_PARAMS | CODEBOOK_PARAMS
 
 # Positional arg holding the axes a quantize blocks along, per op.
@@ -35,46 +56,9 @@ AXES_ARG_INDEX_MAP = {
     torch.ops.quantized_ops.dequantize.default: 3,
     torch.ops.quantized_ops.quantize.default: 3,
     torch.ops.quantized_ops.quantize_mx.default: 2,
-    torch.ops.quantized_ops.quantize_affine.default: 2,
+    torch.ops.quantized_ops.quantize_vsq.default: 4,
+    torch.ops.quantized_ops.dequantize_vsq.default: 3,
 }
-
-# The dynamic quantizes: each computes its qparams in the kernel and returns
-# a tuple -- qparams first, value last -- read through one ``getitem`` per
-# output.
-DYNAMIC_QUANTIZE_OPS = frozenset(
-    {
-        torch.ops.quantized_ops.quantize_mx.default,
-        torch.ops.quantized_ops.quantize_mx_outlier.default,
-        torch.ops.quantized_ops.quantize_affine.default,
-    }
-)
-
-# The whole quantize family: ops that re-encode a tensor -- change its dtype
-# and qparams -- rather than combine it with another.
-QUANTIZE_FAMILY_OPS = DYNAMIC_QUANTIZE_OPS | {
-    torch.ops.quantized_ops.quantize.default,
-    torch.ops.quantized_ops.dequantize.default,
-}
-
-# The layer norms and the softmaxes, in every form a graph spells them: the
-# model's op, the one a training graph's decomposition leaves, and the
-# quantized twin the compiler retargets to.  A log-softmax reduces and stages
-# like a softmax.
-LAYER_NORM_OPS = frozenset(
-    {
-        torch.ops.aten.layer_norm.default,
-        torch.ops.aten.native_layer_norm.default,
-        torch.ops.quantized_ops.layer_norm.default,
-    }
-)
-SOFTMAX_OPS = frozenset(
-    {
-        torch.ops.aten.softmax.int,
-        torch.ops.aten._softmax.default,
-        torch.ops.aten._log_softmax.default,
-        torch.ops.quantized_ops.softmax.default,
-    }
-)
 
 
 # --------------------------------------------------------------------------
@@ -267,44 +251,6 @@ def is_pooling(node: Node) -> bool:
     ]
 
 
-_SUMS = (torch.ops.aten.sum.dim_IntList, torch.ops.aten.mean.dim)
-
-
-def is_axis_reduction(node: Node) -> bool:
-    """``node`` sums or averages over some dims into a tensor, not a scalar:
-    a tile of its output reads each reduced dim whole."""
-    return node.target in _SUMS and len(node.shape) > 0
-
-
-def is_full_reduction(node: Node) -> bool:
-    """``node`` takes the max of a whole tensor, into one value: a tile of
-    its input folds into that value rather than making a tile of its own."""
-    return node.target is aten.amax.default and math.prod(node.shape) == 1
-
-
-def reduced_input_grid(node: Node) -> Optional[tuple]:
-    """For a ``sum`` / ``mean`` that drops the dims it reduces, the output
-    dim each input dim is tiled along, ``None`` for a reduced one, which is
-    read whole; ``None`` for any other op, whose operands right-align onto
-    its output."""
-    if node.target not in _SUMS or get_arg_value(node, 2, "keepdim", False):
-        return None
-    ndim = len(node.args[0].shape)
-    dims = get_arg_value(node, 1, "dim") or range(ndim)
-    reduced = {d % ndim for d in dims}
-    kept = iter(range(ndim - len(reduced)))
-    return tuple(None if d in reduced else next(kept) for d in range(ndim))
-
-
-def reduced_input_tiling(node: Node, tiling: tuple) -> tuple:
-    """``tiling``, over ``node``'s output, as the tiling of its operands: a
-    dim ``reduced_input_grid`` reads whole takes 1."""
-    grid = reduced_input_grid(node)
-    if grid is None:
-        return tiling
-    return tuple(1 if g is None else tiling[g] for g in grid)
-
-
 def is_reshape_op(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.transpose.int,
@@ -334,15 +280,13 @@ def is_prunable_op(node: Node) -> bool:
 
     # Dropout is the identity when the probability is zero or at inference.
     if node.target == torch.ops.aten.dropout.default:
-        return get_arg_value(node, 1, "p") == 0.0 or not get_arg_value(
-            node, 2, "train"
+        return (
+            get_arg_value(node, 1, "p") == 0.0
+            or not get_arg_value(node, 2, "train")
         )
 
-    # A same-dtype cast is a pure pass-through.
-    if node.target in (
-        torch.ops.aten.to.dtype,
-        torch.ops.aten._to_copy.default,
-    ):
+    # A same-dtype ``to.dtype`` is a pure pass-through.
+    if node.target == torch.ops.aten.to.dtype:
         dtype = get_arg_value(node, 1, "dtype")
         inp = node.args[0]
         val = getattr(inp, "value", inp.meta.get("val"))
@@ -636,22 +580,6 @@ def weight_transforms(node: Node):
     return node, False, None, None
 
 
-def activation_transforms(node: Node):
-    """The transpose fused onto a GEMM activation, and the operand beneath it.
-
-    A weight gradient ``dYᵀ @ X`` fuses ``dY.transpose(-2, -1)`` onto its
-    activation, and the transpose folds into the DMA as a weight's does.
-    Only a transpose over an external operand -- a placeholder -- counts.
-
-    Returns:
-        ``(node, transposed)``: the operand the transpose reads, and whether
-        there is one.
-    """
-    if swaps_last_two_dims(node) and node.args[0].op == "placeholder":
-        return node.args[0], True
-    return node, False
-
-
 # --------------------------------------------------------------------------
 # Argument and dtype access
 # --------------------------------------------------------------------------
@@ -706,6 +634,60 @@ def dtype_byte_size(dtype):
         raise ValueError(f"`dtype` is not a valid dtype: {dtype}.")
     bit_width = int(bit_search.groups()[0])
     return bit_width / 8.0
+
+
+def node_operand_bits(node) -> int:
+    """The width, in bits, of one element ``node`` holds.
+
+    Prefers the compiler's *tracked* storage dtype over the traced tensor's:
+    a value quantized to int4 is still traced as something byte-wide, and the
+    width a datapath unrolls against is the stored one. A multi-output node
+    carries one tracked dtype per output -- ``quantize_mx`` gives
+    ``(scale, quantized)`` -- and the operand a unit reads is the last of
+    them, so that is the one taken.
+
+    Args:
+        node: The FX node to size.
+
+    Returns:
+        The element width in bits.
+
+    Raises:
+        ValueError: If the node carries no dtype at all. Fail closed: a
+            substituted default here would silently unroll the array for a
+            width the operand does not have.
+    """
+    dtype = node.meta.get("dtype")
+    value = getattr(node, "value", None)
+    if value is None:
+        value = node.meta.get("val")
+    if isinstance(dtype, (list, tuple)):
+        # One entry per output, and ``None`` where an output was left at the
+        # dtype it was traced with. The payload is last.
+        traced = value if isinstance(value, (list, tuple)) else ()
+        for index in range(len(dtype) - 1, -1, -1):
+            candidate = dtype[index]
+            if candidate is None and index < len(traced):
+                candidate = getattr(traced[index], "dtype", None)
+            if candidate is not None:
+                dtype = candidate
+                break
+        else:
+            dtype = None
+    if dtype is None:
+        if isinstance(value, (list, tuple)):
+            value = next(
+                (
+                    item
+                    for item in reversed(value)
+                    if getattr(item, "dtype", None) is not None
+                ),
+                None,
+            )
+        dtype = getattr(value, "dtype", None)
+    if dtype is None:
+        raise ValueError(f"node {node} carries no dtype to size its operand")
+    return round(dtype_byte_size(dtype) * 8)
 
 
 # --------------------------------------------------------------------------
@@ -789,10 +771,7 @@ def compute_output_tiled_shapes(node, tiling, override_shapes=None):
         return compute_tiled_shape(override_shapes or node.shape, tiling)
     elif isinstance(node.value, (tuple, list)):
         shapes = []
-        # A ``quantize_mx_outlier`` -- bare or fused -- leads with the CSR
-        # triple, whose tile shapes count rows; every other tuple is plain
-        # dense outputs.
-        has_sparse_outputs = csr_quantize_node(node) is not None
+        has_sparse_outputs = len(node.value) > 2
 
         for i, tensor in enumerate(node.value):
             old_shape = override_shapes[i] if override_shapes else tensor.shape
@@ -889,30 +868,24 @@ def _reduced_dims(node, ndim: int) -> set:
     return set(range(ndim - len(normalized_shape), ndim))
 
 
-def relayout_view_shape(relayout, shape):
-    """The shape a relayout chain gives an input of ``shape``, or ``None``
-    when the chain moves elements rather than only renaming dims.
+def _reorders(relayout, spine) -> bool:
+    """Whether ``relayout`` moves elements or only renames dims.
 
     Proved by replaying the chain on an index tensor rather than by
     recognizing ops, so a transpose of a size-1 dim reads as the identity it
-    is.
-
-    Args:
-        relayout: The chain, walked input-ward -- the op nearest the value
-            first, as ``stream_breaking_quantize`` returns it.
-        shape: The shape the chain's input tensor has.
-
-    Returns:
-        The chain's output shape when it only renames dims, else ``None``.
+    is.  An unknown shape counts as reordering: the caller then stages the
+    tile, which is always safe.
     """
+    value = _tensor_value(spine)
+    if value is None:
+        return True
+    shape = tuple(value.shape)
     index = torch.arange(math.prod(shape)).reshape(shape)
     for n in reversed(relayout):
         index = n.target(
             *(index if a is n.args[0] else a for a in n.args), **n.kwargs
         )
-    if not torch.equal(index.reshape(-1), torch.arange(index.numel())):
-        return None
-    return tuple(index.shape)
+    return not torch.equal(index.reshape(-1), torch.arange(index.numel()))
 
 
 def stream_breaking_quantize(gm):
@@ -957,15 +930,9 @@ def stream_breaking_quantize(gm):
     ):
         relayout.append(spine)
         spine = spine.args[0]
-    permuted = False
-    if any(is_reshape_op(n) for n in relayout):
-        # An unknown shape counts as reordering: the caller then stages the
-        # tile, which is always safe.
-        value = _tensor_value(spine)
-        permuted = (
-            value is None
-            or relayout_view_shape(relayout, tuple(value.shape)) is None
-        )
+    permuted = any(is_reshape_op(n) for n in relayout) and _reorders(
+        relayout, spine
+    )
 
     val = getattr(quant.args[0], "value", None)
     if val is None:
@@ -1035,77 +1002,122 @@ def reduction_scratch(node, out_tile, vector_lanes):
     return scratch
 
 
-# --- outlier CSR producers and consumers -------------------------------------
+# -----------------------------------------------------------------------------
+# The logical extent, kept across hardware-only padding
+# -----------------------------------------------------------------------------
+#
+# Channel padding has two levels and only one of them is a graph operation.
+#
+# *Logical to resident* is real: the datapath requires whole channel groups, so
+# the pass materializes the wider tensor, extends the weight, scale and bias
+# with it, and slices the result back to the logical extent. That padding is
+# in the graph because the values are.
+#
+# *Resident to physical lanes* is not. It never becomes a node; a target that
+# needs it emits it as a field of the record it serializes.
+#
+# The first step destroys the information the second one needs. Once a
+# ``get_attr`` has been padded in place -- or replaced by a baked
+# ``<name>_padded`` -- the logical extent is not recoverable from the graph:
+# the added channels are zeros, and a tensor is not required to explain which
+# of its zeros were always there. So it is written down *before* the first
+# mutation rather than reconstructed afterwards by inspecting shapes, which is
+# a guess, or by scanning for zeros, which is a guess that sometimes agrees.
+
+#: Where the pre-padding extent is kept. On the value itself, because that is
+#: what every later reader has in hand.
+HARDWARE_LOGICAL_SHAPE = "hardware_logical_shape"
+
+#: Marks the slice this pass inserts to restore a padded result. A consumer
+#: needs to tell "the compiler widened this and is undoing it" from "the model
+#: asked for a slice", and the two are the same operator.
+HARDWARE_PADDING_SLICE = "hardware_padding_slice"
+
+#: Marks the pad this pass inserts to widen an operand to a resident extent,
+#: and carries the pad it applied. The same distinction as the slice above, in
+#: the other direction and for a sharper reason: a target reading a
+#: convolution's operand has to know whether the tensor in front of it is *the
+#: one the array will read* -- which a hardware channel pad is, since the
+#: resident extent is what the datapath holds -- or a pad the model asked for,
+#: which is a different tensor from the one the layer's semantics name.
+#:
+#: The value is the pad list, not ``True``, because "this pass made it" is not
+#: the property a reader needs. This pass also widens biases, vector-op tails
+#: and layer-norm operands, and none of those is a channel materialization.
+#: Storing the extents lets a reader ask the question it actually has --
+#: ``is_hardware_channel_pad`` -- instead of trusting a boolean that answers a
+#: broader one.
+HARDWARE_PADDING_PAD = "hardware_padding_pad"
 
 
-def csr_quantize_node(node):
-    """The ``quantize_mx_outlier`` ``node`` lowers, or ``None``.
+def is_hardware_channel_pad(node) -> bool:
+    """Whether ``node`` is this compiler widening an NCHW operand's channels.
 
-    A bare node is its own; a fused ``call_module`` carries it as an op of
-    its submodule.
+    ``aten.pad``'s list runs from the *last* dimension backwards in
+    ``(before, after)`` pairs, so a four-dimensional feature map's channel
+    axis is the third pair. A channel pad is therefore exactly six entries,
+    trailing-only, with the growth in the last.
+
+    Everything else this pass emits fails that: a bias pad is two entries, a
+    vector-op tail pad is two, and a spatial pad would put its growth in one
+    of the first four. Which is the point -- those are widenings too, and none
+    of them is the tensor a matrix unit reads.
     """
-    target = torch.ops.quantized_ops.quantize_mx_outlier.default
-    if node.op == "call_function" and node.target is target:
-        return node
-    if node.op != "call_module":
-        return None
-    submod = node.meta.get("submodule")
-    if not isinstance(submod, GraphModule):
-        return None
-    return next(
-        (
-            n
-            for n in submod.graph.nodes
-            if n.op == "call_function" and n.target is target
-        ),
-        None,
+    pad = node.meta.get(HARDWARE_PADDING_PAD)
+    if not isinstance(pad, (tuple, list)) or len(pad) != 6:
+        return False
+    return not any(pad[:4]) and pad[4] == 0 and pad[5] > 0
+
+
+def preserve_hardware_logical_shape(node) -> tuple:
+    """Record ``node``'s semantic shape before hardware-only padding.
+
+    Idempotent by construction -- ``setdefault`` -- so a value padded along
+    two axes by two passes keeps the extent it had before *either*. Calling it
+    after a mutation is the one way to get this wrong, and it is why the calls
+    sit immediately before each one.
+
+    Args:
+        node: The value about to be padded.
+
+    Returns:
+        The logical shape now recorded for it.
+
+    Raises:
+        ValueError: If the rank changed since it was first recorded. Padding
+            widens an axis; it does not add one, so a rank change means this
+            is not the value whose extent was kept.
+    """
+    shape = tuple(getattr(node, "shape", ()) or ())
+    previous = tuple(node.meta.setdefault(HARDWARE_LOGICAL_SHAPE, shape))
+    if len(previous) != len(shape):
+        raise ValueError(
+            f"{node.name}: logical rank changed from {len(previous)} to "
+            f"{len(shape)}; padding widens an axis, it does not add one"
+        )
+    return previous
+
+
+def get_hardware_logical_shape(node) -> tuple:
+    """``node``'s pre-padding extent, or its current shape if it was not padded.
+
+    The fallback is what makes this readable everywhere: a caller asking for
+    the logical extent of an unpadded value gets the right answer without
+    having to know whether the padding pass touched it.
+    """
+    return tuple(
+        node.meta.get(
+            HARDWARE_LOGICAL_SHAPE, getattr(node, "shape", ()) or ()
+        )
     )
 
 
-def is_spmm(node: Node) -> bool:
-    """Whether a GEMM's activation carries an outlier CSR (``A_data``), so
-    the engine adds the sparse correction on the vector pipeline."""
-    return node.kwargs.get("A_data") is not None
+def inherit_hardware_logical_shape(target, source) -> tuple:
+    """Carry ``source``'s logical extent onto a padded replacement value.
 
-
-def gemm_produces_csr(node) -> bool:
-    """Whether this GEMM's fused tail ends in a ``quantize_mx_outlier``.
-
-    Such a group is a producer as well as (possibly) a consumer: the quantize
-    runs on the accumulator tile, so its CSR is emitted per output tile and
-    has to be stored by hand rather than diced by the output grid.  A group
-    whose *anchor* is the quantize is not one -- that is the row-swept case.
+    A pass that pads by *replacing* a value rather than mutating it would
+    otherwise lose the extent at the moment it creates the wider tensor.
     """
-    anchor = get_anchor_node(node)
-    if anchor is None or not is_gemm_op(anchor):
-        return False
-    if csr_quantize_node(node) is None:
-        return False
-    return isinstance(node.value, (list, tuple)) and len(node.value) == 5
-
-
-def csr_consumers(producer):
-    """The GEMMs that consume the outlier CSR ``producer`` emits.
-
-    Each is the bare ``linear_mx`` / ``matmul_mx`` or the fused
-    ``call_module`` around one, reached from the producer's ``getitem``
-    results through any nop view in between (the reshape between a decoder
-    layer and ``lm_head``).
-    """
-    found = []
-    for use in producer.users:
-        if use.target is not operator.getitem:
-            continue
-        stack = list(use.users)
-        while stack:
-            user = stack.pop()
-            if is_nop(user):
-                stack.extend(user.users)
-                continue
-            anchor = get_anchor_node(user)
-            if anchor is None or not is_gemm_op(anchor):
-                continue
-            if anchor.kwargs.get("A_indptr") is None or user in found:
-                continue
-            found.append(user)
-    return found
+    logical = get_hardware_logical_shape(source)
+    target.meta[HARDWARE_LOGICAL_SHAPE] = logical
+    return logical

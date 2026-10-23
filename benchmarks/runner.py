@@ -21,17 +21,6 @@ The output is a single ``results.xlsx`` with one named sheet per sweep:
     python benchmarks/runner.py
     python benchmarks/runner.py --only quant --only hardware
     python benchmarks/runner.py --jobs 8 --fast
-
-``--no-pipelined`` and ``--no-fuse-operators`` turn off software pipelining
-(L2 double buffering) and operator fusion (the MXU dequant / activation /
-requantize tails and the GQA KV-repeat fold) for *every* point in the run, so
-one sweep per arm into its own ``--out`` gives the ablation across all axes:
-
-    python benchmarks/runner.py --out results/full
-    python benchmarks/runner.py --no-pipelined --out results/nopipe
-    python benchmarks/gen_diff.py --out ablation_pipelining.md \
-        --old results/nopipe/results.xlsx --new results/full/results.xlsx \
-        --old-tag no-pipelining --new-tag full
 """
 
 import argparse
@@ -41,8 +30,6 @@ from dataclasses import astuple
 
 import common
 import latency_dram_chart as ldc
-import plot_model_size_scaling
-import plot_results_mpl
 
 # -- axis definitions (moved from the individual sweep scripts) ---------------
 CONTEXT_LENGTHS = [128, 256, 512, 1024, 2048, 4096, 8192]
@@ -55,8 +42,7 @@ MODEL_SIZES = [
     ("meta-llama/Llama-2-13b-hf", "13B"),
 ]
 
-# (label, weight_bits, act_bits).  The decode KV cache follows ``act_bits``
-# unless ``--kv-bits`` asks for a KIVI width.
+# (label, weight_bits, act_bits) -- KV is fixed BF16.
 QUANT_CONFIGS = [
     ("W16A16", 16, 16),
     ("W8A8", 8, 8),
@@ -69,7 +55,6 @@ FAMILY_MODELS = [
     ("mistralai/Mistral-7B-v0.3", "Mistral"),
     ("Qwen/Qwen2.5-7B", "Qwen 2.5"),
     ("google/gemma-2-9b", "Gemma 2"),
-    ("Qwen/Qwen3-VL-8B-Instruct", "Qwen3-VL"),
 ]
 
 PE_ARRAYS = [(16, 16), (32, 32), (64, 64), (128, 128), (256, 256)]
@@ -347,7 +332,7 @@ def main():
         [unique[k] for k in keys],
         args.jobs,
         args.threads_per_job,
-        os.path.join(args.log_dir or args.out, "logs"),
+        args.log_dir or args.out,
         fast=args.fast,
         probe_layers=args.probe_layers,
         tag="sweep",
@@ -375,12 +360,6 @@ def main():
         f"\nwrote {os.path.abspath(path)}  "
         f"({len(sheets)} sheets: {', '.join(s.name for s in sheets)})"
     )
-
-    fig_dir = os.path.join(args.out, "figures")
-    written = plot_results_mpl.plot_workbook(path, fig_dir)
-    if any(s.name == plot_model_size_scaling.SHEET for s in sheets):
-        written += plot_model_size_scaling.plot_params_scaling(path, fig_dir)
-    print(f"wrote {len(written)} figures to {fig_dir}")
 
 
 if __name__ == "__main__":

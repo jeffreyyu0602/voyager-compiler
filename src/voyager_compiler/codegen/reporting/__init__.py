@@ -1,60 +1,37 @@
 """Latency / DRAM-traffic estimation and reporting for bufferized FX graphs.
 
-Two stages:
+Three separate stages:
 
-  * ``estimate_schedule``  walk the graph -> per-node timing + DRAM traffic,
-    folding each loop's steady state as it goes
-  * ``write_excel_report`` / ``write_perfetto``  write the workbook (whose
-    Calibration sheet is the RTL recipe) and the trace
+  * ``estimate_schedule``  walk the graph -> per-node timing + DRAM traffic
+  * ``compress_schedule``  collapse steady-state loop iterations
+  * ``write_excel_report`` / ``write_perfetto``  editable workbook + trace
 
-``report`` runs the common case (call it after ``plan_memory``).
+``report`` runs all three for the common case (call it after ``plan_memory``).
 """
 
 import os
 
-from voyager_compiler.codegen.reporting.calibration import (
-    Calibration,
-    KernelGroup,
-    Measurement,
-    kernel_groups,
-    load_calibration,
-    calibration_sheet,
-)
+from voyager_compiler.codegen.reporting.compress import compress_schedule
 from voyager_compiler.codegen.reporting.excel import write_excel_report
 from voyager_compiler.codegen.reporting.interpret import estimate_schedule
 from voyager_compiler.codegen.reporting.model import (
-    LoopSkip,
-    LoopStats,
+    LoopSummary,
     OpInfo,
     ScheduleResult,
     TimingRecord,
 )
 from voyager_compiler.codegen.reporting.perfetto import write_perfetto
-from voyager_compiler.codegen.reporting.summary import (
-    KernelRow,
-    coverage,
-    kernel_rows,
-)
 
 __all__ = [
-    "Calibration",
-    "KernelRow",
-    "KernelGroup",
-    "LoopSkip",
-    "LoopStats",
-    "Measurement",
+    "LoopSummary",
     "OpInfo",
     "ScheduleResult",
     "TimingRecord",
-    "coverage",
     "estimate_schedule",
-    "kernel_rows",
-    "kernel_groups",
-    "load_calibration",
-    "report",
-    "calibration_sheet",
+    "compress_schedule",
     "write_excel_report",
     "write_perfetto",
+    "report",
 ]
 
 
@@ -65,35 +42,26 @@ def report(
     output_dir: str = ".",
     basename: str = "schedule",
     perfetto: bool = True,
-    full_walk: bool = False,
-    calibration: Calibration = None,
+    compress_events: bool = False,
 ) -> ScheduleResult:
-    """Estimate and write the reports for a bufferized + memory-planned
-    ``model``.
+    """Estimate, compress, and write the reports for a bufferized + memory-
+    planned ``model``.
 
-    Args:
-        model: The graph, after ``plan_memory``.
-        config: The ``AcceleratorConfig`` (physical units; ``cost.py``
-            converts to cycles).
-        output_dir: Where ``<basename>.xlsx`` (and, when ``perfetto``,
-            ``<basename>.perfetto.json``) are written.
-        basename: The report files' stem.
-        perfetto: Also write the trace.
-        full_walk: Walk every loop iteration instead of folding the steady
-            state.
-        calibration: RTL-measured kernel cycles to price compute ops by.
-
-    Returns:
-        The ``ScheduleResult``.
+    ``config`` is the ``AcceleratorConfig`` (physical units; cost.py converts to
+    cycles).  Writes ``<basename>.xlsx`` (and, when ``perfetto``,
+    ``<basename>.perfetto.json``) under ``output_dir`` and returns the
+    (compressed) ``ScheduleResult``.  ``compress_events`` writes only the
+    compressed schedule to the Events sheet, so it stays small (and fast to
+    write) for large trip counts.
     """
-    result = estimate_schedule(
-        model, config, full_walk=full_walk, calibration=calibration
-    )
+    result = estimate_schedule(model, config)
+    compress_schedule(result)
+
     os.makedirs(output_dir, exist_ok=True)
     write_excel_report(
         result,
         os.path.join(output_dir, f"{basename}.xlsx"),
-        calibration=calibration,
+        compress_events=compress_events,
     )
     if perfetto:
         write_perfetto(

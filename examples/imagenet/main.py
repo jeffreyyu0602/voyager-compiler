@@ -21,16 +21,15 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+import torchao
 from tqdm import tqdm
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
     convert_pt2e,
-    disable_observers,
-    fold_conv_bn_qat,
     get_default_quantizer,
-    prepare_qat_pt2e,
-    set_batch_norm_training,
-    set_training,
+    prepare_pt2e,
+    quantize,
 )
 
 model_names = sorted(name for name in models.__dict__
@@ -101,10 +100,13 @@ parser.add_argument('--max_pool2x2', action="store_true",
                     help="Whether to replace 3x3 maxpool with 2x2.")
 parser.add_argument('--bn_folding', action="store_true",
                     help="Whether to fold batch normalization into conv.")
+parser.add_argument('--qat_model_id', default=None, help="Model checkpoint for evaluation.")
 parser.add_argument('--save_val_dataset', action="store_true",
                     help="Whether to save the validation dataset.")
 parser.add_argument('--output_dir', default=None,
                     help="Directory to save model checkpoints.")
+parser.add_argument('--eager_mode_qat', action="store_true",
+                    help="Use eager mode quantization for QAT.")
 add_experiment_args(parser)
 
 best_acc1 = 0
@@ -253,40 +255,130 @@ def main_worker(gpu, ngpus_per_node, args):
 
     example_inputs = (next(iter(calib_loader))[0].to(device, dtype=torch_dtype),)
 
-    # Exported in training mode, so every conv-BN trains through the
-    # simulated fold.
-    model.train()
+    from utils import get_conv_bn_layers
+    conv_bn_pairs = get_conv_bn_layers(model)
 
-    if args.bf16:
-        model.bfloat16()
+    # Use eager mode quantization for QAT or when evaluating a QAT model.
+    # Use PT2E for post-training quantization
+    if args.eager_mode_qat:
+        if args.bn_folding and len(conv_bn_pairs) > 0:
+            model = torch.ao.quantization.fuse_modules_qat(model, conv_bn_pairs)
 
-    quantizer = get_default_quantizer(
-        input_activation=args.activation,
-        weight=args.weight,
-        bias=args.bias,
-    )
+        quantize(model, args)
 
-    quantizer.set_module_name("fc", None)
+        with torch.no_grad():
+            model(*example_inputs)
 
-    dynamic_shapes = tuple(
-        (
-            {0: torch.export.Dim("bs", min=1, max=args.batch_size)}
-            if i == 0
-            else None
+        # Perform PTQ before QAT and fix the scales
+        if args.calibration_steps > 0:
+            calibrate(model)
+            for module in model.modules():
+                if isinstance(module, FakeQuantizeBase):
+                    module.disable_observer()
+
+        if args.qat_model_id is not None:
+            checkpoint = torch.load(args.qat_model_id, map_location=device)
+            model.load_state_dict(checkpoint['state_dict'])
+            print(f"best acc1: {checkpoint['best_acc1']}")
+
+        # Convert intrinsic modules (ConvBn) back to float modules
+        def convert_model(module):
+            modules = dict(module.named_children())
+            for name, child in modules.items():
+                if isinstance(child, torch.ao.nn.intrinsic._FusedModule):
+                    new_mod = child.to_float()
+                    for pre_hook in child._forward_pre_hooks.values():
+                        new_mod.register_forward_pre_hook(pre_hook)
+                    if hasattr(child, 'activation_pre_process'):
+                        new_mod.add_module('activation_pre_process', child.activation_pre_process)
+                    if hasattr(child, 'weight_fake_quant'):
+                        new_mod.weight.data = child.weight_fake_quant(new_mod.weight.data)
+                    module._modules[name] = new_mod
+                else:
+                    convert_model(child)
+
+        if args.convert_model:
+            convert_model(model)
+    else:
+        # We will turn conv1 into im2col + matmul
+        model = torch.ao.quantization.fuse_modules(model.eval(), [['conv1', 'bn1']])
+        model.train()
+
+        if args.bf16:
+            model.bfloat16()
+
+        quantizer = get_default_quantizer(
+            input_activation=args.activation,
+            output_activation=args.output_activation,
+            weight=args.weight,
+            bias=args.bias,
+            force_scale_power_of_two=args.force_scale_power_of_two,
         )
-        for i in range(len(example_inputs))
-    )
-    exported_model = torch.export.export(
-        model, example_inputs, dynamic_shapes=dynamic_shapes
-    ).module()
 
-    model = prepare_qat_pt2e(exported_model, quantizer)
+        quantizer.set_module_name("fc", None)
 
-    model.graph.print_tabular()
+        # if args.activation is not None and "microscaling" in args.activation:
+        #     import re
+        #     from voyager_compiler import (
+        #         QuantizationConfig,
+        #         QuantizationSpec,
+        #         DerivedQuantizationSpec,
+        #         derive_bias_qparams_fn,
+        #     )
 
-    if args.calibration_steps > 0:
-        calibrate(model)
-        disable_observers(model)
+        #     dtype = args.activation.split(",")[0]
+        #     if (match := re.fullmatch(r'nf(\d+)(?:_(\d+))?', dtype)):
+        #         bits = int(match.group(1))
+        #         dtype = f"int{bits}"
+        #     qspec = QuantizationSpec.from_str(f"{dtype},qs=per_tensor_symmetric")
+
+        #     bias_qspec = DerivedQuantizationSpec(
+        #         derived_from=None,
+        #         derive_qparams_fn=derive_bias_qparams_fn,
+        #         dtype=None,
+        #     )
+
+        #     qconfig = QuantizationConfig(qspec, None, qspec, bias_qspec)
+        #     quantizer.set_module_name("^conv1$", qconfig)
+
+        dynamic_shapes = tuple(
+            {0:  torch.export.Dim("bs", min=1, max=args.batch_size)} if i == 0 else None
+            for i in range(len(example_inputs))
+        )
+        exported_model = torch.export.export(model, example_inputs, dynamic_shapes=dynamic_shapes).module()
+
+        from voyager_compiler import replace_conv2d_with_im2col
+
+        replace_conv2d_with_im2col(exported_model)
+
+        from torchao.quantization.pt2e.quantize_pt2e import prepare_qat_pt2e
+        from torchao.quantization.pt2e.qat_utils import _fold_conv_bn_qat, _fuse_conv_bn_qat
+
+        if args.bn_folding and args.evaluate:
+            _fold_conv_bn_qat(exported_model)
+        else:
+            _fuse_conv_bn_qat(exported_model)
+
+        model = prepare_pt2e(exported_model, quantizer)
+
+        model.graph.print_tabular()
+
+        import types
+
+        def _eval(self, mode: bool = True):
+            pass
+
+        model.eval = types.MethodType(_eval, model)
+        model.train = types.MethodType(_eval, model)
+
+        if args.calibration_steps > 0:
+            calibrate(model)
+            for module in model.modules():
+                if isinstance(module, FakeQuantizeBase):
+                    module.disable_observer()
+
+        if args.convert_model:
+            convert_pt2e(model, args.bias)
 
     # define loss function (criterion), optimizer, and learning rate scheduler
     criterion = nn.CrossEntropyLoss().to(device)
@@ -321,11 +413,6 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    if args.bn_folding and args.evaluate:
-        fold_conv_bn_qat(model)
-
-    if args.convert_model:
-        convert_pt2e(model, args.bias)
 
     # Data loading code
     if args.dummy:
@@ -400,10 +487,7 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
-    # train() and eval() do not reach an exported graph's batch norms, so
-    # their mode is set here.
     if args.evaluate:
-        set_training(model, False)
         validate(val_loader, model, criterion, args)
         return
 
@@ -411,21 +495,28 @@ def main_worker(gpu, ngpus_per_node, args):
         if args.distributed:
             train_sampler.set_epoch(epoch)
 
-        # Batch norms update their statistics until epoch
-        # num_batch_norm_update_epochs, then freeze.
-        set_training(model, True)
-        if epoch > args.num_batch_norm_update_epochs:
-            set_batch_norm_training(model, False)
-
         # train for one epoch
         train(train_loader, model, criterion, optimizer, epoch, device, args)
 
-        if epoch >= args.num_observer_update_epochs:
+        if epoch >= args.num_observer_update_epochs and not args.eager_mode_qat:
             print("Disabling observer for subseq epochs, epoch = ", epoch)
-            disable_observers(model)
+            model.apply(torchao.quantization.pt2e.disable_observer)
+        if epoch >= args.num_batch_norm_update_epochs and not args.eager_mode_qat:
+            print("Freezing BN for subseq epochs, epoch = ", epoch)
+            for n in model.graph.nodes:
+                # Args: input, weight, bias, running_mean, running_var, training, momentum, eps
+                # We set the `training` flag to False here to freeze BN stats
+                if n.target in [
+                    torch.ops.aten.batch_norm.default,
+                    torch.ops.aten._native_batch_norm_legit.default,
+                    torch.ops.aten.cudnn_batch_norm.default,
+                ]:
+                    new_args = list(n.args)
+                    new_args[5] = False
+                    n.args = new_args
+            model.recompile()
 
         # evaluate on validation set
-        set_training(model, False)
         acc1 = validate(val_loader, model, criterion, args)
 
         scheduler.step()
