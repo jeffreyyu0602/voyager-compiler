@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """Moving code between FX graphs.
 
 Outlining -- lift a run of nodes into a submodule and call it -- and its
@@ -18,12 +21,7 @@ from voyager_compiler.codegen.iteration_space import (
     IterationSpaceNormalizer,
     NormalizationError,
 )
-from voyager_compiler.codegen.node_info import (
-    LAYER_NORM_OPS,
-    is_gemm_op,
-    is_nop,
-    is_reshape_op,
-)
+from voyager_compiler.codegen.node_info import is_gemm_op, is_nop, is_reshape_op
 from voyager_compiler.export_utils import create_getattr_from_value
 from voyager_compiler.shape_prop import (
     ShapeProp,
@@ -33,6 +31,8 @@ from voyager_compiler.shape_prop import (
 )
 
 logger = logging.getLogger(__name__)
+
+
 
 
 def copy_graph_module(
@@ -126,12 +126,8 @@ def replace_node_with_graph_module(
                     value_remap[n] = graph.create_node("get_attr", name)
                 else:
                     value_remap[n] = create_getattr_from_value(
-                        model, graph, n.target, attr, n.meta.get("producer")
+                        model, graph, n.target, attr
                     )
-                    if "dtype" in n.meta:
-                        # The same tensor keeps its logical dtype (a
-                        # kernel's int1 mask table).
-                        value_remap[n].meta["dtype"] = n.meta["dtype"]
             elif n.op == "call_module":
                 # A fused compute submodule (the attention builders run
                 # _fuse_passes, leaving top-level fused call_modules): register
@@ -171,12 +167,13 @@ def create_subgraph(nodes: List[Node]):
 
 OP_PARAM_ARG_INDEX = {
     torch.ops.aten.conv2d.default: 1,
+    torch.ops.aten.layer_norm.default: 2,
     torch.ops.aten.linear.default: 1,
     torch.ops.quantized_ops.conv2d.default: 1,
     torch.ops.quantized_ops.conv2d_mx.default: 1,
+    torch.ops.quantized_ops.layer_norm.default: 2,
     torch.ops.quantized_ops.linear.default: 1,
     torch.ops.quantized_ops.linear_mx.default: 1,
-    **dict.fromkeys(LAYER_NORM_OPS, 2),
 }
 
 
@@ -261,6 +258,71 @@ def rename_nodes_with_param_names(model: GraphModule):
     model.recompile()
 
 
+def bind_operand_sources(model: GraphModule, *, rename: bool = False) -> int:
+    """Give each fused submodule placeholder an edge to the operand bound to it.
+
+    ``rename_nodes_with_param_names`` gives an outer node a name derived from
+    its module path -- ``model_0_stem_1_conv_weight`` rather than
+    ``_param_constant7``. It stops at the boundary: inside a fused
+    ``call_module`` the same value is a placeholder called ``arg3_1``.
+
+    **The edge is the point, not the name.** ``meta['source_node']`` says which
+    node this placeholder *is*; a name is a string that any later pass may
+    rewrite, and placeholder names are per-subgraph so they are not even unique
+    -- on a bufferized llama decode 1635 nodes carry 1483 distinct names, and
+    anything keying on a name silently conflates them. A consumer that wants to
+    match a serialized operand to the tensor file its weight was written to
+    should follow the edge; a consumer that reads the name inherits the
+    collision.
+
+    So the two halves are gated differently, because their risks differ:
+
+    * the **edge** is additive metadata that never reaches the emitted IR, so
+      it is recorded unconditionally;
+    * the **name** does reach the emitted IR -- ``TensorBox.node`` is a node
+      name -- so rewriting it is opt-in (``--rename_fused_operands``) and
+      changes ``model.txt`` by design.
+
+    Returns the number of placeholders bound, so a caller can tell "nothing to
+    do" from "nothing matched".
+    """
+    bound = 0
+    renamed = 0
+    named_modules = dict(model.named_modules())
+    for node in list(model.graph.nodes):
+        for user in list(node.users):
+            if user.op != "call_module":
+                continue
+            submodule = named_modules.get(str(user.target))
+            if submodule is None or not hasattr(submodule, "graph"):
+                continue
+            operands = user.all_input_nodes
+            if node not in operands:
+                continue
+            index = operands.index(node)
+            placeholders = [
+                p for p in submodule.graph.nodes if p.op == "placeholder"
+            ]
+            if index >= len(placeholders):
+                # A submodule with fewer placeholders than the call has
+                # operands is a real inconsistency, but it is not this pass's
+                # to diagnose -- and binding by a mismatched index would be
+                # worse than leaving the placeholder alone.
+                continue
+            placeholder = placeholders[index]
+            placeholder.meta["source_node"] = node
+            bound += 1
+            if rename and placeholder.name != node.name:
+                placeholder.name = node.name
+                renamed += 1
+    if renamed:
+        # Only a rename needs the graph re-linted and the module rebuilt;
+        # recording an edge changes no code.
+        model.graph.lint()
+        model.recompile()
+    return bound
+
+
 def create_and_insert_subgraph(
     nodes: List[Node],
     model: torch.nn.Module,
@@ -294,8 +356,15 @@ def create_and_insert_subgraph(
     result = ShapeProp(submodule).propagate(*args)
     set_node_value(new_node, result)
 
-    # Normalize the fused submodule to the anchor's iteration space; skip the
-    # group (leaving it fused as-is) if it cannot share one iteration space.
+    # Normalize the fused submodule to the anchor's iteration space. A group
+    # that cannot share one is *rejected*: its members are restored and
+    # ``None`` is returned, which every caller reads as "not fused".
+    #
+    # Rejecting rather than keeping it, because ``normalize`` is not atomic --
+    # it raises part-way through rewriting the parent's operands and the
+    # child's body -- so a group kept after a failure would be half rewritten.
+    # A caller that must not lose the group therefore has to skip
+    # normalization, not tolerate its failure.
     if normalize_iteration_space:
         try:
             IterationSpaceNormalizer().normalize(model, new_node)

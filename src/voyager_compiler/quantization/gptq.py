@@ -22,8 +22,8 @@ import torch
 from torch.fx import Interpreter
 
 from voyager_compiler.export_utils import get_node_name_to_scope
-from voyager_compiler.ops import calculate_mx_qparam, quantize, vmap
-from voyager_compiler.quantization.codebook_optimizer import EPS
+from voyager_compiler.ops import calculate_mx_qparam, vmap
+from voyager_compiler.quantization.lcq import EPS
 from voyager_compiler.shape_prop import fetch_attr
 
 logger = logging.getLogger(__name__)
@@ -99,7 +99,7 @@ def block_scale(block, weights, fake_quant, shrink):
     Returns:
         One scale per output row.
     """
-    scale_qmap = fake_quant.scale_qmap
+    qmap, scale_qmap = fake_quant.qmap, fake_quant.scale_qmap
     base = (
         calculate_mx_qparam(
             block,
@@ -124,7 +124,7 @@ def block_scale(block, weights, fake_quant, shrink):
             .clamp_min(EPS)
         )
         quantized = (
-            quantize(block, scale[:, None], qmap=fake_quant.qmap).float()
+            vmap((block / scale[:, None]).bfloat16(), qmap).float()
             * scale[:, None]
         )
         error = ((block - quantized).pow(2) * weights).sum(dim=1)
@@ -241,21 +241,16 @@ def compensate_weight(
 
     work = weight.float().clone()
     out = torch.zeros_like(work)
-    columns = weight.shape[1]
-    for start in range(0, columns, block_size):
-        end = min(start + block_size, columns)
+    for start in range(0, weight.shape[1], block_size):
+        end = min(start + block_size, weight.shape[1])
         scale = block_scale(
             work[:, start:end], salience[start:end], fake_quant, shrink
         )
         deltas = torch.zeros(weight.shape[0], end - start, device=weight.device)
         for offset, column in enumerate(range(start, end)):
             values = work[:, column]
-            # The codebook names every axis of the weight, so a column
-            # enters as the column it is rather than a bare vector.
             quantized = (
-                quantize(
-                    values[:, None], scale[:, None], qmap=fake_quant.qmap
-                ).float()[:, 0]
+                vmap((values / scale).bfloat16(), fake_quant.qmap).float()
                 * scale
             )
             out[:, column] = quantized
@@ -418,7 +413,6 @@ def _cache_budget(device, reserve):
     return max(0, torch.cuda.mem_get_info(device)[0] - reserve)
 
 
-@torch.no_grad()
 def gptq(
     model,
     calibration,

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+
 """
 Loop-aware output generation for bufferized FX graphs.
 
@@ -41,7 +44,6 @@ import operator
 import os
 import signal
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 import graphviz
@@ -51,7 +53,7 @@ from tabulate import tabulate
 from torch.fx import GraphModule, Node
 from torch.fx.operator_schemas import normalize_function
 
-import interstellar
+from scheduler import interstellar
 from voyager_compiler.codegen.node_info import (
     QMAP_PARAMS,
     is_nop,
@@ -66,6 +68,10 @@ from voyager_compiler.codegen.transform.bufferize.ops import oracle_disabled
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
     _passed_whole,
+)
+from voyager_compiler.codegen.unsupported import (
+    SERIALIZED_UNSUPPORTED_OPERATION,
+    is_declared_unsupported_operation,
 )
 from voyager_compiler.codegen.voyager_ir_pb2 import (
     MEMORY_LEVEL_DRAM,
@@ -87,7 +93,7 @@ from voyager_compiler.codegen.voyager_ir_pb2 import (
     TensorBoxRef,
     Tiling,
 )
-from voyager_compiler.shape_prop import ShapeProp, materialized_values
+from voyager_compiler.shape_prop import ShapeProp
 
 logger = logging.getLogger(__name__)
 
@@ -250,13 +256,7 @@ _TILING_NUM_LEVELS = 3
 def _build_tiling(node) -> Tiling:
     """The interstellar mapping of a tiled matrix op (stamped on the node by its
     builder), as a ``Tiling``.  ``LoopIndex`` is numbered like the interstellar
-    loop ids, so they map across directly.  A level's loops are written in
-    order rank; a loop blocked at a level that gives it no rank could not be
-    placed and would be dropped, so that mapping is rejected.
-
-    Raises:
-        ValueError: A level blocks a loop it assigns no order to.
-    """
+    loop ids, so they map across directly."""
     mapping, access_list = node.meta["interstellar_tiling"]
     tiling = Tiling(name=node.name)
 
@@ -278,17 +278,6 @@ def _build_tiling(node) -> Tiling:
                     break
             if not matched:
                 break
-        for loop in range(interstellar.le.NUM):
-            if (
-                mapping.loop_blockings[loop][level] > 1
-                and mapping.loop_orders[loop][level] >= loop_index
-            ):
-                raise ValueError(
-                    f"{node.name}: level {level} blocks loop {loop} by "
-                    f"{mapping.loop_blockings[loop][level]} but ranks it "
-                    f"{mapping.loop_orders[loop][level]}, past the "
-                    f"{loop_index} loops placed; the Tiling would drop it"
-                )
         tiling.level_tilings.append(lt)
         tiling.level_access_counts.append(
             LevelAccessCount(
@@ -323,7 +312,7 @@ def _is_index_vector(node) -> bool:
 
 
 def _dtype_str(node) -> str:
-    """The logical (quantized) dtype the bufferizer derived (``int4``,
+    """The logical (quantized) dtype the bufferizer derived (``nf4_6``,
     ``fp8_e5m3``) when there is one, else the physical torch dtype."""
     dtype = node.meta.get("dtype")
     if isinstance(dtype, str):
@@ -356,7 +345,9 @@ def _owns_storage(node) -> bool:
     names storage one of these owns."""
     if node.op in ("placeholder", "get_attr"):
         return True
-    if node.op != "call_function":
+    if node.op != "call_function" and not is_declared_unsupported_operation(
+        node
+    ):
         return False
     return node.target in _ALLOCATORS or "memory" in node.meta
 
@@ -797,13 +788,20 @@ class _Emitter:
         ``op`` is where it runs: a tensor written into storage the op does not
         own is a bufferized instruction, so it runs on the datapath.
         """
+        # A call the compiler declared a non-accelerator boundary is
+        # serialized as such, whatever it would otherwise have been: the
+        # declaration states what the hardware will not do, and that
+        # outranks where the work would have landed.
+        if is_declared_unsupported_operation(node):
+            op_kind = SERIALIZED_UNSUPPORTED_OPERATION
+        elif _produces_tensor(node) and not _owns_storage(node):
+            op_kind = "call_function"
+        else:
+            op_kind = "cpu"
+
         call = PrimOp(
             name=node.name,
-            op=(
-                "call_function"
-                if _produces_tensor(node) and not _owns_storage(node)
-                else "cpu"
-            ),
+            op=op_kind,
             target=_target_name(node.target),
         )
         qmaps = quant_param_arg_nodes(node, QMAP_PARAMS)
@@ -841,7 +839,13 @@ class _Emitter:
         other tensor result is a destination the op writes (never a value it
         yields); a scalar result defines an SSA name; a DMA / wait has no result
         at all."""
-        if node.op == "call_function" and _owns_storage(node):
+        # A declared boundary is its own destination: the host writes the
+        # buffer the planner gave it, so there is no ``insert`` to find and
+        # the destination-passing rule below does not apply to it.
+        if _owns_storage(node) and (
+            node.op == "call_function"
+            or is_declared_unsupported_operation(node)
+        ):
             out = op.outputs.add()
             out.name = node.name
             out.tensor_box.CopyFrom(self._tensor_box(node))
@@ -947,7 +951,10 @@ class _Emitter:
 
     def _emit(self, node, gm, named, env, ops) -> None:
         if node.op == "call_module":
-            ops.append(self._fused(node, named, env))
+            if is_declared_unsupported_operation(node):
+                self._host_calls(node, named, env, ops)
+            else:
+                ops.append(self._fused(node, named, env))
             return
         if node.op != "call_function":
             return
@@ -1005,6 +1012,40 @@ class _Emitter:
         if "interstellar_tiling" in node.meta:
             op.tiling.CopyFrom(_build_tiling(node))
         return op
+
+    def _host_calls(self, node, named, env, ops) -> None:
+        """A call the host runs, emitted as the plain operations it is.
+
+        Fusion is a statement about the *datapath*: one instruction whose
+        stages hand tiles to each other without the value ever leaving the
+        array. The host has no such pipeline and no tiling -- it runs each
+        operation and writes the result. So a declared boundary is serialized
+        as its members, in order, rather than as a ``fused`` record that would
+        claim a chaining the machine running it does not have.
+
+        The members keep referring to each other by name, which is what an
+        intermediate of a host chain is: a temporary, not a buffer. Only the
+        last one writes the DRAM buffer the planner gave the group, because
+        that is the value the next accelerator call reads.
+        """
+        sub = named[str(node.target)]
+        sub_env = self.envs[sub]
+        self._dump(node)
+
+        chain = [
+            n
+            for n in sub.graph.nodes
+            if not is_nop(n) and n.op == "call_function"
+        ]
+        internal = frozenset(chain)
+        for position, inner in enumerate(chain):
+            call = self._call(inner, sub_env, internal)
+            call.op = SERIALIZED_UNSUPPORTED_OPERATION
+            operation = Operation(name=inner.name)
+            operation.prim.CopyFrom(call)
+            if position == len(chain) - 1:
+                self._set_outputs(operation, node, env)
+            ops.append(operation)
 
     def _loop(self, node, named, env) -> Operation:
         """A ``while_loop`` over a flattened tile grid is a counted ``for``: the
@@ -1245,9 +1286,7 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     # while_loop / cond body + fused call_module — with a ``.value``, so the
     # emitter below just reads it (no per-body ShapeProp).  oracle_disabled:
     # bodies are walked a single iteration, where a wait may precede its copy.
-    # A dump writes those values out, so it records every one of them whole.
-    whole = materialized_values() if output_dir is not None else nullcontext()
-    with whole, oracle_disabled():
+    with oracle_disabled():
         ShapeProp(model, recurse=True).propagate(*args)
 
     # One iteration is all a tile needs, but it leaves the DRAM buffers holding
@@ -1255,8 +1294,7 @@ def gen_code_bufferized(model: GraphModule, args, output_dir=None) -> Model:
     # loop for real and re-stamps only the top level, so the buffers end up with
     # the true tensors and the tiles keep theirs.
     if output_dir is not None:
-        with materialized_values():
-            ShapeProp(model).propagate(*args)
+        ShapeProp(model).propagate(*args)
 
     return _Emitter(model, output_dir).build()
 
@@ -1307,9 +1345,7 @@ def _node_label(node, named) -> Optional[str]:
             parts.append(str(dtype))
         elif val.dtype not in (torch.float, torch.bfloat16):
             parts.append(str(val.dtype))
-    elif isinstance(val, (tuple, list)) and all(
-        isinstance(t, torch.Tensor) for t in val
-    ):
+    elif isinstance(val, (tuple, list)):
         parts.append(", ".join(str(tuple(t.shape)) for t in val))
         dtypes = [t.dtype for t in val]
         if isinstance(dtype, (list, tuple)):
@@ -1330,11 +1366,27 @@ def _node_label(node, named) -> Optional[str]:
     return ("{" + label + "}").replace("<", r"\<").replace(">", r"\>")
 
 
+#: How a call the accelerator will not run is drawn.  The picture is the
+#: first place anyone looks to see what landed where, so a host-executed op
+#: has to be visible without reading ``model.txt``.
+_HOST_NODE_STYLE = {
+    "style": "filled",
+    "fillcolor": "#ffd8a8",
+    "color": "#b35c00",
+    "fontcolor": "#5c2f00",
+}
+
+
 def _render(model: GraphModule, output_file: str) -> None:
-    """Draw one box per node and one edge per use, then write the SVG."""
+    """Draw one box per node and one edge per use, then write the SVG.
+
+    A call declared a non-accelerator boundary is filled orange: the host
+    runs it, so it is not part of what the array was asked to do.
+    """
     g = graphviz.Digraph()
     named = dict(model.named_modules(remove_duplicate=False))
     edges = []
+    host_nodes = 0
 
     for node in model.graph.nodes:
         if node.op == "get_attr" and not require_allocation(node):
@@ -1342,10 +1394,23 @@ def _render(model: GraphModule, output_file: str) -> None:
         label = _node_label(node, named)
         if label is None:
             continue
-        g.node(node.name, label=label, shape="Mrecord")
+        attributes = {"shape": "Mrecord"}
+        if is_declared_unsupported_operation(node):
+            attributes.update(_HOST_NODE_STYLE)
+            host_nodes += 1
+        g.node(node.name, label=label, **attributes)
         edges += [(node.name, u.name) for u in node.users]
 
     g.edges(edges)
+    if host_nodes:
+        # Only drawn when there is something to explain, so an all-accelerator
+        # graph looks exactly as it did before.
+        g.node(
+            "__legend_host__",
+            label=f"CPU / host  ({host_nodes})",
+            shape="box",
+            **_HOST_NODE_STYLE,
+        )
     g.render(output_file, format="svg", cleanup=True)
 
 
@@ -1395,7 +1460,7 @@ def gen_compute_graph(
 # ===========================================================================
 
 # Short names for the builtin torch dtypes used in the ``<shape x dtype>``
-# annotation (custom quantized dtypes carry their own string, e.g. ``int6``,
+# annotation (custom quantized dtypes carry their own string, e.g. ``nf4_6``,
 # used verbatim).
 _DTYPE_SHORT = {
     torch.float32: "f32",
@@ -1417,7 +1482,7 @@ def _type_str(node) -> str:
     unknown).
 
     The dtype is the custom (quantized) ``meta['dtype']`` string (e.g.
-    ``int6``) used verbatim when set, else a short name for the builtin torch
+    ``nf4_6``) used verbatim when set, else a short name for the builtin torch
     dtype (``f32`` / ``bf16`` / ...).  ``space`` is ``meta['space']`` (``DRAM``
     / ``Scratchpad``) from the bufferize pass.  Shapes come from the node's
     ShapeProp ``value`` or, inside loop bodies, the exported ``meta['val']``.

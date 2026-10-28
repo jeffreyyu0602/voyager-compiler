@@ -15,14 +15,22 @@ models = [
     'bert-large-uncased-whole-word-masking-finetuned-squad',
 ]
 
-dtypes = ['posit8_1', 'fp8_e4m3']
+operations = [
+    'gemm,residual,layernorm,activation,scaling',
+    'gemm,residual,layernorm,activation',
+    'gemm,residual,layernorm',
+    'gemm,residual',
+    'gemm',
+]
+
+dtypes = ['posit8_1', 'e4m3']
 
 
-def run_evaluation(model, dtype, log_file, gpu):
+def run_evaluation(model, ops, dtype, log_file, gpu):
     command = [
         'python', 'examples/question_answering/run_qa_no_trainer.py',
         '--model_name_or_path', model,
-        '--dataset_name', 'rajpurkar/squad',
+        '--dataset_name', 'squad',
         '--per_device_eval_batch_size', '16',
         '--max_seq_length', '384',
         '--doc_stride', '128',
@@ -30,6 +38,7 @@ def run_evaluation(model, dtype, log_file, gpu):
         '--bf16',
         '--activation', dtype,
         '--weight', dtype,
+        '--quantize_forward', ops,
         '--log_file', log_file,
     ]
     if gpu is not None:
@@ -41,14 +50,14 @@ def run_evaluation(model, dtype, log_file, gpu):
 def extract_f1_scores(log_file, out_file):
     with open(log_file, 'r') as file, open(out_file + '.out', 'w') as out:
         scores = (re.findall(r"'f1': (\d+\.\d+)", file.read()))
-        for i in range(0, len(scores), len(dtypes)):
-            out.write('\t'.join(scores[i:i + len(dtypes)]) + '\n')
+        for i in range(0, len(scores), 10):
+            out.write('\t'.join(scores[i:i+10]) + '\n')
         return scores
 
 
 def write_csv(scores, out_file):
-    expected = len(models) * len(dtypes)
-    assert len(scores) == expected, f"Expected {expected}, got {len(scores)}"
+    assert len(scores) == 50, "Expected 50 scores, got %d" % len(scores)
+
     rows = [
         'MobileBERT-tiny',
         'MobileBERT',
@@ -56,17 +65,56 @@ def write_csv(scores, out_file):
         'BERT-base',
         'BERT-large'
     ]
-    columns = ['Posit8', 'E4M3']
-    scores_matrix = [
-        scores[i:i + len(dtypes)] for i in range(0, len(scores), len(dtypes))
+    headers = [
+        "no fusion",
+        "gemm + attention scaling",
+        "\'+ activation fusion",
+        "\'+ layernorm fusion",
+        "\'+ residual fusion"
     ]
+    subheaders = ['Posit8', 'E4M3']
+
+    columns = pd.MultiIndex.from_product([headers, subheaders],
+                                         names=['Fusion', 'Data Type'])
+
+    scores_matrix = [scores[i:i+10] for i in range(0, len(scores), 10)]
     df = pd.DataFrame(scores_matrix, index=rows, columns=columns)
     df.to_csv(out_file + '.csv')
 
 
 def run_experiments(args):
-    for model, dtype in itertools.product(models, dtypes):
-        run_evaluation(model, dtype, args.log_file, args.gpu)
+    for ops, model, dtype in itertools.product(operations, models, dtypes):
+        run_evaluation(model, ops, dtype, args.log_file, args.gpu)
+        scores = extract_f1_scores(args.log_file, args.out_file)
+    print("All commands executed.")
+
+    rows = [
+        "no fusion",
+        "gemm + attention scaling",
+        "\'+ activation fusion",
+        "\'+ layernorm fusion",
+        "\'+ residual fusion"
+    ]
+    headers = [
+        'MobileBERT-tiny',
+        'MobileBERT',
+        'BERT-base',
+        'BERT-large',
+        'DistillBERT-base'
+    ]
+    subheaders = ['Posit8', 'E4M3']
+
+    columns = pd.MultiIndex.from_product([headers, subheaders],
+                                         names=['Model', 'Data Type'])
+
+    scores_matrix = [scores[i:i+10] for i in range(0, len(scores), 10)]
+    df = pd.DataFrame(scores_matrix, index=rows, columns=columns)
+    df.to_csv('squad_f1.csv')
+
+
+def run_experiments_v2(args):
+    for model, ops, dtype in itertools.product(models, operations, dtypes):
+        run_evaluation(model, ops, dtype, args.log_file, args.gpu)
         scores = extract_f1_scores(args.log_file, args.out_file)
     print("All commands executed.")
     write_csv(scores, args.out_file)
@@ -85,4 +133,4 @@ if __name__ == "__main__":
         write_csv(scores, args.out_file)
         sys.exit(0)
 
-    run_experiments(args)
+    run_experiments_v2(args)

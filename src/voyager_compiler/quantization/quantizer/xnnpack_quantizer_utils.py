@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional
 
 import torch
 from torch.ao.quantization.fx.utils import (
@@ -17,103 +17,19 @@ from torchao.quantization.pt2e.quantizer.utils import (
 
 from voyager_compiler.quantization.quantizer.quantizer import (
     DerivedQuantizationSpec,
-    QScheme,
     QuantizationSpec,
 )
-
-_SDPA = torch.ops.aten.scaled_dot_product_attention.default
-# ``split_kv_cache`` spells a decode graph's attention as the twin, with its
-# residual operands; it takes the same annotation.
-_SDPA_OPS = (_SDPA, torch.ops.quantized_ops.sdpa_mx.default)
 
 
 # In the absence of better name, just winging it with QuantizationConfig
 @dataclass(eq=True, frozen=True)
 class QuantizationConfig:
-    """Specs for an op's operands.
-
-    A GEMM of quantized training has each operand tagged with its type in
-    ``meta["operand_types"]``; its operands take ``input_activation``,
-    ``weight`` or ``error`` by that type.  Elsewhere a matmul's second
-    operand takes ``weight``.
-
-    ``random_hadamard_transform`` names the GEMM kinds -- ``"fprop"``,
-    ``"dgrad"``, ``"wgrad"``, from ``meta["gemm_kind"]``, and ``"fprop"``
-    for a GEMM outside quantized training -- whose two operands are each
-    rotated along their contraction axis before they are quantized, which
-    their microscaling specs carry out.
-    """
-
     input_activation: Optional[QuantizationSpec]
     output_activation: Optional[QuantizationSpec]
     weight: Optional[QuantizationSpec]
     bias: Optional[QuantizationSpec]
-    error: Optional[QuantizationSpec] = None
-    random_hadamard_transform: Tuple[str, ...] = ()
-
-
-def _set_ch_axis(qspec: Optional[QuantizationSpec], ch_axis: int):
-    """``qspec`` blocked along ``ch_axis``, if its scheme blocks along one.
-
-    A spec naming several axes, e.g. ``ax=(0,1)`` for square weight blocks,
-    is the user's choice of block and is kept as given.
-    """
-    if (
-        qspec is None
-        or qspec.qscheme
-        not in (QScheme.MICROSCALING, QScheme.GROUP_WISE_AFFINE)
-        or isinstance(qspec.ch_axis, tuple)
-    ):
-        return qspec
-    return replace(qspec, ch_axis=ch_axis)
-
-
-def _typed_specs(node: Node, config: QuantizationConfig, axes):
-    """Specs of a training GEMM's two operands, by their tagged types.
-
-    Args:
-        node: GEMM with ``meta["operand_types"]``.
-        config: Gives each type its spec.
-        axes: Each operand's contraction axis, which its spec is blocked
-            along.
-
-    Returns:
-        The two operands' specs.
-    """
-    specs = {
-        "activation": config.input_activation,
-        "weight": config.weight,
-        "error": config.error,
-    }
-    return [
-        _set_ch_axis(specs[kind], axis)
-        for kind, axis in zip(node.meta["operand_types"], axes)
-    ]
-
-
-def _rotated(specs, axes, node: Node, config: QuantizationConfig):
-    """``specs`` rotated along their ``axes`` if ``config`` rotates
-    ``node``'s GEMM kind.
-
-    Args:
-        specs: The GEMM's two operand specs.
-        axes: Each operand's contraction axis.
-        node: The GEMM.
-        config: Names the GEMM kinds that are rotated.
-
-    Returns:
-        The two specs, each with ``rht_axis`` set to its axis if the GEMM is
-        rotated.
-    """
-    if (
-        node.meta.get("gemm_kind", "fprop")
-        not in config.random_hadamard_transform
-    ):
-        return specs
-    return [
-        None if spec is None else replace(spec, rht_axis=axis)
-        for spec, axis in zip(specs, axes)
-    ]
+    # TODO: remove, since we can use observer_or_fake_quant_ctr to express this
+    is_qat: bool = False
 
 
 OperatorPatternType = List[Callable]
@@ -184,14 +100,6 @@ def _annotate_linear(
         bias_node = None
         if len(node.args) > 2:
             bias_node = node.args[2]
-        act_spec, weight_spec = input_act_qspec, weight_qspec
-        if "operand_types" in node.meta:
-            act_spec, weight_spec = _typed_specs(
-                node, quantization_config, (-1, -1)
-            )
-        act_spec, weight_spec = _rotated(
-            [act_spec, weight_spec], (-1, -1), node, quantization_config
-        )
 
         if isinstance(quantization_config.bias, DerivedQuantizationSpec):
             bias_qspec = replace(
@@ -203,12 +111,12 @@ def _annotate_linear(
             _annotate_input_qspec_map(
                 node,
                 act_node,
-                act_spec,
+                input_act_qspec,
             )
             _annotate_input_qspec_map(
                 node,
                 weight_node,
-                weight_spec,
+                weight_qspec,
             )
             nodes_to_mark_annotated = [node, weight_node]
             if bias_node:
@@ -301,65 +209,19 @@ def _annotate_matmul(
         if _is_annotated([node]):
             continue
 
-        # We use weight_qspec for the second input to differentiate
-        # the two inputs of torch.matmul
-        specs = [input_act_qspec, weight_qspec]
-        if "operand_types" in node.meta:
-            specs = _typed_specs(node, quantization_config, (-1, -2))
-        specs = _rotated(specs, (-1, -2), node, quantization_config)
         input_qspec_map = {}
         input_act0 = node.args[0]
         if isinstance(input_act0, Node):
-            input_qspec_map[input_act0] = specs[0]
+            input_qspec_map[input_act0] = input_act_qspec
 
+        # We use weight_qspec for the second input to differentiate
+        # the two inputs of torch.matmul
         input_act1 = node.args[1]
         if isinstance(input_act1, Node):
-            input_qspec_map[input_act1] = specs[1]
+            input_qspec_map[input_act1] = weight_qspec
 
         node.meta["quantization_annotation"] = QuantizationAnnotation(
             input_qspec_map=input_qspec_map,
-            output_qspec=output_act_qspec,
-            _annotated=True,
-        )
-        annotated_partitions.append(node)
-    return annotated_partitions
-
-
-@register_annotator("sdpa")
-def _annotate_sdpa(
-    gm: torch.fx.GraphModule,
-    quantization_config: Optional[QuantizationConfig],
-    filter_fn: Optional[Callable[[Node], bool]] = None,
-) -> Optional[List[List[Node]]]:
-    """Annotate ``scaled_dot_product_attention`` like the two matmuls it
-    stands for: the query takes the input activation spec, the key and the
-    value the weight spec.  The key is passed ``[keys, head_dim]`` and
-    contracts along its last axis, so its blocks go there rather than on
-    the axis the spec names for a ``[contraction, out]`` operand; the value
-    contracts along the keys, as the spec says.  The probabilities are
-    quantized inside the attention kernel with the query's spec."""
-    annotated_partitions = []
-    input_act_qspec = quantization_config.input_activation
-    output_act_qspec = quantization_config.output_activation
-    weight_qspec = quantization_config.weight
-    key_qspec = (
-        replace(weight_qspec, ch_axis=-1) if weight_qspec is not None else None
-    )
-    for node in gm.graph.nodes:
-        if node.op != "call_function" or node.target not in _SDPA_OPS:
-            continue
-        if filter_fn and not filter_fn(node):
-            continue
-        if _is_annotated([node]):
-            continue
-
-        query, key, value = node.args[:3]
-        node.meta["quantization_annotation"] = QuantizationAnnotation(
-            input_qspec_map={
-                query: input_act_qspec,
-                key: key_qspec,
-                value: weight_qspec,
-            },
             output_qspec=output_act_qspec,
             _annotated=True,
         )

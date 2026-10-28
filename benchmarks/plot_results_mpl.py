@@ -446,14 +446,11 @@ def _rows(ws):
 
 
 def _chart_titles(ws):
-    """The sheet's chart titles, in the order the charts were added.  A
-    workbook written before the titles spelled ``vs.`` carries ``v.s.``; it
-    is read as ``vs.``."""
+    """The sheet's chart titles, in the order the charts were added."""
     titles = []
     for chart in ws._charts:
         rich = chart.title.tx.rich
-        text = "".join(r.t or "" for p in rich.p for r in (p.r or []))
-        titles.append(text.replace("v.s.", "vs."))
+        titles.append("".join(r.t or "" for p in rich.p for r in (p.r or [])))
     return titles
 
 
@@ -649,35 +646,20 @@ def parse_args():
     return p.parse_args()
 
 
-def plot_workbook(workbook, out, only=None, log=False):
-    """Redraw every figure in an aggregate ``results.xlsx``.
+def main():
+    args = parse_args()
+    wb = load_workbook(args.workbook)
+    os.makedirs(args.out, exist_ok=True)
 
-    Args:
-        workbook: Path of the aggregate workbook.
-        out: Directory the figures are written to; created if missing.
-        only: Sheet names to restrict to, or ``None`` for all.
-        log: Log-scale the value axes.
-
-    Returns:
-        The paths written.
-    """
-    wb = load_workbook(workbook)
-    os.makedirs(out, exist_ok=True)
-
-    names = only or wb.sheetnames
+    names = args.only or wb.sheetnames
     written = []
     for name in names:
         if name not in BASELINE_SHEETS:
-            written += plot_metric_sheet(wb[name], log, out)
+            written += plot_metric_sheet(wb[name], args.log, args.out)
     baselines = [wb[n] for n in BASELINE_SHEETS if n in names]
     if baselines:
-        written += plot_baseline_pair(baselines, log, out)
-    return written
+        written += plot_baseline_pair(baselines, args.log, args.out)
 
-
-def main():
-    args = parse_args()
-    written = plot_workbook(args.workbook, args.out, args.only, args.log)
     for path in written:
         print(path)
     print(f"\nwrote {len(written)} files to {os.path.abspath(args.out)}")

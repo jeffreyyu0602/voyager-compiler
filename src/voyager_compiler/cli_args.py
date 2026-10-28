@@ -5,7 +5,6 @@ from voyager_compiler.hardware_config import (
     DEFAULT_DOUBLE_BUFFERED_L2,
     DEFAULT_DRAM_ACCESS_LATENCY_NS,
     DEFAULT_DRAM_BANDWIDTH_GBS,
-    DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
     DEFAULT_DRAM_SIZE_GB,
     DEFAULT_FREQUENCY_GHZ,
     DEFAULT_INPUT_BUFFER_SIZE,
@@ -19,6 +18,7 @@ from voyager_compiler.ops.layout import (
     GEMM_WEIGHT_LAYOUTS,
     LAYOUT_POLICIES,
 )
+from voyager_compiler.quantization.quantizer.quantizer import QuantizationSpec
 from voyager_compiler.utils import SLURM_ARGS
 
 __all__ = [
@@ -29,8 +29,7 @@ __all__ = [
 
 
 qconfig_help_string = """
-Input arguments as a comma-separated list. The first argument must specify \
-the dtype.
+Input arguments as a comma-separated list. The first argument must specify the dtype.
 Subsequent arguments can be specified using either abbreviations or full names.
 Abbreviations and their full names:
   - qs: qscheme
@@ -38,41 +37,20 @@ Abbreviations and their full names:
   - ahl: amax_history_len
   - ax: ch_axis
   - bs: block_size
-  - pot: power_2_scale
-  - sr: stochastic_rounding
-  - gs: global_scale
 
 Example usage:
-  --params int8,qscheme=qscheme1,quant_max=127,amax_history_len=50,\
-ch_axis=0,block_size=32
+  --params int8,qscheme=qscheme1,quant_max=127,amax_history_len=50,ch_axis=0,block_size=32
 or
   --params int8,qs=qscheme1,qmax=127,ahl=50,ax=0,bs=32
 
 Parameter details:
-  - dtype (str): Data type (e.g., int8, int4, fp8_e4m3, fp8_e5m2, fp4_e2m1, \
-posit8_1)
+  - dtype (str): Data type (e.g., int8, int4, fp8_e4m3, fp8_e5m2, fp4_e2m1, posit8_1)
   - qscheme (str): Quantization scheme
   - quant_max (float): Maximum quantization value
   - amax_history_len (int): Length of the amax history (default: 50)
   - ch_axis (int): Channel axis (default: 0)
   - block_size (int): Block size (default: 32)
-  - power_2_scale (0/1): Round each scale to a power of two (default: 0)
-  - stochastic_rounding (0/1): Round each element at random, unbiased;
-    microscaling only (default: 0)
-  - global_scale (0/1): Scale the whole tensor by its amax in FP32 before
-    quantizing the block scales, as NVFP4 does; microscaling with a
-    scale dtype only (default: 0)
 """
-
-
-def _gemm_kinds(value: str):
-    """The GEMM kinds a comma-separated list names."""
-    kinds = tuple(value.split(","))
-    if not set(kinds) <= {"fprop", "dgrad", "wgrad"}:
-        raise argparse.ArgumentTypeError(
-            f"{value}: expected a subset of fprop,dgrad,wgrad"
-        )
-    return kinds
 
 
 def add_quantization_args(parser=None):
@@ -82,36 +60,22 @@ def add_quantization_args(parser=None):
         "--activation",
         default=None,
         help=(
-            "Activation quantization specification. Comma-separated "
-            "key=value pairs "
+            "Activation quantization specification. Comma-separated key=value pairs "
             "using abbreviations or full names. See below for details:\n"
             + qconfig_help_string
+        ),
+    )
+    parser.add_argument(
+        "--output_activation",
+        default=None,
+        help=(
+            "Output activation quantization specification. Format same as activation."
         ),
     )
     parser.add_argument(
         "--weight",
         default=None,
         help=("Weight quantization specification. Format same as activation."),
-    )
-    parser.add_argument(
-        "--error",
-        default=None,
-        help=(
-            "Gradient quantization spec, in the activation's format. Setting "
-            "it quantizes the backward pass too: the backward GEMMs of every "
-            "quantized linear and matmul (not yet convolution)."
-        ),
-    )
-    parser.add_argument(
-        "--random_hadamard_transform",
-        type=_gemm_kinds,
-        default=(),
-        help=(
-            "GEMM kinds whose two operands are rotated by a random Hadamard "
-            "transform along their contraction axis before they are "
-            "quantized: a comma-separated subset of fprop, dgrad, wgrad "
-            "(dgrad and wgrad need --error). Microscaling specs only."
-        ),
     )
     parser.add_argument(
         "--bias",
@@ -122,6 +86,19 @@ def add_quantization_args(parser=None):
         "--residual",
         default=None,
         help="Residual quantization specification. Format same as activation.",
+    )
+    parser.add_argument(
+        "--error",
+        default=None,
+        type=QuantizationSpec.from_str,
+        help=(
+            "Activation gradient quantization data type and configurations. Format same as activation."
+        ),
+    )
+    parser.add_argument(
+        "--force_scale_power_of_two",
+        action="store_true",
+        help="Whether to force the scaling factor to be a power of two.",
     )
     parser.add_argument(
         "--calibration_steps",
@@ -138,6 +115,54 @@ def add_quantization_args(parser=None):
         "--bf16",
         action="store_true",
         help="Use bf16 (mixed) precision instead of 32-bit float.",
+    )
+    #  -- legacy / deprecated args (kept for backward compatibility) ----------------
+    parser.add_argument(
+        "--pt2e",
+        action="store_true",
+        help="Whether to use PyTorch 2 torch.export post-training static quantizaion.",
+    )
+    parser.add_argument(
+        "--quantize_forward",
+        default="gemm",
+        help=(
+            "Forward operations to quantize. Choose from gemm, residual, "
+            "activation, layernorm, and scaling."
+        ),
+    )
+    parser.add_argument(
+        "--quantize_backprop",
+        default="gemm",
+        help=(
+            "Backprop operations to quantize. Choose from gemm, residual, "
+            "activation, layernorm, and scaling."
+        ),
+    )
+    parser.add_argument(
+        "--op_fusion",
+        type=lambda x: x.split(","),
+        default=None,
+        help="Fuse operation with previous GEMM to reduce quantization error.",
+    )
+    parser.add_argument(
+        "--posit_exp",
+        action="store_true",
+        help="Whether to use posit approximated exponential function in softmax.",
+    )
+    parser.add_argument(
+        "--posit_exp_shifted",
+        action="store_true",
+        help="Whether to use shifted posit approximated exponential function in softmax.",
+    )
+    parser.add_argument(
+        "--posit_reciprocal",
+        action="store_true",
+        help="Whether to use posit approximated reciprocal function in softmax.",
+    )
+    parser.add_argument(
+        "--record_histogram",
+        action="store_true",
+        help="Whether to store and plot the histogram of tensor value.",
     )
     return parser
 
@@ -159,10 +184,7 @@ def add_experiment_args(parser=None):
     parser.add_argument(
         "--run_name",
         default=None,
-        help=(
-            "A short display name for this run, which is this run will be "
-            "identified in the UI."
-        ),
+        help="A short display name for this run, which is this run will be identified in the UI.",
     )
     parser.add_argument(
         "--run_id",
@@ -178,10 +200,7 @@ def add_experiment_args(parser=None):
     parser.add_argument(
         "--sweep_id",
         default=None,
-        help=(
-            "The unique identifier for a sweep generated by W&B CLI or Python "
-            "SDK."
-        ),
+        help="The unique identifier for a sweep generated by W&B CLI or Python SDK.",
     )
     parser.add_argument(
         "--sweep_count",
@@ -198,10 +217,7 @@ def add_experiment_args(parser=None):
     parser.add_argument(
         "--log_file",
         default=None,
-        help=(
-            "Set the logging file. If not specified, the log will be printed "
-            "to stdout."
-        ),
+        help="Set the logging file. If not specified, the log will be printed to stdout.",
     )
     # ----------------------------------------------------
     # Training arguments
@@ -241,10 +257,7 @@ def add_experiment_args(parser=None):
         "--target_modules",
         type=lambda x: x.split(","),
         default="query,value",
-        help=(
-            "The modules (for example, attention blocks) to apply the LoRA "
-            "update matrices."
-        ),
+        help="The modules (for example, attention blocks) to apply the LoRA update matrices.",
     )
     parser.add_argument(
         "--peft_model_id",
@@ -267,6 +280,16 @@ def add_experiment_args(parser=None):
 def add_compile_args(parser=None):
     if parser is None:
         parser = argparse.ArgumentParser()
+
+    # -- naming -------------------------------------------------------------
+    parser.add_argument(
+        "--rename_fused_operands",
+        action="store_true",
+        help="Give a fused submodule's placeholders the name of the operand "
+        "bound to them, instead of the generic 'arg3_1'. Off by default "
+        "because node names reach the emitted IR, so enabling it changes "
+        "model.txt by design.",
+    )
 
     # -- memory hierarchy ---------------------------------------------------
     parser.add_argument(
@@ -344,12 +367,6 @@ def add_compile_args(parser=None):
         "frequency.",
     )
     parser.add_argument(
-        "--dram_energy_per_bit",
-        type=float,
-        default=DEFAULT_DRAM_ENERGY_PJ_PER_BIT,
-        help="DRAM access energy (pJ/bit) for the reporting energy columns.",
-    )
-    parser.add_argument(
         "--frequency",
         type=float,
         default=DEFAULT_FREQUENCY_GHZ,
@@ -383,22 +400,6 @@ def add_compile_args(parser=None):
         default=None,
         help="Vector unit lane count; defaults to the PE array columns.",
     )
-    parser.add_argument(
-        "--matrix_vector_unit_width",
-        type=int,
-        default=None,
-        help=(
-            "Matrix-vector unit width in elements; defaults to the PE array "
-            "columns."
-        ),
-    )
-    parser.add_argument(
-        "--accumulator_width",
-        type=int,
-        default=None,
-        help="Channels the vector unit fetches per pooling request "
-        "(ACCUMULATOR_WIDTH); defaults to the vector unit lane count.",
-    )
 
     # -- tiling / lowering --------------------------------------------------
     parser.add_argument(
@@ -407,26 +408,13 @@ def add_compile_args(parser=None):
         help="Do not fuse reshape with the following GEMM in Transformers.",
     )
     parser.add_argument(
-        "--remove_fp32_casts",
-        action="store_true",
-        help="Compute in 16-bit float where the model casts up to float32, "
-        "for an accelerator with no float32 datapath.",
-    )
-    parser.add_argument(
-        "--accumulate_fp32",
-        action="store_true",
-        help="Accumulate a GEMM split along K in float32 rather than its "
-        "output dtype, as training needs.",
-    )
-    parser.add_argument(
         "--runtime_tolerance",
         type=float,
-        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.02) in compile()
+        default=None,  # -> DEFAULT_RUNTIME_TOLERANCE (0.01) in compile()
         help="How much longer than the best modeled runtime an interstellar "
-        "tiling may take and still be chosen, as a fraction; among those, a "
-        "GEMM or conv takes the least modeled energy (mostly DRAM traffic) "
-        "and an attention op the least DRAM traffic.  0 = only the fastest "
-        "(default: 0.02).",
+        "tiling may take and still be chosen, as a fraction; among those, the "
+        "one with the least DRAM traffic wins.  0 = only the fastest "
+        "(default: 0.01).",
     )
 
     # -- reporting (timing / DRAM-traffic estimator) ------------------------
@@ -445,12 +433,5 @@ def add_compile_args(parser=None):
         "--report_basename",
         default="schedule",
         help="Base filename for the reporting outputs.",
-    )
-    parser.add_argument(
-        "--calib_in",
-        default=None,
-        help="A filled-in calibration sheet (a standalone form or a previous "
-        "<basename>.xlsx): price compute ops by its RTL measurements and "
-        "carry its power numbers into the Operation Table.",
     )
     return parser

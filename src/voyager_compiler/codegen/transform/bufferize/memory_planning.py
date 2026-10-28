@@ -42,6 +42,10 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch.fx import GraphModule, Node
 
+from voyager_compiler.codegen.unsupported import (
+    is_declared_unsupported_operation,
+)
+
 from voyager_compiler.codegen.node_info import (
     get_arg_value,
     tensor_alloc_bytes,
@@ -52,6 +56,9 @@ from voyager_compiler.codegen.transform.bufferize.bufferization import (
 from voyager_compiler.codegen.transform.bufferize.ops import (
     UNPIPELINED,
     MemoryLevel,
+)
+from voyager_compiler.codegen.storage.crosscheck import (
+    crosscheck_buffer_identity,
 )
 from voyager_compiler.codegen.transform.bufferize.utils import (
     _collect_codebook_nodes,
@@ -252,9 +259,18 @@ def _materializes_dram(node: Node) -> bool:
     tile, and no ``insert`` stores it); the loop then loads tiles straight out
     of it, so it is a DRAM buffer and needs an address like any other.  A view
     of a buffer is excluded: it owns no bytes of its own.
+
+    A call declared a non-accelerator boundary is host work too, whatever
+    shape the graph gave it.  The loose ``pad`` this rule was written for is a
+    ``call_function``; a fused chain no unit accepts is a ``call_module``.
+    Both are written by the host and read by the next accelerator call, so
+    both need an address.
     """
     return (
-        node.op == "call_function"
+        (
+            node.op == "call_function"
+            or is_declared_unsupported_operation(node)
+        )
         and node.target not in (_ALLOC, _ZERO)
         and node.meta.get("space") == "DRAM"
         and _val(node) is not None
@@ -262,38 +278,10 @@ def _materializes_dram(node: Node) -> bool:
     )
 
 
-def shared_dram_layout(
-    models: List[GraphModule], config
-) -> Dict[str, Tuple[int, int]]:
-    """One DRAM range per input name across programs that share their inputs.
-
-    The programs of a training step read and write the same parameters,
-    gradients and optimizer state; each input keeps one address in all of
-    them, and the ranges are laid out one after another from address 0.
-
-    Args:
-        models: Transformed programs, their inputs shape-propagated.
-        config: The accelerator, which sets each range's alignment.
-
-    Returns:
-        ``{input name: (start, end)}`` in bytes.
-    """
-    layout, offset = {}, 0
-    for model in models:
-        for node in model.graph.nodes:
-            if node.op == "placeholder" and node.name not in layout:
-                size = _nbytes(node, config)
-                layout[node.name] = (offset, offset + size)
-                offset += size
-    return layout
-
-
-def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
+def _plan_dram(model: GraphModule, buffer_of, config) -> int:
     """Place all DRAM tensors: persistent params / inputs first (no reuse), then
     greedy best-fit over the intermediate ``alloc`` activation buffers.  Writes
-    ``meta['memory']`` on each DRAM buffer root.  An input named in
-    ``dram_layout`` takes its range there, and the other persistent tensors
-    follow the whole layout.
+    ``meta['memory']`` on each DRAM buffer root.
     """
     nodes = list(model.graph.nodes)
     pos = {n: i for i, n in enumerate(nodes)}
@@ -313,26 +301,11 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
             persistent.append(n)  # model input
         elif _is_param(n, model, codebooks) and _val(n) is not None:
             persistent.append(n)  # weight
-        elif n.op == "call_function" and (
-            n.target is _ALLOC or _materializes_dram(n)
-        ):
+        elif (
+            n.op == "call_function" or is_declared_unsupported_operation(n)
+        ) and (n.target is _ALLOC or _materializes_dram(n)):
             if n.meta.get("space") != "Scratchpad":
                 reusable.append(n)
-        elif n.op == "call_function" and n.target is _COND:
-            # A split cache's fold computes the chunk's quantized outputs
-            # into buffers of its own inside a branch, born and dead within
-            # the cond: they take the cond's place in the schedule.
-            for handle in n.args[1:3]:
-                for inner in getattr(model, handle.target).graph.nodes:
-                    if (
-                        inner.op == "call_function"
-                        and (
-                            inner.target is _ALLOC or _materializes_dram(inner)
-                        )
-                        and inner.meta.get("space") != "Scratchpad"
-                    ):
-                        reusable.append(inner)
-                        pos[inner] = pos[n]
 
     # Lifetime of each buffer: from its def to the last top-level node reading it
     # — through ``buffer_of``, so a read through a *name* of the buffer (a
@@ -347,12 +320,8 @@ def _plan_dram(model: GraphModule, buffer_of, config, dram_layout) -> int:
                 last_t[root] = max(last_t[root], pos[n])
 
     # Persistent region first (params + inputs), linear, no reuse.
-    offset = max((end for _, end in dram_layout.values()), default=0)
+    offset = 0
     for b in persistent:
-        if b.op == "placeholder" and b.name in dram_layout:
-            start, end = dram_layout[b.name]
-            b.meta["memory"] = Segment(start, end, MemoryLevel.DRAM, b)
-            continue
         size = _nbytes(b, config)
         b.meta["memory"] = Segment(offset, offset + size, MemoryLevel.DRAM, b)
         offset += size
@@ -781,15 +750,8 @@ def _check_invariants(model: GraphModule, bufs: Dict[Node, "_Buf"]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def plan_memory(
-    model: GraphModule,
-    config,
-    dram_layout: Optional[Dict[str, Tuple[int, int]]] = None,
-) -> MemoryPlan:
+def plan_memory(model: GraphModule, config) -> MemoryPlan:
     """Assign concrete DRAM / Scratchpad addresses to a bufferized FX graph.
-
-    ``dram_layout`` (see ``shared_dram_layout``) pins the inputs this
-    program shares with others to their agreed DRAM ranges.
 
     Writes ``meta['memory']`` (DRAM) / ``meta['scratchpad']`` (Scratchpad)
     ``Segment``s on each buffer *root* — the ``alloc`` that owns the storage —
@@ -815,7 +777,11 @@ def plan_memory(
     # them (a buffer dies at the last read of *any* of its names), so compute
     # them once.
     buffer_of = _buffer_identity(model)
-    dram_bytes = _plan_dram(model, buffer_of, config, dram_layout or {})
+    # Off unless VOYAGER_STORAGE_CROSSCHECK names a report path; the typed
+    # storage graph must induce this same partition, and here is the one place
+    # both are available on the same graph.
+    crosscheck_buffer_identity(model, buffer_of)
+    dram_bytes = _plan_dram(model, buffer_of, config)
     bufs = _buffer_lifetimes(model, buffer_of, _timestamps(model), config)
 
     scratchpad_bytes = 0

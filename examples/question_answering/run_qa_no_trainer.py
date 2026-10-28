@@ -35,6 +35,7 @@ from accelerate.data_loader import skip_first_batches
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from datasets import load_dataset
+from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from utils_qa import postprocess_qa_predictions
@@ -52,16 +53,18 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import check_min_version
+from transformers.utils import check_min_version, get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
 import wandb
 from peft import LoraConfig, TaskType, get_peft_model
 
+from torchao.quantization.pt2e import FakeQuantizeBase
 from voyager_compiler import (
     add_experiment_args,
-    disable_observers,
-    prepare_from_args,
+    get_default_quantizer,
+    prepare_pt2e,
+    quantize,
     with_execution_context,
 )
 
@@ -352,6 +355,9 @@ def parse_args():
 def main(args):
     # args = parse_args()
 
+    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
+    # information sent is the one passed as arguments along with your Python/PyTorch versions.
+    send_example_telemetry("run_qa_no_trainer", args)
 
     # Initialize the accelerator. We will let the accelerator handle device placement for us in this example.
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
@@ -786,24 +792,45 @@ def main(args):
         device = torch.device("cpu")
     model.to(device)
 
-    first_batch = next(iter(train_dataloader))
-    example_kwargs = {k: v.to(device) for k, v in first_batch.items()}
-    batch_size = torch.export.Dim("batch_size")
-    # The collator pads each batch to a multiple of 8 tokens.
-    seq_blocks = torch.export.Dim(
-        "seq_blocks", min=1, max=args.max_seq_length // 8
-    )
-    seq_len = 8 * seq_blocks
-    dynamic_shapes = {
-        k: {0: batch_size} if v.dim() == 1 else {0: batch_size, 1: seq_len}
-        for k, v in example_kwargs.items()
-    }
-    model = prepare_from_args(model, args, (), example_kwargs, dynamic_shapes)
+    if args.pt2e:
+        print("PyTorch 2 Export quantization")
+        if args.bf16:
+            model.bfloat16()
+
+        quantizer = get_default_quantizer(
+            input_activation=args.activation,
+            weight=args.weight,
+            record_histogram=args.record_histogram,
+            force_scale_power_of_two=args.force_scale_power_of_two,
+        )
+        first_batch = next(iter(train_dataloader))
+        example_kwargs = {k: v.to(device) for k, v in first_batch.items()}
+        batch_size = torch.export.Dim("batch_size", min=1, max=48)
+        dynamic_shapes = {
+            "input_ids": {0: batch_size},
+            "token_type_ids": {0: batch_size},
+            "attention_mask": {0: batch_size},
+            "start_positions": {0: batch_size},
+            "end_positions": {0: batch_size},
+        }
+        model = prepare_pt2e(model, quantizer, (), example_kwargs, dynamic_shapes)
+    else:
+        print("Eager mode quantization")
+        quantize(model, args)
 
     # calibration data loader does not shuffle input dataset for reproducibility purpose
     calibration_data_loader = DataLoader(
         train_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size
     )
+
+    # observe model weights and register fake quant modules.
+    # this is different from calibration which does not do backward pass
+    batch = next(iter(calibration_data_loader))
+    batch = {k: v.to(device) for k, v in batch.items()}
+    outputs = model(**batch)
+    if args.do_train:
+        outputs.loss.backward()
+    model.zero_grad()
 
     def calibrate(model, data_loader):
         model.eval()
@@ -816,7 +843,9 @@ def main(args):
 
     if args.calibration_steps > 0:
         calibrate(model, calibration_data_loader)
-        disable_observers(model)
+        for module in model.modules():
+            if isinstance(module, FakeQuantizeBase):
+                module.disable_observer()
 
     num_params = sum(p.numel() for p in model.parameters())
     num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -935,9 +964,7 @@ def main(args):
         if best_metric is None or eval_metric['f1'] > best_metric['f1']:
             best_metric = eval_metric
             if args.output_dir is not None:
-                os.makedirs(args.output_dir, exist_ok=True)
-                path = os.path.join(args.output_dir, "model.pt")
-                torch.save(model.state_dict(), path)
+                model.save_pretrained(args.output_dir)
                 tokenizer.save_pretrained(args.output_dir)
 
         if wandb.run is not None:

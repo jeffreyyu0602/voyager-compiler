@@ -1,11 +1,11 @@
-# Make sure we have the conda environment set up.
-_CONDA_ROOT="${SCRATCH}/anaconda3"
 # Copyright (C) 2012 Anaconda, Inc
 # SPDX-License-Identifier: BSD-3-Clause
-\. "$_CONDA_ROOT/etc/profile.d/conda.sh" || return $?
+if ! command -v conda >/dev/null 2>&1; then
+    _CONDA_ROOT="${CONDA_ROOT:?Set CONDA_ROOT when conda is not on PATH}"
+    \. "$_CONDA_ROOT/etc/profile.d/conda.sh" || return $?
+fi
 
-ENV_NAME=myenv
-REPO_PATH="${SCRATCH}/voyager-compiler/"
+ENV_NAME="${VOYAGER_CONDA_ENV:-myenv}"
 WANDB_API_KEY="" # If you want to use wandb, set this to your API key.
 
 # Setup Conda
